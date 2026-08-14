@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PRODUCT_NAME } from '../shared/product';
@@ -8,9 +8,13 @@ import { TERMINAL_CHANNELS } from '../shared/terminal';
 import type { CreateTerminalRequest } from '../shared/terminal';
 import { SESSION_CHANNELS } from '../shared/session';
 import type { RenameSessionRequest, UpgradeSessionRequest } from '../shared/session';
+import { SFTP_CHANNELS } from '../shared/sftp';
+import type { DownloadSelectionRequest, UploadSelectionRequest } from '../shared/sftp';
 import { HostStore } from './hosts/host-store';
 import { SessionManager } from './sessions/session-manager';
 import { SessionStore } from './sessions/session-store';
+import { SftpService } from './sftp/sftp-service';
+import { TransferQueue } from './sftp/transfer-queue';
 import { registerSmokeRunner, smokeModeFromEnvironment } from './smoke/smoke-runner';
 import { TerminalService } from './terminal/terminal-service';
 
@@ -18,6 +22,8 @@ const isDevelopment = Boolean(process.env.VITE_DEV_SERVER_URL);
 const smokeMode = smokeModeFromEnvironment();
 const isSmokeTest = smokeMode !== null;
 const terminalService = new TerminalService();
+const sftpService = new SftpService(terminalService);
+const transferQueue = new TransferQueue(terminalService);
 let hostStore: HostStore | undefined;
 let sessionManager: SessionManager | undefined;
 
@@ -113,6 +119,7 @@ ipcMain.handle(
   },
 );
 ipcMain.handle(TERMINAL_CHANNELS.close, (event, terminalId: string) => {
+  transferQueue.cancelByTerminal(terminalId, event.sender.id);
   terminalService.close(event.sender, terminalId);
 });
 
@@ -157,6 +164,61 @@ ipcMain.handle(
     requireSessionManager().upgrade(event.sender, request.terminalId)
   ),
 );
+
+ipcMain.handle(
+  SFTP_CHANNELS.listDirectory,
+  (event, terminalId: string, path?: string) => (
+    sftpService.listDirectory(event.sender, terminalId, path)
+  ),
+);
+ipcMain.handle(
+  SFTP_CHANNELS.chooseUpload,
+  async (event, request: UploadSelectionRequest) => {
+    const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!ownerWindow) throw new Error('Upload window is unavailable.');
+    const selection = await dialog.showOpenDialog(ownerWindow, {
+      title: 'Upload files',
+      properties: ['openFile', 'multiSelections'],
+    });
+    if (selection.canceled) return [];
+    return selection.filePaths.map((localPath) => transferQueue.enqueueUpload(
+      event.sender,
+      request.terminalId,
+      localPath,
+      request.remoteDirectory,
+    ));
+  },
+);
+ipcMain.handle(
+  SFTP_CHANNELS.chooseDownload,
+  async (event, request: DownloadSelectionRequest) => {
+    const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!ownerWindow) throw new Error('Download window is unavailable.');
+    const safeName = request.suggestedName
+      .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
+      .replace(/[. ]+$/g, '') || 'download';
+    const selection = await dialog.showSaveDialog(ownerWindow, {
+      title: 'Download file',
+      defaultPath: join(app.getPath('downloads'), safeName),
+    });
+    if (selection.canceled || !selection.filePath) return null;
+    return transferQueue.enqueueDownload(
+      event.sender,
+      request.terminalId,
+      request.remotePath,
+      selection.filePath,
+    );
+  },
+);
+ipcMain.handle(SFTP_CHANNELS.listTransfers, (event, terminalId?: string) => (
+  transferQueue.list(event.sender, terminalId)
+));
+ipcMain.handle(SFTP_CHANNELS.cancelTransfer, (event, jobId: string) => (
+  transferQueue.cancel(event.sender, jobId)
+));
+ipcMain.handle(SFTP_CHANNELS.retryTransfer, (event, jobId: string) => (
+  transferQueue.retry(event.sender, jobId)
+));
 ipcMain.handle(
   SESSION_CHANNELS.rename,
   (_event, request: RenameSessionRequest) => requireSessionManager().rename(request),
@@ -179,7 +241,10 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', () => sessionManager?.close());
+app.on('before-quit', () => {
+  transferQueue.close();
+  sessionManager?.close();
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();

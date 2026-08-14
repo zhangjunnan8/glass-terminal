@@ -174,7 +174,7 @@ button { border: 0; }
 .selected-host-card .session-history-actions button { padding: 3px 4px; font-size: 8px; }
 .sidebar-footer { margin-top: auto; padding: 10px 12px; color: #516075; border-top: 1px solid #202a38; font-size: 9px; }
 
-.workspace { grid-area: workspace; display: flex; min-width: 0; flex-direction: column; background: #080c12; }
+.workspace { grid-area: workspace; display: flex; min-width: 0; position: relative; flex-direction: column; background: #080c12; }
 .tabs { display: flex; min-height: 37px; border-bottom: 1px solid #202a38; background: #101720; }
 .tab {
   display: flex;
@@ -250,6 +250,44 @@ button { border: 0; }
 .guardrail span { margin-right: 4px; color: #61d4af; }
 .activate-session { margin-top: 14px; padding: 8px 12px; color: #071410; border: 0; border-radius: 4px; background: #61d4af; cursor: pointer; font-size: 10px; font-weight: 700; }
 .session-ready { margin-top: 14px; padding: 7px 9px; color: #71bba7; border: 1px solid #24453c; border-radius: 4px; background: #0e1a18; font-size: 9px; }
+
+.sftp-drawer { display: flex; position: absolute; z-index: 8; top: 37px; right: 0; bottom: 0; width: min(410px, 75%); flex-direction: column; border-left: 1px solid #2b3a4e; background: #0e151f; box-shadow: -12px 0 24px #02050a88; }
+.sftp-drawer > header { display: flex; align-items: center; justify-content: space-between; min-height: 48px; padding: 0 12px; border-bottom: 1px solid #202c3a; }
+.sftp-drawer > header span, .sftp-drawer > header strong, .sftp-drawer > header small { display: block; }
+.sftp-drawer > header strong { font-size: 11px; letter-spacing: .1em; }
+.sftp-drawer > header small { margin-top: 2px; color: #647489; font-size: 9px; }
+.sftp-drawer > header button { color: #76869a; background: transparent; cursor: pointer; font-size: 16px; }
+.sftp-unavailable, .sftp-loading, .transfer-empty { padding: 22px 14px; color: #647489; font-size: 10px; line-height: 1.5; }
+.sftp-pathbar { display: flex; gap: 4px; padding: 8px; border-bottom: 1px solid #1f2a39; }
+.sftp-pathbar input { min-width: 0; flex: 1; padding: 5px 7px; color: #bdc9d9; border: 1px solid #2a394c; border-radius: 3px; outline: 0; background: #090f17; font: 9px "Cascadia Mono", Consolas, monospace; }
+.sftp-pathbar input:focus { border-color: #438a78; }
+.sftp-pathbar button, .sftp-download, .transfer-job button { padding: 5px 7px; color: #91a0b3; border: 1px solid #2a394c; border-radius: 3px; background: #151f2c; cursor: pointer; font-size: 9px; }
+.sftp-pathbar .sftp-upload { color: #08130f; border-color: #5ac6a5; background: #5ac6a5; font-weight: 700; }
+.sftp-error { padding: 7px 10px; color: #f19aa0; border-bottom: 1px solid #4a252c; background: #251319; font-size: 9px; }
+.sftp-file-list { min-height: 140px; flex: 1; overflow-y: auto; }
+.sftp-entry { display: flex; align-items: center; gap: 6px; padding: 2px 8px; border-bottom: 1px solid #17212e; }
+.sftp-entry:hover { background: #121d29; }
+.sftp-entry-main { display: flex; min-width: 0; flex: 1; align-items: center; gap: 8px; padding: 7px 3px; text-align: left; background: transparent; cursor: pointer; }
+.sftp-entry-main > span:last-child { min-width: 0; }
+.sftp-entry-main strong, .sftp-entry-main small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sftp-entry-main strong { color: #bdc9d8; font-size: 10px; }
+.sftp-entry-main small { margin-top: 2px; color: #5e6e81; font-size: 8px; }
+.sftp-entry-icon { color: #61c9aa; font-size: 12px; }
+.sftp-download { flex-shrink: 0; }
+.transfer-queue { max-height: 38%; overflow-y: auto; border-top: 1px solid #2a3748; background: #0b1119; }
+.transfer-heading { position: sticky; z-index: 1; top: 0; padding: 8px 10px; color: #647489; background: #0e151f; font-size: 8px; font-weight: 700; letter-spacing: .12em; }
+.transfer-heading span { float: right; }
+.transfer-job { position: relative; padding: 8px 10px 9px; border-top: 1px solid #17212e; }
+.transfer-job > div:first-child { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.transfer-job strong { overflow: hidden; color: #adbacb; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-status { color: #748398; font-size: 8px; text-transform: uppercase; }
+.transfer-status.completed { color: #62caaa; }
+.transfer-status.failed { color: #ee838c; }
+.transfer-status.running { color: #d6b76e; }
+.transfer-track { height: 3px; margin: 6px 0 4px; overflow: hidden; border-radius: 2px; background: #1d2a39; }
+.transfer-track span { display: block; height: 100%; background: #5bc9a7; transition: width .1s linear; }
+.transfer-job small { display: block; padding-right: 50px; overflow: hidden; color: #5f6f83; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.transfer-job > button { position: absolute; right: 9px; bottom: 7px; padding: 3px 5px; }
 .composer { margin: 10px; padding: 8px; border: 1px solid #273345; border-radius: 6px; background: #0b1119; }
 .composer textarea { width: 100%; height: 60px; resize: none; border: 0; outline: 0; background: transparent; font-size: 11px; }
 .composer div { display: flex; align-items: center; justify-content: space-between; color: #566579; font-size: 9px; }

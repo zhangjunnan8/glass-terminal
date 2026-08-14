@@ -16,6 +16,12 @@ import type {
   SessionRecord,
   UpgradeSessionRequest,
 } from './session';
+import type {
+  DownloadSelectionRequest,
+  SftpDirectoryListing,
+  TransferJobSnapshot,
+  UploadSelectionRequest,
+} from './sftp';
 
 export interface RuntimeInfo {
   platform: NodeJS.Platform;
@@ -48,5 +54,14 @@ export interface DesktopBridge {
     upgrade(request: UpgradeSessionRequest): Promise<SessionRecord>;
     rename(request: RenameSessionRequest): Promise<SessionRecord>;
     readTerminalHistory(sessionId: string): Promise<string>;
+  };
+  sftp: {
+    listDirectory(terminalId: string, path?: string): Promise<SftpDirectoryListing>;
+    chooseUpload(request: UploadSelectionRequest): Promise<TransferJobSnapshot[]>;
+    chooseDownload(request: DownloadSelectionRequest): Promise<TransferJobSnapshot | null>;
+    listTransfers(terminalId?: string): Promise<TransferJobSnapshot[]>;
+    cancelTransfer(jobId: string): Promise<TransferJobSnapshot>;
+    retryTransfer(jobId: string): Promise<TransferJobSnapshot>;
+    onTransferUpdated(listener: (job: TransferJobSnapshot) => void): () => void;
   };
 }

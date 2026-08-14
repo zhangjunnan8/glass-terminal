@@ -5,7 +5,7 @@ import { StringDecoder } from 'node:string_decoder';
 import type { WebContents } from 'electron';
 import * as pty from 'node-pty';
 import { Client } from 'ssh2';
-import type { ClientChannel, ConnectConfig, PseudoTtyOptions } from 'ssh2';
+import type { ClientChannel, ConnectConfig, PseudoTtyOptions, SFTPWrapper } from 'ssh2';
 import type { HostProfile, SshConnectRequest } from '../../shared/host';
 import { SSH_ERROR_CODES } from '../../shared/host';
 import type { TerminalJournalEvent } from '../../shared/session';
@@ -38,6 +38,7 @@ interface TerminalRecord {
   journalBytes: number;
   droppedJournalBytes: number;
   sessionId?: string;
+  sshClient?: Client;
 }
 
 const MAX_PENDING_OUTPUT = 256 * 1024;
@@ -56,6 +57,7 @@ type JournalListener = (
   sessionId: string,
   event: TerminalJournalEvent,
 ) => void;
+type ExitListener = (terminalId: string, ownerId: number) => void;
 
 function stringEnvironment(): Record<string, string> {
   return Object.fromEntries(
@@ -75,6 +77,7 @@ function fingerprintsMatch(expected: string, actual: string): boolean {
 export class TerminalService {
   private readonly terminals = new Map<string, TerminalRecord>();
   private readonly journalListeners = new Set<JournalListener>();
+  private readonly exitListeners = new Set<ExitListener>();
 
   listShells(): ShellProfile[] {
     return discoverShells();
@@ -184,7 +187,7 @@ export class TerminalService {
             transport: 'ssh',
             hostId: host.id,
           };
-          this.register(owner, descriptor, backend);
+          this.register(owner, descriptor, backend, client);
           for (const banner of banners) this.emitData(terminalId, banner);
           stream.on('data', (data: Buffer) => this.emitData(terminalId, stdoutDecoder.write(data)));
           stream.stderr.on('data', (data: Buffer) => {
@@ -313,10 +316,27 @@ export class TerminalService {
     return () => this.journalListeners.delete(listener);
   }
 
+  onExit(listener: ExitListener): () => void {
+    this.exitListeners.add(listener);
+    return () => this.exitListeners.delete(listener);
+  }
+
+  openSftp(owner: WebContents, terminalId: string): Promise<SFTPWrapper> {
+    const record = this.requireConnected(owner, terminalId);
+    if (!record.sshClient) throw new Error('SFTP requires a connected SSH terminal.');
+    return new Promise((resolve, reject) => {
+      record.sshClient!.sftp((error, sftp) => {
+        if (error) reject(new Error(`Unable to open SFTP: ${error.message}`));
+        else resolve(sftp);
+      });
+    });
+  }
+
   private register(
     owner: WebContents,
     descriptor: TerminalDescriptor,
     backend: TerminalBackend,
+    sshClient?: Client,
   ): void {
     this.terminals.set(descriptor.id, {
       backend,
@@ -332,6 +352,7 @@ export class TerminalService {
       journal: [],
       journalBytes: 0,
       droppedJournalBytes: 0,
+      sshClient,
     });
   }
 
@@ -375,6 +396,7 @@ export class TerminalService {
     if (!record.owner.isDestroyed()) {
       record.owner.send(TERMINAL_CHANNELS.exit, { terminalId, exitCode, signal });
     }
+    for (const listener of this.exitListeners) listener(terminalId, record.ownerId);
   }
 
   private requireOwned(owner: WebContents, terminalId: string): TerminalRecord {

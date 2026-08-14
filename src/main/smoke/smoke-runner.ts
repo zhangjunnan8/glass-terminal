@@ -125,6 +125,10 @@ async function runSshSmoke(window: BrowserWindow): Promise<boolean> {
       );
       if (!paneReady) throw new Error('SSH terminal pane did not attach.');
       const pane = document.querySelector('[data-terminal-id="' + descriptor.id + '"]');
+      document.querySelector('[title="SFTP files and transfers"]')?.click();
+      const sftpReady = await waitFor(
+        () => document.querySelector('[data-sftp-ready="true"]'),
+      );
       await window.aiTerminal.terminal.write(
         descriptor.id,
         ${JSON.stringify(markerCommand)},
@@ -135,7 +139,7 @@ async function runSshSmoke(window: BrowserWindow): Promise<boolean> {
       await window.aiTerminal.terminal.write(descriptor.id, ${JSON.stringify(exitCommand)});
       await waitFor(() => document.querySelector('.tab-state.exited'), 8000);
       await window.aiTerminal.hosts.remove(host.id);
-      return { ok: commandSeen };
+      return { ok: commandSeen && sftpReady };
     } catch (error) {
       return {
         ok: false,

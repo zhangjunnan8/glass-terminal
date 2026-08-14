@@ -6,6 +6,7 @@ import { PRODUCT_NAME } from '../shared/product';
 import type { SessionRecord } from '../shared/session';
 import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
 import { TerminalPane } from './components/TerminalPane';
+import { SftpDrawer } from './components/SftpDrawer';
 
 interface TerminalTab extends TerminalDescriptor {
   createdAt: number;
@@ -37,6 +38,7 @@ export function App() {
   const [activeId, setActiveId] = useState<string | null>(null);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [newTerminalOpen, setNewTerminalOpen] = useState(false);
+  const [sftpOpen, setSftpOpen] = useState(false);
   const [editingHost, setEditingHost] = useState<HostProfile | null | undefined>(undefined);
   const [connectingHost, setConnectingHost] = useState<HostProfile | null>(null);
   const [reconnectingSessionId, setReconnectingSessionId] = useState<string | null>(null);
@@ -254,7 +256,11 @@ export function App() {
       <aside className="activitybar" aria-label="Primary navigation">
         <button className="activity active" title="Terminals">⌁</button>
         <button className="activity" title="Hosts">▦</button>
-        <button className="activity" title="Transfers">⇅</button>
+        <button
+          className={`activity ${sftpOpen ? 'active' : ''}`}
+          title="SFTP files and transfers"
+          onClick={() => setSftpOpen((open) => !open)}
+        >⇅</button>
         <button className="activity" title="History">◷</button>
         <div className="activity-spacer" />
         <button className="activity" title="Settings">⚙</button>
@@ -409,6 +415,7 @@ export function App() {
             <span>{activeTab?.sessionId ? 'Formal Session' : 'Temporary terminal'}</span>
           </footer>
         </section>
+        {sftpOpen && <SftpDrawer terminal={activeTab} onClose={() => setSftpOpen(false)} />}
       </main>
 
       <aside className="agent-panel">

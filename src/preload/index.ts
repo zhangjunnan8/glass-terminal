@@ -4,6 +4,8 @@ import { HOST_CHANNELS } from '../shared/host';
 import { TERMINAL_CHANNELS } from '../shared/terminal';
 import type { TerminalDataEvent, TerminalExitEvent } from '../shared/terminal';
 import { SESSION_CHANNELS } from '../shared/session';
+import { SFTP_CHANNELS } from '../shared/sftp';
+import type { TransferJobSnapshot } from '../shared/sftp';
 
 const terminalBridge: DesktopBridge['terminal'] = {
   listShells: () => ipcRenderer.invoke(TERMINAL_CHANNELS.listShells),
@@ -54,6 +56,26 @@ const sessionBridge: DesktopBridge['sessions'] = {
   ),
 };
 
+const sftpBridge: DesktopBridge['sftp'] = {
+  listDirectory: (terminalId, path) => ipcRenderer.invoke(
+    SFTP_CHANNELS.listDirectory,
+    terminalId,
+    path,
+  ),
+  chooseUpload: (request) => ipcRenderer.invoke(SFTP_CHANNELS.chooseUpload, request),
+  chooseDownload: (request) => ipcRenderer.invoke(SFTP_CHANNELS.chooseDownload, request),
+  listTransfers: (terminalId) => ipcRenderer.invoke(SFTP_CHANNELS.listTransfers, terminalId),
+  cancelTransfer: (jobId) => ipcRenderer.invoke(SFTP_CHANNELS.cancelTransfer, jobId),
+  retryTransfer: (jobId) => ipcRenderer.invoke(SFTP_CHANNELS.retryTransfer, jobId),
+  onTransferUpdated: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, job: TransferJobSnapshot) => {
+      listener(job);
+    };
+    ipcRenderer.on(SFTP_CHANNELS.transferUpdated, handler);
+    return () => ipcRenderer.removeListener(SFTP_CHANNELS.transferUpdated, handler);
+  },
+};
+
 const bridge: DesktopBridge = Object.freeze({
   runtime: Object.freeze({
     getInfo: () => ipcRenderer.invoke('runtime:get-info'),
@@ -61,6 +83,7 @@ const bridge: DesktopBridge = Object.freeze({
   terminal: Object.freeze(terminalBridge),
   hosts: Object.freeze(hostBridge),
   sessions: Object.freeze(sessionBridge),
+  sftp: Object.freeze(sftpBridge),
 });
 
 contextBridge.exposeInMainWorld('aiTerminal', bridge);
