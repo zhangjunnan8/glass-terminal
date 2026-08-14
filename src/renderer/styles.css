@@ -166,8 +166,27 @@ button { border: 0; }
   font-size: 11px;
 }
 .tab.active { color: #d5e0ee; background: #080c12; box-shadow: inset 0 2px #62d6b2; }
+.tab-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tab-close { margin-left: auto; color: #59677b; }
 .new-tab { width: 36px; }
+.new-tab-wrap { position: relative; display: flex; }
+.shell-menu {
+  position: absolute;
+  z-index: 10;
+  top: 34px;
+  left: 2px;
+  width: 230px;
+  padding: 5px;
+  border: 1px solid #2a3749;
+  border-radius: 5px;
+  background: #121a25;
+  box-shadow: 0 12px 32px #0009;
+}
+.shell-menu button { display: block; width: 100%; padding: 8px 9px; text-align: left; border-radius: 3px; background: transparent; cursor: pointer; }
+.shell-menu button:hover { background: #1a2736; }
+.shell-menu strong, .shell-menu span { display: block; }
+.shell-menu strong { color: #cfdae9; font-size: 11px; }
+.shell-menu span { margin-top: 2px; color: #66758a; font-size: 9px; }
 
 .terminal-stage { display: grid; grid-template-rows: 33px minmax(0, 1fr) 25px; min-height: 0; flex: 1; }
 .terminal-toolbar, .terminal-statusbar {
@@ -180,8 +199,14 @@ button { border: 0; }
   letter-spacing: .06em;
 }
 .terminal-toolbar { border-bottom: 1px solid #141c27; }
-.terminal-actions { display: flex; }
+.terminal-actions { display: flex; align-items: center; gap: 8px; }
+.terminal-stack { position: relative; min-width: 0; min-height: 0; background: #080c12; }
+.terminal-pane { position: absolute; inset: 0; display: none; padding: 8px 8px 4px 12px; }
+.terminal-pane.active { display: block; }
+.terminal-pane .xterm { width: 100%; height: 100%; }
+.terminal-pane .xterm-viewport { scrollbar-color: #2b3a4e #080c12; scrollbar-width: thin; }
 .terminal-placeholder { padding: 18px 20px; color: #abb8ca; font: 13px/1.55 "Cascadia Mono", "Cascadia Code", Consolas, monospace; }
+.terminal-error { padding: 18px 20px; color: #f18b92; font: 12px/1.5 "Cascadia Mono", Consolas, monospace; }
 .terminal-placeholder p { margin-top: 12px; color: #445165; font-size: 10px; }
 .prompt-symbol { color: #68dbb9; font-weight: 700; }
 .prompt-path { color: #aebbd0; }

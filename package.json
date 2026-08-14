@@ -21,6 +21,9 @@
     "npm": ">=10.0.0"
   },
   "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "node-pty": "^1.1.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8"
   },
@@ -38,5 +41,9 @@
     "vite": "^8.2.1",
     "vitest": "^4.1.0",
     "wait-on": "^9.0.3"
+  },
+  "allowScripts": {
+    "esbuild@0.27.7": true,
+    "node-pty@1.1.0": true
   }
 }
