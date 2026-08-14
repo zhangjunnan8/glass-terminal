@@ -18,6 +18,8 @@ export interface TerminalDescriptor {
   title: string;
   profileId: string;
   shellKind: ShellProfile['kind'];
+  transport: 'local' | 'ssh';
+  hostId?: string;
 }
 
 export interface TerminalDataEvent {
@@ -34,6 +36,7 @@ export interface TerminalExitEvent {
 export const TERMINAL_CHANNELS = {
   listShells: 'terminal:list-shells',
   create: 'terminal:create',
+  attach: 'terminal:attach',
   write: 'terminal:write',
   resize: 'terminal:resize',
   close: 'terminal:close',

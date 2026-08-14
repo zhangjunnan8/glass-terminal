@@ -13,5 +13,5 @@ export default defineConfig({
   splitting: false,
   sourcemap: true,
   clean: true,
-  external: ['electron', 'node-pty'],
+  external: ['electron', 'node-pty', 'ssh2'],
 });

@@ -5,6 +5,7 @@ release/
 coverage/
 .vite/
 .electron-cache/
+.smoke-data/
 *.log
 *.tsbuildinfo
 .DS_Store

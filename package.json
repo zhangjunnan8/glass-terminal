@@ -10,10 +10,12 @@
     "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:ssh": "vitest run src/main/terminal/ssh-integration.test.ts",
     "build:renderer": "vite build",
     "build:electron": "tsup",
     "build": "npm run typecheck && npm test && npm run build:renderer && npm run build:electron",
     "smoke": "cross-env AI_TERMINAL_SMOKE_TEST=1 electron .",
+    "smoke:ssh": "cross-env AI_TERMINAL_SSH_SMOKE_TEST=1 electron .",
     "start": "electron ."
   },
   "engines": {
@@ -25,12 +27,14 @@
     "@xterm/xterm": "^6.0.0",
     "node-pty": "^1.1.0",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8"
+    "react-dom": "^19.2.8",
+    "ssh2": "^1.17.0"
   },
   "devDependencies": {
     "@types/node": "^24.10.0",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",
+    "@types/ssh2": "^1.15.5",
     "@vitejs/plugin-react": "^6.0.1",
     "concurrently": "^9.2.1",
     "cross-env": "^10.1.0",
@@ -44,6 +48,7 @@
   },
   "allowScripts": {
     "esbuild@0.27.7": true,
-    "node-pty@1.1.0": true
+    "node-pty@1.1.0": true,
+    "ssh2@1.17.0": true
   }
 }

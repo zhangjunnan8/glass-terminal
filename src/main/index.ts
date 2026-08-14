@@ -2,13 +2,28 @@ import { app, BrowserWindow, ipcMain, shell } from 'electron';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PRODUCT_NAME } from '../shared/product';
+import { HOST_CHANNELS, SSH_ERROR_CODES } from '../shared/host';
+import type { HostInput, SshConnectRequest } from '../shared/host';
 import { TERMINAL_CHANNELS } from '../shared/terminal';
 import type { CreateTerminalRequest } from '../shared/terminal';
+import { HostStore } from './hosts/host-store';
+import { registerSmokeRunner, smokeModeFromEnvironment } from './smoke/smoke-runner';
 import { TerminalService } from './terminal/terminal-service';
 
 const isDevelopment = Boolean(process.env.VITE_DEV_SERVER_URL);
-const isSmokeTest = process.env.AI_TERMINAL_SMOKE_TEST === '1';
+const smokeMode = smokeModeFromEnvironment();
+const isSmokeTest = smokeMode !== null;
 const terminalService = new TerminalService();
+let hostStore: HostStore | undefined;
+
+if (isSmokeTest) {
+  app.setPath('userData', join(process.cwd(), '.smoke-data'));
+}
+
+function requireHostStore(): HostStore {
+  if (!hostStore) throw new Error('Host store is not ready.');
+  return hostStore;
+}
 
 function createMainWindow(): BrowserWindow {
   const window = new BrowserWindow({
@@ -32,45 +47,7 @@ function createMainWindow(): BrowserWindow {
   });
 
   if (isSmokeTest) {
-    window.webContents.once('did-finish-load', async () => {
-      const smokeCommand = process.platform === 'win32'
-        ? "Write-Output '__AI_TERMINAL_PTY_SMOKE__'\r"
-        : "printf '__AI_TERMINAL_PTY_SMOKE__\\n'\n";
-      const rendererReady = await window.webContents.executeJavaScript(
-        `(async () => {
-          const waitFor = (predicate, timeout = 10000) => new Promise((resolve) => {
-            const deadline = Date.now() + timeout;
-            const check = () => {
-              if (predicate()) resolve(true);
-              else if (Date.now() >= deadline) resolve(false);
-              else setTimeout(check, 100);
-            };
-            check();
-          });
-          const started = await waitFor(
-            () => document.querySelector('[data-terminal-output="true"]'),
-          );
-          if (!started) return false;
-          const pane = document.querySelector('[data-terminal-output="true"]');
-          const terminalId = pane?.getAttribute('data-terminal-id');
-          if (!terminalId) return false;
-          await window.aiTerminal.terminal.write(terminalId, ${JSON.stringify(smokeCommand)});
-          const commandSeen = await waitFor(
-            () => pane.textContent?.includes('__AI_TERMINAL_PTY_SMOKE__'),
-          );
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          await window.aiTerminal.terminal.close(terminalId);
-          await new Promise((resolve) => setTimeout(resolve, 250));
-          return commandSeen;
-        })()`,
-      );
-      console.log(`SMOKE_LOCAL_TERMINAL_READY=${String(rendererReady)}`);
-      app.exit(rendererReady ? 0 : 1);
-    });
-    window.webContents.once('did-fail-load', (_event, code, description) => {
-      console.error(`SMOKE_RENDERER_FAILED=${code}:${description}`);
-      app.exit(1);
-    });
+    registerSmokeRunner(window, smokeMode!);
   }
   window.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('https://')) void shell.openExternal(url);
@@ -92,6 +69,10 @@ function createMainWindow(): BrowserWindow {
     );
   }
 
+  const contents = window.webContents;
+  const contentsId = contents.id;
+  contents.once('destroyed', () => terminalService.closeOwnedBy(contentsId));
+
   return window;
 }
 
@@ -106,6 +87,9 @@ ipcMain.handle(
   TERMINAL_CHANNELS.create,
   (event, request: CreateTerminalRequest) => terminalService.create(event.sender, request),
 );
+ipcMain.handle(TERMINAL_CHANNELS.attach, (event, terminalId: string) => (
+  terminalService.attach(event.sender, terminalId)
+));
 ipcMain.handle(
   TERMINAL_CHANNELS.write,
   (event, terminalId: string, data: string) => {
@@ -122,13 +106,38 @@ ipcMain.handle(TERMINAL_CHANNELS.close, (event, terminalId: string) => {
   terminalService.close(event.sender, terminalId);
 });
 
+ipcMain.handle(HOST_CHANNELS.list, () => requireHostStore().list());
+ipcMain.handle(HOST_CHANNELS.save, (_event, input: HostInput) => (
+  requireHostStore().save(input)
+));
+ipcMain.handle(HOST_CHANNELS.remove, (_event, hostId: string) => {
+  requireHostStore().remove(hostId);
+});
+ipcMain.handle(HOST_CHANNELS.connect, async (event, request: SshConnectRequest) => {
+  const store = requireHostStore();
+  const host = store.get(request.hostId);
+  try {
+    const result = await terminalService.createSsh(event.sender, host, request);
+    if (!host.hostKeyFingerprint) {
+      store.trustFingerprint(host.id, result.fingerprint);
+    }
+    return { status: 'connected', terminal: result.descriptor };
+  } catch (error) {
+    const message = (error as Error).message;
+    const marker = `${SSH_ERROR_CODES.hostKeyRequired}:`;
+    if (message.startsWith(marker)) {
+      return {
+        status: 'host-key-required',
+        fingerprint: message.slice(marker.length),
+      };
+    }
+    throw error;
+  }
+});
+
 app.whenReady().then(() => {
-  const window = createMainWindow();
-  const contents = window.webContents;
-  const contentsId = contents.id;
-  contents.once('destroyed', () => {
-    terminalService.closeOwnedBy(contentsId);
-  });
+  hostStore = new HostStore(join(app.getPath('userData'), 'config', 'hosts.json'));
+  createMainWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
   });

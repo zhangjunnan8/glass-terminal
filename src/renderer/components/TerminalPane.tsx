@@ -74,6 +74,11 @@ export function TerminalPane({ terminalId, active }: TerminalPaneProps) {
       if (event.terminalId !== terminalId) return;
       terminal.write(`\r\n\x1b[90m[Process exited with code ${event.exitCode}]\x1b[0m\r\n`);
     });
+    void window.aiTerminal.terminal.attach(terminalId).then((pendingOutput) => {
+      if (!pendingOutput) return;
+      terminal.write(pendingOutput);
+      setHasOutput(true);
+    });
 
     return () => {
       cancelAnimationFrame(frame);
