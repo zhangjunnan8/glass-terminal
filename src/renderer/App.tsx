@@ -4,6 +4,7 @@ import type { HostInput, HostProfile } from '../shared/host';
 import type { RuntimeInfo } from '../shared/ipc';
 import { PRODUCT_NAME } from '../shared/product';
 import type { SessionRecord } from '../shared/session';
+import type { ProviderInput, ProviderProfile } from '../shared/provider';
 import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
 import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
@@ -34,11 +35,15 @@ export function App() {
   const [shells, setShells] = useState<ShellProfile[]>([]);
   const [hosts, setHosts] = useState<HostProfile[]>([]);
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
+  const [providers, setProviders] = useState<ProviderProfile[]>([]);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [newTerminalOpen, setNewTerminalOpen] = useState(false);
   const [sftpOpen, setSftpOpen] = useState(false);
+  const [providerModalOpen, setProviderModalOpen] = useState(false);
+  const [editingProvider, setEditingProvider] = useState<ProviderProfile | null>(null);
+  const [providerMessage, setProviderMessage] = useState<string | null>(null);
   const [editingHost, setEditingHost] = useState<HostProfile | null | undefined>(undefined);
   const [connectingHost, setConnectingHost] = useState<HostProfile | null>(null);
   const [reconnectingSessionId, setReconnectingSessionId] = useState<string | null>(null);
@@ -52,6 +57,9 @@ export function App() {
       setStartupError(errorMessage(error));
     });
     void window.aiTerminal.sessions.list().then(setSessions).catch((error) => {
+      setStartupError(errorMessage(error));
+    });
+    void window.aiTerminal.providers.list().then(setProviders).catch((error) => {
       setStartupError(errorMessage(error));
     });
     const removeExitListener = window.aiTerminal.terminal.onExit((event) => {
@@ -103,6 +111,7 @@ export function App() {
   const selectedHostSessions = selectedHost
     ? sessions.filter((session) => session.hostId === selectedHost.id)
     : [];
+  const defaultProvider = providers.find((provider) => provider.isDefault) ?? null;
 
   function addTab(descriptor: TerminalDescriptor) {
     const tab: TerminalTab = {
@@ -141,6 +150,51 @@ export function App() {
 
   async function refreshSessions() {
     setSessions(await window.aiTerminal.sessions.list());
+  }
+
+  async function refreshProviders() {
+    setProviders(await window.aiTerminal.providers.list());
+  }
+
+  async function saveProvider(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const data = new FormData(event.currentTarget);
+    const apiKeyInput = event.currentTarget.elements.namedItem('apiKey') as HTMLInputElement;
+    const input: ProviderInput = {
+      id: editingProvider?.id,
+      name: String(data.get('name') ?? ''),
+      baseUrl: String(data.get('baseUrl') ?? ''),
+      modelId: String(data.get('modelId') ?? ''),
+      apiKey: String(data.get('apiKey') ?? '') || undefined,
+      makeDefault: data.get('makeDefault') === 'on',
+    };
+    apiKeyInput.value = '';
+    try {
+      const saved = await window.aiTerminal.providers.save(input);
+      await refreshProviders();
+      setEditingProvider(saved);
+      setProviderMessage('Saved. Run Test Connection before using this Provider.');
+    } catch (error) {
+      setProviderMessage(errorMessage(error));
+    }
+  }
+
+  async function testProvider(providerId: string) {
+    setProviderMessage('Testing connection…');
+    try {
+      const result = await window.aiTerminal.providers.testConnection(providerId);
+      await refreshProviders();
+      setProviderMessage(result.message);
+    } catch (error) {
+      setProviderMessage(errorMessage(error));
+    }
+  }
+
+  async function removeProvider(provider: ProviderProfile) {
+    if (!window.confirm(`Delete Provider “${provider.name}” and its stored credential?`)) return;
+    await window.aiTerminal.providers.remove(provider.id);
+    setEditingProvider(null);
+    await refreshProviders();
   }
 
   async function activateAiSession() {
@@ -263,7 +317,11 @@ export function App() {
         >⇅</button>
         <button className="activity" title="History">◷</button>
         <div className="activity-spacer" />
-        <button className="activity" title="Settings">⚙</button>
+        <button className="activity" title="Provider settings" onClick={() => {
+          setEditingProvider(defaultProvider);
+          setProviderMessage(null);
+          setProviderModalOpen(true);
+        }}>⚙</button>
       </aside>
 
       <aside className="sidebar">
@@ -422,7 +480,11 @@ export function App() {
         <div className="agent-header">
           <div>
             <strong>AI Agent</strong>
-            <span>Current Provider: Not configured</span>
+            <span>
+              Current Provider: {defaultProvider
+                ? `${defaultProvider.name} · ${defaultProvider.status}`
+                : 'Not configured'}
+            </span>
           </div>
           <button aria-label="Collapse agent panel">›</button>
         </div>
@@ -431,6 +493,13 @@ export function App() {
           <strong>Terminal-aware assistance</strong>
           <p>When activated, the agent reads this terminal and requests permission before sending commands.</p>
           <div className="guardrail"><span>✓</span> Approval required by default</div>
+          <button className="provider-configure" onClick={() => {
+            setEditingProvider(defaultProvider);
+            setProviderMessage(null);
+            setProviderModalOpen(true);
+          }}>
+            {defaultProvider ? 'Manage Provider' : 'Configure Provider'}
+          </button>
           {activeTab && !activeTab.sessionId && (
             <button className="activate-session" onClick={() => void activateAiSession()}>
               Activate AI Session
@@ -443,7 +512,7 @@ export function App() {
         <div className="composer">
           <textarea aria-label="Message AI" placeholder="Ask about this terminal…" disabled />
           <div>
-            <span>Configure a provider to begin</span>
+            <span>{defaultProvider?.status === 'ready' ? 'Agent loop is the next milestone' : 'Configure and test a Provider to begin'}</span>
             <button disabled>↑</button>
           </div>
         </div>
@@ -509,6 +578,75 @@ export function App() {
               <button className="primary" type="submit">Connect</button>
             </div>
           </form>
+        </div>
+      )}
+
+      {providerModalOpen && (
+        <div className="modal-backdrop">
+          <div className="modal provider-modal">
+            <div className="modal-header">
+              <strong>AI Providers</strong>
+              <button type="button" onClick={() => setProviderModalOpen(false)}>×</button>
+            </div>
+            <div className="provider-layout">
+              <div className="provider-list">
+                {providers.map((provider) => (
+                  <button
+                    className={editingProvider?.id === provider.id ? 'active' : ''}
+                    key={provider.id}
+                    onClick={() => {
+                      setEditingProvider(provider);
+                      setProviderMessage(null);
+                    }}
+                  >
+                    <strong>{provider.name}</strong>
+                    <small>{provider.modelId}</small>
+                    <span className={`provider-status ${provider.status}`}>{provider.status}</span>
+                  </button>
+                ))}
+                <button className="add-provider" onClick={() => {
+                  setEditingProvider(null);
+                  setProviderMessage(null);
+                }}>+ Add Provider</button>
+              </div>
+              <form className="provider-form" onSubmit={(event) => void saveProvider(event)}>
+                <label>Name<input name="name" required defaultValue={editingProvider?.name ?? 'OpenAI-compatible API'} key={`name-${editingProvider?.id ?? 'new'}`} /></label>
+                <label>Base URL<input name="baseUrl" type="url" required placeholder="https://api.example.com/v1" defaultValue={editingProvider?.baseUrl ?? ''} key={`url-${editingProvider?.id ?? 'new'}`} /></label>
+                <label>Model ID<input name="modelId" required placeholder="model-id" defaultValue={editingProvider?.modelId ?? ''} key={`model-${editingProvider?.id ?? 'new'}`} /></label>
+                <label>
+                  API key
+                  <input
+                    name="apiKey"
+                    type="password"
+                    required={!editingProvider?.apiKeyConfigured}
+                    autoComplete="new-password"
+                    placeholder={editingProvider?.apiKeyConfigured ? 'Stored in Windows Credential Manager' : 'Required'}
+                  />
+                </label>
+                <label className="check-label">
+                  <input name="makeDefault" type="checkbox" defaultChecked={editingProvider?.isDefault ?? providers.length === 0} />
+                  Use as default Provider
+                </label>
+                <p className="secure-note">The API key is stored as a Windows Generic Credential. Provider JSON contains only its reference.</p>
+                {providerMessage && <div className="provider-message">{providerMessage}</div>}
+                <div className="provider-actions">
+                  {editingProvider && (
+                    <>
+                      <button type="button" onClick={() => void testProvider(editingProvider.id)}>Test Connection</button>
+                      {!editingProvider.isDefault && (
+                        <button type="button" onClick={async () => {
+                          await window.aiTerminal.providers.setDefault(editingProvider.id);
+                          await refreshProviders();
+                        }}>Set Default</button>
+                      )}
+                      <button className="danger-text" type="button" onClick={() => void removeProvider(editingProvider)}>Delete</button>
+                    </>
+                  )}
+                  <button className="primary" type="submit">Save Provider</button>
+                </div>
+              </form>
+            </div>
+          </div>
         </div>
       )}
 

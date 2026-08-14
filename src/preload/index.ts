@@ -6,6 +6,7 @@ import type { TerminalDataEvent, TerminalExitEvent } from '../shared/terminal';
 import { SESSION_CHANNELS } from '../shared/session';
 import { SFTP_CHANNELS } from '../shared/sftp';
 import type { TransferJobSnapshot } from '../shared/sftp';
+import { PROVIDER_CHANNELS } from '../shared/provider';
 
 const terminalBridge: DesktopBridge['terminal'] = {
   listShells: () => ipcRenderer.invoke(TERMINAL_CHANNELS.listShells),
@@ -76,6 +77,17 @@ const sftpBridge: DesktopBridge['sftp'] = {
   },
 };
 
+const providerBridge: DesktopBridge['providers'] = {
+  list: () => ipcRenderer.invoke(PROVIDER_CHANNELS.list),
+  save: (input) => ipcRenderer.invoke(PROVIDER_CHANNELS.save, input),
+  remove: (providerId) => ipcRenderer.invoke(PROVIDER_CHANNELS.remove, providerId),
+  setDefault: (providerId) => ipcRenderer.invoke(PROVIDER_CHANNELS.setDefault, providerId),
+  testConnection: (providerId) => ipcRenderer.invoke(
+    PROVIDER_CHANNELS.testConnection,
+    providerId,
+  ),
+};
+
 const bridge: DesktopBridge = Object.freeze({
   runtime: Object.freeze({
     getInfo: () => ipcRenderer.invoke('runtime:get-info'),
@@ -84,6 +96,7 @@ const bridge: DesktopBridge = Object.freeze({
   hosts: Object.freeze(hostBridge),
   sessions: Object.freeze(sessionBridge),
   sftp: Object.freeze(sftpBridge),
+  providers: Object.freeze(providerBridge),
 });
 
 contextBridge.exposeInMainWorld('aiTerminal', bridge);

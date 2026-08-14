@@ -22,6 +22,11 @@ import type {
   TransferJobSnapshot,
   UploadSelectionRequest,
 } from './sftp';
+import type {
+  ProviderConnectionResult,
+  ProviderInput,
+  ProviderProfile,
+} from './provider';
 
 export interface RuntimeInfo {
   platform: NodeJS.Platform;
@@ -63,5 +68,12 @@ export interface DesktopBridge {
     cancelTransfer(jobId: string): Promise<TransferJobSnapshot>;
     retryTransfer(jobId: string): Promise<TransferJobSnapshot>;
     onTransferUpdated(listener: (job: TransferJobSnapshot) => void): () => void;
+  };
+  providers: {
+    list(): Promise<ProviderProfile[]>;
+    save(input: ProviderInput): Promise<ProviderProfile>;
+    remove(providerId: string): Promise<void>;
+    setDefault(providerId: string): Promise<ProviderProfile>;
+    testConnection(providerId: string): Promise<ProviderConnectionResult>;
   };
 }

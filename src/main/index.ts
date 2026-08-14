@@ -10,11 +10,15 @@ import { SESSION_CHANNELS } from '../shared/session';
 import type { RenameSessionRequest, UpgradeSessionRequest } from '../shared/session';
 import { SFTP_CHANNELS } from '../shared/sftp';
 import type { DownloadSelectionRequest, UploadSelectionRequest } from '../shared/sftp';
+import { PROVIDER_CHANNELS } from '../shared/provider';
+import type { ProviderInput } from '../shared/provider';
 import { HostStore } from './hosts/host-store';
 import { SessionManager } from './sessions/session-manager';
 import { SessionStore } from './sessions/session-store';
 import { SftpService } from './sftp/sftp-service';
 import { TransferQueue } from './sftp/transfer-queue';
+import { ProviderStore } from './providers/provider-store';
+import { WindowsCredentialStore } from './providers/secret-store';
 import { registerSmokeRunner, smokeModeFromEnvironment } from './smoke/smoke-runner';
 import { TerminalService } from './terminal/terminal-service';
 
@@ -26,6 +30,7 @@ const sftpService = new SftpService(terminalService);
 const transferQueue = new TransferQueue(terminalService);
 let hostStore: HostStore | undefined;
 let sessionManager: SessionManager | undefined;
+let providerStore: ProviderStore | undefined;
 
 if (isSmokeTest) {
   app.setPath('userData', join(process.cwd(), '.smoke-data'));
@@ -39,6 +44,11 @@ function requireHostStore(): HostStore {
 function requireSessionManager(): SessionManager {
   if (!sessionManager) throw new Error('Session manager is not ready.');
   return sessionManager;
+}
+
+function requireProviderStore(): ProviderStore {
+  if (!providerStore) throw new Error('Provider store is not ready.');
+  return providerStore;
 }
 
 function createMainWindow(): BrowserWindow {
@@ -219,6 +229,19 @@ ipcMain.handle(SFTP_CHANNELS.cancelTransfer, (event, jobId: string) => (
 ipcMain.handle(SFTP_CHANNELS.retryTransfer, (event, jobId: string) => (
   transferQueue.retry(event.sender, jobId)
 ));
+ipcMain.handle(PROVIDER_CHANNELS.list, () => requireProviderStore().list());
+ipcMain.handle(PROVIDER_CHANNELS.save, (_event, input: ProviderInput) => (
+  requireProviderStore().save(input)
+));
+ipcMain.handle(PROVIDER_CHANNELS.remove, (_event, providerId: string) => (
+  requireProviderStore().remove(providerId)
+));
+ipcMain.handle(PROVIDER_CHANNELS.setDefault, (_event, providerId: string) => (
+  requireProviderStore().setDefault(providerId)
+));
+ipcMain.handle(PROVIDER_CHANNELS.testConnection, (_event, providerId: string) => (
+  requireProviderStore().testConnection(providerId)
+));
 ipcMain.handle(
   SESSION_CHANNELS.rename,
   (_event, request: RenameSessionRequest) => requireSessionManager().rename(request),
@@ -230,6 +253,10 @@ ipcMain.handle(
 
 app.whenReady().then(() => {
   hostStore = new HostStore(join(app.getPath('userData'), 'config', 'hosts.json'));
+  providerStore = new ProviderStore(
+    join(app.getPath('userData'), 'config', 'providers.json'),
+    new WindowsCredentialStore(),
+  );
   sessionManager = new SessionManager(
     new SessionStore(join(app.getPath('userData'), 'sessions')),
     terminalService,
