@@ -1,0 +1,42 @@
+{
+  "name": "ai-terminal",
+  "version": "0.1.0-alpha.0",
+  "private": true,
+  "description": "Windows-first shared terminal AI agent desktop demo",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist-electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && cross-env VITE_DEV_SERVER_URL=http://127.0.0.1:5173 electron .\"",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build:renderer": "vite build",
+    "build:electron": "tsup",
+    "build": "npm run typecheck && npm test && npm run build:renderer && npm run build:electron",
+    "smoke": "cross-env AI_TERMINAL_SMOKE_TEST=1 electron .",
+    "start": "electron ."
+  },
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=10.0.0"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "@vitejs/plugin-react": "^6.0.1",
+    "concurrently": "^9.2.1",
+    "cross-env": "^10.1.0",
+    "electron": "^43.4.0",
+    "jsdom": "^27.2.0",
+    "tsup": "^8.5.1",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1",
+    "vitest": "^4.1.0",
+    "wait-on": "^9.0.3"
+  }
+}
