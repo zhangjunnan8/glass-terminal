@@ -11,6 +11,11 @@ import type {
   TerminalDescriptor,
   TerminalExitEvent,
 } from './terminal';
+import type {
+  RenameSessionRequest,
+  SessionRecord,
+  UpgradeSessionRequest,
+} from './session';
 
 export interface RuntimeInfo {
   platform: NodeJS.Platform;
@@ -37,5 +42,11 @@ export interface DesktopBridge {
     list(): Promise<HostProfile[]>;
     save(input: HostInput): Promise<HostProfile>;
     remove(hostId: string): Promise<void>;
+  };
+  sessions: {
+    list(hostId?: string): Promise<SessionRecord[]>;
+    upgrade(request: UpgradeSessionRequest): Promise<SessionRecord>;
+    rename(request: RenameSessionRequest): Promise<SessionRecord>;
+    readTerminalHistory(sessionId: string): Promise<string>;
   };
 }

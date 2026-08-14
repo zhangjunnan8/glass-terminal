@@ -6,7 +6,11 @@ import { HOST_CHANNELS, SSH_ERROR_CODES } from '../shared/host';
 import type { HostInput, SshConnectRequest } from '../shared/host';
 import { TERMINAL_CHANNELS } from '../shared/terminal';
 import type { CreateTerminalRequest } from '../shared/terminal';
+import { SESSION_CHANNELS } from '../shared/session';
+import type { RenameSessionRequest, UpgradeSessionRequest } from '../shared/session';
 import { HostStore } from './hosts/host-store';
+import { SessionManager } from './sessions/session-manager';
+import { SessionStore } from './sessions/session-store';
 import { registerSmokeRunner, smokeModeFromEnvironment } from './smoke/smoke-runner';
 import { TerminalService } from './terminal/terminal-service';
 
@@ -15,6 +19,7 @@ const smokeMode = smokeModeFromEnvironment();
 const isSmokeTest = smokeMode !== null;
 const terminalService = new TerminalService();
 let hostStore: HostStore | undefined;
+let sessionManager: SessionManager | undefined;
 
 if (isSmokeTest) {
   app.setPath('userData', join(process.cwd(), '.smoke-data'));
@@ -23,6 +28,11 @@ if (isSmokeTest) {
 function requireHostStore(): HostStore {
   if (!hostStore) throw new Error('Host store is not ready.');
   return hostStore;
+}
+
+function requireSessionManager(): SessionManager {
+  if (!sessionManager) throw new Error('Session manager is not ready.');
+  return sessionManager;
 }
 
 function createMainWindow(): BrowserWindow {
@@ -121,6 +131,9 @@ ipcMain.handle(HOST_CHANNELS.connect, async (event, request: SshConnectRequest) 
     if (!host.hostKeyFingerprint) {
       store.trustFingerprint(host.id, result.fingerprint);
     }
+    if (request.sessionId) {
+      requireSessionManager().reconnect(event.sender, result.descriptor, request.sessionId);
+    }
     return { status: 'connected', terminal: result.descriptor };
   } catch (error) {
     const message = (error as Error).message;
@@ -135,13 +148,38 @@ ipcMain.handle(HOST_CHANNELS.connect, async (event, request: SshConnectRequest) 
   }
 });
 
+ipcMain.handle(SESSION_CHANNELS.list, (_event, hostId?: string) => (
+  requireSessionManager().list(hostId)
+));
+ipcMain.handle(
+  SESSION_CHANNELS.upgrade,
+  (event, request: UpgradeSessionRequest) => (
+    requireSessionManager().upgrade(event.sender, request.terminalId)
+  ),
+);
+ipcMain.handle(
+  SESSION_CHANNELS.rename,
+  (_event, request: RenameSessionRequest) => requireSessionManager().rename(request),
+);
+ipcMain.handle(
+  SESSION_CHANNELS.readTerminalHistory,
+  (_event, sessionId: string) => requireSessionManager().readTerminalHistory(sessionId),
+);
+
 app.whenReady().then(() => {
   hostStore = new HostStore(join(app.getPath('userData'), 'config', 'hosts.json'));
+  sessionManager = new SessionManager(
+    new SessionStore(join(app.getPath('userData'), 'sessions')),
+    terminalService,
+    hostStore,
+  );
   createMainWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
   });
 });
+
+app.on('before-quit', () => sessionManager?.close());
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();

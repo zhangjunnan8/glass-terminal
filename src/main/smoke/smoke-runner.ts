@@ -55,9 +55,16 @@ async function runLocalSmoke(window: BrowserWindow): Promise<boolean> {
         () => pane.textContent?.includes('__AI_TERMINAL_PTY_SMOKE__'),
       );
       await new Promise((resolve) => setTimeout(resolve, 500));
+      const session = await window.aiTerminal.sessions.upgrade({ terminalId });
+      const persistedHistory = await window.aiTerminal.sessions.readTerminalHistory(session.id);
+      const sessionListed = (await window.aiTerminal.sessions.list()).some(
+        (item) => item.id === session.id,
+      );
       await window.aiTerminal.terminal.close(terminalId);
       await new Promise((resolve) => setTimeout(resolve, 250));
-      return commandSeen;
+      return commandSeen
+        && sessionListed
+        && persistedHistory.includes('__AI_TERMINAL_PTY_SMOKE__');
     })()`,
   );
 }

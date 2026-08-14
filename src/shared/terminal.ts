@@ -20,6 +20,7 @@ export interface TerminalDescriptor {
   shellKind: ShellProfile['kind'];
   transport: 'local' | 'ssh';
   hostId?: string;
+  sessionId?: string;
 }
 
 export interface TerminalDataEvent {

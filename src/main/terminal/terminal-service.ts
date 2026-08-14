@@ -1,12 +1,14 @@
 import { createHash, timingSafeEqual, randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { StringDecoder } from 'node:string_decoder';
 import type { WebContents } from 'electron';
 import * as pty from 'node-pty';
 import { Client } from 'ssh2';
 import type { ClientChannel, ConnectConfig, PseudoTtyOptions } from 'ssh2';
 import type { HostProfile, SshConnectRequest } from '../../shared/host';
 import { SSH_ERROR_CODES } from '../../shared/host';
+import type { TerminalJournalEvent } from '../../shared/session';
 import type {
   CreateTerminalRequest,
   ShellProfile,
@@ -22,16 +24,38 @@ interface TerminalBackend {
 }
 
 interface TerminalRecord {
-  backend: TerminalBackend;
+  backend?: TerminalBackend;
   owner: WebContents;
   ownerId: number;
   descriptor: TerminalDescriptor;
   attached: boolean;
   pendingOutput: string[];
   pendingOutputLength: number;
+  status: 'connected' | 'exited';
+  startedAt: string;
+  sequence: number;
+  journal: TerminalJournalEvent[];
+  journalBytes: number;
+  droppedJournalBytes: number;
+  sessionId?: string;
 }
 
 const MAX_PENDING_OUTPUT = 256 * 1024;
+const MAX_TEMPORARY_JOURNAL = 8 * 1024 * 1024;
+
+export interface TerminalSnapshot {
+  descriptor: TerminalDescriptor;
+  startedAt: string;
+  history: TerminalJournalEvent[];
+  preludeTruncated: boolean;
+  droppedPreludeBytes: number;
+}
+
+type JournalListener = (
+  terminalId: string,
+  sessionId: string,
+  event: TerminalJournalEvent,
+) => void;
 
 function stringEnvironment(): Record<string, string> {
   return Object.fromEntries(
@@ -50,6 +74,7 @@ function fingerprintsMatch(expected: string, actual: string): boolean {
 
 export class TerminalService {
   private readonly terminals = new Map<string, TerminalRecord>();
+  private readonly journalListeners = new Set<JournalListener>();
 
   listShells(): ShellProfile[] {
     return discoverShells();
@@ -101,6 +126,7 @@ export class TerminalService {
       let observedFingerprint = '';
       let settled = false;
       let exitCode = 0;
+      const banners: string[] = [];
 
       const fail = (error: Error) => {
         if (settled) {
@@ -130,7 +156,7 @@ export class TerminalService {
         finish(prompts.map(() => answer));
       });
       client.on('banner', (message) => {
-        this.emitData(terminalId, message.replaceAll('\n', '\r\n'));
+        banners.push(message.replaceAll('\n', '\r\n'));
       });
       client.on('error', fail);
       client.once('ready', () => {
@@ -148,6 +174,8 @@ export class TerminalService {
           }
 
           const backend = this.sshBackend(client, stream);
+          const stdoutDecoder = new StringDecoder('utf8');
+          const stderrDecoder = new StringDecoder('utf8');
           const descriptor: TerminalDescriptor = {
             id: terminalId,
             title: host.name,
@@ -157,14 +185,19 @@ export class TerminalService {
             hostId: host.id,
           };
           this.register(owner, descriptor, backend);
-          stream.on('data', (data: Buffer) => this.emitData(terminalId, data.toString('utf8')));
+          for (const banner of banners) this.emitData(terminalId, banner);
+          stream.on('data', (data: Buffer) => this.emitData(terminalId, stdoutDecoder.write(data)));
           stream.stderr.on('data', (data: Buffer) => {
-            this.emitData(terminalId, data.toString('utf8'));
+            this.emitData(terminalId, stderrDecoder.write(data));
           });
           stream.on('exit', (code: number | null) => {
             exitCode = typeof code === 'number' ? code : 0;
           });
           stream.once('close', () => {
+            const stdoutRemainder = stdoutDecoder.end();
+            const stderrRemainder = stderrDecoder.end();
+            if (stdoutRemainder) this.emitData(terminalId, stdoutRemainder);
+            if (stderrRemainder) this.emitData(terminalId, stderrRemainder);
             client.end();
             this.emitExit(terminalId, exitCode);
           });
@@ -198,29 +231,86 @@ export class TerminalService {
   }
 
   write(owner: WebContents, terminalId: string, data: string): void {
-    this.requireOwned(owner, terminalId).backend.write(data);
+    const record = this.requireConnected(owner, terminalId);
+    record.backend!.write(data);
   }
 
   resize(owner: WebContents, terminalId: string, cols: number, rows: number): void {
-    this.requireOwned(owner, terminalId).backend.resize(
-      Math.max(2, cols),
-      Math.max(1, rows),
+    const record = this.requireConnected(owner, terminalId);
+    const safeCols = Math.max(2, cols);
+    const safeRows = Math.max(1, rows);
+    record.backend!.resize(
+      safeCols,
+      safeRows,
     );
+    this.appendJournal(record, {
+      version: 1,
+      sequence: this.nextSequence(record),
+      timestamp: new Date().toISOString(),
+      kind: 'resize',
+      cols: safeCols,
+      rows: safeRows,
+    });
   }
 
   close(owner: WebContents, terminalId: string): void {
     const record = this.requireOwned(owner, terminalId);
+    if (record.status === 'connected') {
+      record.backend?.close();
+      this.emitExit(terminalId, 0);
+    }
     this.terminals.delete(terminalId);
-    record.backend.close();
   }
 
   closeOwnedBy(ownerId: number): void {
     for (const [terminalId, record] of this.terminals) {
       if (record.ownerId === ownerId) {
+        if (record.status === 'connected') {
+          record.backend?.close();
+          this.emitExit(terminalId, 0);
+        }
         this.terminals.delete(terminalId);
-        record.backend.close();
       }
     }
+  }
+
+  snapshot(owner: WebContents, terminalId: string): TerminalSnapshot {
+    const record = this.requireOwned(owner, terminalId);
+    const gap: TerminalJournalEvent[] = record.droppedJournalBytes > 0 ? [{
+      version: 1,
+      sequence: 0,
+      timestamp: record.startedAt,
+      kind: 'gap',
+      droppedBytes: record.droppedJournalBytes,
+    }] : [];
+    return {
+      descriptor: { ...record.descriptor },
+      startedAt: record.startedAt,
+      history: [...gap, ...record.journal],
+      preludeTruncated: record.droppedJournalBytes > 0,
+      droppedPreludeBytes: record.droppedJournalBytes,
+    };
+  }
+
+  bindSession(owner: WebContents, terminalId: string, sessionId: string): void {
+    const record = this.requireOwned(owner, terminalId);
+    if (record.sessionId && record.sessionId !== sessionId) {
+      throw new Error('Terminal is already bound to another Session.');
+    }
+    record.sessionId = sessionId;
+    record.descriptor.sessionId = sessionId;
+    record.journal = [];
+    record.journalBytes = 0;
+    record.droppedJournalBytes = 0;
+  }
+
+  sessionId(owner: WebContents, terminalId: string): string | undefined {
+    return this.requireOwned(owner, terminalId).sessionId;
+  }
+
+  onJournal(listener: JournalListener): () => void {
+    this.journalListeners.add(listener);
+    return () => this.journalListeners.delete(listener);
   }
 
   private register(
@@ -236,12 +326,26 @@ export class TerminalService {
       attached: false,
       pendingOutput: [],
       pendingOutputLength: 0,
+      status: 'connected',
+      startedAt: new Date().toISOString(),
+      sequence: 0,
+      journal: [],
+      journalBytes: 0,
+      droppedJournalBytes: 0,
     });
   }
 
   private emitData(terminalId: string, data: string): void {
     const record = this.terminals.get(terminalId);
     if (!record) return;
+    if (!data) return;
+    this.appendJournal(record, {
+      version: 1,
+      sequence: this.nextSequence(record),
+      timestamp: new Date().toISOString(),
+      kind: 'output',
+      data,
+    });
     if (!record.attached) {
       record.pendingOutput.push(data);
       record.pendingOutputLength += data.length;
@@ -257,8 +361,17 @@ export class TerminalService {
 
   private emitExit(terminalId: string, exitCode: number, signal?: number): void {
     const record = this.terminals.get(terminalId);
-    if (!record) return;
-    this.terminals.delete(terminalId);
+    if (!record || record.status === 'exited') return;
+    record.status = 'exited';
+    record.backend = undefined;
+    this.appendJournal(record, {
+      version: 1,
+      sequence: this.nextSequence(record),
+      timestamp: new Date().toISOString(),
+      kind: 'exit',
+      exitCode,
+      signal,
+    });
     if (!record.owner.isDestroyed()) {
       record.owner.send(TERMINAL_CHANNELS.exit, { terminalId, exitCode, signal });
     }
@@ -270,6 +383,41 @@ export class TerminalService {
       throw new Error(`Terminal not found: ${terminalId}`);
     }
     return record;
+  }
+
+  private requireConnected(owner: WebContents, terminalId: string): TerminalRecord {
+    const record = this.requireOwned(owner, terminalId);
+    if (record.status !== 'connected' || !record.backend) {
+      throw new Error('Terminal is no longer connected.');
+    }
+    return record;
+  }
+
+  private nextSequence(record: TerminalRecord): number {
+    record.sequence += 1;
+    return record.sequence;
+  }
+
+  private appendJournal(record: TerminalRecord, event: TerminalJournalEvent): void {
+    if (record.sessionId) {
+      for (const listener of this.journalListeners) {
+        listener(record.descriptor.id, record.sessionId, event);
+      }
+      return;
+    }
+    const eventBytes = event.kind === 'output'
+      ? Buffer.byteLength(event.data, 'utf8')
+      : Buffer.byteLength(JSON.stringify(event), 'utf8');
+    record.journal.push(event);
+    record.journalBytes += eventBytes;
+    while (record.journalBytes > MAX_TEMPORARY_JOURNAL && record.journal.length > 1) {
+      const dropped = record.journal.shift()!;
+      const droppedBytes = dropped.kind === 'output'
+        ? Buffer.byteLength(dropped.data, 'utf8')
+        : Buffer.byteLength(JSON.stringify(dropped), 'utf8');
+      record.journalBytes -= droppedBytes;
+      record.droppedJournalBytes += droppedBytes;
+    }
   }
 
   private sshBackend(client: Client, stream: ClientChannel): TerminalBackend {

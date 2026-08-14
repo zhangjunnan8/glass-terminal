@@ -33,6 +33,7 @@ export interface HostInput {
 
 export interface SshConnectRequest {
   hostId: string;
+  sessionId?: string;
   password?: string;
   passphrase?: string;
   trustHostKey?: string;

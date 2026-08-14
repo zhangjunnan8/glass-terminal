@@ -3,6 +3,7 @@ import type { DesktopBridge } from '../shared/ipc';
 import { HOST_CHANNELS } from '../shared/host';
 import { TERMINAL_CHANNELS } from '../shared/terminal';
 import type { TerminalDataEvent, TerminalExitEvent } from '../shared/terminal';
+import { SESSION_CHANNELS } from '../shared/session';
 
 const terminalBridge: DesktopBridge['terminal'] = {
   listShells: () => ipcRenderer.invoke(TERMINAL_CHANNELS.listShells),
@@ -43,12 +44,23 @@ const hostBridge: DesktopBridge['hosts'] = {
   remove: (hostId) => ipcRenderer.invoke(HOST_CHANNELS.remove, hostId),
 };
 
+const sessionBridge: DesktopBridge['sessions'] = {
+  list: (hostId) => ipcRenderer.invoke(SESSION_CHANNELS.list, hostId),
+  upgrade: (request) => ipcRenderer.invoke(SESSION_CHANNELS.upgrade, request),
+  rename: (request) => ipcRenderer.invoke(SESSION_CHANNELS.rename, request),
+  readTerminalHistory: (sessionId) => ipcRenderer.invoke(
+    SESSION_CHANNELS.readTerminalHistory,
+    sessionId,
+  ),
+};
+
 const bridge: DesktopBridge = Object.freeze({
   runtime: Object.freeze({
     getInfo: () => ipcRenderer.invoke('runtime:get-info'),
   }),
   terminal: Object.freeze(terminalBridge),
   hosts: Object.freeze(hostBridge),
+  sessions: Object.freeze(sessionBridge),
 });
 
 contextBridge.exposeInMainWorld('aiTerminal', bridge);

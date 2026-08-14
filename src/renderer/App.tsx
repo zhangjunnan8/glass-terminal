@@ -3,6 +3,7 @@ import type { FormEvent } from 'react';
 import type { HostInput, HostProfile } from '../shared/host';
 import type { RuntimeInfo } from '../shared/ipc';
 import { PRODUCT_NAME } from '../shared/product';
+import type { SessionRecord } from '../shared/session';
 import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
 import { TerminalPane } from './components/TerminalPane';
 
@@ -20,6 +21,7 @@ interface TrustChallenge {
   host: HostProfile;
   fingerprint: string;
   secret: ConnectionSecret;
+  sessionId?: string;
 }
 
 function errorMessage(error: unknown): string {
@@ -30,12 +32,14 @@ export function App() {
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
   const [shells, setShells] = useState<ShellProfile[]>([]);
   const [hosts, setHosts] = useState<HostProfile[]>([]);
+  const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [newTerminalOpen, setNewTerminalOpen] = useState(false);
   const [editingHost, setEditingHost] = useState<HostProfile | null | undefined>(undefined);
   const [connectingHost, setConnectingHost] = useState<HostProfile | null>(null);
+  const [reconnectingSessionId, setReconnectingSessionId] = useState<string | null>(null);
   const [trustChallenge, setTrustChallenge] = useState<TrustChallenge | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
@@ -45,10 +49,14 @@ export function App() {
     void window.aiTerminal.hosts.list().then(setHosts).catch((error) => {
       setStartupError(errorMessage(error));
     });
+    void window.aiTerminal.sessions.list().then(setSessions).catch((error) => {
+      setStartupError(errorMessage(error));
+    });
     const removeExitListener = window.aiTerminal.terminal.onExit((event) => {
       setTabs((current) => current.map((tab) => (
         tab.id === event.terminalId ? { ...tab, status: 'exited' } : tab
       )));
+      void refreshSessions();
     });
 
     let cancelled = false;
@@ -90,6 +98,9 @@ export function App() {
     [activeId, tabs],
   );
   const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? null;
+  const selectedHostSessions = selectedHost
+    ? sessions.filter((session) => session.hostId === selectedHost.id)
+    : [];
 
   function addTab(descriptor: TerminalDescriptor) {
     const tab: TerminalTab = {
@@ -124,6 +135,34 @@ export function App() {
 
   async function refreshHosts() {
     setHosts(await window.aiTerminal.hosts.list());
+  }
+
+  async function refreshSessions() {
+    setSessions(await window.aiTerminal.sessions.list());
+  }
+
+  async function activateAiSession() {
+    if (!activeTab) return;
+    try {
+      const session = await window.aiTerminal.sessions.upgrade({ terminalId: activeTab.id });
+      setTabs((current) => current.map((tab) => (
+        tab.id === activeTab.id ? { ...tab, sessionId: session.id } : tab
+      )));
+      await refreshSessions();
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    }
+  }
+
+  async function renameSession(session: SessionRecord) {
+    const name = window.prompt('Session name', session.name);
+    if (!name || name.trim() === session.name) return;
+    try {
+      await window.aiTerminal.sessions.rename({ sessionId: session.id, name });
+      await refreshSessions();
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    }
   }
 
   async function saveHost(event: FormEvent<HTMLFormElement>) {
@@ -161,23 +200,27 @@ export function App() {
     host: HostProfile,
     secret: ConnectionSecret,
     trustHostKey?: string,
+    sessionId = reconnectingSessionId ?? undefined,
   ) {
     setConnectionError(null);
     try {
       const result = await window.aiTerminal.terminal.connectSsh({
         hostId: host.id,
+        sessionId,
         ...secret,
         trustHostKey,
       });
       if (result.status === 'host-key-required') {
-        setTrustChallenge({ host, fingerprint: result.fingerprint, secret });
+        setTrustChallenge({ host, fingerprint: result.fingerprint, secret, sessionId });
         setConnectingHost(null);
         return;
       }
       addTab(result.terminal);
       setConnectingHost(null);
+      setReconnectingSessionId(null);
       setTrustChallenge(null);
       await refreshHosts();
+      await refreshSessions();
     } catch (error) {
       setConnectionError(errorMessage(error));
     }
@@ -265,11 +308,32 @@ export function App() {
           <div className="selected-host-card">
             <strong>{selectedHost.name}</strong>
             <span>{selectedHost.authMethod} · {selectedHost.hostKeyFingerprint ? 'trusted' : 'unverified'}</span>
-            <small>Sessions appear here after Milestone 3.</small>
             <div>
-              <button onClick={() => setConnectingHost(selectedHost)}>Connect</button>
+              <button onClick={() => {
+                setReconnectingSessionId(null);
+                setConnectingHost(selectedHost);
+              }}>Connect</button>
               <button onClick={() => setEditingHost(selectedHost)}>Edit</button>
               <button className="danger-text" onClick={() => void removeHost(selectedHost)}>Delete</button>
+            </div>
+            <div className="host-session-history">
+              <small>SESSION HISTORY</small>
+              {selectedHostSessions.map((session) => (
+                <div className="session-history-row" key={session.id}>
+                  <span>
+                    <strong>{session.name}</strong>
+                    <small>{session.status} · {new Date(session.updatedAt).toLocaleString()}</small>
+                  </span>
+                  <span className="session-history-actions">
+                    <button title="Rename Session" onClick={() => void renameSession(session)}>Rename</button>
+                    <button onClick={() => {
+                      setReconnectingSessionId(session.id);
+                      setConnectingHost(selectedHost);
+                    }}>Reconnect</button>
+                  </span>
+                </div>
+              ))}
+              {selectedHostSessions.length === 0 && <small>No formal Sessions yet.</small>}
             </div>
           </div>
         )}
@@ -320,7 +384,10 @@ export function App() {
               {activeTab?.status === 'exited' && activeTab.hostId && (
                 <button onClick={() => {
                   const host = hosts.find((item) => item.id === activeTab.hostId);
-                  if (host) setConnectingHost(host);
+                  if (host) {
+                    setReconnectingSessionId(activeTab.sessionId ?? null);
+                    setConnectingHost(host);
+                  }
                 }}>Reconnect</button>
               )}
               <button title="Search terminal">⌕</button>
@@ -339,7 +406,7 @@ export function App() {
           <footer className="terminal-statusbar">
             <span>UTF-8</span>
             <span>{activeTab?.transport === 'ssh' ? 'SSH PTY' : 'ConPTY'}</span>
-            <span>Temporary terminal</span>
+            <span>{activeTab?.sessionId ? 'Formal Session' : 'Temporary terminal'}</span>
           </footer>
         </section>
       </main>
@@ -357,6 +424,14 @@ export function App() {
           <strong>Terminal-aware assistance</strong>
           <p>When activated, the agent reads this terminal and requests permission before sending commands.</p>
           <div className="guardrail"><span>✓</span> Approval required by default</div>
+          {activeTab && !activeTab.sessionId && (
+            <button className="activate-session" onClick={() => void activateAiSession()}>
+              Activate AI Session
+            </button>
+          )}
+          {activeTab?.sessionId && (
+            <div className="session-ready">Session saved · history and audit enabled</div>
+          )}
         </div>
         <div className="composer">
           <textarea aria-label="Message AI" placeholder="Ask about this terminal…" disabled />
@@ -405,7 +480,10 @@ export function App() {
           <form className="modal compact-modal" onSubmit={submitConnection}>
             <div className="modal-header">
               <strong>Connect to {connectingHost.name}</strong>
-              <button type="button" onClick={() => setConnectingHost(null)}>×</button>
+              <button type="button" onClick={() => {
+                setConnectingHost(null);
+                setReconnectingSessionId(null);
+              }}>×</button>
             </div>
             <div className="connection-summary">{connectingHost.username}@{connectingHost.hostname}:{connectingHost.port}</div>
             {(connectingHost.authMethod === 'password' || connectingHost.authMethod === 'keyboard-interactive') && (
@@ -417,7 +495,10 @@ export function App() {
             <p className="secure-note">The credential is used for this connection only and is not persisted.</p>
             {connectionError && <div className="form-error">{connectionError}</div>}
             <div className="modal-actions">
-              <button type="button" onClick={() => setConnectingHost(null)}>Cancel</button>
+              <button type="button" onClick={() => {
+                setConnectingHost(null);
+                setReconnectingSessionId(null);
+              }}>Cancel</button>
               <button className="primary" type="submit">Connect</button>
             </div>
           </form>
@@ -431,11 +512,15 @@ export function App() {
             <p>This is the first connection to {trustChallenge.host.hostname}. Verify the server fingerprint before continuing.</p>
             <code className="fingerprint">{trustChallenge.fingerprint}</code>
             <div className="modal-actions">
-              <button onClick={() => setTrustChallenge(null)}>Cancel</button>
+              <button onClick={() => {
+                setTrustChallenge(null);
+                setReconnectingSessionId(null);
+              }}>Cancel</button>
               <button className="primary" onClick={() => void establishSsh(
                 trustChallenge.host,
                 trustChallenge.secret,
                 trustChallenge.fingerprint,
+                trustChallenge.sessionId,
               )}>Trust &amp; Connect</button>
             </div>
           </div>
