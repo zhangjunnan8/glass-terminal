@@ -6,11 +6,55 @@ export interface AgentSmokeProvider {
   close(): Promise<void>;
 }
 
+interface SmokeMessage {
+  role?: string;
+  content?: string;
+}
+
+function toolResponse(id: string, command: string, reason: string): string {
+  return JSON.stringify({
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{
+          id,
+          type: 'function',
+          function: {
+            name: 'terminal_execute',
+            arguments: JSON.stringify({ command, reason }),
+          },
+        }],
+      },
+    }],
+  });
+}
+
+function textResponse(content: string): string {
+  return JSON.stringify({ choices: [{ message: { role: 'assistant', content } }] });
+}
+
 export async function startAgentSmokeProvider(remotePosix = false): Promise<AgentSmokeProvider> {
-  let completionCount = 0;
-  const command = !remotePosix && process.platform === 'win32'
+  const windowsShell = !remotePosix && process.platform === 'win32';
+  const approvedCommand = windowsShell
     ? "Write-Output '__AI_AGENT_APPROVED__'"
     : "printf '__AI_AGENT_APPROVED__\\n'";
+  const takeoverCommands = windowsShell
+    ? [
+      "Write-Output '__AI_FULL_TAKEOVER_ONE__'",
+      "Write-Output '__AI_FULL_TAKEOVER_TWO__'",
+    ]
+    : [
+      "printf '__AI_FULL_TAKEOVER_ONE__\\n'",
+      "printf '__AI_FULL_TAKEOVER_TWO__\\n'",
+    ];
+  const authCommand = windowsShell
+    ? "$null = Read-Host -AsSecureString -Prompt 'Password'; Write-Output '__AI_AUTH_OK__'"
+    : "read -s -p 'Password: ' __ait_secret; printf '\\n__AI_AUTH_OK__\\n'";
+  const longCommand = windowsShell
+    ? "Start-Sleep -Seconds 20; Write-Output '__AI_SHOULD_NOT_COMPLETE__'"
+    : "sleep 20; printf '__AI_SHOULD_NOT_COMPLETE__\\n'";
+
   const server = createServer((request, response) => {
     const authorized = request.headers.authorization === 'Bearer agent-smoke-secret';
     if (!authorized) {
@@ -28,39 +72,46 @@ export async function startAgentSmokeProvider(remotePosix = false): Promise<Agen
       request.setEncoding('utf8');
       request.on('data', (chunk) => { body += chunk; });
       request.on('end', () => {
-        const parsed = JSON.parse(body) as { messages?: Array<{ role?: string }> };
-        completionCount += 1;
+        const parsed = JSON.parse(body) as { messages?: SmokeMessage[] };
+        const messages = parsed.messages ?? [];
+        let lastUserIndex = messages.length - 1;
+        while (lastUserIndex >= 0 && messages[lastUserIndex]?.role !== 'user') {
+          lastUserIndex -= 1;
+        }
+        const lastUser = lastUserIndex >= 0 ? messages[lastUserIndex] : undefined;
+        const prompt = lastUser?.content ?? '';
+        const toolResultCount = messages
+          .slice(lastUserIndex + 1)
+          .filter((message) => message.role === 'tool').length;
         response.writeHead(200, { 'content-type': 'application/json' });
-        if (completionCount === 1) {
-          response.end(JSON.stringify({
-            choices: [{
-              message: {
-                role: 'assistant',
-                content: 'I need to run one harmless marker command.',
-                tool_calls: [{
-                  id: 'agent-smoke-call',
-                  type: 'function',
-                  function: {
-                    name: 'terminal_execute',
-                    arguments: JSON.stringify({ command, reason: 'verify shared visible terminal' }),
-                  },
-                }],
-              },
-            }],
-          }));
+
+        if (prompt.includes('Full Takeover marker')) {
+          response.end(toolResultCount < 2
+            ? toolResponse(
+              `full-takeover-${toolResultCount + 1}`,
+              takeoverCommands[toolResultCount],
+              'verify consecutive Full Takeover commands',
+            )
+            : textResponse('Full Takeover smoke complete.'));
           return;
         }
-        const hasToolResult = parsed.messages?.some((message) => message.role === 'tool');
-        response.end(JSON.stringify({
-          choices: [{
-            message: {
-              role: 'assistant',
-              content: hasToolResult
-                ? 'Agent smoke complete: the approved command ran in the shared terminal.'
-                : 'Agent smoke failed to receive a tool result.',
-            },
-          }],
-        }));
+        if (prompt.includes('secure authentication smoke')) {
+          response.end(toolResultCount === 0
+            ? toolResponse('auth-smoke-call', authCommand, 'verify secure input handoff')
+            : textResponse('Authentication smoke complete.'));
+          return;
+        }
+        if (prompt.includes('manual takeover smoke')) {
+          response.end(toolResponse(
+            'manual-takeover-call',
+            longCommand,
+            'verify manual takeover and Ctrl+C',
+          ));
+          return;
+        }
+        response.end(toolResultCount === 0
+          ? toolResponse('agent-smoke-call', approvedCommand, 'verify shared visible terminal')
+          : textResponse('Agent smoke complete: the approved command ran in the shared terminal.'));
       });
       return;
     }

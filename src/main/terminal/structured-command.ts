@@ -9,6 +9,7 @@ export interface CommandEnvelope {
 
 export interface CaptureUpdate {
   output: string[];
+  observed: string;
   exitCode?: number;
   completed: boolean;
 }
@@ -81,19 +82,21 @@ export class SentinelCapture {
   constructor(private readonly envelope: CommandEnvelope) {}
 
   push(data: string): CaptureUpdate {
-    if (this.completed) return { output: [], completed: true };
+    if (this.completed) return { output: [], observed: '', completed: true };
     this.buffer += data;
     const output: string[] = [];
+    let observed = this.started ? data : '';
 
     if (!this.started) {
       const startIndex = this.buffer.indexOf(this.envelope.startMarker);
       if (startIndex < 0) {
         const reserve = Math.max(0, this.envelope.startMarker.length - 1);
         if (this.buffer.length > reserve) this.buffer = this.buffer.slice(-reserve);
-        return { output, completed: false };
+        return { output, observed: '', completed: false };
       }
       this.started = true;
       this.buffer = this.buffer.slice(startIndex + this.envelope.startMarker.length);
+      observed = this.buffer;
     }
 
     const endIndex = this.buffer.indexOf(this.envelope.endPrefix);
@@ -109,18 +112,23 @@ export class SentinelCapture {
         this.buffer = this.buffer.slice(suffixIndex + this.envelope.endSuffix.length);
         return {
           output,
+          observed,
           exitCode: Number.isFinite(parsedCode) ? parsedCode : 1,
           completed: true,
         };
       }
+      const captured = this.buffer.slice(0, endIndex);
+      if (captured) output.push(captured);
+      this.buffer = this.buffer.slice(endIndex);
+      return { output, observed, completed: false };
     }
 
-    const reserve = this.envelope.endPrefix.length + this.envelope.endSuffix.length + 32;
-    if (this.buffer.length > 64 * 1024 + reserve) {
+    const reserve = Math.max(0, this.envelope.endPrefix.length - 1);
+    if (this.buffer.length > reserve) {
       const flushLength = this.buffer.length - reserve;
       output.push(this.buffer.slice(0, flushLength));
       this.buffer = this.buffer.slice(flushLength);
     }
-    return { output, completed: false };
+    return { output, observed, completed: false };
   }
 }

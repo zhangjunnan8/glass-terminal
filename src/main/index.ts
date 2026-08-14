@@ -13,7 +13,14 @@ import type { DownloadSelectionRequest, UploadSelectionRequest } from '../shared
 import { PROVIDER_CHANNELS } from '../shared/provider';
 import type { ProviderInput } from '../shared/provider';
 import { AGENT_CHANNELS } from '../shared/agent';
-import type { ResolveApprovalRequest, SendAgentPromptRequest } from '../shared/agent';
+import type {
+  ConfirmShellReadyRequest,
+  ResolveApprovalRequest,
+  ResolveTakeoverRequest,
+  SendAgentPromptRequest,
+  SetFullTakeoverRequest,
+  TakeoverRequest,
+} from '../shared/agent';
 import { HostStore } from './hosts/host-store';
 import { SessionManager } from './sessions/session-manager';
 import { SessionStore } from './sessions/session-store';
@@ -140,6 +147,7 @@ ipcMain.handle(
 );
 ipcMain.handle(TERMINAL_CHANNELS.close, (event, terminalId: string) => {
   transferQueue.cancelByTerminal(terminalId, event.sender.id);
+  agentService?.closeTerminal(event.sender, terminalId);
   terminalService.close(event.sender, terminalId);
 });
 
@@ -265,6 +273,31 @@ ipcMain.handle(
   (event, request: ResolveApprovalRequest) => {
     if (!agentService) throw new Error('Agent service is not ready.');
     return agentService.resolveApproval(event.sender, request);
+  },
+);
+ipcMain.handle(
+  AGENT_CHANNELS.setFullTakeover,
+  (event, request: SetFullTakeoverRequest) => {
+    if (!agentService) throw new Error('Agent service is not ready.');
+    return agentService.setFullTakeover(event.sender, request);
+  },
+);
+ipcMain.handle(AGENT_CHANNELS.takeover, (event, request: TakeoverRequest) => {
+  if (!agentService) throw new Error('Agent service is not ready.');
+  return agentService.takeover(event.sender, request);
+});
+ipcMain.handle(
+  AGENT_CHANNELS.resolveTakeover,
+  (event, request: ResolveTakeoverRequest) => {
+    if (!agentService) throw new Error('Agent service is not ready.');
+    return agentService.resolveTakeover(event.sender, request);
+  },
+);
+ipcMain.handle(
+  AGENT_CHANNELS.confirmShellReady,
+  (event, request: ConfirmShellReadyRequest) => {
+    if (!agentService) throw new Error('Agent service is not ready.');
+    return agentService.confirmShellReady(event.sender, request);
   },
 );
 ipcMain.handle(

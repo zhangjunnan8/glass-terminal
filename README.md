@@ -3,8 +3,10 @@
 Windows-first desktop terminal where a human and an AI agent share the same
 visible PTY or SSH shell.
 
-> Status: early alpha. The repository is being built milestone by milestone;
-> it is not yet the finished Core Demo.
+> Status: Alpha vertical slice. Local/SSH shared-terminal Agent execution,
+> approval, Full Takeover, manual Take Control, secure authentication handoff,
+> persistence, and linked SFTP are working and tested. This is not yet the
+> finished Core Demo; see `docs/progress/alpha-vertical-slice.md`.
 
 ## Design invariants
 

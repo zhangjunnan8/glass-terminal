@@ -2,18 +2,23 @@ import { useEffect, useRef, useState } from 'react';
 import { FitAddon } from '@xterm/addon-fit';
 import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
+import type { TerminalInputMode } from '../../shared/agent';
 
 interface TerminalPaneProps {
   terminalId: string;
   active: boolean;
-  inputLocked: boolean;
+  inputMode: TerminalInputMode;
 }
 
-export function TerminalPane({ terminalId, active, inputLocked }: TerminalPaneProps) {
+export function TerminalPane({
+  terminalId,
+  active,
+  inputMode,
+}: TerminalPaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
-  const inputLockedRef = useRef(inputLocked);
+  const inputModeRef = useRef(inputMode);
   const [hasOutput, setHasOutput] = useState(false);
 
   useEffect(() => {
@@ -22,7 +27,7 @@ export function TerminalPane({ terminalId, active, inputLocked }: TerminalPanePr
     const terminal = new Terminal({
       allowProposedApi: false,
       convertEol: false,
-      disableStdin: inputLockedRef.current,
+      disableStdin: inputModeRef.current === 'locked',
       cursorBlink: true,
       cursorStyle: 'block',
       fontFamily: 'Cascadia Mono, Cascadia Code, Consolas, monospace',
@@ -66,8 +71,17 @@ export function TerminalPane({ terminalId, active, inputLocked }: TerminalPanePr
     resizeObserver.observe(containerRef.current);
 
     const inputDisposable = terminal.onData((data) => {
-      if (inputLockedRef.current) return;
-      void window.aiTerminal.terminal.write(terminalId, data);
+      if (inputModeRef.current === 'locked') return;
+      let submitted = data;
+      if (inputModeRef.current === 'secure-human') {
+        const newlineIndex = data.search(/[\r\n]/);
+        if (newlineIndex >= 0) {
+          submitted = `${data.slice(0, newlineIndex)}\r`;
+          inputModeRef.current = 'locked';
+          terminal.options.disableStdin = true;
+        }
+      }
+      void window.aiTerminal.terminal.write(terminalId, submitted).catch(() => undefined);
     });
     const removeDataListener = window.aiTerminal.terminal.onData((event) => {
       if (event.terminalId !== terminalId) return;
@@ -97,9 +111,10 @@ export function TerminalPane({ terminalId, active, inputLocked }: TerminalPanePr
   }, [terminalId]);
 
   useEffect(() => {
-    inputLockedRef.current = inputLocked;
-    if (terminalRef.current) terminalRef.current.options.disableStdin = inputLocked;
-  }, [inputLocked]);
+    inputModeRef.current = inputMode;
+    if (terminalRef.current) terminalRef.current.options.disableStdin = inputMode === 'locked';
+    if (active && inputMode === 'secure-human') terminalRef.current?.focus();
+  }, [active, inputMode]);
 
   useEffect(() => {
     if (!active) return;
@@ -115,6 +130,7 @@ export function TerminalPane({ terminalId, active, inputLocked }: TerminalPanePr
       className={`terminal-pane ${active ? 'active' : ''}`}
       data-terminal-id={terminalId}
       data-terminal-output={hasOutput ? 'true' : 'false'}
+      data-input-mode={inputMode}
       ref={containerRef}
     />
   );

@@ -9,7 +9,7 @@ import type { ClientChannel, ConnectConfig, PseudoTtyOptions, SFTPWrapper } from
 import type { HostProfile, SshConnectRequest } from '../../shared/host';
 import { SSH_ERROR_CODES } from '../../shared/host';
 import type { TerminalJournalEvent } from '../../shared/session';
-import type { CommandActor, CommandExecution } from '../../shared/agent';
+import type { CommandActor, CommandExecution, TerminalInputMode } from '../../shared/agent';
 import type {
   CreateTerminalRequest,
   ShellProfile,
@@ -18,6 +18,7 @@ import type {
 import { TERMINAL_CHANNELS } from '../../shared/terminal';
 import { discoverShells } from './shell-discovery';
 import { buildCommandEnvelope, SentinelCapture } from './structured-command';
+import { TerminalInteractionDetector } from './interaction-detector';
 
 interface TerminalBackend {
   write(data: string): void;
@@ -42,21 +43,47 @@ interface TerminalRecord {
   sessionId?: string;
   sshClient?: Client;
   activeExecution?: ActiveExecution;
+  controlLease?: {
+    id: string;
+    inputMode: Exclude<TerminalInputMode, 'human'>;
+  };
+  sensitiveLease?: {
+    id: string;
+    executionId: string;
+    submitted: boolean;
+    claimed: boolean;
+  };
+  sensitiveJournalRedacted: boolean;
 }
 
 interface ActiveExecution {
   execution: CommandExecution;
   capture: SentinelCapture;
+  interactionDetector: TerminalInteractionDetector;
   outputBytes: number;
-  onOutput?: (data: string) => void;
+  hooks: StructuredExecutionHooks;
   resolve: (execution: CommandExecution) => void;
-  timeout: NodeJS.Timeout;
+  timeout?: NodeJS.Timeout;
+  sensitiveTainted: boolean;
+  sensitiveOutputRedacted: boolean;
+  interruptRequested: boolean;
+}
+
+export interface StructuredExecutionHooks {
+  onOutput?: (data: string) => void;
+  onStarted?: (execution: CommandExecution) => void;
+  onAuthPrompt?: (execution: CommandExecution) => void;
+  onConfirmation?: (
+    answer: 'y' | 'n',
+    execution: CommandExecution,
+  ) => boolean;
 }
 
 const MAX_PENDING_OUTPUT = 256 * 1024;
 const MAX_TEMPORARY_JOURNAL = 8 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT = 2 * 1024 * 1024;
 const COMMAND_TIMEOUT_MS = 5 * 60 * 1_000;
+const COMMAND_TIMEOUT_INTERRUPT_GRACE_MS = 5_000;
 
 export interface TerminalSnapshot {
   descriptor: TerminalDescriptor;
@@ -72,6 +99,12 @@ type JournalListener = (
   event: TerminalJournalEvent,
 ) => void;
 type ExitListener = (terminalId: string, ownerId: number) => void;
+type SensitiveSubmissionListener = (
+  terminalId: string,
+  ownerId: number,
+  executionId: string,
+  leaseId: string,
+) => void;
 
 function stringEnvironment(): Record<string, string> {
   return Object.fromEntries(
@@ -92,6 +125,7 @@ export class TerminalService {
   private readonly terminals = new Map<string, TerminalRecord>();
   private readonly journalListeners = new Set<JournalListener>();
   private readonly exitListeners = new Set<ExitListener>();
+  private readonly sensitiveSubmissionListeners = new Set<SensitiveSubmissionListener>();
 
   listShells(): ShellProfile[] {
     return discoverShells();
@@ -249,6 +283,30 @@ export class TerminalService {
 
   write(owner: WebContents, terminalId: string, data: string): void {
     const record = this.requireConnected(owner, terminalId);
+    if (record.controlLease?.inputMode === 'locked') {
+      throw new Error('Terminal input is locked while the Agent has control.');
+    }
+    if (record.controlLease?.inputMode === 'secure-human') {
+      const newlineIndex = data.search(/[\r\n]/);
+      if (newlineIndex >= 0) {
+        const submitted = `${data.slice(0, newlineIndex)}\r`;
+        const lease = record.sensitiveLease;
+        record.controlLease.inputMode = 'locked';
+        if (lease) {
+          lease.submitted = true;
+          if (record.activeExecution?.execution.id === lease.executionId) {
+            record.activeExecution.interactionDetector.rearm();
+          }
+        }
+        record.backend!.write(submitted);
+        if (lease) {
+          for (const listener of this.sensitiveSubmissionListeners) {
+            listener(terminalId, record.ownerId, lease.executionId, lease.id);
+          }
+        }
+        return;
+      }
+    }
     record.backend!.write(data);
   }
 
@@ -335,13 +393,17 @@ export class TerminalService {
     return () => this.exitListeners.delete(listener);
   }
 
+  onSensitiveSubmission(listener: SensitiveSubmissionListener): () => void {
+    this.sensitiveSubmissionListeners.add(listener);
+    return () => this.sensitiveSubmissionListeners.delete(listener);
+  }
+
   executeStructured(
     owner: WebContents,
     terminalId: string,
     command: string,
     actor: CommandActor,
-    onOutput?: (data: string) => void,
-    onStarted?: (execution: CommandExecution) => void,
+    hooks: StructuredExecutionHooks = {},
   ): Promise<CommandExecution> {
     const record = this.requireConnected(owner, terminalId);
     if (!record.sessionId) throw new Error('A formal Session is required before AI execution.');
@@ -367,20 +429,45 @@ export class TerminalService {
     const envelope = buildCommandEnvelope(record.descriptor.shellKind, normalizedCommand, nonce);
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
-        if (record.activeExecution?.execution.id !== execution.id) return;
-        record.backend?.write('\x03');
-        this.finishExecution(record, 'cancelled', undefined, '\r\n[Command timed out.]\r\n');
+        const active = record.activeExecution;
+        if (active?.execution.id !== execution.id) return;
+        active.interruptRequested = true;
+        active.execution.interruptRequestedAt = new Date().toISOString();
+        if (record.controlLease) record.controlLease.inputMode = 'locked';
+        const failClosed = () => {
+          if (record.activeExecution?.execution.id !== execution.id) return;
+          try {
+            record.backend?.close();
+          } catch (error) {
+            console.error('Unable to close a timed-out terminal:', error);
+          } finally {
+            this.emitExit(terminalId, 124);
+          }
+        };
+        const grace = setTimeout(failClosed, COMMAND_TIMEOUT_INTERRUPT_GRACE_MS);
+        grace.unref();
+        active.timeout = grace;
+        try {
+          record.backend?.write('\x03');
+        } catch {
+          clearTimeout(grace);
+          failClosed();
+        }
       }, COMMAND_TIMEOUT_MS);
       timeout.unref();
       record.activeExecution = {
         execution,
         capture: new SentinelCapture(envelope),
+        interactionDetector: new TerminalInteractionDetector(),
         outputBytes: 0,
-        onOutput,
+        hooks,
         resolve,
         timeout,
+        sensitiveTainted: false,
+        sensitiveOutputRedacted: false,
+        interruptRequested: false,
       };
-      onStarted?.({ ...execution });
+      hooks.onStarted?.({ ...execution });
       try {
         record.backend!.write(envelope.input);
       } catch (error) {
@@ -394,11 +481,70 @@ export class TerminalService {
     });
   }
 
-  interruptExecution(owner: WebContents, terminalId: string): CommandExecution | undefined {
+  interruptExecution(
+    owner: WebContents,
+    terminalId: string,
+    executionId: string,
+  ): CommandExecution | undefined {
     const record = this.requireOwned(owner, terminalId);
-    if (!record.activeExecution) return undefined;
-    record.backend?.write('\x03');
+    if (
+      record.activeExecution?.execution.id !== executionId
+      || record.activeExecution.interruptRequested
+    ) return undefined;
+    record.activeExecution.interruptRequested = true;
+    record.activeExecution.execution.interruptRequestedAt = new Date().toISOString();
+    if (record.activeExecution.timeout) {
+      clearTimeout(record.activeExecution.timeout);
+      record.activeExecution.timeout = undefined;
+    }
+    try {
+      record.backend?.write('\x03');
+    } catch {
+      queueMicrotask(() => {
+        if (record.activeExecution?.execution.id !== executionId) return;
+        try {
+          record.backend?.close();
+        } catch (error) {
+          console.error('Unable to close a terminal after Ctrl+C failed:', error);
+        } finally {
+          this.emitExit(terminalId, 130);
+        }
+      });
+    }
     return { ...record.activeExecution.execution };
+  }
+
+  confirmShellReady(
+    owner: WebContents,
+    terminalId: string,
+    executionId: string,
+  ): CommandExecution | undefined {
+    const record = this.requireOwned(owner, terminalId);
+    const active = record.activeExecution;
+    if (
+      active?.execution.id !== executionId
+      || !active.interruptRequested
+    ) return undefined;
+    this.finishExecution(
+      record,
+      'cancelled',
+      undefined,
+      '\r\n[User confirmed that the shell prompt is ready after Ctrl+C.]\r\n',
+    );
+    return {
+      ...active.execution,
+      output: active.execution.output,
+    };
+  }
+
+  keepExecution(owner: WebContents, terminalId: string, executionId: string): boolean {
+    const active = this.requireOwned(owner, terminalId).activeExecution;
+    if (active?.execution.id !== executionId) return false;
+    if (active.timeout) {
+      clearTimeout(active.timeout);
+      active.timeout = undefined;
+    }
+    return true;
   }
 
   currentExecution(owner: WebContents, terminalId: string): CommandExecution | undefined {
@@ -417,7 +563,108 @@ export class TerminalService {
       hostId: record.descriptor.hostId,
       status: record.status,
       activeExecutionId: record.activeExecution?.execution.id,
+      terminalInputMode: record.controlLease?.inputMode ?? 'human',
     };
+  }
+
+  acquireAgentControl(owner: WebContents, terminalId: string): string {
+    const record = this.requireConnected(owner, terminalId);
+    if (record.controlLease) throw new Error('Terminal control is already leased.');
+    const leaseId = randomUUID();
+    record.controlLease = { id: leaseId, inputMode: 'locked' };
+    return leaseId;
+  }
+
+  setAgentControlMode(
+    owner: WebContents,
+    terminalId: string,
+    leaseId: string,
+    inputMode: Exclude<TerminalInputMode, 'human'>,
+  ): void {
+    const record = this.requireOwned(owner, terminalId);
+    if (record.controlLease?.id !== leaseId) {
+      throw new Error('Agent control lease is no longer active.');
+    }
+    record.controlLease.inputMode = inputMode;
+  }
+
+  releaseAgentControl(owner: WebContents, terminalId: string, leaseId: string): boolean {
+    const record = this.terminals.get(terminalId);
+    if (!record) return false;
+    if (record.ownerId !== owner.id) throw new Error('Terminal ownership mismatch.');
+    if (record.controlLease?.id !== leaseId) return false;
+    record.controlLease = undefined;
+    return true;
+  }
+
+  beginSensitiveMode(
+    owner: WebContents,
+    terminalId: string,
+    executionId: string,
+  ): string {
+    const record = this.requireOwned(owner, terminalId);
+    const active = record.activeExecution;
+    if (active?.execution.id !== executionId) {
+      throw new Error('Sensitive input requires the active command execution.');
+    }
+    return this.taintSensitiveExecution(record, active, true);
+  }
+
+  endSensitiveMode(owner: WebContents, terminalId: string, leaseId: string): boolean {
+    const record = this.terminals.get(terminalId);
+    if (!record) return false;
+    if (record.ownerId !== owner.id) throw new Error('Terminal ownership mismatch.');
+    if (record.sensitiveLease?.id !== leaseId) return false;
+    record.sensitiveLease = undefined;
+    record.sensitiveJournalRedacted = false;
+    return true;
+  }
+
+  rearmAuthPrompt(
+    owner: WebContents,
+    terminalId: string,
+    executionId: string,
+  ): void {
+    const active = this.requireOwned(owner, terminalId).activeExecution;
+    if (active?.execution.id !== executionId) {
+      throw new Error('Authentication interaction is no longer active.');
+    }
+    active.interactionDetector.rearm();
+  }
+
+  consumeSensitiveSubmission(
+    owner: WebContents,
+    terminalId: string,
+    executionId: string,
+    leaseId: string,
+  ): boolean {
+    const record = this.requireOwned(owner, terminalId);
+    const lease = record.sensitiveLease;
+    if (
+      !lease
+      || lease.id !== leaseId
+      || lease.executionId !== executionId
+      || !lease.submitted
+    ) {
+      return false;
+    }
+    lease.submitted = false;
+    return true;
+  }
+
+  hasSensitiveSubmission(
+    owner: WebContents,
+    terminalId: string,
+    executionId: string,
+    leaseId: string,
+  ): boolean {
+    const lease = this.requireOwned(owner, terminalId).sensitiveLease;
+    return Boolean(
+      lease
+      && lease.id === leaseId
+      && lease.executionId === executionId
+      && lease.submitted,
+    );
   }
 
   openSftp(owner: WebContents, terminalId: string): Promise<SFTPWrapper> {
@@ -452,21 +699,36 @@ export class TerminalService {
       journalBytes: 0,
       droppedJournalBytes: 0,
       sshClient,
+      sensitiveJournalRedacted: false,
     });
   }
 
   private emitData(terminalId: string, data: string): void {
     const record = this.terminals.get(terminalId);
-    if (!record) return;
+    if (!record || record.status === 'exited') return;
     if (!data) return;
+    const executionAtChunkStart = record.activeExecution;
     this.processExecutionOutput(record, data);
-    this.appendJournal(record, {
-      version: 1,
-      sequence: this.nextSequence(record),
-      timestamp: new Date().toISOString(),
-      kind: 'output',
-      data,
-    });
+    if (record.sensitiveLease || executionAtChunkStart?.sensitiveTainted) {
+      if (!record.sensitiveJournalRedacted) {
+        record.sensitiveJournalRedacted = true;
+        this.appendJournal(record, {
+          version: 1,
+          sequence: this.nextSequence(record),
+          timestamp: new Date().toISOString(),
+          kind: 'output',
+          data: '\r\n[Sensitive interaction hidden]\r\n',
+        });
+      }
+    } else {
+      this.appendJournal(record, {
+        version: 1,
+        sequence: this.nextSequence(record),
+        timestamp: new Date().toISOString(),
+        kind: 'output',
+        data,
+      });
+    }
     if (!record.attached) {
       record.pendingOutput.push(data);
       record.pendingOutputLength += data.length;
@@ -483,28 +745,42 @@ export class TerminalService {
   private emitExit(terminalId: string, exitCode: number, signal?: number): void {
     const record = this.terminals.get(terminalId);
     if (!record || record.status === 'exited') return;
+    record.status = 'exited';
+    record.backend = undefined;
     if (record.activeExecution) {
       this.finishExecution(
         record,
-        'failed',
+        record.activeExecution.interruptRequested ? 'cancelled' : 'failed',
         exitCode,
         '\r\n[Terminal exited before the command sentinel completed.]\r\n',
       );
     }
-    record.status = 'exited';
-    record.backend = undefined;
-    this.appendJournal(record, {
-      version: 1,
-      sequence: this.nextSequence(record),
-      timestamp: new Date().toISOString(),
-      kind: 'exit',
-      exitCode,
-      signal,
-    });
-    if (!record.owner.isDestroyed()) {
-      record.owner.send(TERMINAL_CHANNELS.exit, { terminalId, exitCode, signal });
+    for (const listener of this.exitListeners) {
+      try {
+        listener(terminalId, record.ownerId);
+      } catch (error) {
+        console.error('Terminal exit listener failed:', error);
+      }
     }
-    for (const listener of this.exitListeners) listener(terminalId, record.ownerId);
+    try {
+      this.appendJournal(record, {
+        version: 1,
+        sequence: this.nextSequence(record),
+        timestamp: new Date().toISOString(),
+        kind: 'exit',
+        exitCode,
+        signal,
+      });
+    } catch (error) {
+      console.error('Unable to persist terminal exit:', error);
+    }
+    if (!record.owner.isDestroyed()) {
+      try {
+        record.owner.send(TERMINAL_CHANNELS.exit, { terminalId, exitCode, signal });
+      } catch (error) {
+        console.error('Unable to notify renderer of terminal exit:', error);
+      }
+    }
   }
 
   private requireOwned(owner: WebContents, terminalId: string): TerminalRecord {
@@ -554,14 +830,37 @@ export class TerminalService {
     const active = record.activeExecution;
     if (!active) return;
     const update = active.capture.push(data);
+    const interaction = active.interactionDetector.push(update.observed);
+    if (interaction?.kind === 'authentication') {
+      this.taintSensitiveExecution(record, active, false);
+      active.hooks.onAuthPrompt?.({ ...active.execution });
+    } else if (interaction?.kind === 'confirmation') {
+      const shouldAnswer = active.hooks.onConfirmation?.(
+        interaction.answer,
+        { ...active.execution },
+      ) ?? false;
+      if (shouldAnswer && record.activeExecution?.execution.id === active.execution.id) {
+        record.backend?.write(`${interaction.answer}\r`);
+        active.interactionDetector.rearm();
+      }
+    }
     for (const chunk of update.output) {
-      this.appendExecutionOutput(active, chunk);
-      active.onOutput?.(chunk);
+      if (active.sensitiveTainted) {
+        if (!active.sensitiveOutputRedacted) {
+          active.sensitiveOutputRedacted = true;
+          this.appendExecutionOutput(active, '\r\n[Sensitive interaction hidden]\r\n');
+        }
+      } else {
+        this.appendExecutionOutput(active, chunk);
+        active.hooks.onOutput?.(chunk);
+      }
     }
     if (update.completed) {
       this.finishExecution(
         record,
-        update.exitCode === 0 ? 'completed' : 'failed',
+        active.interruptRequested
+          ? 'cancelled'
+          : update.exitCode === 0 ? 'completed' : 'failed',
         update.exitCode,
       );
     }
@@ -588,7 +887,7 @@ export class TerminalService {
   ): void {
     const active = record.activeExecution;
     if (!active) return;
-    clearTimeout(active.timeout);
+    if (active.timeout) clearTimeout(active.timeout);
     if (extraOutput) this.appendExecutionOutput(active, extraOutput);
     const endedAt = new Date();
     active.execution.status = status;
@@ -598,8 +897,45 @@ export class TerminalService {
       0,
       endedAt.getTime() - Date.parse(active.execution.startedAt),
     );
+    if (
+      record.sensitiveLease?.executionId === active.execution.id
+      && !record.sensitiveLease.claimed
+    ) {
+      record.sensitiveLease = undefined;
+      record.sensitiveJournalRedacted = false;
+    }
     record.activeExecution = undefined;
     active.resolve({ ...active.execution });
+  }
+
+  private taintSensitiveExecution(
+    record: TerminalRecord,
+    active: ActiveExecution,
+    claimed: boolean,
+  ): string {
+    if (record.sensitiveLease) {
+      if (record.sensitiveLease.executionId !== active.execution.id) {
+        throw new Error('Another sensitive interaction is already active.');
+      }
+    } else {
+      record.sensitiveLease = {
+        id: randomUUID(),
+        executionId: active.execution.id,
+        submitted: false,
+        claimed,
+      };
+    }
+    if (claimed) record.sensitiveLease.claimed = true;
+    if (!active.sensitiveTainted) {
+      record.sensitiveJournalRedacted = false;
+      active.sensitiveTainted = true;
+      active.execution.output = '';
+      active.execution.outputRedacted = true;
+      active.outputBytes = 0;
+      this.appendExecutionOutput(active, '\r\n[Sensitive interaction hidden]\r\n');
+      active.sensitiveOutputRedacted = true;
+    }
+    return record.sensitiveLease.id;
   }
 
   private sshBackend(client: Client, stream: ClientChannel): TerminalBackend {

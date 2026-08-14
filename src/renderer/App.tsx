@@ -5,8 +5,9 @@ import type { RuntimeInfo } from '../shared/ipc';
 import { PRODUCT_NAME } from '../shared/product';
 import type { SessionRecord } from '../shared/session';
 import type { ProviderInput, ProviderProfile } from '../shared/provider';
-import type { AgentSessionView } from '../shared/agent';
+import type { AgentRuntimeState, AgentSessionView } from '../shared/agent';
 import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
+import { mergeAgentState } from './agent-state';
 import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
 
@@ -27,17 +28,27 @@ interface TrustChallenge {
   sessionId?: string;
 }
 
+interface FullTakeoverChallenge {
+  terminalId: string;
+  target: string;
+  approvalId?: string;
+  command?: string;
+  editedCommand?: string;
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-function agentLocksKeyboard(state?: AgentSessionView['state']): boolean {
+function agentTurnBusy(state?: AgentRuntimeState): boolean {
   return Boolean(state && [
     'THINKING',
     'WAITING_APPROVAL',
     'AI_CONTROL',
     'RUNNING',
     'WAITING_OUTPUT',
+    'WAITING_AUTH',
+    'TAKEOVER_PENDING',
   ].includes(state));
 }
 
@@ -62,6 +73,7 @@ export function App() {
   const [connectingHost, setConnectingHost] = useState<HostProfile | null>(null);
   const [reconnectingSessionId, setReconnectingSessionId] = useState<string | null>(null);
   const [trustChallenge, setTrustChallenge] = useState<TrustChallenge | null>(null);
+  const [fullTakeoverChallenge, setFullTakeoverChallenge] = useState<FullTakeoverChallenge | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
@@ -83,7 +95,7 @@ export function App() {
       void refreshSessions();
     });
     const removeAgentListener = window.aiTerminal.agent.onStateChanged((state) => {
-      setAgentStates((current) => ({ ...current, [state.terminalId]: state }));
+      setAgentStates((current) => mergeAgentState(current, state));
       setTabs((current) => current.map((tab) => (
         tab.id === state.terminalId ? { ...tab, sessionId: state.sessionId } : tab
       )));
@@ -134,11 +146,15 @@ export function App() {
     : [];
   const defaultProvider = providers.find((provider) => provider.isDefault) ?? null;
   const activeAgent = activeTab ? agentStates[activeTab.id] : undefined;
+  const activeInputMode = activeAgent?.terminalInputMode ?? 'human';
+  const foregroundRunning = activeAgent?.state === 'PAUSED'
+    && activeAgent.activeExecution?.status === 'running';
+  const composerBlocked = agentTurnBusy(activeAgent?.state) || foregroundRunning;
 
   useEffect(() => {
     if (!activeId) return;
     void window.aiTerminal.agent.getState(activeId).then((state) => {
-      if (state) setAgentStates((current) => ({ ...current, [activeId]: state }));
+      if (state) setAgentStates((current) => mergeAgentState(current, state));
     });
   }, [activeId]);
 
@@ -241,7 +257,7 @@ export function App() {
         prompt,
         providerId: defaultProvider?.id,
       });
-      setAgentStates((current) => ({ ...current, [state.terminalId]: state }));
+      setAgentStates((current) => mergeAgentState(current, state));
       setTabs((current) => current.map((tab) => (
         tab.id === state.terminalId ? { ...tab, sessionId: state.sessionId } : tab
       )));
@@ -260,7 +276,70 @@ export function App() {
         decision,
         editedCommand: decision === 'edit' ? editedApprovalCommand : undefined,
       });
-      setAgentStates((current) => ({ ...current, [state.terminalId]: state }));
+      setAgentStates((current) => mergeAgentState(current, state));
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    }
+  }
+
+  async function setFullTakeover(
+    enabled: boolean,
+    terminalId = activeTab?.id,
+    approvalId?: string,
+    editedCommand?: string,
+  ) {
+    if (!terminalId) return;
+    try {
+      const state = await window.aiTerminal.agent.setFullTakeover({
+        terminalId,
+        enabled,
+        providerId: defaultProvider?.id,
+        approvalId,
+        editedCommand,
+      });
+      setAgentStates((current) => mergeAgentState(current, state));
+      setTabs((current) => current.map((tab) => (
+        tab.id === terminalId ? { ...tab, sessionId: state.sessionId } : tab
+      )));
+      setFullTakeoverChallenge(null);
+      await refreshSessions();
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    }
+  }
+
+  async function requestAgentTakeover() {
+    if (!activeTab) return;
+    try {
+      const state = await window.aiTerminal.agent.takeover({ terminalId: activeTab.id });
+      setAgentStates((current) => mergeAgentState(current, state));
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    }
+  }
+
+  async function resolveAgentTakeover(action: 'keep' | 'interrupt') {
+    if (!activeTab || !activeAgent?.pendingTakeover) return;
+    try {
+      const state = await window.aiTerminal.agent.resolveTakeover({
+        terminalId: activeTab.id,
+        takeoverId: activeAgent.pendingTakeover.id,
+        executionId: activeAgent.pendingTakeover.executionId,
+        action,
+      });
+      setAgentStates((current) => mergeAgentState(current, state));
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    }
+  }
+
+  async function confirmShellReady(terminalId: string, executionId: string) {
+    try {
+      const state = await window.aiTerminal.agent.confirmShellReady({
+        terminalId,
+        executionId,
+      });
+      setAgentStates((current) => mergeAgentState(current, state));
     } catch (error) {
       setConnectionError(errorMessage(error));
     }
@@ -509,9 +588,22 @@ export function App() {
           </div>
         </nav>
 
-        <section className={`terminal-stage ${agentLocksKeyboard(activeAgent?.state) ? 'agent-controlled' : ''}`}>
+        <section
+          className={[
+            'terminal-stage',
+            activeInputMode === 'locked' ? 'agent-controlled' : '',
+            activeInputMode === 'secure-human' ? 'auth-required' : '',
+            activeAgent?.fullTakeover ? 'full-takeover' : '',
+          ].filter(Boolean).join(' ')}
+          data-agent-state={activeAgent?.state ?? 'USER_CONTROL'}
+          data-input-mode={activeInputMode}
+          data-full-takeover={activeAgent?.fullTakeover ? 'true' : 'false'}
+        >
           <div className="terminal-toolbar">
-            <span>{activeAgent?.state.replaceAll('_', ' ') ?? 'USER CONTROL'}</span>
+            <span>
+              {activeAgent?.state.replaceAll('_', ' ') ?? 'USER CONTROL'}
+              {activeAgent?.fullTakeover ? ' · FULL TAKEOVER' : ''}
+            </span>
             <div className="terminal-actions">
               <span>{activeTab?.status === 'exited' ? 'DISCONNECTED' : activeTab?.transport.toUpperCase() ?? 'NO TERMINAL'}</span>
               {activeTab?.status === 'exited' && activeTab.hostId && (
@@ -533,7 +625,7 @@ export function App() {
                 key={tab.id}
                 terminalId={tab.id}
                 active={tab.id === activeId}
-                inputLocked={agentLocksKeyboard(agentStates[tab.id]?.state)}
+                inputMode={agentStates[tab.id]?.terminalInputMode ?? 'human'}
               />
             ))}
             {tabs.length === 0 && !startupError && (
@@ -560,7 +652,29 @@ export function App() {
                 : 'Not configured'}
             </span>
           </div>
-          <button aria-label="Collapse agent panel">›</button>
+          <div className="agent-controls">
+            {activeAgent?.fullTakeover && <span className="takeover-badge">FULL TAKEOVER</span>}
+            <button
+              className="take-control"
+              disabled={!agentTurnBusy(activeAgent?.state) || activeAgent?.state === 'TAKEOVER_PENDING'}
+              onClick={() => void requestAgentTakeover()}
+            >Take Control</button>
+            <button
+              className={activeAgent?.fullTakeover ? 'full-takeover-enabled' : ''}
+              disabled={!activeTab || !defaultProvider || defaultProvider.status !== 'ready' || agentTurnBusy(activeAgent?.state)}
+              onClick={() => {
+                if (!activeTab) return;
+                if (activeAgent?.fullTakeover) {
+                  void setFullTakeover(false, activeTab.id);
+                } else {
+                  setFullTakeoverChallenge({
+                    terminalId: activeTab.id,
+                    target: activeTab.title,
+                  });
+                }
+              }}
+            >{activeAgent?.fullTakeover ? 'Disable' : 'Full Takeover'}</button>
+          </div>
         </div>
         <div className="agent-body">
           {!activeAgent?.messages.length && (
@@ -604,8 +718,24 @@ export function App() {
               <div className="approval-actions">
                 <button onClick={() => void resolveAgentApproval('reject')}>Reject</button>
                 <button onClick={() => void resolveAgentApproval('edit')}>Edit &amp; Execute</button>
+                <button onClick={() => {
+                  if (!activeTab || !activeAgent.pendingApproval) return;
+                  setFullTakeoverChallenge({
+                    terminalId: activeTab.id,
+                    target: activeTab.title,
+                    approvalId: activeAgent.pendingApproval.id,
+                    command: activeAgent.pendingApproval.command,
+                    editedCommand: editedApprovalCommand,
+                  });
+                }}>Switch to Full Takeover…</button>
                 <button className="execute" onClick={() => void resolveAgentApproval('execute')}>Execute</button>
               </div>
+            </section>
+          )}
+          {activeAgent?.authRequest && (
+            <section className="auth-card" data-auth-interaction={activeAgent.authRequest.id}>
+              <strong>Authentication required</strong>
+              <p>Type the credential directly in this terminal and press Enter. The Agent resumes automatically. Input after the first Enter is discarded, and the credential is excluded from AI context, Session log, structured output, and Audit.</p>
             </section>
           )}
           {activeAgent?.activeExecution && (
@@ -614,6 +744,14 @@ export function App() {
               <code>{activeAgent.activeExecution.command}</code>
               {activeAgent.activeExecution.exitCode !== undefined && (
                 <span>exit {activeAgent.activeExecution.exitCode} · {activeAgent.activeExecution.durationMs ?? 0} ms</span>
+              )}
+              {activeAgent.state === 'PAUSED'
+                && activeAgent.activeExecution.status === 'running'
+                && activeAgent.activeExecution.interruptRequestedAt && (
+                <button onClick={() => void confirmShellReady(
+                  activeAgent.terminalId,
+                  activeAgent.activeExecution!.id,
+                )}>I can see the shell prompt · release tracking</button>
               )}
             </section>
           )}
@@ -625,7 +763,7 @@ export function App() {
             placeholder="Ask the agent to inspect or operate this terminal…"
             value={agentPrompt}
             onChange={(event) => setAgentPrompt(event.target.value)}
-            disabled={defaultProvider?.status !== 'ready' || !activeTab || activeTab.status !== 'connected' || agentLocksKeyboard(activeAgent?.state)}
+            disabled={defaultProvider?.status !== 'ready' || !activeTab || activeTab.status !== 'connected' || composerBlocked}
           />
           <div>
             <span>{defaultProvider?.status === 'ready'
@@ -633,7 +771,7 @@ export function App() {
               : 'Configure and test a Provider to begin'}</span>
             <button
               type="submit"
-              disabled={!agentPrompt.trim() || defaultProvider?.status !== 'ready' || !activeTab || agentLocksKeyboard(activeAgent?.state)}
+              disabled={!agentPrompt.trim() || defaultProvider?.status !== 'ready' || !activeTab || composerBlocked}
             >↑</button>
           </div>
         </form>
@@ -766,6 +904,63 @@ export function App() {
                   <button className="primary" type="submit">Save Provider</button>
                 </div>
               </form>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {activeAgent?.pendingTakeover && (
+        <div className="modal-backdrop">
+          <div
+            className="modal compact-modal takeover-modal"
+            data-terminal-id={activeAgent.terminalId}
+            data-takeover-id={activeAgent.pendingTakeover.id}
+            data-execution-id={activeAgent.pendingTakeover.executionId}
+          >
+            <div className="modal-header"><strong>Take control of the terminal</strong></div>
+            <p>The Agent is paused. Choose what to do with the command that is still in the foreground.</p>
+            <code>{activeAgent.activeExecution?.command ?? 'Foreground command'}</code>
+            <div className="modal-actions split-actions">
+              <button onClick={() => void resolveAgentTakeover('keep')}>Keep process running</button>
+              <button className="danger-action" onClick={() => void resolveAgentTakeover('interrupt')}>Send Ctrl+C</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {fullTakeoverChallenge && (
+        <div className="modal-backdrop">
+          <div
+            className="modal compact-modal full-takeover-modal"
+            data-terminal-id={fullTakeoverChallenge.terminalId}
+            data-approval-id={fullTakeoverChallenge.approvalId ?? ''}
+          >
+            <div className="modal-header"><strong>Enable Full Takeover?</strong></div>
+            <p>
+              Target: <b>{fullTakeoverChallenge.target}</b>. The Agent may run consecutive commands—including deletion, disk, network, service, or restart commands—without asking again. Take Control remains available and immediately pauses the Agent.
+            </p>
+            <p className="risk-note">
+              {fullTakeoverChallenge.approvalId
+                ? 'Confirming immediately executes the command below; later commands in this terminal will not ask again until Full Takeover is disabled or you Take Control. '
+                : ''}
+              Only enable this for a terminal and task you trust. Authentication still pauses for direct secure input.
+            </p>
+            {fullTakeoverChallenge.command && (
+              <code>{fullTakeoverChallenge.editedCommand ?? fullTakeoverChallenge.command}</code>
+            )}
+            <div className="modal-actions">
+              <button autoFocus onClick={() => setFullTakeoverChallenge(null)}>Cancel</button>
+              <button
+                className="danger-action"
+                onClick={() => void setFullTakeover(
+                  true,
+                  fullTakeoverChallenge.terminalId,
+                  fullTakeoverChallenge.approvalId,
+                  fullTakeoverChallenge.editedCommand,
+                )}
+              >{fullTakeoverChallenge.approvalId
+                  ? 'Enable & execute this command'
+                  : 'Enable Full Takeover'}</button>
             </div>
           </div>
         </div>

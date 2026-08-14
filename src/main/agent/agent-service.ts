@@ -3,12 +3,21 @@ import type { WebContents } from 'electron';
 import { AGENT_CHANNELS } from '../../shared/agent';
 import type {
   AgentChatItem,
+  AgentRuntimeState,
   AgentSessionView,
   CommandActor,
   CommandApproval,
+  CommandExecution,
+  ConfirmShellReadyRequest,
   ResolveApprovalRequest,
+  ResolveTakeoverRequest,
   SendAgentPromptRequest,
+  SetFullTakeoverRequest,
+  TakeoverRequest,
+  TerminalInputMode,
 } from '../../shared/agent';
+import type { ProviderProfile } from '../../shared/provider';
+import type { SessionAuditEvent } from '../../shared/session';
 import type { ProviderStore } from '../providers/provider-store';
 import type { SessionManager } from '../sessions/session-manager';
 import type { TerminalService } from '../terminal/terminal-service';
@@ -27,8 +36,22 @@ interface AgentRuntimeRecord extends AgentSessionView {
   priorMessages: AgentMessage[];
   abortController?: AbortController;
   turnToken: number;
+  controlLeaseId?: string;
+  sensitiveLeaseId?: string;
+  authHandoff?: Promise<void>;
+  resolveAuthHandoff?: () => void;
   resolveApproval?: (resolution: ApprovalResolution) => void;
 }
+
+const BUSY_STATES = new Set<AgentRuntimeState>([
+  'THINKING',
+  'WAITING_APPROVAL',
+  'AI_CONTROL',
+  'RUNNING',
+  'WAITING_OUTPUT',
+  'WAITING_AUTH',
+  'TAKEOVER_PENDING',
+]);
 
 const SYSTEM_PROMPT = `You are the AI agent inside AI Terminal.
 You and the human operate the exact same visible terminal session. Use only the provided terminal tools.
@@ -38,14 +61,18 @@ Commands require explicit user approval unless the UI reports that Full Takeover
 
 function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
   return {
+    revision: runtime.revision,
     terminalId: runtime.terminalId,
     sessionId: runtime.sessionId,
     threadId: runtime.threadId,
     providerId: runtime.providerId,
     state: runtime.state,
+    terminalInputMode: runtime.terminalInputMode,
     fullTakeover: runtime.fullTakeover,
     messages: runtime.messages.map((message) => ({ ...message })),
     pendingApproval: runtime.pendingApproval ? { ...runtime.pendingApproval } : undefined,
+    authRequest: runtime.authRequest ? { ...runtime.authRequest } : undefined,
+    pendingTakeover: runtime.pendingTakeover ? { ...runtime.pendingTakeover } : undefined,
     activeExecution: runtime.activeExecution ? { ...runtime.activeExecution } : undefined,
     error: runtime.error,
   };
@@ -62,6 +89,9 @@ function safePriorMessages(value: unknown): AgentMessage[] {
 
 export class AgentService {
   private readonly runtimes = new Map<string, AgentRuntimeRecord>();
+  private readonly revisionCounters = new Map<string, number>();
+  private readonly removeExitListener: () => void;
+  private readonly removeSensitiveSubmissionListener: () => void;
 
   constructor(
     private readonly terminals: TerminalService,
@@ -70,60 +100,49 @@ export class AgentService {
     private readonly providerFactory: (providerId: string) => AgentProviderRuntime = (
       providerId,
     ) => new GenericOpenAiProvider(providerId, providers),
-  ) {}
+  ) {
+    this.removeExitListener = terminals.onExit((terminalId, ownerId) => {
+      this.handleTerminalExit(terminalId, ownerId);
+    });
+    this.removeSensitiveSubmissionListener = terminals.onSensitiveSubmission((
+      terminalId,
+      ownerId,
+      executionId,
+      leaseId,
+    ) => {
+      this.handleSensitiveSubmission(terminalId, ownerId, executionId, leaseId);
+    });
+  }
 
   sendPrompt(owner: WebContents, request: SendAgentPromptRequest): AgentSessionView {
     const prompt = request.prompt.trim();
     if (!prompt) throw new Error('Agent prompt cannot be empty.');
     if (prompt.length > 20_000) throw new Error('Agent prompt exceeds 20,000 characters.');
-    const provider = request.providerId
-      ? this.providers.get(request.providerId)
-      : this.providers.list().find((profile) => profile.isDefault);
-    if (!provider) throw new Error('Configure a default Provider first.');
-    if (provider.status !== 'ready') throw new Error(`Provider ${provider.name} is not Ready.`);
-
-    const session = this.sessions.upgrade(owner, request.terminalId);
-    let runtime = this.runtimes.get(request.terminalId);
-    if (runtime && runtime.ownerId !== owner.id) throw new Error('Agent Session ownership mismatch.');
-    if (runtime && ['THINKING', 'WAITING_APPROVAL', 'AI_CONTROL', 'RUNNING', 'WAITING_OUTPUT'].includes(runtime.state)) {
+    const provider = this.selectProvider(request.providerId);
+    const existing = this.runtimes.get(request.terminalId);
+    if (existing && existing.ownerId !== owner.id) {
+      throw new Error('Agent Session ownership mismatch.');
+    }
+    if (existing && BUSY_STATES.has(existing.state)) {
       throw new Error('The Agent is already working in this terminal.');
     }
-
-    if (!runtime || runtime.providerId !== provider.id || runtime.sessionId !== session.id) {
-      const canReuseThread = session.providerId === provider.id && Boolean(session.aiThreadId);
-      const threadId = canReuseThread ? session.aiThreadId! : randomUUID();
-      if (!canReuseThread) this.sessions.bindAgentThread(session.id, provider.id, threadId);
-      const persisted = this.sessions.readThreadEvents(session.id, threadId);
-      const chats = persisted
-        .filter((event) => event.type === 'chat')
-        .map((event) => event.item as AgentChatItem)
-        .filter((item) => item && typeof item.content === 'string');
-      const lastTurn = [...persisted].reverse().find((event) => event.type === 'turn');
-      runtime = {
-        owner,
-        ownerId: owner.id,
-        terminalId: request.terminalId,
-        sessionId: session.id,
-        threadId,
-        providerId: provider.id,
-        state: 'USER_CONTROL',
-        fullTakeover: false,
-        messages: chats,
-        priorMessages: safePriorMessages(lastTurn?.messages),
-        turnToken: 0,
-      };
-      this.runtimes.set(request.terminalId, runtime);
+    if (this.terminals.currentExecution(owner, request.terminalId)) {
+      throw new Error('A foreground process retained by Takeover is still running.');
     }
 
+    const runtime = this.ensureRuntime(owner, request.terminalId, provider);
     runtime.turnToken += 1;
     const token = runtime.turnToken;
     runtime.abortController = new AbortController();
     runtime.error = undefined;
     runtime.activeExecution = undefined;
+    runtime.pendingTakeover = undefined;
+    runtime.authRequest = undefined;
     this.addChat(runtime, 'user', prompt);
-    runtime.state = 'THINKING';
+    runtime.controlLeaseId = this.terminals.acquireAgentControl(owner, request.terminalId);
+    this.setLockedState(runtime, 'THINKING');
     this.emit(runtime);
-    void this.runTurn(runtime, token, prompt);
+    void this.runTurn(runtime, token, prompt, runtime.controlLeaseId);
     return cloneView(runtime);
   }
 
@@ -158,20 +177,20 @@ export class AgentService {
         approvalId: approval.id,
         command: approval.command,
       });
-      runtime.state = 'THINKING';
+      this.setLockedState(runtime, 'THINKING');
     } else if (request.decision === 'edit') {
       this.sessions.appendAudit(runtime.sessionId, 'command_edited', 'user', {
         approvalId: approval.id,
         requestedCommand: approval.command,
         command,
       });
-      runtime.state = 'AI_CONTROL';
+      this.setLockedState(runtime, 'AI_CONTROL');
     } else {
       this.sessions.appendAudit(runtime.sessionId, 'command_approved', 'user', {
         approvalId: approval.id,
         command,
       });
-      runtime.state = 'AI_CONTROL';
+      this.setLockedState(runtime, 'AI_CONTROL');
     }
     const resolve = runtime.resolveApproval;
     runtime.resolveApproval = undefined;
@@ -180,18 +199,219 @@ export class AgentService {
     return cloneView(runtime);
   }
 
+  setFullTakeover(owner: WebContents, request: SetFullTakeoverRequest): AgentSessionView {
+    let runtime = this.runtimes.get(request.terminalId);
+    if (runtime && runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
+    if (request.approvalId) {
+      if (!request.enabled || !runtime) {
+        throw new Error('Full Takeover approval is no longer pending.');
+      }
+      const approval = runtime.pendingApproval;
+      if (
+        runtime.state !== 'WAITING_APPROVAL'
+        || !approval
+        || approval.id !== request.approvalId
+        || !runtime.resolveApproval
+      ) {
+        throw new Error('Full Takeover approval is no longer pending.');
+      }
+      const editedCommand = request.editedCommand?.trim();
+      const decision = request.editedCommand === undefined || editedCommand === approval.command
+        ? 'execute'
+        : 'edit';
+      if (decision === 'edit' && !editedCommand) {
+        throw new Error('Edited command cannot be empty.');
+      }
+      if (!runtime.fullTakeover) {
+        this.sessions.appendAudit(runtime.sessionId, 'full_takeover_changed', 'user', {
+          enabled: true,
+          approvalId: approval.id,
+        });
+        runtime.fullTakeover = true;
+      }
+      try {
+        return this.resolveApproval(owner, {
+          terminalId: request.terminalId,
+          approvalId: approval.id,
+          decision,
+          editedCommand: decision === 'edit' ? editedCommand : undefined,
+        });
+      } catch (error) {
+        runtime.fullTakeover = false;
+        this.appendControlAudit(runtime, 'full_takeover_changed', 'system', {
+          enabled: false,
+          reason: 'approval_resolution_failed',
+          approvalId: approval.id,
+        });
+        throw error;
+      }
+    }
+    if (runtime && BUSY_STATES.has(runtime.state)) {
+      throw new Error('Take control of the active Agent turn before changing Full Takeover.');
+    }
+    if (runtime && this.terminals.currentExecution(owner, request.terminalId)) {
+      throw new Error('A foreground process retained by Takeover is still running.');
+    }
+    if (!runtime) {
+      if (!request.enabled) throw new Error('Agent Session not found.');
+      runtime = this.ensureRuntime(owner, request.terminalId, this.selectProvider(request.providerId));
+    }
+    if (runtime.fullTakeover === request.enabled) return cloneView(runtime);
+    if (request.enabled) {
+      this.sessions.appendAudit(runtime.sessionId, 'full_takeover_changed', 'user', {
+        enabled: true,
+      });
+      runtime.fullTakeover = true;
+    } else {
+      runtime.fullTakeover = false;
+      this.appendControlAudit(runtime, 'full_takeover_changed', 'user', {
+        enabled: false,
+      });
+    }
+    this.emit(runtime);
+    return cloneView(runtime);
+  }
+
+  takeover(owner: WebContents, request: TakeoverRequest): AgentSessionView {
+    const runtime = this.requireOwned(owner, request.terminalId);
+    if (runtime.state === 'TAKEOVER_PENDING') return cloneView(runtime);
+    if (!BUSY_STATES.has(runtime.state) && !runtime.fullTakeover) {
+      return cloneView(runtime);
+    }
+
+    runtime.turnToken += 1;
+    runtime.abortController?.abort();
+    runtime.abortController = undefined;
+    if (runtime.pendingApproval) {
+      this.appendControlAudit(runtime, 'command_rejected', 'user', {
+        approvalId: runtime.pendingApproval.id,
+        command: runtime.pendingApproval.command,
+        reason: 'manual_takeover',
+      });
+    }
+    const resolveApproval = runtime.resolveApproval;
+    runtime.resolveApproval = undefined;
+    runtime.pendingApproval = undefined;
+    resolveApproval?.({ decision: 'reject', command: '' });
+    this.resolveAuth(runtime);
+
+    if (runtime.fullTakeover) {
+      runtime.fullTakeover = false;
+      this.appendControlAudit(runtime, 'full_takeover_changed', 'user', {
+        enabled: false,
+        reason: 'manual_takeover',
+      });
+    }
+
+    const execution = this.terminals.currentExecution(owner, request.terminalId);
+    if (execution) {
+      runtime.activeExecution = execution;
+      runtime.pendingTakeover = {
+        id: randomUUID(),
+        executionId: execution.id,
+        requestedAt: new Date().toISOString(),
+      };
+      this.setLockedState(runtime, 'TAKEOVER_PENDING');
+    } else {
+      runtime.pendingTakeover = undefined;
+      this.setHumanState(runtime, 'PAUSED');
+      this.appendControlAudit(runtime, 'agent_paused', 'user', {
+        processAction: 'none',
+      });
+    }
+    this.emit(runtime);
+    return cloneView(runtime);
+  }
+
+  resolveTakeover(owner: WebContents, request: ResolveTakeoverRequest): AgentSessionView {
+    const runtime = this.requireOwned(owner, request.terminalId);
+    const pending = runtime.pendingTakeover;
+    if (
+      runtime.state !== 'TAKEOVER_PENDING'
+      || !pending
+      || pending.id !== request.takeoverId
+      || pending.executionId !== request.executionId
+    ) {
+      throw new Error('Takeover choice is no longer pending.');
+    }
+
+    let applied = false;
+    if (request.action === 'interrupt') {
+      const interrupted = this.terminals.interruptExecution(
+        owner,
+        request.terminalId,
+        request.executionId,
+      );
+      applied = Boolean(interrupted);
+      if (interrupted) runtime.activeExecution = interrupted;
+    } else {
+      applied = this.terminals.keepExecution(owner, request.terminalId, request.executionId);
+    }
+    runtime.pendingTakeover = undefined;
+    this.setHumanState(runtime, 'PAUSED');
+    this.appendControlAudit(runtime, 'agent_paused', 'user', {
+      processAction: request.action,
+      executionId: request.executionId,
+      applied,
+    });
+    this.emit(runtime);
+    return cloneView(runtime);
+  }
+
+  confirmShellReady(
+    owner: WebContents,
+    request: ConfirmShellReadyRequest,
+  ): AgentSessionView {
+    const runtime = this.requireOwned(owner, request.terminalId);
+    if (
+      runtime.state !== 'PAUSED'
+      || runtime.activeExecution?.id !== request.executionId
+      || !runtime.activeExecution.interruptRequestedAt
+    ) {
+      throw new Error('Interrupted command is no longer awaiting shell confirmation.');
+    }
+    const execution = this.terminals.confirmShellReady(
+      owner,
+      request.terminalId,
+      request.executionId,
+    );
+    if (!execution) {
+      throw new Error('Interrupted command is no longer awaiting shell confirmation.');
+    }
+    runtime.activeExecution = execution;
+    this.appendControlAudit(runtime, 'agent_paused', 'user', {
+      processAction: 'shell-ready-confirmed',
+      executionId: request.executionId,
+    });
+    this.emit(runtime);
+    return cloneView(runtime);
+  }
+
+  closeTerminal(owner: WebContents, terminalId: string): void {
+    const runtime = this.runtimes.get(terminalId);
+    if (!runtime) return;
+    if (runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
+    this.clearFullTakeover(runtime, 'terminal_closed');
+    this.invalidateRuntime(runtime);
+    this.runtimes.delete(terminalId);
+  }
+
   closeOwnedBy(ownerId: number): void {
     for (const [terminalId, runtime] of this.runtimes) {
       if (runtime.ownerId !== ownerId) continue;
-      runtime.turnToken += 1;
-      runtime.abortController?.abort();
-      runtime.resolveApproval?.({ decision: 'reject', command: '' });
+      this.clearFullTakeover(runtime, 'window_closed');
+      this.invalidateRuntime(runtime);
       this.runtimes.delete(terminalId);
     }
   }
 
   close(): void {
-    for (const runtime of this.runtimes.values()) runtime.abortController?.abort();
+    this.removeExitListener();
+    this.removeSensitiveSubmissionListener();
+    for (const runtime of this.runtimes.values()) {
+      this.clearFullTakeover(runtime, 'application_shutdown');
+      this.invalidateRuntime(runtime);
+    }
     this.runtimes.clear();
   }
 
@@ -199,6 +419,7 @@ export class AgentService {
     runtime: AgentRuntimeRecord,
     token: number,
     prompt: string,
+    controlLeaseId: string,
   ): Promise<void> {
     const signal = runtime.abortController!.signal;
     const provider = this.providerFactory(runtime.providerId);
@@ -209,10 +430,11 @@ export class AgentService {
       getTerminalState: async () => ({
         ...this.terminals.state(runtime.owner, runtime.terminalId),
         controlState: runtime.state,
+        fullTakeover: runtime.fullTakeover,
       }),
       executeCommand: (request) => this.requestCommand(runtime, token, request),
     }, (event) => {
-      if (runtime.turnToken !== token) return;
+      if (!this.isCurrentTurn(runtime, token)) return;
       if (event.type === 'assistant_text' && event.text) {
         this.addChat(runtime, 'assistant', event.text);
         this.emit(runtime);
@@ -228,7 +450,7 @@ export class AgentService {
         priorMessages: runtime.priorMessages,
         signal,
       });
-      if (runtime.turnToken !== token) return;
+      if (!this.isCurrentTurn(runtime, token)) return;
       runtime.priorMessages = result.messages.filter((message) => message.role !== 'system');
       this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
         type: 'turn',
@@ -238,14 +460,14 @@ export class AgentService {
       });
       runtime.pendingApproval = undefined;
       runtime.activeExecution = undefined;
-      runtime.state = 'COMPLETED';
+      this.setHumanState(runtime, 'COMPLETED', controlLeaseId);
       this.emit(runtime);
     } catch (error) {
-      if (runtime.turnToken !== token) return;
+      if (!this.isCurrentTurn(runtime, token)) return;
       runtime.pendingApproval = undefined;
       runtime.activeExecution = undefined;
       runtime.error = error instanceof Error ? error.message : String(error);
-      runtime.state = signal.aborted ? 'PAUSED' : 'FAILED';
+      this.setHumanState(runtime, signal.aborted ? 'PAUSED' : 'FAILED', controlLeaseId);
       this.emit(runtime);
     }
   }
@@ -255,7 +477,7 @@ export class AgentService {
     token: number,
     request: { command: string; reason?: string },
   ): Promise<AgentCommandResult> {
-    if (runtime.turnToken !== token) throw new Error('Agent turn is no longer active.');
+    if (!this.isCurrentTurn(runtime, token)) throw new Error('Agent turn is no longer active.');
     const approval: CommandApproval = {
       id: randomUUID(),
       sessionId: runtime.sessionId,
@@ -265,48 +487,108 @@ export class AgentService {
       status: 'waiting',
       requestedAt: new Date().toISOString(),
     };
-    runtime.pendingApproval = approval;
-    runtime.state = 'WAITING_APPROVAL';
     this.sessions.appendAudit(runtime.sessionId, 'command_requested', 'ai', {
       approvalId: approval.id,
       command: approval.command,
       reason: approval.reason,
     });
-    this.emit(runtime);
 
-    const resolution = await new Promise<ApprovalResolution>((resolve) => {
-      runtime.resolveApproval = resolve;
-    });
-    runtime.pendingApproval = undefined;
-    if (runtime.turnToken !== token) throw new Error('Agent turn is no longer active.');
-    if (resolution.decision === 'reject') {
-      return {
-        executionId: approval.id,
+    let resolution: ApprovalResolution;
+    if (runtime.fullTakeover) {
+      resolution = { decision: 'execute', command: approval.command };
+      this.sessions.appendAudit(runtime.sessionId, 'command_approved', 'system', {
+        approvalId: approval.id,
         command: approval.command,
-        status: 'rejected',
-        output: 'User rejected this command.',
-      };
+        fullTakeover: true,
+      });
+      this.setLockedState(runtime, 'AI_CONTROL');
+      this.emit(runtime);
+    } else {
+      runtime.pendingApproval = approval;
+      this.setLockedState(runtime, 'WAITING_APPROVAL');
+      this.emit(runtime);
+      resolution = await new Promise<ApprovalResolution>((resolve) => {
+        runtime.resolveApproval = resolve;
+      });
+      runtime.pendingApproval = undefined;
+      if (!this.isCurrentTurn(runtime, token)) throw new Error('Agent turn is no longer active.');
+      if (resolution.decision === 'reject') {
+        return {
+          executionId: approval.id,
+          command: approval.command,
+          status: 'rejected',
+          output: 'User rejected this command.',
+        };
+      }
     }
 
     const actor: CommandActor = resolution.decision === 'edit'
       ? 'user_modified_ai_command'
       : 'ai';
-    runtime.state = 'RUNNING';
+    this.setLockedState(runtime, 'RUNNING');
     this.emit(runtime);
-    const execution = await this.terminals.executeStructured(
-      runtime.owner,
-      runtime.terminalId,
-      resolution.command,
-      actor,
-      undefined,
-      (started) => {
-        runtime.activeExecution = started;
-        runtime.state = 'RUNNING';
+
+    let execution: CommandExecution;
+    try {
+      execution = await this.terminals.executeStructured(
+        runtime.owner,
+        runtime.terminalId,
+        resolution.command,
+        actor,
+        {
+          onStarted: (started) => {
+            if (!this.isCurrentTurn(runtime, token)) return;
+            runtime.activeExecution = started;
+            this.setLockedState(runtime, 'RUNNING');
+            this.emit(runtime);
+          },
+          onAuthPrompt: (started) => {
+            this.handleAuthPrompt(runtime, token, started);
+          },
+          onConfirmation: (answer, started) => (
+            this.handleConfirmation(runtime, token, answer, started)
+          ),
+        },
+      );
+      if (
+        this.isCurrentTurn(runtime, token)
+        && runtime.authRequest?.executionId === execution.id
+        && runtime.sensitiveLeaseId
+        && !this.terminals.hasSensitiveSubmission(
+          runtime.owner,
+          runtime.terminalId,
+          execution.id,
+          runtime.sensitiveLeaseId,
+        )
+      ) {
+        const interactionId = runtime.authRequest.id;
+        this.resolveAuth(runtime);
+        this.setLockedState(runtime, 'RUNNING');
+        this.appendControlAudit(runtime, 'interactive_auth', 'system', {
+          phase: 'execution_ended_without_submission',
+          executionId: execution.id,
+          interactionId,
+        });
         this.emit(runtime);
-      },
-    );
-    runtime.activeExecution = execution;
-    runtime.state = 'WAITING_OUTPUT';
+      }
+      while (
+        this.isCurrentTurn(runtime, token)
+        && runtime.authRequest?.executionId === execution.id
+        && runtime.authHandoff
+      ) {
+        await runtime.authHandoff;
+      }
+    } finally {
+      if (runtime.sensitiveLeaseId) {
+        this.terminals.endSensitiveMode(
+          runtime.owner,
+          runtime.terminalId,
+          runtime.sensitiveLeaseId,
+        );
+        runtime.sensitiveLeaseId = undefined;
+      }
+    }
+
     this.sessions.appendAudit(runtime.sessionId, 'command_completed', 'system', {
       executionId: execution.id,
       command: execution.command,
@@ -314,14 +596,38 @@ export class AgentService {
       status: execution.status === 'running' ? 'failed' : execution.status,
       exitCode: execution.exitCode,
       durationMs: execution.durationMs,
+      outputRedacted: execution.outputRedacted === true,
     });
     this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
       type: 'command_execution',
       timestamp: new Date().toISOString(),
       execution,
     });
+
+    const sameRuntime = this.runtimes.get(runtime.terminalId) === runtime;
+    if (sameRuntime) {
+      runtime.activeExecution = execution;
+      if (
+        runtime.state === 'TAKEOVER_PENDING'
+        && runtime.pendingTakeover?.executionId === execution.id
+      ) {
+        runtime.pendingTakeover = undefined;
+        this.setHumanState(runtime, 'PAUSED');
+        this.appendControlAudit(runtime, 'agent_paused', 'system', {
+          processAction: 'process-finished-before-choice',
+          executionId: execution.id,
+        });
+        this.emit(runtime);
+      } else if (this.isCurrentTurn(runtime, token)) {
+        this.setLockedState(runtime, 'WAITING_OUTPUT');
+        this.emit(runtime);
+      } else {
+        this.emit(runtime);
+      }
+    }
+    if (!this.isCurrentTurn(runtime, token)) throw new Error('Agent turn is no longer active.');
+    this.setLockedState(runtime, 'THINKING');
     this.emit(runtime);
-    runtime.state = 'THINKING';
     return {
       executionId: execution.id,
       command: execution.command,
@@ -330,6 +636,268 @@ export class AgentService {
       output: execution.output,
       durationMs: execution.durationMs,
     };
+  }
+
+  private handleAuthPrompt(
+    runtime: AgentRuntimeRecord,
+    token: number,
+    execution: CommandExecution,
+  ): void {
+    if (!this.isCurrentTurn(runtime, token)) return;
+    if (runtime.authRequest?.executionId === execution.id) return;
+    runtime.sensitiveLeaseId ??= this.terminals.beginSensitiveMode(
+      runtime.owner,
+      runtime.terminalId,
+      execution.id,
+    );
+    runtime.authRequest = {
+      id: randomUUID(),
+      executionId: execution.id,
+      detectedAt: new Date().toISOString(),
+    };
+    runtime.authHandoff = new Promise<void>((resolve) => {
+      runtime.resolveAuthHandoff = resolve;
+    });
+    this.setSecureInputState(runtime);
+    this.appendControlAudit(runtime, 'interactive_auth', 'system', {
+      phase: 'detected',
+      executionId: execution.id,
+      interactionId: runtime.authRequest.id,
+    });
+    this.emit(runtime);
+  }
+
+  private handleSensitiveSubmission(
+    terminalId: string,
+    ownerId: number,
+    executionId: string,
+    leaseId: string,
+  ): void {
+    const runtime = this.runtimes.get(terminalId);
+    const interaction = runtime?.authRequest;
+    if (
+      !runtime
+      || runtime.ownerId !== ownerId
+      || runtime.state !== 'WAITING_AUTH'
+      || !interaction
+      || interaction.executionId !== executionId
+      || runtime.sensitiveLeaseId !== leaseId
+      || !this.terminals.consumeSensitiveSubmission(
+        runtime.owner,
+        terminalId,
+        executionId,
+        leaseId,
+      )
+    ) return;
+    runtime.authRequest = undefined;
+    const resolve = runtime.resolveAuthHandoff;
+    runtime.resolveAuthHandoff = undefined;
+    runtime.authHandoff = undefined;
+    this.setLockedState(runtime, 'RUNNING');
+    this.appendControlAudit(runtime, 'interactive_auth', 'user', {
+      phase: 'submitted',
+      executionId,
+      interactionId: interaction.id,
+    });
+    this.emit(runtime);
+    resolve?.();
+  }
+
+  private handleConfirmation(
+    runtime: AgentRuntimeRecord,
+    token: number,
+    answer: 'y' | 'n',
+    execution: CommandExecution,
+  ): boolean {
+    if (
+      !this.isCurrentTurn(runtime, token)
+      || runtime.authRequest
+      || !runtime.fullTakeover
+    ) return false;
+    try {
+      this.sessions.appendAudit(runtime.sessionId, 'interactive_response', 'ai', {
+        executionId: execution.id,
+        response: answer,
+        policy: 'displayed-default',
+      });
+    } catch (error) {
+      console.error('Unable to persist interactive response; leaving it unanswered:', error);
+      return false;
+    }
+    return true;
+  }
+
+  private ensureRuntime(
+    owner: WebContents,
+    terminalId: string,
+    provider: ProviderProfile,
+  ): AgentRuntimeRecord {
+    const session = this.sessions.upgrade(owner, terminalId);
+    const existing = this.runtimes.get(terminalId);
+    if (existing && existing.ownerId !== owner.id) throw new Error('Agent Session ownership mismatch.');
+    if (existing && existing.providerId === provider.id && existing.sessionId === session.id) {
+      return existing;
+    }
+    if (existing) {
+      if (BUSY_STATES.has(existing.state) || this.terminals.currentExecution(owner, terminalId)) {
+        throw new Error('Cannot switch Provider while the Agent or a foreground process is active.');
+      }
+      this.invalidateRuntime(existing);
+    }
+
+    const canReuseThread = session.providerId === provider.id && Boolean(session.aiThreadId);
+    const threadId = canReuseThread ? session.aiThreadId! : randomUUID();
+    if (!canReuseThread) this.sessions.bindAgentThread(session.id, provider.id, threadId);
+    const persisted = this.sessions.readThreadEvents(session.id, threadId);
+    const chats = persisted
+      .filter((event) => event.type === 'chat')
+      .map((event) => event.item as AgentChatItem)
+      .filter((item) => item && typeof item.content === 'string');
+    const lastTurn = [...persisted].reverse().find((event) => event.type === 'turn');
+    const runtime: AgentRuntimeRecord = {
+      revision: this.revisionCounters.get(terminalId) ?? 0,
+      owner,
+      ownerId: owner.id,
+      terminalId,
+      sessionId: session.id,
+      threadId,
+      providerId: provider.id,
+      state: 'USER_CONTROL',
+      terminalInputMode: 'human',
+      fullTakeover: false,
+      messages: chats,
+      priorMessages: safePriorMessages(lastTurn?.messages),
+      turnToken: 0,
+    };
+    this.runtimes.set(terminalId, runtime);
+    return runtime;
+  }
+
+  private selectProvider(providerId?: string): ProviderProfile {
+    const provider = providerId
+      ? this.providers.get(providerId)
+      : this.providers.list().find((profile) => profile.isDefault);
+    if (!provider) throw new Error('Configure a default Provider first.');
+    if (provider.status !== 'ready') throw new Error(`Provider ${provider.name} is not Ready.`);
+    return provider;
+  }
+
+  private isCurrentTurn(runtime: AgentRuntimeRecord, token: number): boolean {
+    return this.runtimes.get(runtime.terminalId) === runtime
+      && runtime.turnToken === token;
+  }
+
+  private setLockedState(runtime: AgentRuntimeRecord, state: AgentRuntimeState): void {
+    runtime.state = state;
+    runtime.terminalInputMode = 'locked';
+    if (runtime.controlLeaseId) {
+      this.terminals.setAgentControlMode(
+        runtime.owner,
+        runtime.terminalId,
+        runtime.controlLeaseId,
+        'locked',
+      );
+    }
+  }
+
+  private setSecureInputState(runtime: AgentRuntimeRecord): void {
+    runtime.state = 'WAITING_AUTH';
+    runtime.terminalInputMode = 'secure-human';
+    if (!runtime.controlLeaseId) throw new Error('Agent control lease is missing.');
+    this.terminals.setAgentControlMode(
+      runtime.owner,
+      runtime.terminalId,
+      runtime.controlLeaseId,
+      'secure-human',
+    );
+  }
+
+  private setHumanState(
+    runtime: AgentRuntimeRecord,
+    state: AgentRuntimeState,
+    expectedLeaseId = runtime.controlLeaseId,
+  ): void {
+    runtime.state = state;
+    runtime.terminalInputMode = 'human';
+    if (expectedLeaseId) {
+      this.terminals.releaseAgentControl(runtime.owner, runtime.terminalId, expectedLeaseId);
+      if (runtime.controlLeaseId === expectedLeaseId) runtime.controlLeaseId = undefined;
+    }
+  }
+
+  private resolveAuth(runtime: AgentRuntimeRecord): void {
+    runtime.authRequest = undefined;
+    const resolve = runtime.resolveAuthHandoff;
+    runtime.resolveAuthHandoff = undefined;
+    runtime.authHandoff = undefined;
+    resolve?.();
+  }
+
+  private invalidateRuntime(runtime: AgentRuntimeRecord): void {
+    runtime.turnToken += 1;
+    runtime.abortController?.abort();
+    runtime.abortController = undefined;
+    runtime.resolveApproval?.({ decision: 'reject', command: '' });
+    runtime.resolveApproval = undefined;
+    runtime.pendingApproval = undefined;
+    this.resolveAuth(runtime);
+    if (
+      runtime.sensitiveLeaseId
+      && !this.terminals.currentExecution(runtime.owner, runtime.terminalId)
+    ) {
+      this.terminals.endSensitiveMode(
+        runtime.owner,
+        runtime.terminalId,
+        runtime.sensitiveLeaseId,
+      );
+      runtime.sensitiveLeaseId = undefined;
+    }
+    if (runtime.controlLeaseId) {
+      this.terminals.releaseAgentControl(
+        runtime.owner,
+        runtime.terminalId,
+        runtime.controlLeaseId,
+      );
+      runtime.controlLeaseId = undefined;
+    }
+  }
+
+  private handleTerminalExit(terminalId: string, ownerId: number): void {
+    const runtime = this.runtimes.get(terminalId);
+    if (!runtime || runtime.ownerId !== ownerId) return;
+    this.invalidateRuntime(runtime);
+    runtime.pendingTakeover = undefined;
+    runtime.error = 'Terminal disconnected.';
+    runtime.state = 'FAILED';
+    runtime.terminalInputMode = 'human';
+    this.clearFullTakeover(runtime, 'terminal_disconnected');
+    this.emit(runtime);
+  }
+
+  private clearFullTakeover(runtime: AgentRuntimeRecord, reason: string): void {
+    if (!runtime.fullTakeover) return;
+    runtime.fullTakeover = false;
+    try {
+      this.sessions.appendAudit(runtime.sessionId, 'full_takeover_changed', 'system', {
+        enabled: false,
+        reason,
+      });
+    } catch (error) {
+      console.error('Unable to persist Full Takeover shutdown:', error);
+    }
+  }
+
+  private appendControlAudit(
+    runtime: AgentRuntimeRecord,
+    type: SessionAuditEvent['type'],
+    actor: SessionAuditEvent['actor'],
+    details: Record<string, unknown>,
+  ): void {
+    try {
+      this.sessions.appendAudit(runtime.sessionId, type, actor, details);
+    } catch (error) {
+      console.error(`Unable to persist ${type} control transition:`, error);
+    }
   }
 
   private addChat(
@@ -343,12 +911,12 @@ export class AgentService {
       content,
       createdAt: new Date().toISOString(),
     };
-    runtime.messages.push(item);
     this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
       type: 'chat',
       timestamp: item.createdAt,
       item,
     });
+    runtime.messages.push(item);
   }
 
   private requireOwned(owner: WebContents, terminalId: string): AgentRuntimeRecord {
@@ -358,8 +926,14 @@ export class AgentService {
   }
 
   private emit(runtime: AgentRuntimeRecord): void {
+    runtime.revision = (this.revisionCounters.get(runtime.terminalId) ?? 0) + 1;
+    this.revisionCounters.set(runtime.terminalId, runtime.revision);
     if (!runtime.owner.isDestroyed()) {
-      runtime.owner.send(AGENT_CHANNELS.stateChanged, cloneView(runtime));
+      try {
+        runtime.owner.send(AGENT_CHANNELS.stateChanged, cloneView(runtime));
+      } catch (error) {
+        console.error('Unable to notify renderer of Agent state:', error);
+      }
     }
   }
 }

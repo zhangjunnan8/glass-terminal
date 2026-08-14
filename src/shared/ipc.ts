@@ -29,8 +29,12 @@ import type {
 } from './provider';
 import type {
   AgentSessionView,
+  ConfirmShellReadyRequest,
   ResolveApprovalRequest,
+  ResolveTakeoverRequest,
   SendAgentPromptRequest,
+  SetFullTakeoverRequest,
+  TakeoverRequest,
 } from './agent';
 
 export interface RuntimeInfo {
@@ -85,6 +89,10 @@ export interface DesktopBridge {
     sendPrompt(request: SendAgentPromptRequest): Promise<AgentSessionView>;
     getState(terminalId: string): Promise<AgentSessionView | null>;
     resolveApproval(request: ResolveApprovalRequest): Promise<AgentSessionView>;
+    setFullTakeover(request: SetFullTakeoverRequest): Promise<AgentSessionView>;
+    takeover(request: TakeoverRequest): Promise<AgentSessionView>;
+    resolveTakeover(request: ResolveTakeoverRequest): Promise<AgentSessionView>;
+    confirmShellReady(request: ConfirmShellReadyRequest): Promise<AgentSessionView>;
     onStateChanged(listener: (state: AgentSessionView) => void): () => void;
   };
 }

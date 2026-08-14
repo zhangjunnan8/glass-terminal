@@ -93,17 +93,20 @@ async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<bo
         terminalId = pane?.getAttribute('data-terminal-id');
         if (!terminalId) throw new Error('Local terminal id is missing.');
       }
-      const textarea = document.querySelector('textarea[aria-label="Message AI"]');
-      if (!(textarea instanceof HTMLTextAreaElement) || textarea.disabled) {
-        throw new Error('Agent composer is not ready.');
-      }
       const setter = Object.getOwnPropertyDescriptor(
         HTMLTextAreaElement.prototype,
         'value',
       )?.set;
-      setter?.call(textarea, 'Run the harmless shared-terminal marker test.');
-      textarea.dispatchEvent(new Event('input', { bubbles: true }));
-      textarea.closest('form')?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      const sendPrompt = (prompt) => {
+        const textarea = document.querySelector('textarea[aria-label="Message AI"]');
+        if (!(textarea instanceof HTMLTextAreaElement) || textarea.disabled) {
+          throw new Error('Agent composer is not ready.');
+        }
+        setter?.call(textarea, prompt);
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        textarea.closest('form')?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      };
+      sendPrompt('Run the harmless shared-terminal marker test.');
       const approvalReady = await waitFor(() => document.querySelector('.approval-card'));
       if (!approvalReady) throw new Error('Command approval did not appear.');
       if (pane?.textContent?.includes('__AI_AGENT_APPROVED__')) {
@@ -119,14 +122,127 @@ async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<bo
       const completed = await waitFor(
         () => document.querySelector('.agent-body')?.textContent?.includes('Agent smoke complete'),
       );
+      if (!markerVisible || !completed) throw new Error('Approved Agent command did not complete.');
+
+      sendPrompt('Run two Full Takeover marker commands.');
+      const takeoverApprovalReady = await waitFor(() => document.querySelector('.approval-card'));
+      if (!takeoverApprovalReady) throw new Error('Full Takeover command approval did not appear.');
+      const takeoverApprovalState = await window.aiTerminal.agent.getState(terminalId);
+      const switchToFull = [...document.querySelectorAll('.approval-actions button')]
+        .find((button) => button.textContent?.startsWith('Switch to Full Takeover'));
+      if (!(switchToFull instanceof HTMLButtonElement)) {
+        throw new Error('Approval card Full Takeover action is missing.');
+      }
+      switchToFull.click();
+      const riskVisible = await waitFor(() => document.querySelector('.full-takeover-modal'));
+      if (!riskVisible) throw new Error('Full Takeover risk confirmation did not appear.');
+      const riskModal = document.querySelector('.full-takeover-modal');
+      if (
+        riskModal?.getAttribute('data-terminal-id') !== terminalId
+        || riskModal?.getAttribute('data-approval-id') !== takeoverApprovalState?.pendingApproval?.id
+      ) throw new Error('Full Takeover risk confirmation is not bound to the exact approval.');
+      if (pane?.textContent?.includes('__AI_FULL_TAKEOVER_ONE__')) {
+        throw new Error('Full Takeover command ran before risk confirmation.');
+      }
+      const enableFull = [...document.querySelectorAll('.full-takeover-modal button')]
+        .find((button) => button.textContent === 'Enable & execute this command');
+      if (!(enableFull instanceof HTMLButtonElement)) throw new Error('Full Takeover confirmation is missing.');
+      enableFull.click();
+      const fullEnabled = await waitFor(
+        () => document.querySelector('.terminal-stage')?.getAttribute('data-full-takeover') === 'true',
+      );
+      if (!fullEnabled) throw new Error('Full Takeover did not become active.');
+
+      const fullOne = await waitFor(() => pane?.textContent?.includes('__AI_FULL_TAKEOVER_ONE__'));
+      const fullTwo = await waitFor(() => pane?.textContent?.includes('__AI_FULL_TAKEOVER_TWO__'));
+      const fullComplete = await waitFor(
+        () => document.querySelector('.agent-body')?.textContent?.includes('Full Takeover smoke complete'),
+      );
+      if (!fullOne || !fullTwo || !fullComplete || document.querySelector('.approval-card')) {
+        throw new Error('Consecutive Full Takeover execution failed.');
+      }
+
+      sendPrompt('Run the secure authentication smoke.');
+      const authReady = await waitFor(
+        () => document.querySelector('.terminal-stage')?.getAttribute('data-input-mode') === 'secure-human',
+      );
+      if (!authReady) throw new Error('Secure authentication handoff did not open.');
+      const authState = await window.aiTerminal.agent.getState(terminalId);
+      if (!authState?.authRequest) throw new Error('Authentication request metadata is missing.');
+      const terminalTextarea = document.querySelector(
+        '.terminal-pane[data-terminal-id="' + terminalId + '"] .xterm-helper-textarea',
+      );
+      if (!(terminalTextarea instanceof HTMLTextAreaElement)) {
+        throw new Error('xterm secure input surface is missing.');
+      }
+      terminalTextarea.focus();
+      terminalTextarea.dispatchEvent(new InputEvent('input', {
+        data: '__AI_AUTH_SECRET_CANARY__\\rprintf __AI_PASTE_TAIL_EXECUTED__\\r',
+        inputType: 'insertText',
+        bubbles: true,
+      }));
+      const authMarker = await waitFor(() => pane?.textContent?.includes('__AI_AUTH_OK__'));
+      const authComplete = await waitFor(
+        () => document.querySelector('.agent-body')?.textContent?.includes('Authentication smoke complete'),
+      );
+      if (!authMarker || !authComplete) throw new Error('Authentication smoke did not resume the Agent.');
+      if (pane?.textContent?.includes('__AI_PASTE_TAIL_EXECUTED__')) {
+        throw new Error('Secure multiline paste tail reached the shell.');
+      }
+
+      sendPrompt('Run the manual takeover smoke.');
+      const running = await waitFor(
+        () => document.querySelector('.terminal-stage')?.getAttribute('data-agent-state') === 'RUNNING',
+      );
+      if (!running) throw new Error('Manual Takeover command did not start.');
+      const takeControl = [...document.querySelectorAll('.agent-controls button')]
+        .find((button) => button.textContent === 'Take Control');
+      if (!(takeControl instanceof HTMLButtonElement)) throw new Error('Take Control button is missing.');
+      takeControl.click();
+      const takeoverVisible = await waitFor(() => document.querySelector('.takeover-modal'));
+      if (!takeoverVisible) throw new Error('Takeover process choice did not appear.');
+      const pendingTakeoverState = await window.aiTerminal.agent.getState(terminalId);
+      const takeoverModal = document.querySelector('.takeover-modal');
+      if (
+        takeoverModal?.getAttribute('data-terminal-id') !== terminalId
+        || takeoverModal?.getAttribute('data-takeover-id') !== pendingTakeoverState?.pendingTakeover?.id
+        || takeoverModal?.getAttribute('data-execution-id') !== pendingTakeoverState?.pendingTakeover?.executionId
+      ) throw new Error('Takeover modal is not bound to the exact foreground execution.');
+      const interrupt = [...document.querySelectorAll('.takeover-modal button')]
+        .find((button) => button.textContent === 'Send Ctrl+C');
+      if (!(interrupt instanceof HTMLButtonElement)) throw new Error('Takeover Ctrl+C action is missing.');
+      interrupt.click();
+      const paused = await waitFor(
+        () => document.querySelector('.terminal-stage')?.getAttribute('data-agent-state') === 'PAUSED',
+      );
+      const shellReadyVisible = await waitFor(
+        () => [...document.querySelectorAll('.execution-card button')]
+          .some((button) => button.textContent?.startsWith('I can see the shell prompt')),
+        1500,
+      );
+      if (shellReadyVisible) {
+        const shellReady = [...document.querySelectorAll('.execution-card button')]
+          .find((button) => button.textContent?.startsWith('I can see the shell prompt'));
+        if (shellReady instanceof HTMLButtonElement) shellReady.click();
+      }
+      const trackingSettled = await waitFor(
+        () => !document.querySelector('.execution-card.running'),
+      );
       const state = await window.aiTerminal.agent.getState(terminalId);
       if (host) {
+        await new Promise((resolve) => setTimeout(resolve, 500));
         await window.aiTerminal.terminal.write(terminalId, 'exit\\r');
         await waitFor(() => document.querySelector('.tab-state.exited'), 8000);
         await window.aiTerminal.hosts.remove(host.id);
       }
       return {
-        ok: Boolean(markerVisible && completed && state?.state === 'COMPLETED'),
+        ok: Boolean(
+          paused
+          && trackingSettled
+          && state?.state === 'PAUSED'
+          && state.activeExecution?.status !== 'running'
+          && !state.fullTakeover
+        ),
         sessionId: state?.sessionId,
       };
     } catch (error) {

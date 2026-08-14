@@ -224,6 +224,9 @@ button { border: 0; }
 .terminal-toolbar { border-bottom: 1px solid #141c27; }
 .terminal-stage.agent-controlled .terminal-toolbar { color: #07130f; border-bottom-color: #4eb793; background: #5ed1ac; font-weight: 800; }
 .terminal-stage.agent-controlled .terminal-stack { box-shadow: inset 0 0 0 1px #54c5a266; }
+.terminal-stage.auth-required .terminal-toolbar { color: #241500; border-bottom-color: #d89f37; background: #e7b352; font-weight: 800; }
+.terminal-stage.auth-required .terminal-stack { box-shadow: inset 0 0 0 2px #e7b35299; }
+.terminal-stage.full-takeover .terminal-statusbar { color: #ffd0d3; border-top-color: #833641; background: #35151b; }
 .terminal-actions { display: flex; align-items: center; gap: 8px; }
 .terminal-stack { position: relative; min-width: 0; min-height: 0; background: #080c12; }
 .terminal-pane { position: absolute; inset: 0; display: none; padding: 8px 8px 4px 12px; }
@@ -244,6 +247,12 @@ button { border: 0; }
 .agent-header strong, .agent-header span { display: block; }
 .agent-header strong { color: #cbd7e7; font-size: 11px; }
 .agent-header span { margin-top: 4px; color: #68778b; font-size: 9px; }
+.agent-controls { display: flex; max-width: 155px; flex-wrap: wrap; justify-content: flex-end; gap: 4px; }
+.agent-header .agent-controls button { padding: 4px 6px; border: 1px solid #2e3c4e; border-radius: 3px; background: #151f2b; font-size: 8px; }
+.agent-header .agent-controls button:disabled { opacity: .42; cursor: default; }
+.agent-header .agent-controls .take-control { color: #77d6b8; border-color: #31574e; }
+.agent-header .agent-controls .full-takeover-enabled { color: #ffd1d5; border-color: #8f3d49; background: #3a171d; }
+.agent-header .agent-controls .takeover-badge { width: 100%; margin: 0 0 2px; color: #ff9ca4; text-align: right; font-size: 7px; font-weight: 900; letter-spacing: .09em; }
 .agent-body { min-height: 0; flex: 1; overflow-y: auto; }
 .agent-empty { display: flex; align-items: center; flex: 1; flex-direction: column; justify-content: center; padding: 34px; text-align: center; }
 .agent-glyph { display: grid; place-items: center; width: 42px; height: 42px; margin-bottom: 16px; color: #68dbb9; border: 1px solid #2c5a50; border-radius: 50%; background: #112720; font-size: 18px; }
@@ -263,9 +272,13 @@ button { border: 0; }
 .approval-card strong { color: #e0bd76; font-size: 10px; }
 .approval-card > div:first-child span { color: #87765a; font-size: 8px; text-align: right; }
 .approval-card textarea { width: 100%; min-height: 70px; margin-top: 8px; padding: 8px; resize: vertical; color: #d7dfeb; border: 1px solid #55462d; border-radius: 3px; outline: 0; background: #0c1017; font: 10px/1.45 "Cascadia Mono", Consolas, monospace; }
-.approval-actions { display: flex; justify-content: flex-end; gap: 5px; margin-top: 7px; }
+.approval-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; margin-top: 7px; }
 .approval-actions button { padding: 5px 7px; color: #a9b5c4; border: 1px solid #39475a; border-radius: 3px; background: #17212d; cursor: pointer; font-size: 8px; }
 .approval-actions .execute { color: #07130f; border-color: #5bc9a7; background: #5bc9a7; font-weight: 800; }
+.auth-card { margin: 10px; padding: 11px; color: #e8c77f; border: 1px solid #b78635; border-radius: 5px; background: #241b0d; box-shadow: 0 0 20px #d397292b; }
+.auth-card strong { display: block; font-size: 10px; letter-spacing: .04em; }
+.auth-card p { margin: 6px 0 9px; color: #b49c70; font-size: 9px; line-height: 1.5; }
+.auth-card button { padding: 5px 7px; color: #241500; border: 1px solid #e1ad50; border-radius: 3px; background: #e1ad50; cursor: pointer; font-size: 8px; font-weight: 800; }
 .execution-card { margin: 10px; padding: 9px; border: 1px solid #2b3a4e; border-radius: 4px; background: #0b1119; }
 .execution-card strong, .execution-card code, .execution-card span { display: block; }
 .execution-card strong { color: #d0ae69; font-size: 8px; }
@@ -273,6 +286,7 @@ button { border: 0; }
 .execution-card.failed strong { color: #ed858d; }
 .execution-card code { margin-top: 5px; color: #bac6d5; font: 9px/1.4 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; }
 .execution-card span { margin-top: 5px; color: #627286; font-size: 8px; }
+.execution-card button { margin-top: 7px; padding: 5px 7px; color: #d4b36f; border: 1px solid #8d6b31; border-radius: 3px; background: #21190d; cursor: pointer; font-size: 8px; }
 .agent-error { margin: 10px; padding: 8px; color: #f09aa0; border: 1px solid #512c33; border-radius: 4px; background: #241419; font-size: 9px; }
 
 .sftp-drawer { display: flex; position: absolute; z-index: 8; top: 37px; right: 0; bottom: 0; width: min(410px, 75%); flex-direction: column; border-left: 1px solid #2b3a4e; background: #0e151f; box-shadow: -12px 0 24px #02050a88; }
@@ -384,6 +398,11 @@ button { border: 0; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 7px; margin-top: 17px; }
 .modal-actions button { padding: 7px 12px; color: #9aa8ba; border: 1px solid #2d3a4c; border-radius: 4px; background: #182230; cursor: pointer; font-size: 10px; }
 .modal-actions button.primary { color: #07120f; border-color: #66d8b6; background: #66d8b6; font-weight: 700; }
+.modal-actions .danger-action { color: #ffe1e4; border-color: #a84b58; background: #702a35; font-weight: 800; }
+.takeover-modal code { display: block; max-height: 100px; margin-top: 10px; padding: 9px; overflow: auto; color: #c6d1df; border: 1px solid #29384a; border-radius: 4px; background: #080e15; font: 9px/1.5 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; }
+.split-actions { justify-content: space-between; }
+.full-takeover-modal { border-color: #87404a; box-shadow: 0 22px 70px #000c, 0 0 0 1px #9e435055; }
+.full-takeover-modal .risk-note { margin-top: 10px; padding: 8px; color: #e4aab0; border: 1px solid #63343b; border-radius: 4px; background: #29151a; }
 .connection-summary { margin-bottom: 14px; padding: 9px; color: #8ba0b7; border: 1px solid #253346; border-radius: 4px; background: #0b121b; font: 10px "Cascadia Code", Consolas, monospace; }
 .secure-note { padding-left: 16px; position: relative; }
 .secure-note::before { content: "◆"; position: absolute; left: 0; color: #5ed0ae; }

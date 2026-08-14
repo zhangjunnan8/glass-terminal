@@ -80,7 +80,8 @@ export interface SessionAuditEvent {
     | 'command_completed'
     | 'agent_paused'
     | 'full_takeover_changed'
-    | 'interactive_auth';
+    | 'interactive_auth'
+    | 'interactive_response';
   actor: 'user' | 'system' | 'ai';
   timestamp: string;
   details: Record<string, unknown>;

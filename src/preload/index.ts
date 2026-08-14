@@ -94,6 +94,13 @@ const agentBridge: DesktopBridge['agent'] = {
   sendPrompt: (request) => ipcRenderer.invoke(AGENT_CHANNELS.sendPrompt, request),
   getState: (terminalId) => ipcRenderer.invoke(AGENT_CHANNELS.getState, terminalId),
   resolveApproval: (request) => ipcRenderer.invoke(AGENT_CHANNELS.resolveApproval, request),
+  setFullTakeover: (request) => ipcRenderer.invoke(AGENT_CHANNELS.setFullTakeover, request),
+  takeover: (request) => ipcRenderer.invoke(AGENT_CHANNELS.takeover, request),
+  resolveTakeover: (request) => ipcRenderer.invoke(AGENT_CHANNELS.resolveTakeover, request),
+  confirmShellReady: (request) => ipcRenderer.invoke(
+    AGENT_CHANNELS.confirmShellReady,
+    request,
+  ),
   onStateChanged: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, state: AgentSessionView) => {
       listener(state);
