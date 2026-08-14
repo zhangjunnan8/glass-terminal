@@ -5,6 +5,7 @@ import type { RuntimeInfo } from '../shared/ipc';
 import { PRODUCT_NAME } from '../shared/product';
 import type { SessionRecord } from '../shared/session';
 import type { ProviderInput, ProviderProfile } from '../shared/provider';
+import type { AgentSessionView } from '../shared/agent';
 import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
 import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
@@ -30,6 +31,16 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function agentLocksKeyboard(state?: AgentSessionView['state']): boolean {
+  return Boolean(state && [
+    'THINKING',
+    'WAITING_APPROVAL',
+    'AI_CONTROL',
+    'RUNNING',
+    'WAITING_OUTPUT',
+  ].includes(state));
+}
+
 export function App() {
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
   const [shells, setShells] = useState<ShellProfile[]>([]);
@@ -44,6 +55,9 @@ export function App() {
   const [providerModalOpen, setProviderModalOpen] = useState(false);
   const [editingProvider, setEditingProvider] = useState<ProviderProfile | null>(null);
   const [providerMessage, setProviderMessage] = useState<string | null>(null);
+  const [agentStates, setAgentStates] = useState<Record<string, AgentSessionView>>({});
+  const [agentPrompt, setAgentPrompt] = useState('');
+  const [editedApprovalCommand, setEditedApprovalCommand] = useState('');
   const [editingHost, setEditingHost] = useState<HostProfile | null | undefined>(undefined);
   const [connectingHost, setConnectingHost] = useState<HostProfile | null>(null);
   const [reconnectingSessionId, setReconnectingSessionId] = useState<string | null>(null);
@@ -68,6 +82,12 @@ export function App() {
       )));
       void refreshSessions();
     });
+    const removeAgentListener = window.aiTerminal.agent.onStateChanged((state) => {
+      setAgentStates((current) => ({ ...current, [state.terminalId]: state }));
+      setTabs((current) => current.map((tab) => (
+        tab.id === state.terminalId ? { ...tab, sessionId: state.sessionId } : tab
+      )));
+    });
 
     let cancelled = false;
     void window.aiTerminal.terminal.listShells()
@@ -89,6 +109,7 @@ export function App() {
     return () => {
       cancelled = true;
       removeExitListener();
+      removeAgentListener();
     };
   }, []);
 
@@ -112,6 +133,18 @@ export function App() {
     ? sessions.filter((session) => session.hostId === selectedHost.id)
     : [];
   const defaultProvider = providers.find((provider) => provider.isDefault) ?? null;
+  const activeAgent = activeTab ? agentStates[activeTab.id] : undefined;
+
+  useEffect(() => {
+    if (!activeId) return;
+    void window.aiTerminal.agent.getState(activeId).then((state) => {
+      if (state) setAgentStates((current) => ({ ...current, [activeId]: state }));
+    });
+  }, [activeId]);
+
+  useEffect(() => {
+    setEditedApprovalCommand(activeAgent?.pendingApproval?.command ?? '');
+  }, [activeAgent?.pendingApproval?.id]);
 
   function addTab(descriptor: TerminalDescriptor) {
     const tab: TerminalTab = {
@@ -195,6 +228,42 @@ export function App() {
     await window.aiTerminal.providers.remove(provider.id);
     setEditingProvider(null);
     await refreshProviders();
+  }
+
+  async function sendAgentPrompt(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!activeTab || !agentPrompt.trim()) return;
+    const prompt = agentPrompt.trim();
+    setAgentPrompt('');
+    try {
+      const state = await window.aiTerminal.agent.sendPrompt({
+        terminalId: activeTab.id,
+        prompt,
+        providerId: defaultProvider?.id,
+      });
+      setAgentStates((current) => ({ ...current, [state.terminalId]: state }));
+      setTabs((current) => current.map((tab) => (
+        tab.id === state.terminalId ? { ...tab, sessionId: state.sessionId } : tab
+      )));
+      await refreshSessions();
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    }
+  }
+
+  async function resolveAgentApproval(decision: 'execute' | 'edit' | 'reject') {
+    if (!activeTab || !activeAgent?.pendingApproval) return;
+    try {
+      const state = await window.aiTerminal.agent.resolveApproval({
+        terminalId: activeTab.id,
+        approvalId: activeAgent.pendingApproval.id,
+        decision,
+        editedCommand: decision === 'edit' ? editedApprovalCommand : undefined,
+      });
+      setAgentStates((current) => ({ ...current, [state.terminalId]: state }));
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    }
   }
 
   async function activateAiSession() {
@@ -440,9 +509,9 @@ export function App() {
           </div>
         </nav>
 
-        <section className="terminal-stage">
+        <section className={`terminal-stage ${agentLocksKeyboard(activeAgent?.state) ? 'agent-controlled' : ''}`}>
           <div className="terminal-toolbar">
-            <span>USER CONTROL</span>
+            <span>{activeAgent?.state.replaceAll('_', ' ') ?? 'USER CONTROL'}</span>
             <div className="terminal-actions">
               <span>{activeTab?.status === 'exited' ? 'DISCONNECTED' : activeTab?.transport.toUpperCase() ?? 'NO TERMINAL'}</span>
               {activeTab?.status === 'exited' && activeTab.hostId && (
@@ -460,7 +529,12 @@ export function App() {
           </div>
           <div className="terminal-stack">
             {tabs.map((tab) => (
-              <TerminalPane key={tab.id} terminalId={tab.id} active={tab.id === activeId} />
+              <TerminalPane
+                key={tab.id}
+                terminalId={tab.id}
+                active={tab.id === activeId}
+                inputLocked={agentLocksKeyboard(agentStates[tab.id]?.state)}
+              />
             ))}
             {tabs.length === 0 && !startupError && (
               <div className="terminal-placeholder">Choose a local shell or SSH host to open a terminal.</div>
@@ -488,34 +562,81 @@ export function App() {
           </div>
           <button aria-label="Collapse agent panel">›</button>
         </div>
-        <div className="agent-empty">
-          <div className="agent-glyph">✦</div>
-          <strong>Terminal-aware assistance</strong>
-          <p>When activated, the agent reads this terminal and requests permission before sending commands.</p>
-          <div className="guardrail"><span>✓</span> Approval required by default</div>
-          <button className="provider-configure" onClick={() => {
-            setEditingProvider(defaultProvider);
-            setProviderMessage(null);
-            setProviderModalOpen(true);
-          }}>
-            {defaultProvider ? 'Manage Provider' : 'Configure Provider'}
-          </button>
-          {activeTab && !activeTab.sessionId && (
-            <button className="activate-session" onClick={() => void activateAiSession()}>
-              Activate AI Session
-            </button>
+        <div className="agent-body">
+          {!activeAgent?.messages.length && (
+            <div className="agent-empty">
+              <div className="agent-glyph">✦</div>
+              <strong>Terminal-aware assistance</strong>
+              <p>The agent reads this Session and asks before sending every command into the visible terminal.</p>
+              <div className="guardrail"><span>✓</span> Approval required by default</div>
+              <button className="provider-configure" onClick={() => {
+                setEditingProvider(defaultProvider);
+                setProviderMessage(null);
+                setProviderModalOpen(true);
+              }}>
+                {defaultProvider ? 'Manage Provider' : 'Configure Provider'}
+              </button>
+              {activeTab && !activeTab.sessionId && (
+                <button className="activate-session" onClick={() => void activateAiSession()}>
+                  Activate AI Session
+                </button>
+              )}
+            </div>
           )}
-          {activeTab?.sessionId && (
-            <div className="session-ready">Session saved · history and audit enabled</div>
+          {activeAgent?.messages.map((message) => (
+            <article className={`agent-message ${message.role}`} key={message.id}>
+              <span>{message.role === 'assistant' ? 'AI' : message.role.toUpperCase()}</span>
+              <p>{message.content}</p>
+            </article>
+          ))}
+          {activeAgent?.pendingApproval?.status === 'waiting' && (
+            <section className="approval-card">
+              <div>
+                <strong>Command approval</strong>
+                <span>{activeAgent.pendingApproval.reason ?? 'Agent requested terminal execution'}</span>
+              </div>
+              <textarea
+                aria-label="Proposed command"
+                value={editedApprovalCommand}
+                onChange={(event) => setEditedApprovalCommand(event.target.value)}
+                spellCheck={false}
+              />
+              <div className="approval-actions">
+                <button onClick={() => void resolveAgentApproval('reject')}>Reject</button>
+                <button onClick={() => void resolveAgentApproval('edit')}>Edit &amp; Execute</button>
+                <button className="execute" onClick={() => void resolveAgentApproval('execute')}>Execute</button>
+              </div>
+            </section>
           )}
+          {activeAgent?.activeExecution && (
+            <section className={`execution-card ${activeAgent.activeExecution.status}`}>
+              <strong>{activeAgent.activeExecution.status.toUpperCase()}</strong>
+              <code>{activeAgent.activeExecution.command}</code>
+              {activeAgent.activeExecution.exitCode !== undefined && (
+                <span>exit {activeAgent.activeExecution.exitCode} · {activeAgent.activeExecution.durationMs ?? 0} ms</span>
+              )}
+            </section>
+          )}
+          {activeAgent?.error && <div className="agent-error">{activeAgent.error}</div>}
         </div>
-        <div className="composer">
-          <textarea aria-label="Message AI" placeholder="Ask about this terminal…" disabled />
+        <form className="composer" onSubmit={(event) => void sendAgentPrompt(event)}>
+          <textarea
+            aria-label="Message AI"
+            placeholder="Ask the agent to inspect or operate this terminal…"
+            value={agentPrompt}
+            onChange={(event) => setAgentPrompt(event.target.value)}
+            disabled={defaultProvider?.status !== 'ready' || !activeTab || activeTab.status !== 'connected' || agentLocksKeyboard(activeAgent?.state)}
+          />
           <div>
-            <span>{defaultProvider?.status === 'ready' ? 'Agent loop is the next milestone' : 'Configure and test a Provider to begin'}</span>
-            <button disabled>↑</button>
+            <span>{defaultProvider?.status === 'ready'
+              ? activeAgent?.state.replaceAll('_', ' ') ?? 'Ready · approval required'
+              : 'Configure and test a Provider to begin'}</span>
+            <button
+              type="submit"
+              disabled={!agentPrompt.trim() || defaultProvider?.status !== 'ready' || !activeTab || agentLocksKeyboard(activeAgent?.state)}
+            >↑</button>
           </div>
-        </div>
+        </form>
       </aside>
 
       {editingHost !== undefined && (

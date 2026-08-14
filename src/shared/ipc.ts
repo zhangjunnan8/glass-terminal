@@ -27,6 +27,11 @@ import type {
   ProviderInput,
   ProviderProfile,
 } from './provider';
+import type {
+  AgentSessionView,
+  ResolveApprovalRequest,
+  SendAgentPromptRequest,
+} from './agent';
 
 export interface RuntimeInfo {
   platform: NodeJS.Platform;
@@ -75,5 +80,11 @@ export interface DesktopBridge {
     remove(providerId: string): Promise<void>;
     setDefault(providerId: string): Promise<ProviderProfile>;
     testConnection(providerId: string): Promise<ProviderConnectionResult>;
+  };
+  agent: {
+    sendPrompt(request: SendAgentPromptRequest): Promise<AgentSessionView>;
+    getState(terminalId: string): Promise<AgentSessionView | null>;
+    resolveApproval(request: ResolveApprovalRequest): Promise<AgentSessionView>;
+    onStateChanged(listener: (state: AgentSessionView) => void): () => void;
   };
 }

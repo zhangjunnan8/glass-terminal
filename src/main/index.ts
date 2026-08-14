@@ -12,13 +12,18 @@ import { SFTP_CHANNELS } from '../shared/sftp';
 import type { DownloadSelectionRequest, UploadSelectionRequest } from '../shared/sftp';
 import { PROVIDER_CHANNELS } from '../shared/provider';
 import type { ProviderInput } from '../shared/provider';
+import { AGENT_CHANNELS } from '../shared/agent';
+import type { ResolveApprovalRequest, SendAgentPromptRequest } from '../shared/agent';
 import { HostStore } from './hosts/host-store';
 import { SessionManager } from './sessions/session-manager';
 import { SessionStore } from './sessions/session-store';
 import { SftpService } from './sftp/sftp-service';
 import { TransferQueue } from './sftp/transfer-queue';
 import { ProviderStore } from './providers/provider-store';
-import { WindowsCredentialStore } from './providers/secret-store';
+import { MemorySecretStore, WindowsCredentialStore } from './providers/secret-store';
+import { AgentService } from './agent/agent-service';
+import { startAgentSmokeProvider } from './smoke/agent-provider-server';
+import type { AgentSmokeProvider } from './smoke/agent-provider-server';
 import { registerSmokeRunner, smokeModeFromEnvironment } from './smoke/smoke-runner';
 import { TerminalService } from './terminal/terminal-service';
 
@@ -31,9 +36,11 @@ const transferQueue = new TransferQueue(terminalService);
 let hostStore: HostStore | undefined;
 let sessionManager: SessionManager | undefined;
 let providerStore: ProviderStore | undefined;
+let agentService: AgentService | undefined;
+let agentSmokeProvider: AgentSmokeProvider | undefined;
 
 if (isSmokeTest) {
-  app.setPath('userData', join(process.cwd(), '.smoke-data'));
+  app.setPath('userData', join(process.cwd(), '.smoke-data', smokeMode!));
 }
 
 function requireHostStore(): HostStore {
@@ -97,7 +104,10 @@ function createMainWindow(): BrowserWindow {
 
   const contents = window.webContents;
   const contentsId = contents.id;
-  contents.once('destroyed', () => terminalService.closeOwnedBy(contentsId));
+  contents.once('destroyed', () => {
+    agentService?.closeOwnedBy(contentsId);
+    terminalService.closeOwnedBy(contentsId);
+  });
 
   return window;
 }
@@ -242,6 +252,21 @@ ipcMain.handle(PROVIDER_CHANNELS.setDefault, (_event, providerId: string) => (
 ipcMain.handle(PROVIDER_CHANNELS.testConnection, (_event, providerId: string) => (
   requireProviderStore().testConnection(providerId)
 ));
+ipcMain.handle(AGENT_CHANNELS.sendPrompt, (event, request: SendAgentPromptRequest) => {
+  if (!agentService) throw new Error('Agent service is not ready.');
+  return agentService.sendPrompt(event.sender, request);
+});
+ipcMain.handle(AGENT_CHANNELS.getState, (event, terminalId: string) => {
+  if (!agentService) throw new Error('Agent service is not ready.');
+  return agentService.getState(event.sender, terminalId);
+});
+ipcMain.handle(
+  AGENT_CHANNELS.resolveApproval,
+  (event, request: ResolveApprovalRequest) => {
+    if (!agentService) throw new Error('Agent service is not ready.');
+    return agentService.resolveApproval(event.sender, request);
+  },
+);
 ipcMain.handle(
   SESSION_CHANNELS.rename,
   (_event, request: RenameSessionRequest) => requireSessionManager().rename(request),
@@ -251,17 +276,34 @@ ipcMain.handle(
   (_event, sessionId: string) => requireSessionManager().readTerminalHistory(sessionId),
 );
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   hostStore = new HostStore(join(app.getPath('userData'), 'config', 'hosts.json'));
+  if (smokeMode === 'agent' || smokeMode === 'agent-ssh') {
+    agentSmokeProvider = await startAgentSmokeProvider(smokeMode === 'agent-ssh');
+  }
   providerStore = new ProviderStore(
     join(app.getPath('userData'), 'config', 'providers.json'),
-    new WindowsCredentialStore(),
+    smokeMode === 'agent' || smokeMode === 'agent-ssh'
+      ? new MemorySecretStore()
+      : new WindowsCredentialStore(),
   );
+  if (agentSmokeProvider) {
+    const profile = await providerStore.save({
+      name: 'Agent Smoke Provider',
+      baseUrl: agentSmokeProvider.baseUrl,
+      modelId: 'agent-smoke-model',
+      apiKey: 'agent-smoke-secret',
+      makeDefault: true,
+    });
+    const result = await providerStore.testConnection(profile.id);
+    if (!result.ok) throw new Error(`Unable to prepare Agent smoke Provider: ${result.message}`);
+  }
   sessionManager = new SessionManager(
     new SessionStore(join(app.getPath('userData'), 'sessions')),
     terminalService,
     hostStore,
   );
+  agentService = new AgentService(terminalService, sessionManager, providerStore);
   createMainWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
@@ -270,7 +312,9 @@ app.whenReady().then(() => {
 
 app.on('before-quit', () => {
   transferQueue.close();
+  agentService?.close();
   sessionManager?.close();
+  void agentSmokeProvider?.close();
 });
 
 app.on('window-all-closed', () => {

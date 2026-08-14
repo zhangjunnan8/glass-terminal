@@ -71,8 +71,17 @@ export interface SessionAuditEvent {
     | 'session_created'
     | 'session_renamed'
     | 'session_reconnected'
-    | 'session_disconnected';
-  actor: 'user' | 'system';
+    | 'session_disconnected'
+    | 'provider_changed'
+    | 'command_requested'
+    | 'command_approved'
+    | 'command_edited'
+    | 'command_rejected'
+    | 'command_completed'
+    | 'agent_paused'
+    | 'full_takeover_changed'
+    | 'interactive_auth';
+  actor: 'user' | 'system' | 'ai';
   timestamp: string;
   details: Record<string, unknown>;
 }

@@ -7,6 +7,8 @@ import { SESSION_CHANNELS } from '../shared/session';
 import { SFTP_CHANNELS } from '../shared/sftp';
 import type { TransferJobSnapshot } from '../shared/sftp';
 import { PROVIDER_CHANNELS } from '../shared/provider';
+import { AGENT_CHANNELS } from '../shared/agent';
+import type { AgentSessionView } from '../shared/agent';
 
 const terminalBridge: DesktopBridge['terminal'] = {
   listShells: () => ipcRenderer.invoke(TERMINAL_CHANNELS.listShells),
@@ -88,6 +90,19 @@ const providerBridge: DesktopBridge['providers'] = {
   ),
 };
 
+const agentBridge: DesktopBridge['agent'] = {
+  sendPrompt: (request) => ipcRenderer.invoke(AGENT_CHANNELS.sendPrompt, request),
+  getState: (terminalId) => ipcRenderer.invoke(AGENT_CHANNELS.getState, terminalId),
+  resolveApproval: (request) => ipcRenderer.invoke(AGENT_CHANNELS.resolveApproval, request),
+  onStateChanged: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: AgentSessionView) => {
+      listener(state);
+    };
+    ipcRenderer.on(AGENT_CHANNELS.stateChanged, handler);
+    return () => ipcRenderer.removeListener(AGENT_CHANNELS.stateChanged, handler);
+  },
+};
+
 const bridge: DesktopBridge = Object.freeze({
   runtime: Object.freeze({
     getInfo: () => ipcRenderer.invoke('runtime:get-info'),
@@ -97,6 +112,7 @@ const bridge: DesktopBridge = Object.freeze({
   sessions: Object.freeze(sessionBridge),
   sftp: Object.freeze(sftpBridge),
   providers: Object.freeze(providerBridge),
+  agent: Object.freeze(agentBridge),
 });
 
 contextBridge.exposeInMainWorld('aiTerminal', bridge);

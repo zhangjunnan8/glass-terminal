@@ -6,12 +6,14 @@ import '@xterm/xterm/css/xterm.css';
 interface TerminalPaneProps {
   terminalId: string;
   active: boolean;
+  inputLocked: boolean;
 }
 
-export function TerminalPane({ terminalId, active }: TerminalPaneProps) {
+export function TerminalPane({ terminalId, active, inputLocked }: TerminalPaneProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const inputLockedRef = useRef(inputLocked);
   const [hasOutput, setHasOutput] = useState(false);
 
   useEffect(() => {
@@ -20,6 +22,7 @@ export function TerminalPane({ terminalId, active }: TerminalPaneProps) {
     const terminal = new Terminal({
       allowProposedApi: false,
       convertEol: false,
+      disableStdin: inputLockedRef.current,
       cursorBlink: true,
       cursorStyle: 'block',
       fontFamily: 'Cascadia Mono, Cascadia Code, Consolas, monospace',
@@ -63,6 +66,7 @@ export function TerminalPane({ terminalId, active }: TerminalPaneProps) {
     resizeObserver.observe(containerRef.current);
 
     const inputDisposable = terminal.onData((data) => {
+      if (inputLockedRef.current) return;
       void window.aiTerminal.terminal.write(terminalId, data);
     });
     const removeDataListener = window.aiTerminal.terminal.onData((event) => {
@@ -91,6 +95,11 @@ export function TerminalPane({ terminalId, active }: TerminalPaneProps) {
       fitRef.current = null;
     };
   }, [terminalId]);
+
+  useEffect(() => {
+    inputLockedRef.current = inputLocked;
+    if (terminalRef.current) terminalRef.current.options.disableStdin = inputLocked;
+  }, [inputLocked]);
 
   useEffect(() => {
     if (!active) return;

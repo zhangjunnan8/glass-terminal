@@ -320,6 +320,60 @@ export class SessionStore {
       });
   }
 
+  bindAgentThread(sessionId: string, providerId: string, threadId: string): SessionRecord {
+    const current = this.get(sessionId);
+    const updated: SessionRecord = {
+      ...current,
+      aiThreadId: threadId,
+      providerId,
+      updatedAt: new Date().toISOString(),
+    };
+    this.save(updated);
+    mkdirSync(join(this.sessionPath(sessionId), 'ai'), { recursive: true });
+    const threadPath = this.threadPath(sessionId, threadId);
+    if (!existsSync(threadPath)) {
+      writeFileSync(threadPath, '', { encoding: 'utf8', mode: 0o600 });
+    }
+    this.audit(sessionId, 'provider_changed', 'user', { providerId, threadId });
+    return updated;
+  }
+
+  appendThreadEvent(
+    sessionId: string,
+    threadId: string,
+    event: Record<string, unknown>,
+  ): void {
+    this.get(sessionId);
+    appendFileSync(
+      this.threadPath(sessionId, threadId),
+      `${JSON.stringify(event)}\n`,
+      { encoding: 'utf8', mode: 0o600 },
+    );
+  }
+
+  readThreadEvents(sessionId: string, threadId: string): Array<Record<string, unknown>> {
+    this.get(sessionId);
+    const path = this.threadPath(sessionId, threadId);
+    if (!existsSync(path)) return [];
+    return readFileSync(path, 'utf8').split('\n').filter(Boolean).flatMap((line) => {
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    });
+  }
+
+  appendAudit(
+    sessionId: string,
+    type: SessionAuditEvent['type'],
+    actor: SessionAuditEvent['actor'],
+    details: Record<string, unknown>,
+  ): void {
+    this.get(sessionId);
+    this.audit(sessionId, type, actor, details);
+  }
+
   private load(): void {
     if (!existsSync(this.rootPath)) return;
     for (const entry of readdirSync(this.rootPath, { withFileTypes: true })) {
@@ -445,5 +499,10 @@ export class SessionStore {
   private safeChunkPath(sessionId: string, file: string): string {
     if (basename(file) !== file) throw new Error('Invalid terminal log chunk path.');
     return join(this.sessionPath(sessionId), 'terminal', file);
+  }
+
+  private threadPath(sessionId: string, threadId: string): string {
+    if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error('Invalid AI Thread identifier.');
+    return join(this.sessionPath(sessionId), 'ai', `${threadId}.jsonl`);
   }
 }

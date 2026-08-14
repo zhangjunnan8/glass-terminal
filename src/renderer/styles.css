@@ -222,6 +222,8 @@ button { border: 0; }
   letter-spacing: .06em;
 }
 .terminal-toolbar { border-bottom: 1px solid #141c27; }
+.terminal-stage.agent-controlled .terminal-toolbar { color: #07130f; border-bottom-color: #4eb793; background: #5ed1ac; font-weight: 800; }
+.terminal-stage.agent-controlled .terminal-stack { box-shadow: inset 0 0 0 1px #54c5a266; }
 .terminal-actions { display: flex; align-items: center; gap: 8px; }
 .terminal-stack { position: relative; min-width: 0; min-height: 0; background: #080c12; }
 .terminal-pane { position: absolute; inset: 0; display: none; padding: 8px 8px 4px 12px; }
@@ -242,6 +244,7 @@ button { border: 0; }
 .agent-header strong, .agent-header span { display: block; }
 .agent-header strong { color: #cbd7e7; font-size: 11px; }
 .agent-header span { margin-top: 4px; color: #68778b; font-size: 9px; }
+.agent-body { min-height: 0; flex: 1; overflow-y: auto; }
 .agent-empty { display: flex; align-items: center; flex: 1; flex-direction: column; justify-content: center; padding: 34px; text-align: center; }
 .agent-glyph { display: grid; place-items: center; width: 42px; height: 42px; margin-bottom: 16px; color: #68dbb9; border: 1px solid #2c5a50; border-radius: 50%; background: #112720; font-size: 18px; }
 .agent-empty strong { font-size: 12px; }
@@ -251,6 +254,26 @@ button { border: 0; }
 .activate-session { margin-top: 14px; padding: 8px 12px; color: #071410; border: 0; border-radius: 4px; background: #61d4af; cursor: pointer; font-size: 10px; font-weight: 700; }
 .provider-configure { margin-top: 8px; padding: 6px 9px; color: #91a5bd; border: 1px solid #2a3b50; border-radius: 4px; background: #131d29; cursor: pointer; font-size: 9px; }
 .session-ready { margin-top: 14px; padding: 7px 9px; color: #71bba7; border: 1px solid #24453c; border-radius: 4px; background: #0e1a18; font-size: 9px; }
+.agent-message { margin: 10px; padding: 9px 10px; border: 1px solid #233043; border-radius: 5px; background: #111a26; }
+.agent-message.user { border-color: #29463f; background: #101d1a; }
+.agent-message > span { color: #61c9a8; font-size: 8px; font-weight: 800; letter-spacing: .1em; }
+.agent-message p { margin: 5px 0 0; color: #b5c1d1; font-size: 10px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.approval-card { margin: 10px; padding: 10px; border: 1px solid #aa8743; border-radius: 5px; background: #211b10; box-shadow: 0 0 18px #ad822322; }
+.approval-card > div:first-child { display: flex; justify-content: space-between; gap: 8px; }
+.approval-card strong { color: #e0bd76; font-size: 10px; }
+.approval-card > div:first-child span { color: #87765a; font-size: 8px; text-align: right; }
+.approval-card textarea { width: 100%; min-height: 70px; margin-top: 8px; padding: 8px; resize: vertical; color: #d7dfeb; border: 1px solid #55462d; border-radius: 3px; outline: 0; background: #0c1017; font: 10px/1.45 "Cascadia Mono", Consolas, monospace; }
+.approval-actions { display: flex; justify-content: flex-end; gap: 5px; margin-top: 7px; }
+.approval-actions button { padding: 5px 7px; color: #a9b5c4; border: 1px solid #39475a; border-radius: 3px; background: #17212d; cursor: pointer; font-size: 8px; }
+.approval-actions .execute { color: #07130f; border-color: #5bc9a7; background: #5bc9a7; font-weight: 800; }
+.execution-card { margin: 10px; padding: 9px; border: 1px solid #2b3a4e; border-radius: 4px; background: #0b1119; }
+.execution-card strong, .execution-card code, .execution-card span { display: block; }
+.execution-card strong { color: #d0ae69; font-size: 8px; }
+.execution-card.completed strong { color: #60c7a6; }
+.execution-card.failed strong { color: #ed858d; }
+.execution-card code { margin-top: 5px; color: #bac6d5; font: 9px/1.4 "Cascadia Mono", Consolas, monospace; white-space: pre-wrap; }
+.execution-card span { margin-top: 5px; color: #627286; font-size: 8px; }
+.agent-error { margin: 10px; padding: 8px; color: #f09aa0; border: 1px solid #512c33; border-radius: 4px; background: #241419; font-size: 9px; }
 
 .sftp-drawer { display: flex; position: absolute; z-index: 8; top: 37px; right: 0; bottom: 0; width: min(410px, 75%); flex-direction: column; border-left: 1px solid #2b3a4e; background: #0e151f; box-shadow: -12px 0 24px #02050a88; }
 .sftp-drawer > header { display: flex; align-items: center; justify-content: space-between; min-height: 48px; padding: 0 12px; border-bottom: 1px solid #202c3a; }

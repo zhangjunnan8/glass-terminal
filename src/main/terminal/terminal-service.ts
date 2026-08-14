@@ -9,6 +9,7 @@ import type { ClientChannel, ConnectConfig, PseudoTtyOptions, SFTPWrapper } from
 import type { HostProfile, SshConnectRequest } from '../../shared/host';
 import { SSH_ERROR_CODES } from '../../shared/host';
 import type { TerminalJournalEvent } from '../../shared/session';
+import type { CommandActor, CommandExecution } from '../../shared/agent';
 import type {
   CreateTerminalRequest,
   ShellProfile,
@@ -16,6 +17,7 @@ import type {
 } from '../../shared/terminal';
 import { TERMINAL_CHANNELS } from '../../shared/terminal';
 import { discoverShells } from './shell-discovery';
+import { buildCommandEnvelope, SentinelCapture } from './structured-command';
 
 interface TerminalBackend {
   write(data: string): void;
@@ -39,10 +41,22 @@ interface TerminalRecord {
   droppedJournalBytes: number;
   sessionId?: string;
   sshClient?: Client;
+  activeExecution?: ActiveExecution;
+}
+
+interface ActiveExecution {
+  execution: CommandExecution;
+  capture: SentinelCapture;
+  outputBytes: number;
+  onOutput?: (data: string) => void;
+  resolve: (execution: CommandExecution) => void;
+  timeout: NodeJS.Timeout;
 }
 
 const MAX_PENDING_OUTPUT = 256 * 1024;
 const MAX_TEMPORARY_JOURNAL = 8 * 1024 * 1024;
+const MAX_COMMAND_OUTPUT = 2 * 1024 * 1024;
+const COMMAND_TIMEOUT_MS = 5 * 60 * 1_000;
 
 export interface TerminalSnapshot {
   descriptor: TerminalDescriptor;
@@ -321,6 +335,91 @@ export class TerminalService {
     return () => this.exitListeners.delete(listener);
   }
 
+  executeStructured(
+    owner: WebContents,
+    terminalId: string,
+    command: string,
+    actor: CommandActor,
+    onOutput?: (data: string) => void,
+    onStarted?: (execution: CommandExecution) => void,
+  ): Promise<CommandExecution> {
+    const record = this.requireConnected(owner, terminalId);
+    if (!record.sessionId) throw new Error('A formal Session is required before AI execution.');
+    if (record.activeExecution) throw new Error('Another AI command is already running.');
+    const normalizedCommand = command.trim();
+    if (!normalizedCommand) throw new Error('Command cannot be empty.');
+    if (Buffer.byteLength(normalizedCommand, 'utf8') > 32 * 1024) {
+      throw new Error('Command exceeds the 32 KiB safety limit.');
+    }
+    const now = new Date().toISOString();
+    const execution: CommandExecution = {
+      id: randomUUID(),
+      sessionId: record.sessionId,
+      terminalId,
+      actor,
+      command: normalizedCommand,
+      requestedAt: now,
+      startedAt: now,
+      status: 'running',
+      output: '',
+    };
+    const nonce = randomUUID().replaceAll('-', '');
+    const envelope = buildCommandEnvelope(record.descriptor.shellKind, normalizedCommand, nonce);
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        if (record.activeExecution?.execution.id !== execution.id) return;
+        record.backend?.write('\x03');
+        this.finishExecution(record, 'cancelled', undefined, '\r\n[Command timed out.]\r\n');
+      }, COMMAND_TIMEOUT_MS);
+      timeout.unref();
+      record.activeExecution = {
+        execution,
+        capture: new SentinelCapture(envelope),
+        outputBytes: 0,
+        onOutput,
+        resolve,
+        timeout,
+      };
+      onStarted?.({ ...execution });
+      try {
+        record.backend!.write(envelope.input);
+      } catch (error) {
+        this.finishExecution(
+          record,
+          'failed',
+          undefined,
+          `\r\n[Unable to write command: ${(error as Error).message}]\r\n`,
+        );
+      }
+    });
+  }
+
+  interruptExecution(owner: WebContents, terminalId: string): CommandExecution | undefined {
+    const record = this.requireOwned(owner, terminalId);
+    if (!record.activeExecution) return undefined;
+    record.backend?.write('\x03');
+    return { ...record.activeExecution.execution };
+  }
+
+  currentExecution(owner: WebContents, terminalId: string): CommandExecution | undefined {
+    const execution = this.requireOwned(owner, terminalId).activeExecution?.execution;
+    return execution ? { ...execution } : undefined;
+  }
+
+  state(owner: WebContents, terminalId: string): Record<string, unknown> {
+    const record = this.requireOwned(owner, terminalId);
+    return {
+      terminalId,
+      sessionId: record.sessionId,
+      transport: record.descriptor.transport,
+      shellKind: record.descriptor.shellKind,
+      profileId: record.descriptor.profileId,
+      hostId: record.descriptor.hostId,
+      status: record.status,
+      activeExecutionId: record.activeExecution?.execution.id,
+    };
+  }
+
   openSftp(owner: WebContents, terminalId: string): Promise<SFTPWrapper> {
     const record = this.requireConnected(owner, terminalId);
     if (!record.sshClient) throw new Error('SFTP requires a connected SSH terminal.');
@@ -360,6 +459,7 @@ export class TerminalService {
     const record = this.terminals.get(terminalId);
     if (!record) return;
     if (!data) return;
+    this.processExecutionOutput(record, data);
     this.appendJournal(record, {
       version: 1,
       sequence: this.nextSequence(record),
@@ -383,6 +483,14 @@ export class TerminalService {
   private emitExit(terminalId: string, exitCode: number, signal?: number): void {
     const record = this.terminals.get(terminalId);
     if (!record || record.status === 'exited') return;
+    if (record.activeExecution) {
+      this.finishExecution(
+        record,
+        'failed',
+        exitCode,
+        '\r\n[Terminal exited before the command sentinel completed.]\r\n',
+      );
+    }
     record.status = 'exited';
     record.backend = undefined;
     this.appendJournal(record, {
@@ -440,6 +548,58 @@ export class TerminalService {
       record.journalBytes -= droppedBytes;
       record.droppedJournalBytes += droppedBytes;
     }
+  }
+
+  private processExecutionOutput(record: TerminalRecord, data: string): void {
+    const active = record.activeExecution;
+    if (!active) return;
+    const update = active.capture.push(data);
+    for (const chunk of update.output) {
+      this.appendExecutionOutput(active, chunk);
+      active.onOutput?.(chunk);
+    }
+    if (update.completed) {
+      this.finishExecution(
+        record,
+        update.exitCode === 0 ? 'completed' : 'failed',
+        update.exitCode,
+      );
+    }
+  }
+
+  private appendExecutionOutput(active: ActiveExecution, data: string): void {
+    if (!data || active.outputBytes >= MAX_COMMAND_OUTPUT) return;
+    const remaining = MAX_COMMAND_OUTPUT - active.outputBytes;
+    const bytes = Buffer.from(data, 'utf8');
+    if (bytes.length <= remaining) {
+      active.execution.output += data;
+      active.outputBytes += bytes.length;
+      return;
+    }
+    active.execution.output += `${bytes.subarray(0, remaining).toString('utf8')}\r\n[Output truncated]\r\n`;
+    active.outputBytes = MAX_COMMAND_OUTPUT;
+  }
+
+  private finishExecution(
+    record: TerminalRecord,
+    status: CommandExecution['status'],
+    exitCode?: number,
+    extraOutput?: string,
+  ): void {
+    const active = record.activeExecution;
+    if (!active) return;
+    clearTimeout(active.timeout);
+    if (extraOutput) this.appendExecutionOutput(active, extraOutput);
+    const endedAt = new Date();
+    active.execution.status = status;
+    active.execution.exitCode = exitCode;
+    active.execution.endedAt = endedAt.toISOString();
+    active.execution.durationMs = Math.max(
+      0,
+      endedAt.getTime() - Date.parse(active.execution.startedAt),
+    );
+    record.activeExecution = undefined;
+    active.resolve({ ...active.execution });
   }
 
   private sshBackend(client: Client, stream: ClientChannel): TerminalBackend {

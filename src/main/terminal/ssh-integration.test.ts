@@ -75,12 +75,21 @@ describe.runIf(enabled)('real SSH shared terminal', () => {
       rows: 28,
     });
     output.push(service.attach(owner, descriptor.id));
+    service.bindSession(owner, descriptor.id, '00000000-0000-0000-0000-000000000001');
     service.resize(owner, descriptor.id, 100, 30);
-    service.write(owner, descriptor.id, "printf '__AI_TERMINAL_SSH_SMOKE__\\n'\r");
+    const executionPromise = service.executeStructured(
+      owner,
+      descriptor.id,
+      "printf '__AI_TERMINAL_SSH_SMOKE__\\n'",
+      'ai',
+    );
     await Promise.race([
       markerSeen.promise,
       new Promise((_, reject) => setTimeout(() => reject(new Error('SSH marker timeout')), 12_000)),
     ]);
+    const execution = await executionPromise;
+    expect(execution).toMatchObject({ status: 'completed', exitCode: 0, actor: 'ai' });
+    expect(execution.output).toContain('__AI_TERMINAL_SSH_SMOKE__');
     service.write(owner, descriptor.id, 'exit\r');
     const exit = await Promise.race([
       terminalExited.promise,

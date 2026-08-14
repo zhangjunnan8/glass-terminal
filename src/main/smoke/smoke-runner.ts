@@ -1,9 +1,11 @@
 import { app } from 'electron';
 import type { BrowserWindow } from 'electron';
 
-export type SmokeMode = 'local' | 'ssh' | null;
+export type SmokeMode = 'local' | 'ssh' | 'agent' | 'agent-ssh' | null;
 
 export function smokeModeFromEnvironment(): SmokeMode {
+  if (process.env.AI_TERMINAL_AGENT_SSH_SMOKE_TEST === '1') return 'agent-ssh';
+  if (process.env.AI_TERMINAL_AGENT_SMOKE_TEST === '1') return 'agent';
   if (process.env.AI_TERMINAL_SSH_SMOKE_TEST === '1') return 'ssh';
   if (process.env.AI_TERMINAL_SMOKE_TEST === '1') return 'local';
   return null;
@@ -14,7 +16,9 @@ export function registerSmokeRunner(window: BrowserWindow, mode: Exclude<SmokeMo
     try {
       const ready = mode === 'ssh'
         ? await runSshSmoke(window)
-        : await runLocalSmoke(window);
+        : mode === 'agent' || mode === 'agent-ssh'
+          ? await runAgentSmoke(window, mode === 'agent-ssh')
+          : await runLocalSmoke(window);
       console.log(`SMOKE_${mode.toUpperCase()}_TERMINAL_READY=${String(ready)}`);
       app.exit(ready ? 0 : 1);
     } catch (error) {
@@ -25,6 +29,112 @@ export function registerSmokeRunner(window: BrowserWindow, mode: Exclude<SmokeMo
   window.webContents.once('did-fail-load', (_event, code, description) => {
     console.error(`SMOKE_RENDERER_FAILED=${code}:${description}`);
     app.exit(1);
+  });
+}
+
+async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<boolean> {
+  const sshConfig = useSsh ? {
+    hostname: process.env.AI_TERMINAL_SSH_TEST_HOST,
+    username: process.env.AI_TERMINAL_SSH_TEST_USER,
+    password: process.env.AI_TERMINAL_SSH_TEST_PASSWORD,
+    port: Number(process.env.AI_TERMINAL_SSH_TEST_PORT ?? 22),
+  } : null;
+  if (useSsh && (!sshConfig?.hostname || !sshConfig.username || !sshConfig.password)) {
+    throw new Error('Agent SSH smoke requires host, user, and password variables.');
+  }
+  return window.webContents.executeJavaScript(
+    `(async () => { try {
+      const sshConfig = ${JSON.stringify(sshConfig)};
+      const waitFor = (predicate, timeout = 15000) => new Promise((resolve) => {
+        const deadline = Date.now() + timeout;
+        const check = () => {
+          if (predicate()) resolve(true);
+          else if (Date.now() >= deadline) resolve(false);
+          else setTimeout(check, 100);
+        };
+        check();
+      });
+      let host = null;
+      let terminalId = null;
+      let pane = null;
+      if (sshConfig) {
+        host = await window.aiTerminal.hosts.save({
+          name: 'Agent SSH Smoke Target',
+          hostname: sshConfig.hostname,
+          port: sshConfig.port,
+          username: sshConfig.username,
+          authMethod: 'password',
+        });
+        let connection = await window.aiTerminal.terminal.connectSsh({
+          hostId: host.id,
+          password: sshConfig.password,
+        });
+        if (connection.status === 'host-key-required') {
+          connection = await window.aiTerminal.terminal.connectSsh({
+            hostId: host.id,
+            password: sshConfig.password,
+            trustHostKey: connection.fingerprint,
+          });
+        }
+        if (connection.status !== 'connected') throw new Error('Agent SSH connection failed.');
+        terminalId = connection.terminal.id;
+        window.dispatchEvent(new CustomEvent('ai-terminal:terminal-opened', {
+          detail: connection.terminal,
+        }));
+        const ready = await waitFor(() => document.querySelector(
+          '[data-terminal-id="' + terminalId + '"][data-terminal-output="true"]',
+        ));
+        if (!ready) throw new Error('Agent SSH terminal did not attach.');
+        pane = document.querySelector('[data-terminal-id="' + terminalId + '"]');
+      } else {
+        const started = await waitFor(() => document.querySelector('[data-terminal-output="true"]'));
+        if (!started) throw new Error('Local terminal did not start.');
+        pane = document.querySelector('[data-terminal-output="true"]');
+        terminalId = pane?.getAttribute('data-terminal-id');
+        if (!terminalId) throw new Error('Local terminal id is missing.');
+      }
+      const textarea = document.querySelector('textarea[aria-label="Message AI"]');
+      if (!(textarea instanceof HTMLTextAreaElement) || textarea.disabled) {
+        throw new Error('Agent composer is not ready.');
+      }
+      const setter = Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        'value',
+      )?.set;
+      setter?.call(textarea, 'Run the harmless shared-terminal marker test.');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      textarea.closest('form')?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+      const approvalReady = await waitFor(() => document.querySelector('.approval-card'));
+      if (!approvalReady) throw new Error('Command approval did not appear.');
+      if (pane?.textContent?.includes('__AI_AGENT_APPROVED__')) {
+        throw new Error('Command executed before approval.');
+      }
+      const execute = [...document.querySelectorAll('.approval-actions button')]
+        .find((button) => button.textContent === 'Execute');
+      if (!(execute instanceof HTMLButtonElement)) throw new Error('Execute button is missing.');
+      execute.click();
+      const markerVisible = await waitFor(
+        () => pane?.textContent?.includes('__AI_AGENT_APPROVED__'),
+      );
+      const completed = await waitFor(
+        () => document.querySelector('.agent-body')?.textContent?.includes('Agent smoke complete'),
+      );
+      const state = await window.aiTerminal.agent.getState(terminalId);
+      if (host) {
+        await window.aiTerminal.terminal.write(terminalId, 'exit\\r');
+        await waitFor(() => document.querySelector('.tab-state.exited'), 8000);
+        await window.aiTerminal.hosts.remove(host.id);
+      }
+      return {
+        ok: Boolean(markerVisible && completed && state?.state === 'COMPLETED'),
+        sessionId: state?.sessionId,
+      };
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.stack ?? error.message : String(error) };
+    } })()`,
+  ).then((result) => {
+    if (!result?.ok && result?.error) throw new Error(result.error);
+    return Boolean(result?.ok && result?.sessionId);
   });
 }
 

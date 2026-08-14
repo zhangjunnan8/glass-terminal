@@ -2,6 +2,7 @@ import { homedir } from 'node:os';
 import type { WebContents } from 'electron';
 import type { HostStore } from '../hosts/host-store';
 import type { RenameSessionRequest, SessionRecord } from '../../shared/session';
+import type { SessionAuditEvent } from '../../shared/session';
 import type { TerminalDescriptor } from '../../shared/terminal';
 import type { TerminalService } from '../terminal/terminal-service';
 import { SessionStore } from './session-store';
@@ -86,6 +87,31 @@ export class SessionManager {
 
   readTerminalHistory(sessionId: string): string {
     return this.store.readTerminalHistory(sessionId);
+  }
+
+  bindAgentThread(sessionId: string, providerId: string, threadId: string): SessionRecord {
+    return this.store.bindAgentThread(sessionId, providerId, threadId);
+  }
+
+  appendThreadEvent(
+    sessionId: string,
+    threadId: string,
+    event: Record<string, unknown>,
+  ): void {
+    this.store.appendThreadEvent(sessionId, threadId, event);
+  }
+
+  readThreadEvents(sessionId: string, threadId: string): Array<Record<string, unknown>> {
+    return this.store.readThreadEvents(sessionId, threadId);
+  }
+
+  appendAudit(
+    sessionId: string,
+    type: SessionAuditEvent['type'],
+    actor: SessionAuditEvent['actor'],
+    details: Record<string, unknown>,
+  ): void {
+    this.store.appendAudit(sessionId, type, actor, details);
   }
 
   close(): void {

@@ -17,6 +17,8 @@
     "build": "npm run typecheck && npm test && npm run build:renderer && npm run build:electron",
     "smoke": "cross-env AI_TERMINAL_SMOKE_TEST=1 electron .",
     "smoke:ssh": "cross-env AI_TERMINAL_SSH_SMOKE_TEST=1 electron .",
+    "smoke:agent": "cross-env AI_TERMINAL_AGENT_SMOKE_TEST=1 electron .",
+    "smoke:agent:ssh": "cross-env AI_TERMINAL_AGENT_SSH_SMOKE_TEST=1 electron .",
     "start": "electron ."
   },
   "engines": {
