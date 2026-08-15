@@ -60,6 +60,8 @@ export interface DesktopBridge {
     write(terminalId: string, data: string): Promise<void>;
     resize(terminalId: string, cols: number, rows: number): Promise<void>;
     close(terminalId: string): Promise<void>;
+    readClipboardText(): Promise<string>;
+    writeClipboardText(text: string): Promise<void>;
     onData(listener: (event: TerminalDataEvent) => void): () => void;
     onExit(listener: (event: TerminalExitEvent) => void): () => void;
   };

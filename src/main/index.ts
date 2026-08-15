@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
+import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron';
 import type { IpcMainInvokeEvent } from 'electron';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -199,6 +199,20 @@ handleTrusted(TERMINAL_CHANNELS.close, (event, terminalId: string) => {
   transferQueue.cancelByTerminal(terminalId, event.sender.id);
   agentService?.closeTerminal(event.sender, terminalId);
   terminalService.close(event.sender, terminalId);
+});
+handleTrusted(TERMINAL_CHANNELS.readClipboardText, () => {
+  const text = clipboard.readText();
+  if (Buffer.byteLength(text, 'utf8') > 8 * 1024 * 1024) {
+    throw new Error('粘贴内容超过 8 MiB 限制。');
+  }
+  return text;
+});
+handleTrusted(TERMINAL_CHANNELS.writeClipboardText, (_event, text: unknown) => {
+  if (typeof text !== 'string') throw new Error('剪贴板内容必须是文本。');
+  if (Buffer.byteLength(text, 'utf8') > 8 * 1024 * 1024) {
+    throw new Error('复制内容超过 8 MiB 限制。');
+  }
+  clipboard.writeText(text);
 });
 
 handleTrusted(HOST_CHANNELS.list, () => requireHostService().list());

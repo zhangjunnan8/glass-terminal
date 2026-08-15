@@ -81,6 +81,8 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       write: vi.fn().mockResolvedValue(undefined),
       resize: vi.fn().mockResolvedValue(undefined),
       close: vi.fn().mockResolvedValue(undefined),
+      readClipboardText: vi.fn().mockResolvedValue(''),
+      writeClipboardText: vi.fn().mockResolvedValue(undefined),
       onData: vi.fn(() => () => undefined),
       onExit: vi.fn(() => () => undefined),
     },

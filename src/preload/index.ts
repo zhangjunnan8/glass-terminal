@@ -29,6 +29,11 @@ const terminalBridge: DesktopBridge['terminal'] = {
     rows,
   ),
   close: (terminalId) => ipcRenderer.invoke(TERMINAL_CHANNELS.close, terminalId),
+  readClipboardText: () => ipcRenderer.invoke(TERMINAL_CHANNELS.readClipboardText),
+  writeClipboardText: (text) => ipcRenderer.invoke(
+    TERMINAL_CHANNELS.writeClipboardText,
+    text,
+  ),
   onData: (listener) => {
     const handler = (_event: Electron.IpcRendererEvent, payload: TerminalDataEvent) => {
       listener(payload);

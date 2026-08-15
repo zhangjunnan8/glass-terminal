@@ -238,10 +238,47 @@ button { border: 0; }
 .terminal-actions { display: flex; align-items: center; gap: 8px; }
 .terminal-actions button { min-width: 30px; min-height: 30px; font-size: 15px; }
 .terminal-stack { position: relative; min-width: 0; min-height: 0; background: #080c12; }
-.terminal-pane { position: absolute; inset: 0; display: none; padding: 8px 8px 4px 12px; }
+.terminal-pane { position: absolute; inset: 0; display: none; }
 .terminal-pane.active { display: block; }
+.terminal-surface { position: absolute; inset: 0; padding: 8px 8px 4px 12px; }
 .terminal-pane .xterm { width: 100%; height: 100%; }
 .terminal-pane .xterm-viewport { scrollbar-color: #2b3a4e #080c12; scrollbar-width: thin; }
+.terminal-context-menu {
+  position: absolute;
+  z-index: 30;
+  width: 210px;
+  padding: 5px;
+  color: #d4deeb;
+  border: 1px solid #35465b;
+  border-radius: 6px;
+  background: #151d28;
+  box-shadow: 0 14px 38px #000b;
+  user-select: none;
+}
+.terminal-context-menu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  min-height: 38px;
+  padding: 7px 9px;
+  color: #cbd6e4;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.terminal-context-menu button:hover:not(:disabled),
+.terminal-context-menu button:focus-visible {
+  outline: 0;
+  background: #243347;
+}
+.terminal-context-menu button:disabled { color: #657286; cursor: not-allowed; }
+.terminal-context-menu kbd {
+  color: #8493a7;
+  font: 11px "Cascadia Mono", Consolas, monospace;
+}
+.terminal-context-separator { height: 1px; margin: 4px 6px; background: #2a394d; }
 .terminal-placeholder { padding: 20px 22px; color: #abb8ca; font: 14px/1.55 "Cascadia Mono", "Cascadia Code", Consolas, monospace; }
 .terminal-error { padding: 20px 22px; color: #f18b92; font: 14px/1.5 "Cascadia Mono", Consolas, monospace; }
 .terminal-placeholder p { margin-top: 12px; color: #718096; font-size: 13px; }

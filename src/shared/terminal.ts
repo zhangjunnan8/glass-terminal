@@ -41,6 +41,8 @@ export const TERMINAL_CHANNELS = {
   write: 'terminal:write',
   resize: 'terminal:resize',
   close: 'terminal:close',
+  readClipboardText: 'terminal:read-clipboard-text',
+  writeClipboardText: 'terminal:write-clipboard-text',
   data: 'terminal:data',
   exit: 'terminal:exit',
 } as const;
