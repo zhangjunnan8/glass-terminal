@@ -81,6 +81,9 @@ export interface AgentSessionView {
   terminalInputMode: TerminalInputMode;
   fullTakeover: boolean;
   messages: AgentChatItem[];
+  streamingMessageId?: string;
+  /** App Server interrupt is still draining; terminal input is human-owned but a new turn is unsafe. */
+  backendTurnDraining?: boolean;
   pendingApproval?: CommandApproval;
   authRequest?: InteractiveAuthRequest;
   pendingTakeover?: PendingTakeover;

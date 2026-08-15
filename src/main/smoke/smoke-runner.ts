@@ -118,10 +118,32 @@ async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<bo
       const markerVisible = await waitFor(
         () => pane?.textContent?.includes('__AI_AGENT_APPROVED__'),
       );
+      const partialVisible = await waitFor(() => {
+        const streaming = document.querySelector('.agent-markdown[data-streaming="true"]');
+        return streaming?.textContent?.includes('Agent smoke complete');
+      });
       const completed = await waitFor(
-        () => document.querySelector('.agent-body')?.textContent?.includes('Agent smoke complete'),
+        () => document.querySelector('.terminal-stage')?.getAttribute('data-agent-state') === 'COMPLETED'
+          && document.querySelector('.agent-body')?.textContent?.includes('Agent smoke complete'),
       );
-      if (!markerVisible || !completed) throw new Error('Approved Agent command did not complete.');
+      if (!markerVisible || !partialVisible || !completed) {
+        const agentState = document.querySelector('.terminal-stage')?.getAttribute('data-agent-state');
+        const streamingText = document.querySelector('.agent-markdown[data-streaming="true"]')?.textContent;
+        throw new Error(
+          'Approved Agent command did not stream and complete: marker=' + markerVisible
+          + ', partial=' + partialVisible + ', completed=' + completed
+          + ', state=' + agentState + ', streaming=' + JSON.stringify(streamingText),
+        );
+      }
+      const markdownStrong = document.querySelector('.agent-message.assistant .agent-markdown strong');
+      if (markdownStrong?.textContent !== 'approved command ran in the shared terminal') {
+        throw new Error('Agent Markdown was not rendered as semantic markup.');
+      }
+      const agentScroll = document.querySelector('[data-testid="agent-scroll-container"]');
+      if (!(agentScroll instanceof HTMLElement)
+        || agentScroll.scrollHeight - agentScroll.clientHeight - agentScroll.scrollTop > 33) {
+        throw new Error('Agent output did not automatically follow the latest message.');
+      }
 
       sendPrompt('Run two Full Takeover marker commands.');
       const takeoverApprovalReady = await waitFor(() => document.querySelector('.approval-card'));

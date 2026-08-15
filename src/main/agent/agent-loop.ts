@@ -25,6 +25,7 @@ export interface AgentCompletionRequest {
   messages: AgentMessage[];
   tools: AgentToolDefinition[];
   signal: AbortSignal;
+  onTextDelta?(delta: string): void;
 }
 
 export interface AgentCompletion {
@@ -51,7 +52,7 @@ export interface AgentLoopTools {
 }
 
 export interface AgentLoopEvent {
-  type: 'assistant_text' | 'tool_started' | 'tool_completed';
+  type: 'assistant_delta' | 'assistant_text' | 'tool_started' | 'tool_completed';
   text?: string;
   toolCall?: AgentToolCall;
   result?: string;
@@ -141,6 +142,9 @@ export class AgentLoop {
         messages,
         tools: TERMINAL_TOOLS,
         signal: input.signal,
+        onTextDelta: (delta) => {
+          if (delta) this.onEvent({ type: 'assistant_delta', text: delta });
+        },
       });
       const assistant = completion.message;
       messages.push(assistant);

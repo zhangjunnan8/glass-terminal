@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import type { ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 
 export interface AgentSmokeProvider {
@@ -14,6 +15,7 @@ interface SmokeMessage {
 function toolResponse(id: string, command: string, reason: string): string {
   return JSON.stringify({
     choices: [{
+      finish_reason: 'tool_calls',
       message: {
         role: 'assistant',
         content: null,
@@ -31,7 +33,30 @@ function toolResponse(id: string, command: string, reason: string): string {
 }
 
 function textResponse(content: string): string {
-  return JSON.stringify({ choices: [{ message: { role: 'assistant', content } }] });
+  return JSON.stringify({ choices: [{ finish_reason: 'stop', message: { role: 'assistant', content } }] });
+}
+
+function sendTextResponse(response: ServerResponse, content: string, stream: boolean): void {
+  if (!stream) {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(textResponse(content));
+    return;
+  }
+  const splitAt = Math.max(1, Math.floor(content.length / 2));
+  const chunks = [content.slice(0, splitAt), content.slice(splitAt)];
+  response.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+  });
+  response.write(`data: ${JSON.stringify({
+    choices: [{ delta: { content: chunks[0] } }],
+  })}\n\n`);
+  setTimeout(() => {
+    response.write(`data: ${JSON.stringify({
+      choices: [{ delta: { content: chunks[1] } }],
+    })}\n\n`);
+    response.end('data: [DONE]\n\n');
+  }, 800);
 }
 
 export async function startAgentSmokeProvider(remotePosix = false): Promise<AgentSmokeProvider> {
@@ -72,7 +97,7 @@ export async function startAgentSmokeProvider(remotePosix = false): Promise<Agen
       request.setEncoding('utf8');
       request.on('data', (chunk) => { body += chunk; });
       request.on('end', () => {
-        const parsed = JSON.parse(body) as { messages?: SmokeMessage[] };
+        const parsed = JSON.parse(body) as { messages?: SmokeMessage[]; stream?: boolean };
         const messages = parsed.messages ?? [];
         let lastUserIndex = messages.length - 1;
         while (lastUserIndex >= 0 && messages[lastUserIndex]?.role !== 'user') {
@@ -83,25 +108,32 @@ export async function startAgentSmokeProvider(remotePosix = false): Promise<Agen
         const toolResultCount = messages
           .slice(lastUserIndex + 1)
           .filter((message) => message.role === 'tool').length;
-        response.writeHead(200, { 'content-type': 'application/json' });
-
         if (prompt.includes('Full Takeover marker')) {
-          response.end(toolResultCount < 2
-            ? toolResponse(
+          if (toolResultCount < 2) {
+            response.writeHead(200, { 'content-type': 'application/json' });
+            response.end(toolResponse(
               `full-takeover-${toolResultCount + 1}`,
               takeoverCommands[toolResultCount],
               'verify consecutive Full Takeover commands',
-            )
-            : textResponse('Full Takeover smoke complete.'));
+            ));
+          } else {
+            sendTextResponse(response, 'Full Takeover smoke complete.', parsed.stream === true);
+          }
           return;
         }
         if (prompt.includes('secure authentication smoke')) {
-          response.end(toolResultCount === 0
-            ? toolResponse('auth-smoke-call', authCommand, 'verify secure input handoff')
-            : textResponse('Authentication smoke complete.'));
+          if (toolResultCount === 0) {
+            response.writeHead(200, { 'content-type': 'application/json' });
+            response.end(toolResponse(
+              'auth-smoke-call', authCommand, 'verify secure input handoff',
+            ));
+          } else {
+            sendTextResponse(response, 'Authentication smoke complete.', parsed.stream === true);
+          }
           return;
         }
         if (prompt.includes('manual takeover smoke')) {
+          response.writeHead(200, { 'content-type': 'application/json' });
           response.end(toolResponse(
             'manual-takeover-call',
             longCommand,
@@ -109,9 +141,18 @@ export async function startAgentSmokeProvider(remotePosix = false): Promise<Agen
           ));
           return;
         }
-        response.end(toolResultCount === 0
-          ? toolResponse('agent-smoke-call', approvedCommand, 'verify shared visible terminal')
-          : textResponse('Agent smoke complete: the approved command ran in the shared terminal.'));
+        if (toolResultCount === 0) {
+          response.writeHead(200, { 'content-type': 'application/json' });
+          response.end(toolResponse(
+            'agent-smoke-call', approvedCommand, 'verify shared visible terminal',
+          ));
+        } else {
+          sendTextResponse(
+            response,
+            'Agent smoke complete: **approved command ran in the shared terminal**.',
+            parsed.stream === true,
+          );
+        }
       });
       return;
     }

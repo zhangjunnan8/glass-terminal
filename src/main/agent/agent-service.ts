@@ -48,6 +48,7 @@ interface AgentRuntimeRecord extends AgentSessionView {
   authHandoff?: Promise<void>;
   resolveAuthHandoff?: () => void;
   resolveApproval?: (resolution: ApprovalResolution) => void;
+  streamEmitTimer?: ReturnType<typeof setTimeout>;
 }
 
 const BUSY_STATES = new Set<AgentRuntimeState>([
@@ -78,6 +79,8 @@ function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
     terminalInputMode: runtime.terminalInputMode,
     fullTakeover: runtime.fullTakeover,
     messages: runtime.messages.map((message) => ({ ...message })),
+    streamingMessageId: runtime.streamingMessageId,
+    backendTurnDraining: runtime.backendTurnDraining,
     pendingApproval: runtime.pendingApproval ? { ...runtime.pendingApproval } : undefined,
     authRequest: runtime.authRequest ? { ...runtime.authRequest } : undefined,
     pendingTakeover: runtime.pendingTakeover ? { ...runtime.pendingTakeover } : undefined,
@@ -141,7 +144,7 @@ export class AgentService {
     if (existing && existing.ownerId !== owner.id) {
       throw new Error('Agent Session ownership mismatch.');
     }
-    if (existing && BUSY_STATES.has(existing.state)) {
+    if (existing && (BUSY_STATES.has(existing.state) || existing.backendTurnDraining)) {
       throw new Error('The Agent is already working in this terminal.');
     }
     if (this.terminals.currentExecution(owner, request.terminalId)) {
@@ -156,6 +159,7 @@ export class AgentService {
     runtime.activeExecution = undefined;
     runtime.pendingTakeover = undefined;
     runtime.authRequest = undefined;
+    runtime.streamingMessageId = undefined;
     this.addChat(runtime, 'user', prompt);
     runtime.controlLeaseId = this.terminals.acquireAgentControl(owner, request.terminalId);
     this.setLockedState(runtime, 'THINKING');
@@ -272,7 +276,7 @@ export class AgentService {
         throw error;
       }
     }
-    if (runtime && BUSY_STATES.has(runtime.state)) {
+    if (runtime && (BUSY_STATES.has(runtime.state) || runtime.backendTurnDraining)) {
       throw new Error('Take control of the active Agent turn before changing Full Takeover.');
     }
     if (runtime && this.terminals.currentExecution(owner, request.terminalId)) {
@@ -319,9 +323,31 @@ export class AgentService {
       return cloneView(runtime);
     }
 
+    const drainAppServerTurn = runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
+      && BUSY_STATES.has(runtime.state);
+    const partial = runtime.streamingMessageId
+      ? runtime.messages.find((message) => message.id === runtime.streamingMessageId)
+      : undefined;
+    if (partial?.content) {
+      try { this.persistChatItem(runtime, partial); } catch { /* takeover must still proceed */ }
+    }
+    runtime.streamingMessageId = undefined;
+    this.cancelStreamEmit(runtime);
     runtime.turnToken += 1;
     runtime.abortController?.abort();
     runtime.abortController = undefined;
+    if (drainAppServerTurn) {
+      runtime.backendTurnDraining = true;
+      const drain = Promise.resolve().then(() => {
+        if (!this.codexAppServer) throw new Error('Codex App Server Agent Runtime 未初始化。');
+        return this.codexAppServer.interruptTerminalAgentTurn();
+      });
+      void drain.catch(() => undefined).finally(() => {
+        if (this.runtimes.get(runtime.terminalId) !== runtime || !runtime.backendTurnDraining) return;
+        runtime.backendTurnDraining = false;
+        this.emit(runtime);
+      });
+    }
     if (runtime.pendingApproval) {
       this.appendControlAudit(runtime, 'command_rejected', 'user', {
         approvalId: runtime.pendingApproval.id,
@@ -467,6 +493,7 @@ export class AgentService {
     }
     const signal = runtime.abortController!.signal;
     const provider = this.providerFactory(runtime.providerId);
+    let streamedMessage: AgentChatItem | undefined;
     const loop = new AgentLoop(provider, {
       readTerminal: async ({ maxChars }) => (
         this.sessions.readTerminalHistory(runtime.sessionId).slice(-maxChars)
@@ -479,8 +506,29 @@ export class AgentService {
       executeCommand: (request) => this.requestCommand(runtime, token, request),
     }, (event) => {
       if (!this.isCurrentTurn(runtime, token)) return;
-      if (event.type === 'assistant_text' && event.text) {
-        this.addChat(runtime, 'assistant', event.text);
+      if (event.type === 'assistant_delta' && event.text) {
+        if (!streamedMessage) {
+          streamedMessage = {
+            id: randomUUID(),
+            role: 'assistant',
+            content: '',
+            createdAt: new Date().toISOString(),
+          };
+          runtime.messages.push(streamedMessage);
+          runtime.streamingMessageId = streamedMessage.id;
+        }
+        streamedMessage.content += event.text;
+        this.queueStreamEmit(runtime, token);
+      } else if (event.type === 'assistant_text' && event.text) {
+        if (streamedMessage) {
+          streamedMessage.content = event.text;
+          this.persistChatItem(runtime, streamedMessage);
+          runtime.streamingMessageId = undefined;
+          streamedMessage = undefined;
+          this.cancelStreamEmit(runtime);
+        } else {
+          this.addChat(runtime, 'assistant', event.text);
+        }
         this.emit(runtime);
       }
     });
@@ -504,10 +552,18 @@ export class AgentService {
       });
       runtime.pendingApproval = undefined;
       runtime.activeExecution = undefined;
+      runtime.streamingMessageId = undefined;
+      this.cancelStreamEmit(runtime);
       this.setHumanState(runtime, 'COMPLETED', controlLeaseId);
       this.emit(runtime);
     } catch (error) {
       if (!this.isCurrentTurn(runtime, token)) return;
+      if (streamedMessage?.content) {
+        try { this.persistChatItem(runtime, streamedMessage); } catch { /* preserve original error */ }
+      }
+      streamedMessage = undefined;
+      runtime.streamingMessageId = undefined;
+      this.cancelStreamEmit(runtime);
       runtime.pendingApproval = undefined;
       runtime.activeExecution = undefined;
       runtime.error = error instanceof Error ? error.message : String(error);
@@ -578,9 +634,10 @@ export class AgentService {
               createdAt: new Date().toISOString(),
             };
             runtime.messages.push(streamedMessage);
+            runtime.streamingMessageId = streamedMessage.id;
           }
           streamedMessage.content += delta;
-          this.emit(runtime);
+          this.queueStreamEmit(runtime, token);
         },
       });
       if (!this.isCurrentTurn(runtime, token)) return;
@@ -597,14 +654,13 @@ export class AgentService {
       const finalText = result.finalText.trim();
       if (streamedMessage) {
         if (finalText) streamedMessage.content = result.finalText;
-        this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
-          type: 'chat',
-          timestamp: streamedMessage.createdAt,
-          item: streamedMessage,
-        });
+        this.persistChatItem(runtime, streamedMessage);
+        streamedMessage = undefined;
       } else if (finalText) {
         this.addChat(runtime, 'assistant', result.finalText);
       }
+      runtime.streamingMessageId = undefined;
+      this.cancelStreamEmit(runtime);
       this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
         type: 'codex_app_server_turn',
         timestamp: new Date().toISOString(),
@@ -619,6 +675,12 @@ export class AgentService {
       this.emit(runtime);
     } catch (error) {
       if (!this.isCurrentTurn(runtime, token)) return;
+      if (streamedMessage?.content) {
+        try { this.persistChatItem(runtime, streamedMessage); } catch { /* preserve original error */ }
+      }
+      streamedMessage = undefined;
+      runtime.streamingMessageId = undefined;
+      this.cancelStreamEmit(runtime);
       const wasAborted = signal.aborted
         || (error instanceof Error && error.name === 'AbortError');
       runtime.turnToken += 1;
@@ -936,7 +998,11 @@ export class AgentService {
       return existing;
     }
     if (existing) {
-      if (BUSY_STATES.has(existing.state) || this.terminals.currentExecution(owner, terminalId)) {
+      if (
+        BUSY_STATES.has(existing.state)
+        || existing.backendTurnDraining
+        || this.terminals.currentExecution(owner, terminalId)
+      ) {
         throw new Error('Cannot switch Provider while the Agent or a foreground process is active.');
       }
       this.invalidateRuntime(existing);
@@ -1079,6 +1145,9 @@ export class AgentService {
 
   private invalidateRuntime(runtime: AgentRuntimeRecord): void {
     runtime.turnToken += 1;
+    runtime.streamingMessageId = undefined;
+    runtime.backendTurnDraining = false;
+    this.cancelStreamEmit(runtime);
     runtime.abortController?.abort();
     runtime.abortController = undefined;
     runtime.resolveApproval?.({ decision: 'reject', command: '' });
@@ -1155,12 +1224,40 @@ export class AgentService {
       content,
       createdAt: new Date().toISOString(),
     };
+    this.persistChatItem(runtime, item);
+    runtime.messages.push(item);
+  }
+
+  private persistChatItem(runtime: AgentRuntimeRecord, item: AgentChatItem): void {
     this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
       type: 'chat',
       timestamp: item.createdAt,
       item,
     });
-    runtime.messages.push(item);
+  }
+
+  private queueStreamEmit(runtime: AgentRuntimeRecord, token: number): void {
+    if (runtime.streamEmitTimer) return;
+    const streamingLength = runtime.streamingMessageId
+      ? runtime.messages.find((item) => item.id === runtime.streamingMessageId)?.content.length ?? 0
+      : 0;
+    const delay = streamingLength >= 64_000
+      ? 250
+      : streamingLength >= 32_000
+        ? 160
+        : streamingLength >= 8_000
+          ? 80
+          : 40;
+    runtime.streamEmitTimer = setTimeout(() => {
+      runtime.streamEmitTimer = undefined;
+      if (this.isCurrentTurn(runtime, token)) this.emit(runtime);
+    }, delay);
+  }
+
+  private cancelStreamEmit(runtime: AgentRuntimeRecord): void {
+    if (!runtime.streamEmitTimer) return;
+    clearTimeout(runtime.streamEmitTimer);
+    runtime.streamEmitTimer = undefined;
   }
 
   private requireOwned(owner: WebContents, terminalId: string): AgentRuntimeRecord {

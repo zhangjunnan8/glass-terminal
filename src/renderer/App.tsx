@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import type { HostInput, HostProfile } from '../shared/host';
 import type { RuntimeInfo } from '../shared/ipc';
@@ -22,6 +22,11 @@ import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
 import { mergeAgentState } from './agent-state';
 import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
+import { AgentMessageContent } from './components/AgentMessageContent';
+import {
+  isAgentOutputNearBottom,
+  scrollAgentOutputToBottom,
+} from './agent-scroll';
 import {
   agentStateLabel,
   authMethodLabel,
@@ -139,8 +144,11 @@ export function App() {
   const codexActionLock = useRef(false);
   const providerModalRef = useRef<HTMLDivElement>(null);
   const codexAgentConfirmationRef = useRef<HTMLDivElement>(null);
+  const agentBodyRef = useRef<HTMLDivElement>(null);
+  const agentStickToBottomRef = useRef(true);
   const [agentStates, setAgentStates] = useState<Record<string, AgentSessionView>>({});
   const [agentBackendChoices, setAgentBackendChoices] = useState<Record<string, AgentBackendKind>>({});
+  const [agentUpdatesBelow, setAgentUpdatesBelow] = useState(false);
   const [agentPrompt, setAgentPrompt] = useState('');
   const [editedApprovalCommand, setEditedApprovalCommand] = useState('');
   const [editingHost, setEditingHost] = useState<HostProfile | null | undefined>(undefined);
@@ -333,10 +341,45 @@ export function App() {
     : selectedGenericProvider
       ? `${selectedGenericProvider.name} · ${providerStatusLabel(selectedGenericProvider.status)}`
       : '尚未配置默认 Provider。';
+
+  useLayoutEffect(() => {
+    agentStickToBottomRef.current = true;
+    setAgentUpdatesBelow(false);
+    if (agentBodyRef.current) scrollAgentOutputToBottom(agentBodyRef.current);
+  }, [activeId]);
+
+  useLayoutEffect(() => {
+    const element = agentBodyRef.current;
+    if (!element) return;
+    if (agentStickToBottomRef.current) {
+      scrollAgentOutputToBottom(element);
+      setAgentUpdatesBelow(false);
+    } else {
+      setAgentUpdatesBelow(true);
+    }
+  }, [activeId, activeAgent?.revision]);
+
+  function handleAgentBodyScroll() {
+    const element = agentBodyRef.current;
+    if (!element) return;
+    const follows = isAgentOutputNearBottom(element);
+    agentStickToBottomRef.current = follows;
+    if (follows) setAgentUpdatesBelow(false);
+  }
+
+  function followLatestAgentOutput() {
+    const element = agentBodyRef.current;
+    if (!element) return;
+    agentStickToBottomRef.current = true;
+    scrollAgentOutputToBottom(element);
+    setAgentUpdatesBelow(false);
+  }
   const activeInputMode = activeAgent?.terminalInputMode ?? 'human';
   const foregroundRunning = activeAgent?.state === 'PAUSED'
     && activeAgent.activeExecution?.status === 'running';
-  const composerBlocked = agentTurnBusy(activeAgent?.state) || foregroundRunning;
+  const composerBlocked = agentTurnBusy(activeAgent?.state)
+    || foregroundRunning
+    || Boolean(activeAgent?.backendTurnDraining);
 
   useEffect(() => {
     if (!activeId) return;
@@ -986,7 +1029,13 @@ export function App() {
             >{activeAgent?.fullTakeover ? '关闭全接管' : 'AI 全接管'}</button>
           </div>
         </div>
-        <div className="agent-body">
+        <div className="agent-body-shell">
+          <div
+            className="agent-body"
+            data-testid="agent-scroll-container"
+            ref={agentBodyRef}
+            onScroll={handleAgentBodyScroll}
+          >
           {selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND && (
             <section
               className={`agent-backend-notice ${codexIsolation?.availability ?? 'unavailable'}`}
@@ -1026,7 +1075,11 @@ export function App() {
           {activeAgent?.messages.map((message) => (
             <article className={`agent-message ${message.role}`} key={message.id}>
               <span>{roleLabel(message.role)}</span>
-              <p>{message.content}</p>
+              <AgentMessageContent
+                role={message.role}
+                content={message.content}
+                streaming={activeAgent.streamingMessageId === message.id}
+              />
             </article>
           ))}
           {activeAgent?.pendingApproval?.status === 'waiting' && (
@@ -1082,7 +1135,15 @@ export function App() {
               )}
             </section>
           )}
-          {activeAgent?.error && <div className="agent-error">{activeAgent.error}</div>}
+            {activeAgent?.error && <div className="agent-error">{activeAgent.error}</div>}
+          </div>
+          {agentUpdatesBelow && (
+            <button
+              className="agent-follow-output"
+              data-action="follow-agent-output"
+              onClick={followLatestAgentOutput}
+            >↓ 回到底部 · 查看新输出</button>
+          )}
         </div>
         <form className="composer" onSubmit={(event) => void sendAgentPrompt(event)}>
           <textarea
@@ -1094,7 +1155,9 @@ export function App() {
             disabled={!selectedAgentBackendReady || !activeTab || activeTab.status !== 'connected' || composerBlocked}
           />
           <div>
-            <span>{selectedAgentBackendReady
+            <span>{activeAgent?.backendTurnDraining
+              ? '正在等待 App Server 安全停止旧轮次…'
+              : selectedAgentBackendReady
               ? activeAgent
                 ? agentStateLabel(activeAgent.state)
                 : selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND

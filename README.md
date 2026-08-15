@@ -12,6 +12,8 @@ visible PTY or SSH shell.
 登录、账号、模型、首选项与实验隔离 Agent 启用均可全程在 UI 中完成。实验后端使用
 空 environment、私有只读运行目录和三个 `terminal_*` 动态工具，并将命令复用到现有
 逐条审批与同一可见 PTY 链路；具体边界见 `docs/codex-app-server.md`。
+右侧 Agent 面板支持流式输出、安全 CommonMark/GFM 渲染与底部自动跟随；
+用户主动向上阅读时不会被新输出强制拉回底部。
 
 ## Design invariants
 

@@ -44,6 +44,28 @@ class FakeProvider implements AgentProviderRuntime {
   }
 }
 
+class DeferredStreamingProvider implements AgentProviderRuntime {
+  request?: AgentCompletionRequest;
+  private resolveCompletion?: (value: AgentCompletion) => void;
+
+  complete(request: AgentCompletionRequest): Promise<AgentCompletion> {
+    this.request = request;
+    return new Promise((resolve) => {
+      this.resolveCompletion = resolve;
+    });
+  }
+
+  push(delta: string): void {
+    if (!this.request) throw new Error('Streaming request has not started.');
+    this.request.onTextDelta?.(delta);
+  }
+
+  finish(content: string): void {
+    if (!this.resolveCompletion) throw new Error('Streaming request has not started.');
+    this.resolveCompletion({ message: { role: 'assistant', content } });
+  }
+}
+
 class FakeSessions {
   readonly audits: Array<{ type: string; details?: Record<string, unknown> }> = [];
   readonly threadEvents: Array<Record<string, unknown>> = [];
@@ -146,6 +168,70 @@ class FakeCodexAppServer {
       status: 'completed' as const,
       finalText,
     };
+  }
+}
+
+class DeferredStreamingCodexAppServer {
+  input?: RunCodexTurnInput;
+  interruptRequested = false;
+  private resolveTurn?: (value: {
+    threadId: string;
+    turnId: string;
+    status: 'completed' | 'interrupted';
+    finalText: string;
+  }) => void;
+  private resolveInterrupt?: () => void;
+
+  getState() {
+    return {
+      terminalAgentEnabled: true,
+      terminalAgentReason: 'ready',
+      selection: { modelId: 'gpt-codex', reasoningEffort: 'high' },
+    };
+  }
+
+  runTerminalAgentTurn(input: RunCodexTurnInput) {
+    this.input = input;
+    input.onThreadBound?.('provider-thread-stream');
+    return new Promise<{
+      threadId: string;
+      turnId: string;
+      status: 'completed' | 'interrupted';
+      finalText: string;
+    }>((resolve) => {
+      this.resolveTurn = resolve;
+    });
+  }
+
+  push(delta: string): void {
+    if (!this.input) throw new Error('Codex turn has not started.');
+    this.input.onDelta?.(delta);
+  }
+
+  finish(finalText: string): void {
+    if (!this.resolveTurn) throw new Error('Codex turn has not started.');
+    this.resolveTurn({
+      threadId: 'provider-thread-stream',
+      turnId: 'provider-turn-stream',
+      status: 'completed',
+      finalText,
+    });
+  }
+
+  interruptTerminalAgentTurn(): Promise<void> {
+    this.interruptRequested = true;
+    return new Promise<void>((resolve) => { this.resolveInterrupt = resolve; });
+  }
+
+  finishInterrupt(): void {
+    this.resolveTurn?.({
+      threadId: 'provider-thread-stream',
+      turnId: 'provider-turn-stream',
+      status: 'interrupted',
+      finalText: '',
+    });
+    this.resolveInterrupt?.();
+    this.resolveInterrupt = undefined;
   }
 }
 
@@ -339,6 +425,165 @@ function toolCall(id: string, command: string): AgentCompletion {
 }
 
 describe('AgentService shared-terminal controls', () => {
+  it('publishes App Server deltas before turn completion using one stable message', async () => {
+    const codex = new DeferredStreamingCodexAppServer();
+    const sessions = new FakeSessions();
+    const owner = browserOwner();
+    const send = owner.send as unknown as ReturnType<typeof vi.fn>;
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      () => { throw new Error('Generic Provider must not be used.'); },
+      codex as unknown as CodexAppServerService,
+    );
+
+    service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Stream from App Server.',
+      backend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      },
+    });
+    await waitFor(() => Boolean(codex.input));
+    codex.push('**部分');
+    codex.push('输出');
+    await waitFor(() => send.mock.calls.some((call) => {
+      const view = call[1] as {
+        streamingMessageId?: string;
+        messages?: Array<{ id: string; content: string }>;
+      };
+      return Boolean(view?.streamingMessageId)
+        && view.messages?.at(-1)?.content === '**部分输出';
+    }));
+    const partial = service.getState(owner, 'terminal')!;
+    const partialId = partial.streamingMessageId;
+    expect(partial.messages.at(-1)?.id).toBe(partialId);
+    expect(partial.state).toBe('THINKING');
+
+    codex.finish('**部分输出**');
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    const completed = service.getState(owner, 'terminal')!;
+    expect(completed.streamingMessageId).toBeUndefined();
+    expect(completed.messages.at(-1)).toMatchObject({
+      id: partialId,
+      content: '**部分输出**',
+    });
+  });
+
+  it('blocks a new App Server prompt until manual takeover finishes draining the old turn', async () => {
+    const codex = new DeferredStreamingCodexAppServer();
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      () => { throw new Error('Generic Provider must not be used.'); },
+      codex as unknown as CodexAppServerService,
+    );
+    const request = {
+      terminalId: 'terminal',
+      prompt: 'First turn.',
+      backend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      } as const,
+    };
+
+    service.sendPrompt(owner, request);
+    await waitFor(() => Boolean(codex.input));
+    const paused = service.takeover(owner, { terminalId: 'terminal' });
+    expect(paused).toMatchObject({ state: 'PAUSED', backendTurnDraining: true });
+    expect(() => service.sendPrompt(owner, { ...request, prompt: 'Must wait.' }))
+      .toThrow('already working');
+    expect(service.getState(owner, 'terminal')?.messages.filter((item) => item.role === 'user'))
+      .toHaveLength(1);
+
+    await waitFor(() => codex.interruptRequested);
+    codex.finishInterrupt();
+    await waitFor(() => service.getState(owner, 'terminal')?.backendTurnDraining === false);
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      state: 'PAUSED',
+      backendTurnDraining: false,
+    });
+  });
+
+  it('publishes partial Generic Provider output and finalizes one persisted chat item', async () => {
+    const provider = new DeferredStreamingProvider();
+    const sessions = new FakeSessions();
+    const terminals = new FakeTerminals();
+    const owner = browserOwner();
+    const send = owner.send as unknown as ReturnType<typeof vi.fn>;
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      () => provider,
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Stream Markdown.' });
+    await waitFor(() => Boolean(provider.request));
+    provider.push('**正在');
+    provider.push('生成');
+
+    await waitFor(() => send.mock.calls.some((call) => {
+      const view = call[1] as { streamingMessageId?: string; messages?: Array<{ content: string }> };
+      return Boolean(view?.streamingMessageId)
+        && view.messages?.at(-1)?.content === '**正在生成';
+    }));
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      state: 'THINKING',
+      messages: [
+        { role: 'user', content: 'Stream Markdown.' },
+        { role: 'assistant', content: '**正在生成' },
+      ],
+    });
+
+    provider.finish('**正在生成**');
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    const completed = service.getState(owner, 'terminal')!;
+    expect(completed.streamingMessageId).toBeUndefined();
+    expect(completed.messages.at(-1)?.content).toBe('**正在生成**');
+    expect(sessions.threadEvents.filter((event) => (
+      event.type === 'chat' && (event.item as { role?: string }).role === 'assistant'
+    ))).toHaveLength(1);
+  });
+
+  it('clears and persists partial streaming output before manual takeover', async () => {
+    const provider = new DeferredStreamingProvider();
+    const sessions = new FakeSessions();
+    const owner = browserOwner();
+    const send = owner.send as unknown as ReturnType<typeof vi.fn>;
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      () => provider,
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Stream then pause.' });
+    await waitFor(() => Boolean(provider.request));
+    provider.push('partial answer');
+    await waitFor(() => Boolean(service.getState(owner, 'terminal')?.streamingMessageId));
+
+    const paused = service.takeover(owner, { terminalId: 'terminal' });
+    const sendCount = send.mock.calls.length;
+    expect(paused.state).toBe('PAUSED');
+    expect(paused.streamingMessageId).toBeUndefined();
+    expect(sessions.threadEvents.filter((event) => (
+      event.type === 'chat'
+      && (event.item as { role?: string; content?: string }).role === 'assistant'
+    ))).toContainEqual(expect.objectContaining({
+      item: expect.objectContaining({ content: 'partial answer' }),
+    }));
+
+    provider.finish('partial answer');
+    await new Promise((resolve) => setTimeout(resolve, 70));
+    expect(send.mock.calls).toHaveLength(sendCount);
+    expect(service.getState(owner, 'terminal')?.state).toBe('PAUSED');
+  });
+
   it('routes an isolated App Server turn through the existing approval and terminal path', async () => {
     const sessions = new FakeSessions();
     const terminals = new FakeTerminals();

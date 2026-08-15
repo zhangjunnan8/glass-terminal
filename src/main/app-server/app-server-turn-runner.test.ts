@@ -170,7 +170,7 @@ function completeTurn(
     turn: {
       id: turnId,
       status,
-      items: [{ id: 'message-1', type: 'agentMessage', text }],
+      items: [{ id: 'message-1', type: 'agentMessage', phase: 'final_answer', text }],
       ...(status === 'failed' ? { error: { message: 'turn failed' } } : {}),
     },
   });
@@ -261,10 +261,10 @@ describe('CodexAppServerTurnRunner', () => {
     });
 
     connection.emit('item/agentMessage/delta', {
-      threadId: 'thread-new', turnId: 'turn-1', delta: 'Finished ',
+      threadId: 'thread-new', turnId: 'turn-1', itemId: 'message-1', delta: 'Finished ',
     });
     connection.emit('item/agentMessage/delta', {
-      threadId: 'thread-new', turnId: 'turn-1', delta: 'safely.',
+      threadId: 'thread-new', turnId: 'turn-1', itemId: 'message-1', delta: 'safely.',
     });
     completeTurn(connection);
 
@@ -277,6 +277,67 @@ describe('CodexAppServerTurnRunner', () => {
     expect(onDelta.mock.calls.flat()).toEqual(['Finished ', 'safely.']);
     expect(onThreadBound).toHaveBeenCalledOnce();
     expect(onThreadBound).toHaveBeenCalledWith('thread-new');
+  });
+
+  it('keeps commentary separate and streams only the final-answer item', async () => {
+    const connection = new FakeConnection();
+    const onDelta = vi.fn();
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-sandbox'));
+    runner.attach(connection);
+    const resultPromise = runner.run(createInput({ onDelta }));
+    await waitForRequest(connection, 'turn/start');
+
+    connection.emit('item/started', {
+      threadId: 'thread-new',
+      turnId: 'turn-1',
+      item: { id: 'commentary-1', type: 'agentMessage', phase: 'commentary', text: '' },
+    });
+    connection.emit('item/agentMessage/delta', {
+      threadId: 'thread-new', turnId: 'turn-1', itemId: 'commentary-1', delta: 'Internal note.',
+    });
+    connection.emit('item/completed', {
+      threadId: 'thread-new',
+      turnId: 'turn-1',
+      item: {
+        id: 'commentary-1', type: 'agentMessage', phase: 'commentary', text: 'Internal note.',
+      },
+    });
+    connection.emit('item/started', {
+      threadId: 'thread-new',
+      turnId: 'turn-1',
+      item: { id: 'final-1', type: 'agentMessage', phase: 'final_answer', text: '' },
+    });
+    connection.emit('item/agentMessage/delta', {
+      threadId: 'thread-new', turnId: 'turn-1', itemId: 'final-1', delta: '**Visible',
+    });
+    connection.emit('item/agentMessage/delta', {
+      threadId: 'thread-new', turnId: 'turn-1', itemId: 'final-1', delta: ' answer**',
+    });
+    connection.emit('item/completed', {
+      threadId: 'thread-new',
+      turnId: 'turn-1',
+      item: {
+        id: 'final-1', type: 'agentMessage', phase: 'final_answer', text: '**Visible answer**',
+      },
+    });
+    connection.emit('turn/completed', {
+      threadId: 'thread-new',
+      turn: {
+        id: 'turn-1',
+        status: 'completed',
+        items: [
+          {
+            id: 'commentary-1', type: 'agentMessage', phase: 'commentary', text: 'Internal note.',
+          },
+          {
+            id: 'final-1', type: 'agentMessage', phase: 'final_answer', text: '**Visible answer**',
+          },
+        ],
+      },
+    });
+
+    await expect(resultPromise).resolves.toMatchObject({ finalText: '**Visible answer**' });
+    expect(onDelta.mock.calls.flat()).toEqual(['**Visible', ' answer**']);
   });
 
   it('resumes only the exact requested thread and reapplies per-turn isolation', async () => {
@@ -514,6 +575,204 @@ describe('CodexAppServerTurnRunner', () => {
       turnId: 'turn-1',
       status: 'interrupted',
       finalText: 'partial',
+    });
+  });
+
+  it('quarantines a failed connection and never binds stale pre-response Turn activity', async () => {
+    const firstConnection = new FakeConnection();
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-sandbox'));
+    const firstTools = createTools();
+    runner.attach(firstConnection);
+    const firstRun = runner.run(createInput({ tools: firstTools }));
+    const firstFailure = firstRun.then(() => undefined, (error: Error) => error);
+    await waitForRequest(firstConnection, 'turn/start');
+
+    firstConnection.emit('item/completed', {
+      threadId: 'thread-new',
+      turnId: 'turn-1',
+    });
+    expect((await firstFailure)?.message).toContain('item');
+    expect(firstConnection.requests).toContainEqual({
+      method: 'turn/interrupt',
+      params: { threadId: 'thread-new', turnId: 'turn-1' },
+    });
+    await expect(runner.run(createInput({ threadId: 'thread-new' }))).rejects.toThrow('隔离');
+
+    firstConnection.emit('turn/started', {
+      threadId: 'thread-new',
+      turn: { id: 'turn-1', status: 'inProgress', items: [] },
+    });
+    await expect(firstConnection.invoke('item/tool/call', {
+      threadId: 'thread-new', turnId: 'turn-1', callId: 'stale-first-call',
+      tool: 'terminal_execute', arguments: { command: 'must-not-run' },
+    })).rejects.toThrow('当前没有');
+    expect(firstTools.executeCommand).not.toHaveBeenCalled();
+
+    const turnStartResponse = deferred<unknown>();
+    const replacement = new FakeConnection();
+    replacement.responder = (method, params) => {
+      if (method === 'thread/resume') return { thread: { id: asRecord(params).threadId } };
+      if (method === 'turn/start') return turnStartResponse.promise;
+      if (method === 'turn/interrupt') return {};
+      throw new Error(`Unexpected request: ${method}`);
+    };
+    const secondTools = createTools();
+    runner.attach(replacement);
+    const secondRun = runner.run(createInput({ threadId: 'thread-new', tools: secondTools }));
+    await waitForRequest(replacement, 'turn/start');
+
+    replacement.emit('turn/started', {
+      threadId: 'thread-new',
+      turn: { id: 'turn-1', status: 'inProgress', items: [] },
+    });
+    await expect(replacement.invoke('item/tool/call', {
+      threadId: 'thread-new', turnId: 'turn-1', callId: 'stale-pending-call',
+      tool: 'terminal_execute', arguments: { command: 'still-must-not-run' },
+    })).rejects.toThrow('exact turn/start');
+    expect(secondTools.executeCommand).not.toHaveBeenCalled();
+
+    turnStartResponse.resolve({
+      turn: { id: 'turn-2', status: 'inProgress', items: [] },
+    });
+    await vi.waitFor(async () => {
+      await expect(replacement.invoke('item/tool/call', {
+        threadId: 'thread-new', turnId: 'turn-2', callId: 'current-call',
+        tool: 'terminal_execute', arguments: { command: 'allowed-after-exact-response' },
+      })).resolves.toMatchObject({ success: true });
+    });
+    expect(secondTools.executeCommand).toHaveBeenCalledTimes(1);
+    completeTurn(replacement, 'thread-new', 'turn-2');
+    await expect(secondRun).resolves.toMatchObject({ turnId: 'turn-2', status: 'completed' });
+  });
+
+  it('enforces the 100,000-character aggregate and authoritative completion limits', async () => {
+    const connection = new FakeConnection();
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-sandbox'));
+    runner.attach(connection);
+    const aggregateRun = runner.run(createInput());
+    const aggregateFailure = aggregateRun.then(() => undefined, (error: Error) => error);
+    await waitForRequest(connection, 'turn/start');
+    connection.emit('item/agentMessage/delta', {
+      threadId: 'thread-new', turnId: 'turn-1', itemId: 'message-a', delta: 'a'.repeat(60_000),
+    });
+    connection.emit('item/agentMessage/delta', {
+      threadId: 'thread-new', turnId: 'turn-1', itemId: 'message-b', delta: 'b'.repeat(40_001),
+    });
+    expect((await aggregateFailure)?.message).toContain('100000');
+    expect(connection.requests).toContainEqual({
+      method: 'turn/interrupt',
+      params: { threadId: 'thread-new', turnId: 'turn-1' },
+    });
+
+    const authoritativeConnection = new FakeConnection();
+    const authoritativeRunner = new CodexAppServerTurnRunner(resolve('app-server-agent-sandbox'));
+    authoritativeRunner.attach(authoritativeConnection);
+    const authoritativeRun = authoritativeRunner.run(createInput());
+    const authoritativeFailure = authoritativeRun.then(() => undefined, (error: Error) => error);
+    await waitForRequest(authoritativeConnection, 'turn/start');
+    completeTurn(authoritativeConnection, 'thread-new', 'turn-1', 'x'.repeat(100_001));
+    expect((await authoritativeFailure)?.message).toContain('100000');
+    await expect(authoritativeRunner.run(createInput())).rejects.toThrow('隔离');
+  });
+
+  it('allows 64 assistant items and quarantines the 65th', async () => {
+    const connection = new FakeConnection();
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-sandbox'));
+    runner.attach(connection);
+    const resultPromise = runner.run(createInput());
+    const failure = resultPromise.then(() => undefined, (error: Error) => error);
+    await waitForRequest(connection, 'turn/start');
+    for (let index = 0; index < 65; index += 1) {
+      connection.emit('item/started', {
+        threadId: 'thread-new',
+        turnId: 'turn-1',
+        item: { id: `message-${index}`, type: 'agentMessage', text: '' },
+      });
+    }
+    expect((await failure)?.message).toContain('64');
+    expect(connection.requests).toContainEqual({
+      method: 'turn/interrupt',
+      params: { threadId: 'thread-new', turnId: 'turn-1' },
+    });
+  });
+
+  it('allows 256 unique dynamic calls and rejects the 257th before execution', async () => {
+    const connection = new FakeConnection();
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-sandbox'));
+    const tools = createTools();
+    runner.attach(connection);
+    const resultPromise = runner.run(createInput({ tools }));
+    const failure = resultPromise.then(() => undefined, (error: Error) => error);
+    await waitForRequest(connection, 'turn/start');
+    for (let index = 0; index < 256; index += 1) {
+      await expect(connection.invoke('item/tool/call', {
+        threadId: 'thread-new', turnId: 'turn-1', callId: `call-${index}`,
+        tool: 'terminal_state', arguments: {},
+      })).resolves.toMatchObject({ success: true });
+    }
+    await expect(connection.invoke('item/tool/call', {
+      threadId: 'thread-new', turnId: 'turn-1', callId: 'call-256',
+      tool: 'terminal_execute', arguments: { command: 'must-not-run' },
+    })).rejects.toThrow('256');
+    expect((await failure)?.message).toContain('256');
+    expect(tools.executeCommand).not.toHaveBeenCalled();
+    expect(connection.requests).toContainEqual({
+      method: 'turn/interrupt',
+      params: { threadId: 'thread-new', turnId: 'turn-1' },
+    });
+  });
+
+  it('never refunds the monotonic streaming budget when an item snapshot shrinks', async () => {
+    const connection = new FakeConnection();
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-sandbox'));
+    const onDelta = vi.fn();
+    runner.attach(connection);
+    const resultPromise = runner.run(createInput({ onDelta }));
+    const failure = resultPromise.then(() => undefined, (error: Error) => error);
+    await waitForRequest(connection, 'turn/start');
+
+    connection.emit('item/agentMessage/delta', {
+      threadId: 'thread-new', turnId: 'turn-1', itemId: 'message-stream',
+      phase: 'final_answer', delta: 'x'.repeat(100_000),
+    });
+    connection.emit('item/completed', {
+      threadId: 'thread-new', turnId: 'turn-1',
+      item: { id: 'message-stream', type: 'agentMessage', phase: 'final_answer', text: '' },
+    });
+    connection.emit('item/agentMessage/delta', {
+      threadId: 'thread-new', turnId: 'turn-1', itemId: 'message-stream',
+      phase: 'final_answer', delta: 'y',
+    });
+
+    expect((await failure)?.message).toContain('100000');
+    expect(onDelta).toHaveBeenCalledTimes(1);
+    expect(onDelta.mock.calls[0]?.[0]).toHaveLength(100_000);
+    await expect(runner.run(createInput())).rejects.toThrow('隔离');
+  });
+
+  it('bounds the complete serialized payload buffered before turn/start responds', async () => {
+    const turnStartResponse = deferred<unknown>();
+    const connection = new FakeConnection();
+    connection.responder = (method) => {
+      if (method === 'thread/start') return { thread: { id: 'thread-new' } };
+      if (method === 'turn/start') return turnStartResponse.promise;
+      if (method === 'turn/interrupt') return {};
+      throw new Error(`Unexpected request: ${method}`);
+    };
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-sandbox'));
+    runner.attach(connection);
+    const resultPromise = runner.run(createInput());
+    await waitForRequest(connection, 'turn/start');
+
+    connection.emit('item/started', {
+      threadId: 'thread-new', turnId: 'turn-pending',
+      item: { id: 'reasoning-1', type: 'reasoning', metadata: 'z'.repeat(600_000) },
+    });
+
+    await expect(resultPromise).rejects.toThrow('通知缓冲超过安全上限');
+    await expect(runner.run(createInput())).rejects.toThrow('隔离');
+    turnStartResponse.resolve({
+      turn: { id: 'turn-pending', status: 'inProgress', items: [] },
     });
   });
 

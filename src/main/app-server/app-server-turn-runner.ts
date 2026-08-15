@@ -10,6 +10,12 @@ const DEFAULT_TERMINAL_READ_CHARS = 8_000;
 const MAX_TERMINAL_READ_CHARS = 30_000;
 const MAX_COMMAND_CHARS = 20_000;
 const MAX_REASON_CHARS = 1_000;
+const MAX_ASSISTANT_TEXT_CHARS = 100_000;
+const MAX_ASSISTANT_MESSAGE_ITEMS = 64;
+const MAX_TOOL_CALL_IDS = 256;
+const MAX_PENDING_NOTIFICATIONS = 256;
+const MAX_PENDING_NOTIFICATION_BYTES = 512 * 1024;
+const MAX_PROTOCOL_ID_CHARS = 256;
 
 const DEVELOPER_INSTRUCTIONS = `You and the human operate the exact same visible terminal session.
 Use only terminal_read, terminal_state, and terminal_execute for terminal or filesystem work.
@@ -126,9 +132,14 @@ interface ActiveTurn {
   interruptRequest?: Promise<void>;
   observedCompletion?: RunCodexTurnResult;
   finalText: string;
+  messageItems: Map<string, { phase?: 'commentary' | 'final_answer'; text: string }>;
+  assistantTextChars: number;
+  assistantDeltaChars: number;
   seenCallIds: Set<string>;
+  pendingNotifications: AppServerNotification[];
+  pendingNotificationBytes: number;
+  pendingIsolationByTurnId: Map<string, CodexAppServerIsolationViolation>;
   executeInFlight: boolean;
-  pendingIsolationError?: Error;
   settled: boolean;
 }
 
@@ -156,6 +167,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function optionalText(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function protocolId(value: unknown, label: string): string {
+  const id = optionalText(value);
+  if (!id || id.length > MAX_PROTOCOL_ID_CHARS) {
+    throw new Error(`${label} 必须是不超过 ${MAX_PROTOCOL_ID_CHARS} 字符的非空字符串。`);
+  }
+  return id;
 }
 
 function errorMessage(error: unknown): string {
@@ -188,11 +207,31 @@ function extractAgentText(turn: Record<string, unknown>): string | undefined {
   if (!Array.isArray(turn.items)) return undefined;
   for (let index = turn.items.length - 1; index >= 0; index -= 1) {
     const item = turn.items[index];
-    if (isRecord(item) && item.type === 'agentMessage' && typeof item.text === 'string') {
+    if (
+      isRecord(item)
+      && item.type === 'agentMessage'
+      && item.phase === 'final_answer'
+      && typeof item.text === 'string'
+    ) return item.text;
+  }
+  for (let index = turn.items.length - 1; index >= 0; index -= 1) {
+    const item = turn.items[index];
+    if (
+      isRecord(item)
+      && item.type === 'agentMessage'
+      && item.phase !== 'commentary'
+      && typeof item.text === 'string'
+    ) {
       return item.text;
     }
   }
   return undefined;
+}
+
+function agentMessagePhase(
+  value: unknown,
+): 'commentary' | 'final_answer' | undefined {
+  return value === 'commentary' || value === 'final_answer' ? value : undefined;
 }
 
 function turnError(turn: Record<string, unknown>): string | undefined {
@@ -220,6 +259,26 @@ function forbiddenTurnItemKind(
   return undefined;
 }
 
+function isHandledTurnNotification(method: string): boolean {
+  return method === 'turn/started'
+    || method === 'turn/completed'
+    || method === 'item/agentMessage/delta'
+    || method === 'item/started'
+    || method === 'item/completed'
+    || method.startsWith('item/commandExecution/')
+    || method.startsWith('item/fileChange/');
+}
+
+function notificationTurnId(notification: AppServerNotification): string | undefined {
+  if (!isRecord(notification.params)) return undefined;
+  if (notification.method === 'turn/started' || notification.method === 'turn/completed') {
+    return isRecord(notification.params.turn)
+      ? optionalText(notification.params.turn.id)
+      : undefined;
+  }
+  return optionalText(notification.params.turnId);
+}
+
 export class CodexAppServerTurnRunner {
   private readonly sandboxRoot: string;
   private readonly options: CodexAppServerTurnRunnerOptions;
@@ -228,6 +287,7 @@ export class CodexAppServerTurnRunner {
   private sequence = 0;
   private disposed = false;
   private active?: ActiveTurn;
+  private quarantinedAttachmentGeneration?: number;
   private removeNotificationListener?: () => void;
   private removeRequestHandler?: () => void;
   private removeExitListener?: () => void;
@@ -296,6 +356,11 @@ export class CodexAppServerTurnRunner {
     if (this.disposed) return Promise.reject(new Error('Codex App Server Turn Runner 已关闭。'));
     const connection = this.connection;
     if (!connection) return Promise.reject(new Error('Codex App Server 尚未连接。'));
+    if (this.quarantinedAttachmentGeneration === this.attachmentGeneration) {
+      return Promise.reject(new Error(
+        'Codex App Server 连接已因协议或资源边界违规被隔离；请重启并重新连接。',
+      ));
+    }
     if (this.active) return Promise.reject(new Error('同一时间只能运行一个 Codex App Server Turn。'));
     const prompt = input.prompt.trim();
     const model = input.model.trim();
@@ -326,7 +391,13 @@ export class CodexAppServerTurnRunner {
       turnStartAcknowledged: false,
       interruptRequested: false,
       finalText: '',
+      messageItems: new Map(),
+      assistantTextChars: 0,
+      assistantDeltaChars: 0,
       seenCallIds: new Set(),
+      pendingNotifications: [],
+      pendingNotificationBytes: 0,
+      pendingIsolationByTurnId: new Map(),
       executeInFlight: false,
       settled: false,
     };
@@ -336,7 +407,7 @@ export class CodexAppServerTurnRunner {
     input.signal.addEventListener('abort', onAbort, { once: true });
     active.removeExternalAbort = () => input.signal.removeEventListener('abort', onAbort);
     this.active = active;
-    void this.startTurn(active).catch((error) => this.failActive(active, error));
+    void this.startTurn(active).catch((error) => this.failProtocol(active, error));
     return completion.promise;
   }
 
@@ -386,18 +457,21 @@ export class CodexAppServerTurnRunner {
     if (!isRecord(response) || !isRecord(response.turn)) {
       throw new Error('App Server 返回了无效的 turn/start 响应。');
     }
-    const turnId = optionalText(response.turn.id);
-    if (!turnId) throw new Error('App Server turn/start 响应缺少 turn.id。');
-    this.bindTurnId(active, turnId);
-    if (this.settlePendingIsolation(active)) return;
+    const turnId = protocolId(response.turn.id, 'App Server turn/start 响应 turn.id');
+    if (active.turnId) throw new Error('App Server Turn 在 turn/start 响应前已被错误绑定。');
+    active.turnId = turnId;
     const forbiddenKind = forbiddenTurnItemKind(response.turn);
     if (forbiddenKind) {
       this.failIsolation(active, forbiddenKind, 'turn/start 响应包含被禁用的内建项目。');
       return;
     }
+    this.recordTurnMessageItems(active, response.turn);
     active.turnStartAcknowledged = true;
+    if (this.settlePendingIsolation(active)) return;
     const status = optionalText(response.turn.status);
     if (status && status !== 'inProgress') this.observeCompletion(active, response.turn);
+    this.replayPendingNotifications(active);
+    if (!this.isActive(active)) return;
     this.maybeSendInterrupt(active);
     this.maybeComplete(active);
   }
@@ -439,17 +513,58 @@ export class CodexAppServerTurnRunner {
     if (!isRecord(response) || !isRecord(response.thread)) {
       throw new Error(`App Server 返回了无效的 ${method} 响应。`);
     }
-    const threadId = optionalText(response.thread.id);
-    if (!threadId) throw new Error(`App Server ${method} 响应缺少 thread.id。`);
-    return threadId;
+    return protocolId(response.thread.id, `App Server ${method} 响应 thread.id`);
   }
 
   private handleNotification(notification: AppServerNotification): void {
     const active = this.active;
-    if (!active || !isRecord(notification.params)) return;
+    if (!active || !isHandledTurnNotification(notification.method)) return;
+    if (!isRecord(notification.params)) {
+      if (active.turnStartAcknowledged) {
+        this.failProtocol(active, new Error(
+          `App Server ${notification.method} 通知参数无效。`,
+        ));
+      }
+      return;
+    }
     const params = notification.params;
     const threadId = optionalText(params.threadId);
-    if (!threadId || !active.threadId || threadId !== active.threadId) return;
+    if (!threadId) {
+      if (active.turnStartAcknowledged) {
+        this.failProtocol(active, new Error(
+          `App Server ${notification.method} 通知缺少 threadId。`,
+        ));
+      }
+      return;
+    }
+    if (!active.threadId || threadId !== active.threadId) return;
+
+    const candidateTurnId = notificationTurnId(notification);
+    if (!candidateTurnId || candidateTurnId.length > MAX_PROTOCOL_ID_CHARS) {
+      if (active.turnStartAcknowledged) {
+        this.failProtocol(active, new Error(
+          `App Server ${notification.method} 通知缺少有效 turnId。`,
+        ));
+      }
+      return;
+    }
+    if (!active.turnStartAcknowledged) {
+      this.bufferPendingNotification(active, notification);
+      return;
+    }
+    if (candidateTurnId !== active.turnId) {
+      this.failProtocol(active, new Error('App Server Turn 收到不匹配的 turnId。'));
+      return;
+    }
+    this.handleConfirmedNotification(active, notification);
+  }
+
+  private handleConfirmedNotification(
+    active: ActiveTurn,
+    notification: AppServerNotification,
+  ): void {
+    if (!this.isActive(active) || !isRecord(notification.params)) return;
+    const params = notification.params;
 
     if (notification.method.startsWith('item/commandExecution/')) {
       this.failIsolation(
@@ -470,25 +585,19 @@ export class CodexAppServerTurnRunner {
 
     if (notification.method === 'turn/started') {
       if (!isRecord(params.turn)) {
-        this.failActive(active, new Error('App Server turn/started 通知无效。'));
-        return;
-      }
-      const turnId = optionalText(params.turn.id);
-      if (!turnId) {
-        this.failActive(active, new Error('App Server turn/started 缺少 turn.id。'));
+        this.failProtocol(active, new Error('App Server turn/started 通知无效。'));
         return;
       }
       try {
-        this.bindTurnId(active, turnId);
-        if (this.settlePendingIsolation(active)) return;
         const forbiddenKind = forbiddenTurnItemKind(params.turn);
         if (forbiddenKind) {
           this.failIsolation(active, forbiddenKind, 'turn/started 包含被禁用的内建项目。');
           return;
         }
+        this.recordTurnMessageItems(active, params.turn);
         this.maybeSendInterrupt(active);
       } catch (error) {
-        this.failActive(active, error);
+        this.failProtocol(active, error);
       }
       return;
     }
@@ -496,13 +605,24 @@ export class CodexAppServerTurnRunner {
     if (notification.method === 'item/agentMessage/delta') {
       try {
         this.validateNotificationTurn(active, params);
+        if (typeof params.delta !== 'string') {
+          throw new Error('App Server item/agentMessage/delta 通知缺少有效 delta。');
+        }
+        if (params.delta) {
+          const itemId = optionalText(params.itemId) ?? '__legacy_agent_message__';
+          const message = this.appendMessageDelta(
+            active,
+            itemId,
+            agentMessagePhase(params.phase),
+            params.delta,
+          );
+          if (message.phase !== 'commentary') {
+            active.finalText = message.text;
+            try { active.input.onDelta?.(params.delta); } catch { /* UI callback isolation */ }
+          }
+        }
       } catch (error) {
-        this.failActive(active, error);
-        return;
-      }
-      if (typeof params.delta === 'string') {
-        active.finalText += params.delta;
-        try { active.input.onDelta?.(params.delta); } catch { /* UI callback isolation */ }
+        this.failProtocol(active, error);
       }
       return;
     }
@@ -510,47 +630,53 @@ export class CodexAppServerTurnRunner {
     if (notification.method === 'item/started' || notification.method === 'item/completed') {
       try {
         this.validateNotificationTurn(active, params);
+        if (!isRecord(params.item)) {
+          throw new Error(`App Server ${notification.method} 通知缺少有效 item。`);
+        }
+        const forbiddenKind = forbiddenItemKind(params.item);
+        if (forbiddenKind) {
+          this.failIsolation(
+            active,
+            forbiddenKind,
+            `观察到被禁用的内建项目：${String(params.item.type)}`,
+          );
+          return;
+        }
+        if (params.item.type === 'agentMessage') {
+          const itemId = protocolId(params.item.id, 'App Server agentMessage item.id');
+          const phase = agentMessagePhase(params.item.phase);
+          const existing = active.messageItems.get(itemId);
+          const text = typeof params.item.text === 'string'
+            ? params.item.text
+            : existing?.text ?? '';
+          const message = this.storeMessageItem(active, itemId, phase ?? existing?.phase, text);
+          if (
+            notification.method === 'item/completed'
+            && (message.phase === 'final_answer' || message.phase !== 'commentary')
+          ) active.finalText = message.text;
+        }
       } catch (error) {
-        this.failActive(active, error);
-        return;
+        this.failProtocol(active, error);
       }
-      if (!isRecord(params.item)) return;
-      const forbiddenKind = forbiddenItemKind(params.item);
-      if (forbiddenKind) {
-        this.failIsolation(
-          active,
-          forbiddenKind,
-          `观察到被禁用的内建项目：${String(params.item.type)}`,
-        );
-        return;
-      }
-      if (
-        notification.method === 'item/completed'
-        && params.item.type === 'agentMessage'
-        && typeof params.item.text === 'string'
-      ) active.finalText = params.item.text;
       return;
     }
 
     if (notification.method === 'turn/completed') {
       if (!isRecord(params.turn)) {
-        this.failActive(active, new Error('App Server turn/completed 通知无效。'));
+        this.failProtocol(active, new Error('App Server turn/completed 通知无效。'));
         return;
       }
       try {
-        const turnId = optionalText(params.turn.id);
-        if (!turnId) throw new Error('App Server turn/completed 缺少 turn.id。');
-        this.bindTurnId(active, turnId);
-        if (this.settlePendingIsolation(active)) return;
         const forbiddenKind = forbiddenTurnItemKind(params.turn);
         if (forbiddenKind) {
           this.failIsolation(active, forbiddenKind, 'turn/completed 包含被禁用的内建项目。');
           return;
         }
+        this.recordTurnMessageItems(active, params.turn);
         this.observeCompletion(active, params.turn);
         this.maybeComplete(active);
       } catch (error) {
-        this.failActive(active, error);
+        this.failProtocol(active, error);
       }
     }
   }
@@ -561,25 +687,33 @@ export class CodexAppServerTurnRunner {
       || request.method === 'item/fileChange/requestApproval'
     ) {
       const active = this.active;
-      if (active && this.requestTargetsActiveTurn(request.params, active)) {
-        this.failIsolation(
-          active,
-          request.method === 'item/commandExecution/requestApproval'
+      if (active) {
+        const violation: CodexAppServerIsolationViolation = {
+          kind: request.method === 'item/commandExecution/requestApproval'
             ? 'command-execution'
             : 'file-change',
-          `收到被禁用的内建审批：${request.method}`,
-        );
+          detail: `收到被禁用的内建审批：${request.method}`,
+        };
+        if (this.requestTargetsActiveTurn(request.params, active)) {
+          this.failIsolation(active, violation.kind, violation.detail);
+        } else {
+          this.rememberPendingIsolation(active, request.params, violation);
+        }
       }
       return { decision: 'decline' };
     }
     if (request.method === 'item/permissions/requestApproval') {
       const active = this.active;
-      if (active && this.requestTargetsActiveTurn(request.params, active)) {
-        this.failIsolation(
-          active,
-          'permission-request',
-          '收到被禁用的权限审批：item/permissions/requestApproval',
-        );
+      if (active) {
+        const violation: CodexAppServerIsolationViolation = {
+          kind: 'permission-request',
+          detail: '收到被禁用的权限审批：item/permissions/requestApproval',
+        };
+        if (this.requestTargetsActiveTurn(request.params, active)) {
+          this.failIsolation(active, violation.kind, violation.detail);
+        } else {
+          this.rememberPendingIsolation(active, request.params, violation);
+        }
       }
       return { permissions: {} };
     }
@@ -596,16 +730,17 @@ export class CodexAppServerTurnRunner {
     if (!isRecord(params)) throw new Error('App Server 动态工具请求参数无效。');
     const threadId = optionalText(params.threadId);
     const turnId = optionalText(params.turnId);
-    const callId = optionalText(params.callId);
+    const callId = protocolId(params.callId, 'App Server 动态工具 callId');
     const tool = optionalText(params.tool);
     if (!threadId || threadId !== active.threadId) {
       throw new Error('App Server 动态工具请求的 threadId 不匹配。');
     }
-    if (!turnId) throw new Error('App Server 动态工具请求缺少 turnId。');
-    if (!active.turnId || turnId !== active.turnId) {
+    if (!active.turnStartAcknowledged || !active.turnId) {
+      throw new Error('App Server 动态工具请求在 exact turn/start 响应确认前被拒绝。');
+    }
+    if (!turnId || turnId !== active.turnId) {
       throw new Error('App Server 动态工具请求的 turnId 不匹配。');
     }
-    if (!callId) throw new Error('App Server 动态工具请求缺少 callId。');
     if (active.seenCallIds.has(callId)) {
       throw new Error(`App Server 动态工具 callId 已处理：${callId}`);
     }
@@ -614,6 +749,13 @@ export class CodexAppServerTurnRunner {
     }
     if (!tool) throw new Error('App Server 动态工具请求缺少 tool。');
     if (!isRecord(params.arguments)) throw new Error(`${tool} 参数必须是对象。`);
+    if (active.seenCallIds.size >= MAX_TOOL_CALL_IDS) {
+      const error = new Error(
+        `App Server Turn 动态工具调用超过 ${MAX_TOOL_CALL_IDS} 个唯一 callId。`,
+      );
+      this.failProtocol(active, error);
+      throw error;
+    }
     active.seenCallIds.add(callId);
 
     try {
@@ -703,13 +845,162 @@ export class CodexAppServerTurnRunner {
     });
   }
 
+  private bufferPendingNotification(
+    active: ActiveTurn,
+    notification: AppServerNotification,
+  ): void {
+    let notificationBytes: number;
+    try {
+      notificationBytes = Buffer.byteLength(JSON.stringify(notification), 'utf8');
+    } catch {
+      this.failProtocol(active, new Error(
+        'App Server turn/start 响应前的通知无法安全序列化。',
+      ));
+      return;
+    }
+    if (
+      active.pendingNotifications.length >= MAX_PENDING_NOTIFICATIONS
+      || notificationBytes > MAX_PENDING_NOTIFICATION_BYTES
+      || active.pendingNotificationBytes + notificationBytes > MAX_PENDING_NOTIFICATION_BYTES
+    ) {
+      this.failProtocol(
+        active,
+        new Error('App Server turn/start 响应前的通知缓冲超过安全上限。'),
+      );
+      return;
+    }
+    active.pendingNotifications.push(notification);
+    active.pendingNotificationBytes += notificationBytes;
+  }
+
+  private replayPendingNotifications(active: ActiveTurn): void {
+    const pending = active.pendingNotifications;
+    active.pendingNotifications = [];
+    active.pendingNotificationBytes = 0;
+    for (const notification of pending) {
+      if (!this.isActive(active)) return;
+      if (notificationTurnId(notification) !== active.turnId) continue;
+      this.handleConfirmedNotification(active, notification);
+    }
+  }
+
+  private rememberPendingIsolation(
+    active: ActiveTurn,
+    params: unknown,
+    violation: CodexAppServerIsolationViolation,
+  ): void {
+    if (
+      active.turnStartAcknowledged
+      || !active.turnStartIssued
+      || !isRecord(params)
+      || optionalText(params.threadId) !== active.threadId
+    ) return;
+    const turnId = optionalText(params.turnId);
+    if (!turnId || turnId.length > MAX_PROTOCOL_ID_CHARS) return;
+    if (
+      !active.pendingIsolationByTurnId.has(turnId)
+      && active.pendingIsolationByTurnId.size >= MAX_ASSISTANT_MESSAGE_ITEMS
+    ) {
+      this.failProtocol(
+        active,
+        new Error('App Server turn/start 响应前的隔离事件超过安全上限。'),
+      );
+      return;
+    }
+    if (!active.pendingIsolationByTurnId.has(turnId)) {
+      active.pendingIsolationByTurnId.set(turnId, violation);
+    }
+  }
+
+  private appendMessageDelta(
+    active: ActiveTurn,
+    itemIdValue: string,
+    phase: 'commentary' | 'final_answer' | undefined,
+    delta: string,
+  ): { phase?: 'commentary' | 'final_answer'; text: string } {
+    const itemId = protocolId(itemIdValue, 'App Server agentMessage itemId');
+    const existing = active.messageItems.get(itemId);
+    if (!existing && active.messageItems.size >= MAX_ASSISTANT_MESSAGE_ITEMS) {
+      throw new Error(
+        `App Server Turn assistant message item 超过 ${MAX_ASSISTANT_MESSAGE_ITEMS} 个。`,
+      );
+    }
+    if (active.assistantDeltaChars + delta.length > MAX_ASSISTANT_TEXT_CHARS) {
+      throw new Error(
+        `App Server Turn assistant 流式增量总计超过 ${MAX_ASSISTANT_TEXT_CHARS} 字符。`,
+      );
+    }
+    if (active.assistantTextChars + delta.length > MAX_ASSISTANT_TEXT_CHARS) {
+      throw new Error(
+        `App Server Turn assistant message 总文本超过 ${MAX_ASSISTANT_TEXT_CHARS} 字符。`,
+      );
+    }
+    const message = {
+      phase: existing?.phase ?? phase,
+      text: `${existing?.text ?? ''}${delta}`,
+    };
+    active.messageItems.set(itemId, message);
+    active.assistantTextChars += delta.length;
+    active.assistantDeltaChars += delta.length;
+    return message;
+  }
+
+  private storeMessageItem(
+    active: ActiveTurn,
+    itemIdValue: string,
+    phase: 'commentary' | 'final_answer' | undefined,
+    text: string,
+  ): { phase?: 'commentary' | 'final_answer'; text: string } {
+    const itemId = protocolId(itemIdValue, 'App Server agentMessage item.id');
+    const existing = active.messageItems.get(itemId);
+    if (!existing && active.messageItems.size >= MAX_ASSISTANT_MESSAGE_ITEMS) {
+      throw new Error(
+        `App Server Turn assistant message item 超过 ${MAX_ASSISTANT_MESSAGE_ITEMS} 个。`,
+      );
+    }
+    const nextTotal = active.assistantTextChars - (existing?.text.length ?? 0) + text.length;
+    if (nextTotal > MAX_ASSISTANT_TEXT_CHARS) {
+      throw new Error(
+        `App Server Turn assistant message 总文本超过 ${MAX_ASSISTANT_TEXT_CHARS} 字符。`,
+      );
+    }
+    const message = { phase, text };
+    active.messageItems.set(itemId, message);
+    active.assistantTextChars = nextTotal;
+    return message;
+  }
+
+  private recordTurnMessageItems(active: ActiveTurn, turn: Record<string, unknown>): void {
+    if (!Array.isArray(turn.items)) return;
+    let assistantItems = 0;
+    for (const item of turn.items) {
+      if (!isRecord(item) || item.type !== 'agentMessage') continue;
+      assistantItems += 1;
+      if (assistantItems > MAX_ASSISTANT_MESSAGE_ITEMS) {
+        throw new Error(
+          `App Server Turn assistant message item 超过 ${MAX_ASSISTANT_MESSAGE_ITEMS} 个。`,
+        );
+      }
+      const itemId = protocolId(item.id, 'App Server turn.items agentMessage id');
+      const existing = active.messageItems.get(itemId);
+      const text = typeof item.text === 'string' ? item.text : existing?.text ?? '';
+      this.storeMessageItem(
+        active,
+        itemId,
+        agentMessagePhase(item.phase) ?? existing?.phase,
+        text,
+      );
+    }
+  }
+
   private requestTargetsActiveTurn(params: unknown, active: ActiveTurn): boolean {
     if (!isRecord(params)) return false;
     const threadId = optionalText(params.threadId);
     const turnId = optionalText(params.turnId);
-    return threadId === active.threadId
-      && Boolean(turnId)
-      && (!active.turnId || turnId === active.turnId);
+    return active.turnStartAcknowledged
+      && Boolean(active.turnId)
+      && threadId === active.threadId
+      && turnId === active.turnId;
   }
 
   private validateNotificationTurn(
@@ -718,17 +1009,9 @@ export class CodexAppServerTurnRunner {
   ): void {
     const turnId = optionalText(params.turnId);
     if (!turnId) throw new Error('App Server Turn 通知缺少 turnId。');
-    this.bindTurnId(active, turnId);
-    if (this.settlePendingIsolation(active)) {
-      throw active.pendingIsolationError ?? new Error('App Server Agent 隔离违规。');
-    }
-  }
-
-  private bindTurnId(active: ActiveTurn, turnId: string): void {
-    if (active.turnId && active.turnId !== turnId) {
+    if (!active.turnStartAcknowledged || !active.turnId || active.turnId !== turnId) {
       throw new Error('App Server Turn 收到不匹配的 turnId。');
     }
-    active.turnId = turnId;
   }
 
   private observeCompletion(active: ActiveTurn, turn: Record<string, unknown>): void {
@@ -767,7 +1050,7 @@ export class CodexAppServerTurnRunner {
       threadId: active.threadId,
       turnId: active.turnId,
     }).then(() => undefined).catch((error) => {
-      this.failActive(active, error);
+      this.failProtocol(active, error);
       throw error;
     });
     void active.interruptRequest.catch(() => undefined);
@@ -780,25 +1063,31 @@ export class CodexAppServerTurnRunner {
   ): void {
     if (active.settled) return;
     const error = new Error(`App Server Agent 隔离违规：${detail}`);
-    if (!active.pendingIsolationError) {
-      try { this.options.onIsolationViolation?.({ kind, detail }); } catch { /* host callback isolation */ }
-    }
+    try { this.options.onIsolationViolation?.({ kind, detail }); } catch { /* host callback isolation */ }
     active.interruptRequested = true;
     active.controller.abort(error);
-    if (!active.turnId) {
-      active.pendingIsolationError = error;
-      return;
-    }
     this.maybeSendInterrupt(active);
     this.failActive(active, error);
   }
 
   private settlePendingIsolation(active: ActiveTurn): boolean {
-    const error = active.pendingIsolationError;
-    if (!error || !active.turnId || active.settled) return false;
-    this.maybeSendInterrupt(active);
-    this.failActive(active, error);
+    const turnId = active.turnId;
+    if (!turnId || active.settled) return false;
+    const violation = active.pendingIsolationByTurnId.get(turnId);
+    active.pendingIsolationByTurnId.clear();
+    if (!violation) return false;
+    this.failIsolation(active, violation.kind, violation.detail);
     return true;
+  }
+
+  private failProtocol(active: ActiveTurn, error: unknown): void {
+    if (active.settled) return;
+    const failure = error instanceof Error ? error : new Error(String(error));
+    this.quarantinedAttachmentGeneration = active.attachmentGeneration;
+    active.interruptRequested = true;
+    active.controller.abort(failure);
+    this.maybeSendInterrupt(active);
+    this.failActive(active, failure);
   }
 
   private resolveActive(active: ActiveTurn, result: RunCodexTurnResult): void {

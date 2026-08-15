@@ -38,6 +38,8 @@ Core dependencies are permissively licensed:
 | --- | --- | --- |
 | Electron | MIT | Desktop runtime |
 | React | MIT | Renderer UI |
+| react-markdown | MIT | Safe Agent Markdown rendering |
+| remark-gfm | MIT | GitHub-Flavored Markdown support |
 | TypeScript | Apache-2.0 | Language/tooling |
 | Vite | MIT | Renderer build |
 | xterm.js | MIT | Terminal emulator |
