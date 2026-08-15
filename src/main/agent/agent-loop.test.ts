@@ -272,7 +272,7 @@ describe('GenericOpenAiProvider', () => {
       get: () => profile,
       apiKey: async () => 'request-only-secret',
     } as unknown as ProviderStore;
-    const chunk = new Uint8Array(1024 * 1024);
+    const chunk = new Uint8Array(2 * 1024 * 1024);
     let pulls = 0;
     let cancelled = false;
     const body = new ReadableStream<Uint8Array>({
@@ -293,9 +293,80 @@ describe('GenericOpenAiProvider', () => {
       messages: [{ role: 'user', content: 'test' }],
       tools: [],
       signal: new AbortController().signal,
-    })).rejects.toThrow('Provider response is too large.');
+    })).rejects.toThrow(
+      /Provider JSON 响应已接收 \d+ 字节，超过安全上限 8388608 字节（8 MiB）/,
+    );
     expect(pulls).toBeLessThan(8);
     expect(cancelled).toBe(true);
+  });
+
+  it('rejects an oversized streamed tool call instead of returning truncated arguments', async () => {
+    const profile: ProviderProfile = {
+      id: 'provider-1', name: 'Mock Provider', kind: 'generic-openai-compatible',
+      baseUrl: 'https://provider.example/v1', modelId: 'model-1', apiKeyConfigured: true,
+      isDefault: true, status: 'ready', createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+    const providerStore = {
+      get: () => profile,
+      apiKey: async () => 'request-only-secret',
+    } as unknown as ProviderStore;
+    const argumentsFragment = 'x'.repeat(1024 * 1024 + 1);
+    const wire = `data: ${JSON.stringify({
+      choices: [{
+        delta: {
+          tool_calls: [{
+            index: 0,
+            id: 'call-too-large',
+            type: 'function',
+            function: { name: 'terminal_execute', arguments: argumentsFragment },
+          }],
+        },
+      }],
+    })}\n\n`;
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(wire, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    }));
+    const runtime = new GenericOpenAiProvider(profile.id, providerStore, fetchMock);
+
+    await expect(runtime.complete({
+      messages: [{ role: 'user', content: 'test' }],
+      tools: [],
+      signal: new AbortController().signal,
+    })).rejects.toThrow(
+      /参数长度 1048577 超过安全上限 1048576 字符；未完整的工具调用不会执行/,
+    );
+  });
+
+  it('allows normal SSE protocol overhead beyond the old four MiB aggregate limit', async () => {
+    const profile: ProviderProfile = {
+      id: 'provider-1', name: 'Mock Provider', kind: 'generic-openai-compatible',
+      baseUrl: 'https://provider.example/v1', modelId: 'model-1', apiKeyConfigured: true,
+      isDefault: true, status: 'ready', createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+    const providerStore = {
+      get: () => profile,
+      apiKey: async () => 'request-only-secret',
+    } as unknown as ProviderStore;
+    const paddingLine = `: ${'x'.repeat(1022)}\n`;
+    const wire = paddingLine.repeat(4_200)
+      + 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+      + 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+      + 'data: [DONE]\n\n';
+    expect(new TextEncoder().encode(wire).byteLength).toBeGreaterThan(4 * 1024 * 1024);
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(wire, {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    }));
+    const runtime = new GenericOpenAiProvider(profile.id, providerStore, fetchMock);
+
+    await expect(runtime.complete({
+      messages: [{ role: 'user', content: 'test' }],
+      tools: [],
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({ message: { content: 'ok' } });
   });
 
   it.each(['length', 'content_filter', undefined])(

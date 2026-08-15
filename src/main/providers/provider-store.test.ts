@@ -186,4 +186,27 @@ describe('ProviderStore', () => {
       }),
     );
   });
+
+  it('reports the exact number of normalized model options returned to the UI', async () => {
+    const data = Array.from({ length: 520 }, (_, index) => ({
+      id: `model-${String(index).padStart(3, '0')}`,
+    }));
+    data.push({ id: ' model-001 ' }, { id: '' });
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({ data }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    }));
+    const { store } = fixture(fetchMock);
+
+    const result = await store.discoverModels({
+      baseUrl: 'https://provider.example/v1',
+      apiKey: 'discovery-secret',
+    });
+
+    expect(result.models).toHaveLength(500);
+    expect(new Set(result.models).size).toBe(500);
+    expect(result.models[0]).toBe('model-000');
+    expect(result.models.at(-1)).toBe('model-499');
+    expect(result.message).toBe(`已检索到 ${result.models.length} 个可用模型。`);
+  });
 });

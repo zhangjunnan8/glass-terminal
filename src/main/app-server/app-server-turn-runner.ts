@@ -13,6 +13,9 @@ const MAX_TOOL_CALL_IDS = 256;
 const MAX_PENDING_NOTIFICATIONS = 256;
 const MAX_PENDING_NOTIFICATION_BYTES = 512 * 1024;
 const MAX_PROTOCOL_ID_CHARS = 256;
+// `thread/start` and `thread/resume` use the CLI-facing kebab-case enum.
+// This is distinct from turn/start's structured sandboxPolicy.type enum.
+const THREAD_WORKSPACE_SANDBOX = 'workspace-write';
 
 const DEVELOPER_INSTRUCTIONS = `You are the native Codex agent embedded in AI Terminal.
 Use Codex's built-in shell and file tools inside the Codex-managed workspace for all execution and filesystem work.
@@ -351,7 +354,11 @@ export class CodexAppServerTurnRunner {
     input.signal.addEventListener('abort', onAbort, { once: true });
     active.removeExternalAbort = () => input.signal.removeEventListener('abort', onAbort);
     this.active = active;
-    void this.startTurn(active).catch((error) => this.failProtocol(active, error));
+    // A JSON-RPC request rejection (for example, an option unsupported by the
+    // installed CLI) does not corrupt the connection. Keep it reusable so the
+    // user can retry after changing configuration instead of quarantining every
+    // ordinary `Invalid request` response as a hostile protocol violation.
+    void this.startTurn(active).catch((error) => this.failActive(active, error));
     return completion.promise;
   }
 
@@ -428,7 +435,7 @@ export class CodexAppServerTurnRunner {
       cwd: this.workspaceRoot,
       runtimeWorkspaceRoots: [this.workspaceRoot],
       approvalPolicy: 'never',
-      sandbox: 'workspaceWrite',
+      sandbox: THREAD_WORKSPACE_SANDBOX,
       developerInstructions: DEVELOPER_INSTRUCTIONS,
       dynamicTools: active.input.terminalContextAccess
         ? [CODEX_TERMINAL_READ_DYNAMIC_TOOL]
@@ -446,7 +453,7 @@ export class CodexAppServerTurnRunner {
       cwd: this.workspaceRoot,
       runtimeWorkspaceRoots: [this.workspaceRoot],
       approvalPolicy: 'never',
-      sandbox: 'workspaceWrite',
+      sandbox: THREAD_WORKSPACE_SANDBOX,
       developerInstructions: DEVELOPER_INSTRUCTIONS,
       dynamicTools: active.input.terminalContextAccess
         ? [CODEX_TERMINAL_READ_DYNAMIC_TOOL]
@@ -924,7 +931,9 @@ export class CodexAppServerTurnRunner {
       threadId: active.threadId,
       turnId: active.turnId,
     }).then(() => undefined).catch((error) => {
-      this.failProtocol(active, error);
+      // A rejected interrupt is an RPC/application error, not evidence that
+      // subsequent messages on this connection are structurally unsafe.
+      this.failActive(active, error);
       throw error;
     });
     void active.interruptRequest.catch(() => undefined);

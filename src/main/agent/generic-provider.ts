@@ -6,8 +6,15 @@ import type {
   AgentProviderRuntime,
 } from './agent-loop';
 
-const MAX_PROVIDER_RESPONSE_BYTES = 4 * 1024 * 1024;
+const MAX_PROVIDER_JSON_RESPONSE_BYTES = 8 * 1024 * 1024;
+const MAX_PROVIDER_STREAM_RESPONSE_BYTES = 32 * 1024 * 1024;
+const MAX_PROVIDER_STREAM_EVENT_BYTES = 2 * 1024 * 1024;
+const MAX_PROVIDER_STREAM_EVENT_LINES = 4_096;
 const MAX_ASSISTANT_TEXT_CHARS = 100_000;
+const MAX_TOOL_CALLS = 64;
+const MAX_TOOL_CALL_NAME_CHARS = 256;
+const MAX_TOOL_CALL_ARGUMENT_CHARS = 1024 * 1024;
+const MAX_TOTAL_TOOL_CALL_ARGUMENT_CHARS = 2 * 1024 * 1024;
 const SAFE_STREAM_FINISH_REASONS = new Set(['stop', 'tool_calls']);
 
 interface OpenAiToolCall {
@@ -45,6 +52,32 @@ interface StreamedToolCall {
   type?: string;
   name: string;
   arguments: string;
+}
+
+function sizeLimitError(
+  responseKind: '流式' | 'JSON',
+  actualBytes: number,
+  limitBytes: number,
+  declared = false,
+): Error {
+  const actualLabel = declared ? '声明长度' : '已接收';
+  return new Error(
+    `Provider ${responseKind} 响应${actualLabel} ${actualBytes} 字节，`
+    + `超过安全上限 ${limitBytes} 字节`
+    + `（${limitBytes / 1024 / 1024} MiB）。已停止读取以避免内存占用过高；`
+    + '任何未完整接收的工具调用都不会执行。',
+  );
+}
+
+function textLimitError(actualChars: number): Error {
+  return new Error(
+    `Provider 助手文本为 ${actualChars} 字符，`
+    + `超过安全上限 ${MAX_ASSISTANT_TEXT_CHARS} 字符。`,
+  );
+}
+
+function toolCallLimitError(detail: string): Error {
+  return new Error(`Provider 工具调用${detail}；未完整的工具调用不会执行。`);
 }
 
 function openAiMessage(message: AgentMessage): Record<string, unknown> {
@@ -89,7 +122,12 @@ function completionFromMessage(
   if (
     typeof message.content === 'string'
     && message.content.length > MAX_ASSISTANT_TEXT_CHARS
-  ) throw new Error('Provider assistant message is too large.');
+  ) throw textLimitError(message.content.length);
+  const rawToolCalls = message.tool_calls ?? [];
+  if (rawToolCalls.length > MAX_TOOL_CALLS) {
+    throw toolCallLimitError(`数量 ${rawToolCalls.length} 超过安全上限 ${MAX_TOOL_CALLS}`);
+  }
+  let totalArgumentChars = 0;
   return {
     message: {
       role: 'assistant',
@@ -98,10 +136,32 @@ function completionFromMessage(
         if (call.type !== 'function' || !call.function?.name) {
           throw new Error('Provider returned an invalid tool call.');
         }
+        if (call.function.name.length > MAX_TOOL_CALL_NAME_CHARS) {
+          throw toolCallLimitError(
+            ` #${index + 1} 名称长度超过 ${MAX_TOOL_CALL_NAME_CHARS} 字符`,
+          );
+        }
+        const argumentsText = call.function.arguments ?? '{}';
+        if (typeof argumentsText !== 'string') {
+          throw new Error('Provider returned invalid tool-call arguments.');
+        }
+        if (argumentsText.length > MAX_TOOL_CALL_ARGUMENT_CHARS) {
+          throw toolCallLimitError(
+            ` #${index + 1} 参数长度 ${argumentsText.length} 超过安全上限 `
+            + `${MAX_TOOL_CALL_ARGUMENT_CHARS} 字符`,
+          );
+        }
+        totalArgumentChars += argumentsText.length;
+        if (totalArgumentChars > MAX_TOTAL_TOOL_CALL_ARGUMENT_CHARS) {
+          throw toolCallLimitError(
+            `参数总长度 ${totalArgumentChars} 超过安全上限 `
+            + `${MAX_TOTAL_TOOL_CALL_ARGUMENT_CHARS} 字符`,
+          );
+        }
         return {
           id: call.id ?? `tool-${index}`,
           name: call.function.name,
-          arguments: call.function.arguments ?? '{}',
+          arguments: argumentsText,
         };
       }),
     },
@@ -117,6 +177,7 @@ async function readEventStream(
   const decoder = new TextDecoder();
   const toolCalls = new Map<number, StreamedToolCall>();
   const dataLines: string[] = [];
+  let dataLinesBytes = 0;
   let buffered = '';
   let content = '';
   let receivedBytes = 0;
@@ -126,9 +187,11 @@ async function readEventStream(
   const dispatch = () => {
     if (dataLines.length === 0 || done) {
       dataLines.length = 0;
+      dataLinesBytes = 0;
       return;
     }
     const payload = dataLines.splice(0).join('\n').trim();
+    dataLinesBytes = 0;
     if (!payload) return;
     if (payload === '[DONE]') {
       done = true;
@@ -158,7 +221,7 @@ async function readEventStream(
     if (!delta) return;
     if (typeof delta.content === 'string' && delta.content) {
       if (content.length + delta.content.length > MAX_ASSISTANT_TEXT_CHARS) {
-        throw new Error('Provider assistant message is too large.');
+        throw textLimitError(content.length + delta.content.length);
       }
       content += delta.content;
       onTextDelta?.(delta.content);
@@ -168,12 +231,42 @@ async function readEventStream(
         throw new Error('Provider streamed an invalid tool-call index.');
       }
       const index = streamed.index!;
-      const current = toolCalls.get(index) ?? { name: '', arguments: '' };
+      let current = toolCalls.get(index);
+      if (!current) {
+        if (toolCalls.size >= MAX_TOOL_CALLS) {
+          throw toolCallLimitError(`数量超过安全上限 ${MAX_TOOL_CALLS}`);
+        }
+        current = { name: '', arguments: '' };
+      }
       if (streamed.id) current.id = streamed.id;
       if (streamed.type) current.type = streamed.type;
-      if (typeof streamed.function?.name === 'string') current.name += streamed.function.name;
+      if (typeof streamed.function?.name === 'string') {
+        const nextName = current.name + streamed.function.name;
+        if (nextName.length > MAX_TOOL_CALL_NAME_CHARS) {
+          throw toolCallLimitError(
+            ` #${index + 1} 名称长度超过 ${MAX_TOOL_CALL_NAME_CHARS} 字符`,
+          );
+        }
+        current.name = nextName;
+      }
       if (typeof streamed.function?.arguments === 'string') {
-        current.arguments += streamed.function.arguments;
+        const nextArguments = current.arguments + streamed.function.arguments;
+        if (nextArguments.length > MAX_TOOL_CALL_ARGUMENT_CHARS) {
+          throw toolCallLimitError(
+            ` #${index + 1} 参数长度 ${nextArguments.length} 超过安全上限 `
+            + `${MAX_TOOL_CALL_ARGUMENT_CHARS} 字符`,
+          );
+        }
+        const otherArgumentChars = [...toolCalls.entries()].reduce(
+          (total, [otherIndex, call]) => total + (otherIndex === index ? 0 : call.arguments.length),
+          0,
+        );
+        if (otherArgumentChars + nextArguments.length > MAX_TOTAL_TOOL_CALL_ARGUMENT_CHARS) {
+          throw toolCallLimitError(
+            `参数总长度超过安全上限 ${MAX_TOTAL_TOOL_CALL_ARGUMENT_CHARS} 字符`,
+          );
+        }
+        current.arguments = nextArguments;
       }
       toolCalls.set(index, current);
     }
@@ -186,8 +279,25 @@ async function readEventStream(
       return;
     }
     if (line.startsWith(':')) return;
-    if (line === 'data') dataLines.push('');
-    else if (line.startsWith('data:')) dataLines.push(line.slice(5).replace(/^ /, ''));
+    let data: string | undefined;
+    if (line === 'data') data = '';
+    else if (line.startsWith('data:')) data = line.slice(5).replace(/^ /, '');
+    if (data !== undefined) {
+      if (dataLines.length >= MAX_PROVIDER_STREAM_EVENT_LINES) {
+        throw new Error(
+          `Provider 单个流式事件已接收 ${dataLines.length + 1} 行，`
+          + `超过安全上限 ${MAX_PROVIDER_STREAM_EVENT_LINES} 行，`
+          + '已停止读取以避免内存占用过高。',
+        );
+      }
+      dataLinesBytes += Buffer.byteLength(data, 'utf8');
+      if (dataLinesBytes > MAX_PROVIDER_STREAM_EVENT_BYTES) {
+        throw sizeLimitError(
+          '流式', dataLinesBytes, MAX_PROVIDER_STREAM_EVENT_BYTES,
+        );
+      }
+      dataLines.push(data);
+    }
   };
 
   try {
@@ -195,8 +305,10 @@ async function readEventStream(
       const chunk = await reader.read();
       if (chunk.done) break;
       receivedBytes += chunk.value.byteLength;
-      if (receivedBytes > MAX_PROVIDER_RESPONSE_BYTES) {
-        throw new Error('Provider response is too large.');
+      if (receivedBytes > MAX_PROVIDER_STREAM_RESPONSE_BYTES) {
+        throw sizeLimitError(
+          '流式', receivedBytes, MAX_PROVIDER_STREAM_RESPONSE_BYTES,
+        );
       }
       buffered += decoder.decode(chunk.value, { stream: true });
       let newline = buffered.indexOf('\n');
@@ -204,6 +316,10 @@ async function readEventStream(
         acceptLine(buffered.slice(0, newline));
         buffered = buffered.slice(newline + 1);
         newline = buffered.indexOf('\n');
+      }
+      const bufferedBytes = Buffer.byteLength(buffered, 'utf8');
+      if (bufferedBytes > MAX_PROVIDER_STREAM_EVENT_BYTES) {
+        throw sizeLimitError('流式', bufferedBytes, MAX_PROVIDER_STREAM_EVENT_BYTES);
       }
     }
     buffered += decoder.decode();
@@ -249,8 +365,8 @@ async function readBoundedResponseText(response: Response): Promise<string> {
       const chunk = await reader.read();
       if (chunk.done) break;
       receivedBytes += chunk.value.byteLength;
-      if (receivedBytes > MAX_PROVIDER_RESPONSE_BYTES) {
-        throw new Error('Provider response is too large.');
+      if (receivedBytes > MAX_PROVIDER_JSON_RESPONSE_BYTES) {
+        throw sizeLimitError('JSON', receivedBytes, MAX_PROVIDER_JSON_RESPONSE_BYTES);
       }
       text += decoder.decode(chunk.value, { stream: true });
     }
@@ -294,10 +410,16 @@ export class GenericOpenAiProvider implements AgentProviderRuntime {
       }),
     });
     if (!response.ok) throw new Error(`Provider completion failed with HTTP ${response.status}.`);
-    const declaredLength = Number(response.headers.get('content-length') ?? 0);
-    if (declaredLength > MAX_PROVIDER_RESPONSE_BYTES) throw new Error('Provider response is too large.');
     const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
-    if (contentType.includes('text/event-stream')) {
+    const streamed = contentType.includes('text/event-stream');
+    const responseLimit = streamed
+      ? MAX_PROVIDER_STREAM_RESPONSE_BYTES
+      : MAX_PROVIDER_JSON_RESPONSE_BYTES;
+    const declaredLength = Number(response.headers.get('content-length') ?? 0);
+    if (Number.isFinite(declaredLength) && declaredLength > responseLimit) {
+      throw sizeLimitError(streamed ? '流式' : 'JSON', declaredLength, responseLimit, true);
+    }
+    if (streamed) {
       return readEventStream(response, request.onTextDelta);
     }
     const text = await readBoundedResponseText(response);

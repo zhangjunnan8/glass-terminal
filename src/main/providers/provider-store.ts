@@ -90,8 +90,11 @@ function modelIdsFromPayload(payload: unknown): string[] {
   const models = [...new Set(data.flatMap((item) => {
     if (!item || typeof item !== 'object') return [];
     const id = (item as { id?: unknown }).id;
-    return typeof id === 'string' && id.trim() && id.length <= 256 ? [id] : [];
-  }))].slice(0, MAX_DISCOVERED_MODELS).sort((left, right) => left.localeCompare(right));
+    const normalizedId = typeof id === 'string' ? id.trim() : '';
+    return normalizedId && normalizedId.length <= 256 ? [normalizedId] : [];
+  }))]
+    .sort((left, right) => left.localeCompare(right))
+    .slice(0, MAX_DISCOVERED_MODELS);
   if (models.length === 0) throw new Error('Provider 没有返回可用模型；你仍可手动输入模型 ID。');
   return models;
 }
@@ -299,6 +302,8 @@ export class ProviderStore {
       const models = modelIdsFromPayload(await readBoundedJson(response));
       return {
         models,
+        // Keep the user-facing count derived from the exact bounded array sent
+        // to the renderer; it must never describe hidden or discarded entries.
         message: `已检索到 ${models.length} 个可用模型。`,
       };
     } catch (error) {

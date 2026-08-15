@@ -142,7 +142,7 @@ describe('CodexAppServerTurnRunner native mode', () => {
       cwd: workspaceRoot,
       runtimeWorkspaceRoots: [workspaceRoot],
       approvalPolicy: 'never',
-      sandbox: 'workspaceWrite',
+      sandbox: 'workspace-write',
       dynamicTools: CODEX_TERMINAL_DYNAMIC_TOOLS,
       serviceName: 'ai_terminal',
     });
@@ -254,7 +254,7 @@ describe('CodexAppServerTurnRunner native mode', () => {
     const resume = await waitForRequest(connection, 'thread/resume');
     expect(resume.params).toMatchObject({
       threadId: 'thread-existing', approvalPolicy: 'never',
-      sandbox: 'workspaceWrite', dynamicTools: [],
+      sandbox: 'workspace-write', dynamicTools: [],
     });
     await waitForRequest(connection, 'turn/start');
     completeTurn(connection, 'thread-existing');
@@ -277,5 +277,38 @@ describe('CodexAppServerTurnRunner native mode', () => {
     await waitForRequest(connection, 'turn/interrupt');
     completeTurn(connection, 'thread-new', 'turn-1', 'Hello', 'interrupted');
     await expect(resultPromise).resolves.toMatchObject({ status: 'interrupted' });
+  });
+
+  it('keeps the connection reusable after an ordinary JSON-RPC request rejection', async () => {
+    const connection = new FakeConnection();
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));
+    let threadStarts = 0;
+    connection.responder = (method, params) => {
+      if (method === 'thread/start') {
+        threadStarts += 1;
+        if (threadStarts === 1) {
+          throw new Error(
+            'Codex App Server：Invalid request: unknown variant `workspaceWrite`',
+          );
+        }
+        return { thread: { id: 'thread-retry' } };
+      }
+      if (method === 'turn/start') {
+        return { turn: { id: 'turn-1', status: 'inProgress', items: [] } };
+      }
+      if (method === 'turn/interrupt') return {};
+      throw new Error(`Unexpected request: ${method} ${JSON.stringify(params)}`);
+    };
+    runner.attach(connection);
+
+    await expect(runner.run(createInput())).rejects.toThrow('Invalid request');
+
+    const retried = runner.run(createInput());
+    await waitForRequest(connection, 'turn/start');
+    completeTurn(connection, 'thread-retry');
+    await expect(retried).resolves.toMatchObject({
+      threadId: 'thread-retry', status: 'completed',
+    });
+    expect(threadStarts).toBe(2);
   });
 });
