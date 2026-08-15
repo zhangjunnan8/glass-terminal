@@ -11,6 +11,11 @@ import { PRODUCT_NAME } from '../shared/product';
 import type { SessionRecord } from '../shared/session';
 import type { ProviderInput, ProviderProfile } from '../shared/provider';
 import {
+  PROVIDER_TEMPLATES,
+  providerTemplateForBaseUrl,
+} from '../shared/provider-templates';
+import type { ProviderTemplate } from '../shared/provider-templates';
+import {
   CODEX_APP_SERVER_AGENT_BACKEND,
   CODEX_APP_SERVER_AGENT_POLICY_VERSION,
 } from '../shared/agent';
@@ -33,6 +38,7 @@ import {
   scrollAgentOutputToBottom,
 } from './agent-scroll';
 import { clampAgentPanelWidth, shouldSubmitAgentComposer } from './agent-ui';
+import { mergeProviderModelOptions } from './provider-ui';
 import {
   agentStateLabel,
   authMethodLabel,
@@ -66,6 +72,11 @@ interface CodexUiMessage {
 
 interface HostCredentialMessage extends CodexUiMessage {
   hostId: string;
+}
+
+interface ProviderDiscoveryMessage {
+  tone: 'loading' | 'success' | 'error';
+  text: string;
 }
 
 interface TrustChallenge {
@@ -148,6 +159,12 @@ export function App() {
   const [providerSettingsSection, setProviderSettingsSection] = useState<'codex' | 'generic'>('codex');
   const [editingProvider, setEditingProvider] = useState<ProviderProfile | null>(null);
   const [providerMessage, setProviderMessage] = useState<string | null>(null);
+  const [providerDraftRevision, setProviderDraftRevision] = useState(0);
+  const [providerTemplateId, setProviderTemplateId] = useState<ProviderTemplate['id']>('openai');
+  const [providerModelOptions, setProviderModelOptions] = useState<string[]>(
+    () => [...(PROVIDER_TEMPLATES[0]?.suggestedModels ?? [])],
+  );
+  const [providerDiscoveryMessage, setProviderDiscoveryMessage] = useState<ProviderDiscoveryMessage | null>(null);
   const [codexAppServer, setCodexAppServer] = useState<CodexAppServerSnapshot | null>(null);
   const [codexMessage, setCodexMessage] = useState<CodexUiMessage | null>(null);
   const [codexActionPending, setCodexActionPending] = useState(false);
@@ -157,9 +174,16 @@ export function App() {
   const [codexAgentBoundaryAcknowledged, setCodexAgentBoundaryAcknowledged] = useState(false);
   const codexActionLock = useRef(false);
   const providerModalRef = useRef<HTMLDivElement>(null);
+  const providerNameInputRef = useRef<HTMLInputElement>(null);
+  const providerBaseUrlInputRef = useRef<HTMLInputElement>(null);
+  const providerModelInputRef = useRef<HTMLInputElement>(null);
+  const providerApiKeyInputRef = useRef<HTMLInputElement>(null);
+  const providerDiscoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const providerDiscoveryGenerationRef = useRef(0);
   const codexAgentConfirmationRef = useRef<HTMLDivElement>(null);
   const agentBodyRef = useRef<HTMLDivElement>(null);
   const agentStickToBottomRef = useRef(true);
+  const agentResizeCleanupRef = useRef<(() => void) | null>(null);
   const sshConnectionLock = useRef(false);
   const [agentStates, setAgentStates] = useState<Record<string, AgentSessionView>>({});
   const [agentBackendChoices, setAgentBackendChoices] = useState<Record<string, AgentBackendKind>>({});
@@ -286,6 +310,32 @@ export function App() {
   }, [providerModalOpen, codexAgentEnableChallenge]);
 
   useEffect(() => {
+    if (!providerModalOpen || providerSettingsSection !== 'generic') {
+      cancelPendingProviderDiscovery();
+      return undefined;
+    }
+    const template = editingProvider
+      ? providerTemplateForBaseUrl(editingProvider.baseUrl)
+      : PROVIDER_TEMPLATES[0]!;
+    setProviderTemplateId(template.id);
+    setProviderModelOptions(mergeProviderModelOptions(
+      template.suggestedModels,
+      editingProvider ? [editingProvider.modelId] : undefined,
+    ));
+    setProviderDiscoveryMessage(null);
+    if (editingProvider?.apiKeyConfigured) scheduleProviderModelDiscovery(250);
+    return cancelPendingProviderDiscovery;
+  }, [
+    providerModalOpen,
+    providerSettingsSection,
+    editingProvider?.id,
+    editingProvider?.updatedAt,
+    providerDraftRevision,
+  ]);
+
+  useEffect(() => cancelPendingProviderDiscovery, []);
+
+  useEffect(() => {
     if (codexAgentEnableChallenge) codexAgentConfirmationRef.current?.focus();
   }, [codexAgentEnableChallenge]);
 
@@ -328,6 +378,9 @@ export function App() {
     })
     : sessions;
   const defaultProvider = providers.find((provider) => provider.isDefault) ?? null;
+  const selectedProviderTemplate = PROVIDER_TEMPLATES.find((template) => (
+    template.id === providerTemplateId
+  )) ?? PROVIDER_TEMPLATES[PROVIDER_TEMPLATES.length - 1]!;
   const selectedCodexModel = codexAppServer?.models.find((model) => (
     model.id === codexModelId
   ));
@@ -411,6 +464,11 @@ export function App() {
     return () => window.removeEventListener('resize', clampForViewport);
   }, []);
 
+  useEffect(() => () => {
+    agentResizeCleanupRef.current?.();
+    document.body.classList.remove('agent-panel-resizing');
+  }, []);
+
   function handleAgentBodyScroll() {
     const element = agentBodyRef.current;
     if (!element) return;
@@ -430,22 +488,41 @@ export function App() {
   function beginAgentPanelResize(event: ReactPointerEvent<HTMLDivElement>) {
     if (event.button !== 0) return;
     event.preventDefault();
+    agentResizeCleanupRef.current?.();
+    const separator = event.currentTarget;
+    const pointerId = event.pointerId;
     const startX = event.clientX;
     const startWidth = agentPanelWidth;
     const resize = (moveEvent: PointerEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
       const requested = startWidth + startX - moveEvent.clientX;
       setAgentPanelWidth(clampAgentPanelWidth(requested, window.innerWidth));
     };
+    let stopped = false;
     const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      agentResizeCleanupRef.current = null;
       document.body.classList.remove('agent-panel-resizing');
       window.removeEventListener('pointermove', resize);
       window.removeEventListener('pointerup', stop);
       window.removeEventListener('pointercancel', stop);
+      window.removeEventListener('blur', stop);
+      separator.removeEventListener('lostpointercapture', stop);
+      if (separator.hasPointerCapture?.(pointerId)) separator.releasePointerCapture(pointerId);
     };
+    agentResizeCleanupRef.current = stop;
     document.body.classList.add('agent-panel-resizing');
+    try {
+      separator.setPointerCapture(pointerId);
+    } catch {
+      // Window-level listeners remain a safe fallback for synthetic/older pointer implementations.
+    }
+    separator.addEventListener('lostpointercapture', stop, { once: true });
     window.addEventListener('pointermove', resize);
     window.addEventListener('pointerup', stop, { once: true });
     window.addEventListener('pointercancel', stop, { once: true });
+    window.addEventListener('blur', stop, { once: true });
   }
 
   function handleAgentComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
@@ -598,16 +675,21 @@ export function App() {
 
   async function saveProvider(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
-    const apiKeyInput = event.currentTarget.elements.namedItem('apiKey') as HTMLInputElement;
+    cancelPendingProviderDiscovery();
+    const form = event.currentTarget;
+    const nameInput = form.elements.namedItem('name') as HTMLInputElement;
+    const baseUrlInput = form.elements.namedItem('baseUrl') as HTMLInputElement;
+    const modelInput = form.elements.namedItem('modelId') as HTMLInputElement;
+    const apiKeyInput = form.elements.namedItem('apiKey') as HTMLInputElement;
+    const makeDefaultInput = form.elements.namedItem('makeDefault') as HTMLInputElement;
     const input: ProviderInput = {
       id: editingProvider?.id,
-      name: String(data.get('name') ?? ''),
-      baseUrl: String(data.get('baseUrl') ?? ''),
-      modelId: String(data.get('modelId') ?? ''),
-      apiKey: String(data.get('apiKey') ?? '') || undefined,
-      makeDefault: data.get('makeDefault') === 'on',
+      name: nameInput.value,
+      baseUrl: baseUrlInput.value,
+      modelId: modelInput.value,
+      makeDefault: makeDefaultInput.checked,
     };
+    if (apiKeyInput.value) input.apiKey = apiKeyInput.value;
     apiKeyInput.value = '';
     try {
       const saved = await window.aiTerminal.providers.save(input);
@@ -616,7 +698,123 @@ export function App() {
       setProviderMessage('已保存。请先测试连接，再使用此 Provider。');
     } catch (error) {
       setProviderMessage(errorMessage(error));
+    } finally {
+      delete input.apiKey;
     }
+  }
+
+  function cancelPendingProviderDiscovery() {
+    providerDiscoveryGenerationRef.current += 1;
+    if (providerDiscoveryTimerRef.current) {
+      clearTimeout(providerDiscoveryTimerRef.current);
+      providerDiscoveryTimerRef.current = null;
+    }
+  }
+
+  function scheduleProviderModelDiscovery(delay = 650) {
+    if (providerDiscoveryTimerRef.current) clearTimeout(providerDiscoveryTimerRef.current);
+    const generation = ++providerDiscoveryGenerationRef.current;
+    const hasTypedKey = Boolean(providerApiKeyInputRef.current?.value.trim());
+    const canUseSavedKey = Boolean(editingProvider?.apiKeyConfigured);
+    if (!hasTypedKey && !canUseSavedKey) {
+      providerDiscoveryTimerRef.current = null;
+      setProviderDiscoveryMessage(delay === 0
+        ? { tone: 'error', text: '请先输入 API Key。' }
+        : null);
+      return;
+    }
+    setProviderDiscoveryMessage({
+      tone: 'loading',
+      text: delay > 0 ? '等待输入完成后自动检索模型…' : '正在检索可用模型…',
+    });
+    providerDiscoveryTimerRef.current = setTimeout(() => {
+      providerDiscoveryTimerRef.current = null;
+      void discoverProviderModels(generation);
+    }, delay);
+  }
+
+  async function discoverProviderModels(generation = ++providerDiscoveryGenerationRef.current) {
+    const baseUrl = providerBaseUrlInputRef.current?.value.trim() ?? '';
+    const canUseSavedKey = Boolean(editingProvider?.apiKeyConfigured);
+    const request: {
+      baseUrl: string;
+      apiKey?: string;
+      providerId?: string;
+    } = { baseUrl };
+    if (providerApiKeyInputRef.current?.value.trim()) {
+      request.apiKey = providerApiKeyInputRef.current.value.trim();
+    } else if (canUseSavedKey && editingProvider) {
+      request.providerId = editingProvider.id;
+    }
+    if (!request.apiKey && !request.providerId) {
+      setProviderDiscoveryMessage({ tone: 'error', text: '请先输入 API Key。' });
+      return;
+    }
+    setProviderDiscoveryMessage({ tone: 'loading', text: '正在检索可用模型…' });
+    try {
+      const result = await window.aiTerminal.providers.discoverModels(request);
+      if (providerDiscoveryGenerationRef.current !== generation) return;
+      const template = providerTemplateForBaseUrl(baseUrl);
+      const currentModel = providerModelInputRef.current?.value ?? '';
+      const models = mergeProviderModelOptions(
+        result.models,
+        template.suggestedModels,
+        currentModel ? [currentModel] : undefined,
+      );
+      setProviderModelOptions(models);
+      if (providerModelInputRef.current && !providerModelInputRef.current.value.trim()) {
+        providerModelInputRef.current.value = models[0] ?? '';
+      }
+      setProviderDiscoveryMessage({ tone: 'success', text: result.message });
+    } catch (error) {
+      if (providerDiscoveryGenerationRef.current !== generation) return;
+      setProviderDiscoveryMessage({
+        tone: 'error',
+        text: `${errorMessage(error)} 你仍可手动输入模型 ID。`,
+      });
+    } finally {
+      delete request.apiKey;
+    }
+  }
+
+  function selectProviderTemplate(templateId: ProviderTemplate['id']) {
+    cancelPendingProviderDiscovery();
+    const template = PROVIDER_TEMPLATES.find((candidate) => candidate.id === templateId)
+      ?? PROVIDER_TEMPLATES[PROVIDER_TEMPLATES.length - 1]!;
+    setProviderTemplateId(template.id);
+    setProviderDiscoveryMessage(null);
+    setProviderModelOptions([...template.suggestedModels]);
+    if (providerNameInputRef.current) providerNameInputRef.current.value = template.name;
+    if (providerBaseUrlInputRef.current) providerBaseUrlInputRef.current.value = template.baseUrl;
+    if (providerModelInputRef.current) {
+      providerModelInputRef.current.value = template.suggestedModels[0] ?? '';
+    }
+    scheduleProviderModelDiscovery(250);
+  }
+
+  function editProvider(provider: ProviderProfile) {
+    cancelPendingProviderDiscovery();
+    const template = providerTemplateForBaseUrl(provider.baseUrl);
+    setProviderTemplateId(template.id);
+    setProviderModelOptions(mergeProviderModelOptions(
+      template.suggestedModels,
+      [provider.modelId],
+    ));
+    setProviderDiscoveryMessage(null);
+    setEditingProvider(provider);
+    setProviderDraftRevision((current) => current + 1);
+    setProviderMessage(null);
+  }
+
+  function addProvider() {
+    cancelPendingProviderDiscovery();
+    const template = PROVIDER_TEMPLATES[0]!;
+    setProviderTemplateId(template.id);
+    setProviderModelOptions([...template.suggestedModels]);
+    setProviderDiscoveryMessage(null);
+    setEditingProvider(null);
+    setProviderDraftRevision((current) => current + 1);
+    setProviderMessage(null);
   }
 
   async function testProvider(providerId: string) {
@@ -2160,33 +2358,97 @@ export function App() {
                       <button
                         className={editingProvider?.id === provider.id ? 'active' : ''}
                         key={provider.id}
-                        onClick={() => {
-                          setEditingProvider(provider);
-                          setProviderMessage(null);
-                        }}
+                        onClick={() => editProvider(provider)}
                       >
                         <strong>{provider.name}</strong>
                         <small>{provider.modelId}</small>
                         <span className={`provider-status ${provider.status}`}>{providerStatusLabel(provider.status)}</span>
                       </button>
                     ))}
-                    <button className="add-provider" onClick={() => {
-                      setEditingProvider(null);
-                      setProviderMessage(null);
-                    }}>＋ 添加 Provider</button>
+                    <button className="add-provider" onClick={addProvider}>＋ 添加 Provider</button>
                   </div>
-                  <form className="provider-form" onSubmit={(event) => void saveProvider(event)}>
-                    <label>名称<input name="name" required defaultValue={editingProvider?.name ?? 'OpenAI 兼容 API'} key={`name-${editingProvider?.id ?? 'new'}`} /></label>
-                    <label>基础 URL<input name="baseUrl" type="url" required placeholder="https://api.example.com/v1" defaultValue={editingProvider?.baseUrl ?? ''} key={`url-${editingProvider?.id ?? 'new'}`} /></label>
-                    <label>模型 ID<input name="modelId" required placeholder="model-id" defaultValue={editingProvider?.modelId ?? ''} key={`model-${editingProvider?.id ?? 'new'}`} /></label>
+                  <form
+                    className="provider-form"
+                    key={`provider-${editingProvider?.id ?? 'new'}-${providerDraftRevision}`}
+                    onSubmit={(event) => void saveProvider(event)}
+                  >
+                    <label>
+                      API 模板
+                      <select
+                        name="template"
+                        value={providerTemplateId}
+                        onChange={(event) => selectProviderTemplate(
+                          event.currentTarget.value as ProviderTemplate['id'],
+                        )}
+                      >
+                        {PROVIDER_TEMPLATES.map((template) => (
+                          <option value={template.id} key={template.id}>{template.name}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      名称
+                      <input
+                        ref={providerNameInputRef}
+                        name="name"
+                        required
+                        defaultValue={editingProvider?.name ?? selectedProviderTemplate.name}
+                      />
+                    </label>
+                    <label>
+                      基础 URL
+                      <input
+                        ref={providerBaseUrlInputRef}
+                        name="baseUrl"
+                        type="url"
+                        required
+                        readOnly={!selectedProviderTemplate.custom}
+                        aria-describedby="provider-base-url-note"
+                        placeholder="https://api.example.com/v1"
+                        defaultValue={editingProvider?.baseUrl ?? selectedProviderTemplate.baseUrl}
+                        onInput={() => scheduleProviderModelDiscovery()}
+                      />
+                    </label>
+                    <small id="provider-base-url-note" className="provider-field-note">
+                      {selectedProviderTemplate.custom
+                        ? '自定义模板可编辑 Base URL；不要在 URL 中放入 API Key。'
+                        : '内置模板已锁定官方 Base URL，只需输入 API Key。'}
+                    </small>
+                    <label>
+                      模型 ID
+                      <div className="provider-model-field">
+                        <input
+                          ref={providerModelInputRef}
+                          name="modelId"
+                          list="provider-model-options"
+                          required
+                          placeholder="从检索结果选择或手动输入"
+                          defaultValue={editingProvider?.modelId
+                            ?? selectedProviderTemplate.suggestedModels[0]
+                            ?? ''}
+                        />
+                        <button
+                          type="button"
+                          disabled={providerDiscoveryMessage?.tone === 'loading'}
+                          onClick={() => scheduleProviderModelDiscovery(0)}
+                        >检索模型</button>
+                      </div>
+                      <datalist id="provider-model-options">
+                        {providerModelOptions.map((model) => (
+                          <option value={model} key={model} />
+                        ))}
+                      </datalist>
+                    </label>
                     <label>
                       API Key
                       <input
+                        ref={providerApiKeyInputRef}
                         name="apiKey"
                         type="password"
                         required={!editingProvider?.apiKeyConfigured}
                         autoComplete="new-password"
                         placeholder={editingProvider?.apiKeyConfigured ? '已保存到 Windows 凭据管理器' : '必填'}
+                        onInput={() => scheduleProviderModelDiscovery()}
                       />
                     </label>
                     <label className="check-label">
@@ -2194,6 +2456,12 @@ export function App() {
                       设为默认 Provider
                     </label>
                     <p className="secure-note">API Key 作为 Windows 通用凭据保存；Provider JSON 只保存凭据引用。</p>
+                    {providerDiscoveryMessage && (
+                      <div
+                        className={`provider-discovery-message ${providerDiscoveryMessage.tone}`}
+                        role="status"
+                      >{providerDiscoveryMessage.text}</div>
+                    )}
                     {providerMessage && <div className="provider-message">{providerMessage}</div>}
                     <div className="provider-actions">
                       {editingProvider && (

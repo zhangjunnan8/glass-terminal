@@ -104,6 +104,7 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       remove: vi.fn(),
       setDefault: vi.fn(),
       testConnection: vi.fn(),
+      discoverModels: vi.fn(),
     },
     codexAppServer: {
       getState: vi.fn(() => new Promise<CodexAppServerSnapshot>(() => undefined)),
@@ -118,6 +119,7 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       refresh: vi.fn(),
       saveSelection: vi.fn(),
       setTerminalAgentEnabled: vi.fn(),
+      setTerminalContextAccess: vi.fn(),
       onStateChanged: vi.fn(() => () => undefined),
     },
     agent: {

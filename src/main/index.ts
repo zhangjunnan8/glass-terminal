@@ -12,7 +12,7 @@ import type { RenameSessionRequest, UpgradeSessionRequest } from '../shared/sess
 import { SFTP_CHANNELS } from '../shared/sftp';
 import type { DownloadSelectionRequest, UploadSelectionRequest } from '../shared/sftp';
 import { PROVIDER_CHANNELS } from '../shared/provider';
-import type { ProviderInput } from '../shared/provider';
+import type { ProviderInput, ProviderModelDiscoveryInput } from '../shared/provider';
 import { AGENT_CHANNELS } from '../shared/agent';
 import type {
   ConfirmShellReadyRequest,
@@ -307,6 +307,10 @@ handleTrusted(PROVIDER_CHANNELS.setDefault, (_event, providerId: string) => (
 handleTrusted(PROVIDER_CHANNELS.testConnection, (_event, providerId: string) => (
   requireProviderStore().testConnection(providerId)
 ));
+handleTrusted(PROVIDER_CHANNELS.discoverModels, (
+  _event,
+  input: ProviderModelDiscoveryInput,
+) => requireProviderStore().discoverModels(input));
 handleTrusted(CODEX_APP_SERVER_CHANNELS.getState, () => (
   requireCodexAppServerService().getState()
 ));

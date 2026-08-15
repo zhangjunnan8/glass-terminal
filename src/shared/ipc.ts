@@ -25,6 +25,8 @@ import type {
 import type {
   ProviderConnectionResult,
   ProviderInput,
+  ProviderModelDiscoveryInput,
+  ProviderModelDiscoveryResult,
   ProviderProfile,
 } from './provider';
 import type {
@@ -93,6 +95,7 @@ export interface DesktopBridge {
     remove(providerId: string): Promise<void>;
     setDefault(providerId: string): Promise<ProviderProfile>;
     testConnection(providerId: string): Promise<ProviderConnectionResult>;
+    discoverModels(input: ProviderModelDiscoveryInput): Promise<ProviderModelDiscoveryResult>;
   };
   codexAppServer: {
     getState(): Promise<CodexAppServerSnapshot>;

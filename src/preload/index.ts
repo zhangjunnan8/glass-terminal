@@ -96,6 +96,7 @@ const providerBridge: DesktopBridge['providers'] = {
     PROVIDER_CHANNELS.testConnection,
     providerId,
   ),
+  discoverModels: (input) => ipcRenderer.invoke(PROVIDER_CHANNELS.discoverModels, input),
 };
 
 const codexAppServerBridge: DesktopBridge['codexAppServer'] = {
