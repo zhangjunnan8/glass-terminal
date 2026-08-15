@@ -280,24 +280,83 @@ describe('renderer host and session dialogs', () => {
     });
   });
 
-  it('allows an empty password and checks credential saving for a saved host', async () => {
+  it('connects a saved host immediately without reopening the password dialog', async () => {
     const savedHost = { ...host, credentialConfigured: true };
     const bridge = bridgeWith(vi.fn());
     vi.mocked(bridge.hosts.list).mockResolvedValue([savedHost]);
+    vi.mocked(bridge.terminal.connectSsh).mockResolvedValue({
+      status: 'connected',
+      terminal: {
+        id: 'ssh-terminal-saved',
+        title: savedHost.name,
+        profileId: 'ssh-host-1',
+        shellKind: 'posix',
+        transport: 'ssh',
+        hostId: savedHost.id,
+      },
+    });
     await renderSelectedHost(bridge);
 
     const connectButton = [...container.querySelectorAll<HTMLButtonElement>(
       '.selected-host-card button',
     )].find((button) => button.textContent === '连接')!;
     await act(async () => connectButton.click());
+    await settle();
 
-    const dialog = container.querySelector<HTMLFormElement>('[data-testid="ssh-connect-dialog"]')!;
-    const password = dialog.elements.namedItem('password') as HTMLInputElement;
-    const saveCredential = dialog.elements.namedItem('saveCredential') as HTMLInputElement;
-    expect(password.required).toBe(false);
-    expect(password.placeholder).toBe('留空使用已保存密码');
-    expect(password.value).toBe('');
-    expect(saveCredential.checked).toBe(true);
+    expect(bridge.terminal.connectSsh).toHaveBeenCalledWith({
+      hostId: savedHost.id,
+      sessionId: undefined,
+      trustHostKey: undefined,
+    });
+    expect(container.querySelector('[data-testid="ssh-connect-dialog"]')).toBeNull();
+  });
+
+  it('reconnects a saved session immediately with its durable session id', async () => {
+    const savedHost = { ...host, credentialConfigured: true };
+    const bridge = bridgeWith(vi.fn());
+    vi.mocked(bridge.hosts.list).mockResolvedValue([savedHost]);
+    vi.mocked(bridge.terminal.connectSsh).mockResolvedValue({
+      status: 'connected',
+      terminal: {
+        id: 'ssh-terminal-reconnected',
+        title: session.name,
+        profileId: 'ssh-host-1',
+        shellKind: 'posix',
+        transport: 'ssh',
+        hostId: savedHost.id,
+        sessionId: session.id,
+      },
+    });
+    await renderSelectedHost(bridge);
+
+    const reconnect = container.querySelector<HTMLButtonElement>(
+      `[data-action="reconnect-session"][data-session-id="${session.id}"]`,
+    );
+    expect(reconnect).not.toBeNull();
+    await act(async () => reconnect!.click());
+    await settle();
+
+    expect(bridge.terminal.connectSsh).toHaveBeenCalledWith({
+      hostId: savedHost.id,
+      sessionId: session.id,
+      trustHostKey: undefined,
+    });
+    expect(container.querySelector('[data-testid="ssh-connect-dialog"]')).toBeNull();
+  });
+
+  it('falls back to the credential dialog when a saved credential cannot connect', async () => {
+    const savedHost = { ...host, credentialConfigured: true };
+    const bridge = bridgeWith(vi.fn());
+    vi.mocked(bridge.hosts.list).mockResolvedValue([savedHost]);
+    vi.mocked(bridge.terminal.connectSsh).mockRejectedValue(new Error('认证失败'));
+    await renderSelectedHost(bridge);
+
+    const connect = container.querySelector<HTMLButtonElement>('[data-action="connect-host"]')!;
+    await act(async () => connect.click());
+    await settle();
+
+    expect(container.querySelector('[data-testid="ssh-connect-dialog"]')).not.toBeNull();
+    expect(container.querySelector('.form-error')?.textContent).toContain('认证失败');
   });
 
   it('forgets a saved credential through the bridge and refreshes the host state', async () => {

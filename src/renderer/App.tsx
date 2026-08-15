@@ -782,6 +782,10 @@ export function App() {
   function openSshConnection(host: HostProfile, sessionId?: string) {
     setConnectionError(null);
     setReconnectingSessionId(sessionId ?? null);
+    if (host.credentialConfigured || host.authMethod === 'agent') {
+      void establishSsh(host, {}, undefined, sessionId);
+      return;
+    }
     setConnectingHost(host);
   }
 
@@ -861,6 +865,10 @@ export function App() {
       }
     } catch (error) {
       setConnectionError(errorMessage(error));
+      if (host.credentialConfigured && !secret.password && !secret.passphrase) {
+        setConnectingHost(host);
+        setReconnectingSessionId(sessionId ?? null);
+      }
     } finally {
       sshConnectionLock.current = false;
       setSshConnectionPending(false);
@@ -962,9 +970,11 @@ export function App() {
             <strong>{selectedHost.name}</strong>
             <span>{authMethodLabel(selectedHost.authMethod)} · {selectedHost.hostKeyFingerprint ? '已信任' : '未验证'}</span>
             <div>
-              <button onClick={() => {
-                openSshConnection(selectedHost);
-              }}>连接</button>
+              <button
+                data-action="connect-host"
+                disabled={sshConnectionPending}
+                onClick={() => openSshConnection(selectedHost)}
+              >{sshConnectionPending ? '正在连接…' : '连接'}</button>
               <button onClick={() => setEditingHost(selectedHost)}>编辑</button>
               <button className="danger-text" onClick={() => void removeHost(selectedHost)}>删除</button>
             </div>
@@ -1003,9 +1013,12 @@ export function App() {
                       data-session-id={session.id}
                       onClick={() => openSessionRename(session)}
                     >重命名</button>
-                    <button onClick={() => {
-                      openSshConnection(selectedHost, session.id);
-                    }}>重连</button>
+                    <button
+                      data-action="reconnect-session"
+                      data-session-id={session.id}
+                      disabled={sshConnectionPending}
+                      onClick={() => openSshConnection(selectedHost, session.id)}
+                    >重连</button>
                   </span>
                 </div>
               ))}
@@ -1075,10 +1088,7 @@ export function App() {
               {activeTab?.status === 'exited' && activeTab.hostId && (
                 <button onClick={() => {
                   const host = hosts.find((item) => item.id === activeTab.hostId);
-                  if (host) {
-                    setReconnectingSessionId(activeTab.sessionId ?? null);
-                    setConnectingHost(host);
-                  }
+                  if (host) openSshConnection(host, activeTab.sessionId);
                 }}>重连</button>
               )}
               <button title="搜索终端">⌕</button>
