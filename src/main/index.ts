@@ -1,4 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron';
+import type { IpcMainInvokeEvent } from 'electron';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PRODUCT_NAME } from '../shared/product';
@@ -21,6 +22,8 @@ import type {
   SetFullTakeoverRequest,
   TakeoverRequest,
 } from '../shared/agent';
+import { CODEX_APP_SERVER_CHANNELS } from '../shared/codex-app-server';
+import type { SaveCodexAppServerSelectionRequest } from '../shared/codex-app-server';
 import { HostStore } from './hosts/host-store';
 import { SessionManager } from './sessions/session-manager';
 import { SessionStore } from './sessions/session-store';
@@ -33,8 +36,20 @@ import { startAgentSmokeProvider } from './smoke/agent-provider-server';
 import type { AgentSmokeProvider } from './smoke/agent-provider-server';
 import { registerSmokeRunner, smokeModeFromEnvironment } from './smoke/smoke-runner';
 import { TerminalService } from './terminal/terminal-service';
+import { CodexAppServerService } from './app-server/app-server-service';
+import {
+  isTrustedRendererUrl,
+  resolveDevelopmentRendererUrl,
+} from './security/renderer-trust';
 
-const isDevelopment = Boolean(process.env.VITE_DEV_SERVER_URL);
+const developmentRendererUrl = resolveDevelopmentRendererUrl(
+  process.env.VITE_DEV_SERVER_URL,
+  app.isPackaged,
+);
+const isDevelopment = Boolean(developmentRendererUrl);
+const rendererEntryUrl = developmentRendererUrl?.href ?? pathToFileURL(
+  join(__dirname, '..', 'dist', 'index.html'),
+).toString();
 const smokeMode = smokeModeFromEnvironment();
 const isSmokeTest = smokeMode !== null;
 const terminalService = new TerminalService();
@@ -44,7 +59,9 @@ let hostStore: HostStore | undefined;
 let sessionManager: SessionManager | undefined;
 let providerStore: ProviderStore | undefined;
 let agentService: AgentService | undefined;
+let codexAppServerService: CodexAppServerService | undefined;
 let agentSmokeProvider: AgentSmokeProvider | undefined;
+const trustedRendererContents = new Set<number>();
 
 if (isSmokeTest) {
   app.setPath('userData', join(process.cwd(), '.smoke-data', smokeMode!));
@@ -63,6 +80,30 @@ function requireSessionManager(): SessionManager {
 function requireProviderStore(): ProviderStore {
   if (!providerStore) throw new Error('Provider store is not ready.');
   return providerStore;
+}
+
+function requireCodexAppServerService(): CodexAppServerService {
+  if (!codexAppServerService) throw new Error('Codex App Server service is not ready.');
+  return codexAppServerService;
+}
+
+function assertTrustedSender(event: IpcMainInvokeEvent): void {
+  if (
+    !trustedRendererContents.has(event.sender.id)
+    || event.sender.isDestroyed()
+    || event.senderFrame !== event.sender.mainFrame
+    || !isTrustedRendererUrl(event.senderFrame.url, rendererEntryUrl, isDevelopment)
+  ) throw new Error('拒绝来自非受信页面的应用请求。');
+}
+
+function handleTrusted(
+  channel: string,
+  listener: (event: IpcMainInvokeEvent, ...args: any[]) => unknown,
+): void {
+  ipcMain.handle(channel, (event, ...args) => {
+    assertTrustedSender(event);
+    return listener(event, ...args);
+  });
 }
 
 function createMainWindow(): BrowserWindow {
@@ -95,70 +136,63 @@ function createMainWindow(): BrowserWindow {
   });
 
   window.webContents.on('will-navigate', (event, url) => {
-    const allowed = isDevelopment
-      ? url.startsWith(process.env.VITE_DEV_SERVER_URL ?? '')
-      : url.startsWith('file:');
-    if (!allowed) event.preventDefault();
+    if (!isTrustedRendererUrl(url, rendererEntryUrl, isDevelopment)) event.preventDefault();
   });
-
-  if (isDevelopment) {
-    void window.loadURL(process.env.VITE_DEV_SERVER_URL!);
-  } else {
-    void window.loadURL(
-      pathToFileURL(join(__dirname, '..', 'dist', 'index.html')).toString(),
-    );
-  }
 
   const contents = window.webContents;
   const contentsId = contents.id;
+  trustedRendererContents.add(contentsId);
   contents.once('destroyed', () => {
+    trustedRendererContents.delete(contentsId);
     agentService?.closeOwnedBy(contentsId);
     terminalService.closeOwnedBy(contentsId);
   });
 
+  void window.loadURL(rendererEntryUrl);
+
   return window;
 }
 
-ipcMain.handle('runtime:get-info', () => ({
+handleTrusted('runtime:get-info', () => ({
   platform: process.platform,
   arch: process.arch,
   version: app.getVersion(),
 }));
 
-ipcMain.handle(TERMINAL_CHANNELS.listShells, () => terminalService.listShells());
-ipcMain.handle(
+handleTrusted(TERMINAL_CHANNELS.listShells, () => terminalService.listShells());
+handleTrusted(
   TERMINAL_CHANNELS.create,
   (event, request: CreateTerminalRequest) => terminalService.create(event.sender, request),
 );
-ipcMain.handle(TERMINAL_CHANNELS.attach, (event, terminalId: string) => (
+handleTrusted(TERMINAL_CHANNELS.attach, (event, terminalId: string) => (
   terminalService.attach(event.sender, terminalId)
 ));
-ipcMain.handle(
+handleTrusted(
   TERMINAL_CHANNELS.write,
   (event, terminalId: string, data: string) => {
     terminalService.write(event.sender, terminalId, data);
   },
 );
-ipcMain.handle(
+handleTrusted(
   TERMINAL_CHANNELS.resize,
   (event, terminalId: string, cols: number, rows: number) => {
     terminalService.resize(event.sender, terminalId, cols, rows);
   },
 );
-ipcMain.handle(TERMINAL_CHANNELS.close, (event, terminalId: string) => {
+handleTrusted(TERMINAL_CHANNELS.close, (event, terminalId: string) => {
   transferQueue.cancelByTerminal(terminalId, event.sender.id);
   agentService?.closeTerminal(event.sender, terminalId);
   terminalService.close(event.sender, terminalId);
 });
 
-ipcMain.handle(HOST_CHANNELS.list, () => requireHostStore().list());
-ipcMain.handle(HOST_CHANNELS.save, (_event, input: HostInput) => (
+handleTrusted(HOST_CHANNELS.list, () => requireHostStore().list());
+handleTrusted(HOST_CHANNELS.save, (_event, input: HostInput) => (
   requireHostStore().save(input)
 ));
-ipcMain.handle(HOST_CHANNELS.remove, (_event, hostId: string) => {
+handleTrusted(HOST_CHANNELS.remove, (_event, hostId: string) => {
   requireHostStore().remove(hostId);
 });
-ipcMain.handle(HOST_CHANNELS.connect, async (event, request: SshConnectRequest) => {
+handleTrusted(HOST_CHANNELS.connect, async (event, request: SshConnectRequest) => {
   const store = requireHostStore();
   const host = store.get(request.hostId);
   try {
@@ -183,23 +217,23 @@ ipcMain.handle(HOST_CHANNELS.connect, async (event, request: SshConnectRequest) 
   }
 });
 
-ipcMain.handle(SESSION_CHANNELS.list, (_event, hostId?: string) => (
+handleTrusted(SESSION_CHANNELS.list, (_event, hostId?: string) => (
   requireSessionManager().list(hostId)
 ));
-ipcMain.handle(
+handleTrusted(
   SESSION_CHANNELS.upgrade,
   (event, request: UpgradeSessionRequest) => (
     requireSessionManager().upgrade(event.sender, request.terminalId)
   ),
 );
 
-ipcMain.handle(
+handleTrusted(
   SFTP_CHANNELS.listDirectory,
   (event, terminalId: string, path?: string) => (
     sftpService.listDirectory(event.sender, terminalId, path)
   ),
 );
-ipcMain.handle(
+handleTrusted(
   SFTP_CHANNELS.chooseUpload,
   async (event, request: UploadSelectionRequest) => {
     const ownerWindow = BrowserWindow.fromWebContents(event.sender);
@@ -217,7 +251,7 @@ ipcMain.handle(
     ));
   },
 );
-ipcMain.handle(
+handleTrusted(
   SFTP_CHANNELS.chooseDownload,
   async (event, request: DownloadSelectionRequest) => {
     const ownerWindow = BrowserWindow.fromWebContents(event.sender);
@@ -238,73 +272,123 @@ ipcMain.handle(
     );
   },
 );
-ipcMain.handle(SFTP_CHANNELS.listTransfers, (event, terminalId?: string) => (
+handleTrusted(SFTP_CHANNELS.listTransfers, (event, terminalId?: string) => (
   transferQueue.list(event.sender, terminalId)
 ));
-ipcMain.handle(SFTP_CHANNELS.cancelTransfer, (event, jobId: string) => (
+handleTrusted(SFTP_CHANNELS.cancelTransfer, (event, jobId: string) => (
   transferQueue.cancel(event.sender, jobId)
 ));
-ipcMain.handle(SFTP_CHANNELS.retryTransfer, (event, jobId: string) => (
+handleTrusted(SFTP_CHANNELS.retryTransfer, (event, jobId: string) => (
   transferQueue.retry(event.sender, jobId)
 ));
-ipcMain.handle(PROVIDER_CHANNELS.list, () => requireProviderStore().list());
-ipcMain.handle(PROVIDER_CHANNELS.save, (_event, input: ProviderInput) => (
+handleTrusted(PROVIDER_CHANNELS.list, () => requireProviderStore().list());
+handleTrusted(PROVIDER_CHANNELS.save, (_event, input: ProviderInput) => (
   requireProviderStore().save(input)
 ));
-ipcMain.handle(PROVIDER_CHANNELS.remove, (_event, providerId: string) => (
+handleTrusted(PROVIDER_CHANNELS.remove, (_event, providerId: string) => (
   requireProviderStore().remove(providerId)
 ));
-ipcMain.handle(PROVIDER_CHANNELS.setDefault, (_event, providerId: string) => (
+handleTrusted(PROVIDER_CHANNELS.setDefault, (_event, providerId: string) => (
   requireProviderStore().setDefault(providerId)
 ));
-ipcMain.handle(PROVIDER_CHANNELS.testConnection, (_event, providerId: string) => (
+handleTrusted(PROVIDER_CHANNELS.testConnection, (_event, providerId: string) => (
   requireProviderStore().testConnection(providerId)
 ));
-ipcMain.handle(AGENT_CHANNELS.sendPrompt, (event, request: SendAgentPromptRequest) => {
+handleTrusted(CODEX_APP_SERVER_CHANNELS.getState, () => (
+  requireCodexAppServerService().getState()
+));
+handleTrusted(CODEX_APP_SERVER_CHANNELS.start, () => (
+  requireCodexAppServerService().start()
+));
+handleTrusted(CODEX_APP_SERVER_CHANNELS.chooseExecutable, async (event) => {
+  const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!ownerWindow) throw new Error('无法打开 Codex CLI 选择窗口。');
+  const selection = await dialog.showOpenDialog(ownerWindow, {
+    title: '选择 Codex CLI 可执行文件',
+    properties: ['openFile'],
+    filters: process.platform === 'win32'
+      ? [{ name: 'Codex CLI', extensions: ['exe'] }]
+      : [{ name: 'Codex CLI', extensions: ['*'] }],
+  });
+  if (selection.canceled || !selection.filePaths[0]) {
+    return requireCodexAppServerService().getState();
+  }
+  return requireCodexAppServerService().configureExecutableAndStart(
+    selection.filePaths[0],
+  );
+});
+handleTrusted(CODEX_APP_SERVER_CHANNELS.restart, () => (
+  requireCodexAppServerService().restart()
+));
+handleTrusted(CODEX_APP_SERVER_CHANNELS.refresh, () => (
+  requireCodexAppServerService().refresh()
+));
+handleTrusted(CODEX_APP_SERVER_CHANNELS.loginBrowser, () => (
+  requireCodexAppServerService().loginBrowser()
+));
+handleTrusted(CODEX_APP_SERVER_CHANNELS.loginDeviceCode, () => (
+  requireCodexAppServerService().loginDeviceCode()
+));
+handleTrusted(CODEX_APP_SERVER_CHANNELS.reopenLogin, () => (
+  requireCodexAppServerService().openPendingLogin()
+));
+handleTrusted(CODEX_APP_SERVER_CHANNELS.cancelLogin, () => (
+  requireCodexAppServerService().cancelLogin()
+));
+handleTrusted(CODEX_APP_SERVER_CHANNELS.logout, () => (
+  requireCodexAppServerService().logout()
+));
+handleTrusted(
+  CODEX_APP_SERVER_CHANNELS.saveSelection,
+  (_event, request: SaveCodexAppServerSelectionRequest) => (
+    requireCodexAppServerService().saveSelection(request)
+  ),
+);
+handleTrusted(AGENT_CHANNELS.sendPrompt, (event, request: SendAgentPromptRequest) => {
   if (!agentService) throw new Error('Agent service is not ready.');
   return agentService.sendPrompt(event.sender, request);
 });
-ipcMain.handle(AGENT_CHANNELS.getState, (event, terminalId: string) => {
+handleTrusted(AGENT_CHANNELS.getState, (event, terminalId: string) => {
   if (!agentService) throw new Error('Agent service is not ready.');
   return agentService.getState(event.sender, terminalId);
 });
-ipcMain.handle(
+handleTrusted(
   AGENT_CHANNELS.resolveApproval,
   (event, request: ResolveApprovalRequest) => {
     if (!agentService) throw new Error('Agent service is not ready.');
     return agentService.resolveApproval(event.sender, request);
   },
 );
-ipcMain.handle(
+handleTrusted(
   AGENT_CHANNELS.setFullTakeover,
   (event, request: SetFullTakeoverRequest) => {
     if (!agentService) throw new Error('Agent service is not ready.');
     return agentService.setFullTakeover(event.sender, request);
   },
 );
-ipcMain.handle(AGENT_CHANNELS.takeover, (event, request: TakeoverRequest) => {
+handleTrusted(AGENT_CHANNELS.takeover, (event, request: TakeoverRequest) => {
   if (!agentService) throw new Error('Agent service is not ready.');
   return agentService.takeover(event.sender, request);
 });
-ipcMain.handle(
+handleTrusted(
   AGENT_CHANNELS.resolveTakeover,
   (event, request: ResolveTakeoverRequest) => {
     if (!agentService) throw new Error('Agent service is not ready.');
     return agentService.resolveTakeover(event.sender, request);
   },
 );
-ipcMain.handle(
+handleTrusted(
   AGENT_CHANNELS.confirmShellReady,
   (event, request: ConfirmShellReadyRequest) => {
     if (!agentService) throw new Error('Agent service is not ready.');
     return agentService.confirmShellReady(event.sender, request);
   },
 );
-ipcMain.handle(
+handleTrusted(
   SESSION_CHANNELS.rename,
   (_event, request: RenameSessionRequest) => requireSessionManager().rename(request),
 );
-ipcMain.handle(
+handleTrusted(
   SESSION_CHANNELS.readTerminalHistory,
   (_event, sessionId: string) => requireSessionManager().readTerminalHistory(sessionId),
 );
@@ -336,8 +420,29 @@ app.whenReady().then(async () => {
     terminalService,
     hostStore,
   );
+  codexAppServerService = new CodexAppServerService(
+    join(app.getPath('userData'), 'config', 'codex-app-server.json'),
+    app.getAppPath(),
+    process.resourcesPath,
+    app.getVersion(),
+    async (url) => {
+      await shell.openExternal(url);
+    },
+  );
+  codexAppServerService.onStateChanged((state) => {
+    for (const window of BrowserWindow.getAllWindows()) {
+      if (!window.webContents.isDestroyed()) {
+        try {
+          window.webContents.send(CODEX_APP_SERVER_CHANNELS.stateChanged, state);
+        } catch {
+          // A concurrently closing window must not starve other windows of state.
+        }
+      }
+    }
+  });
   agentService = new AgentService(terminalService, sessionManager, providerStore);
   createMainWindow();
+  void codexAppServerService.startIfBound();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
   });
@@ -346,6 +451,7 @@ app.whenReady().then(async () => {
 app.on('before-quit', () => {
   transferQueue.close();
   agentService?.close();
+  codexAppServerService?.close();
   sessionManager?.close();
   void agentSmokeProvider?.close();
 });

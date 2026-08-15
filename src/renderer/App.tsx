@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent } from 'react';
 import type { HostInput, HostProfile } from '../shared/host';
 import type { RuntimeInfo } from '../shared/ipc';
@@ -6,6 +6,10 @@ import { PRODUCT_NAME } from '../shared/product';
 import type { SessionRecord } from '../shared/session';
 import type { ProviderInput, ProviderProfile } from '../shared/provider';
 import type { AgentRuntimeState, AgentSessionView } from '../shared/agent';
+import type {
+  CodexAppServerSnapshot,
+  CodexModelInfo,
+} from '../shared/codex-app-server';
 import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
 import { mergeAgentState } from './agent-state';
 import { TerminalPane } from './components/TerminalPane';
@@ -13,6 +17,10 @@ import { SftpDrawer } from './components/SftpDrawer';
 import {
   agentStateLabel,
   authMethodLabel,
+  codexAppServerOperationLabel,
+  codexAppServerPhaseLabel,
+  codexPlanTypeLabel,
+  codexReasoningEffortLabel,
   executionStatusLabel,
   providerStatusLabel,
   roleLabel,
@@ -27,6 +35,11 @@ interface TerminalTab extends TerminalDescriptor {
 interface ConnectionSecret {
   password?: string;
   passphrase?: string;
+}
+
+interface CodexUiMessage {
+  tone: 'success' | 'error';
+  text: string;
 }
 
 interface TrustChallenge {
@@ -60,6 +73,29 @@ function agentTurnBusy(state?: AgentRuntimeState): boolean {
   ].includes(state));
 }
 
+function mergeCodexAppServerState(
+  current: CodexAppServerSnapshot | null,
+  incoming: CodexAppServerSnapshot,
+): CodexAppServerSnapshot {
+  return current && current.revision >= incoming.revision ? current : incoming;
+}
+
+function preferredCodexReasoningEffort(
+  model: CodexModelInfo,
+  preferred?: string,
+): string {
+  const efforts = model.supportedReasoningEfforts;
+  if (efforts.length === 0) return '';
+  if (preferred && efforts.some((effort) => effort.reasoningEffort === preferred)) {
+    return preferred;
+  }
+  if (
+    model.defaultReasoningEffort
+    && efforts.some((effort) => effort.reasoningEffort === model.defaultReasoningEffort)
+  ) return model.defaultReasoningEffort;
+  return efforts[0]?.reasoningEffort ?? '';
+}
+
 export function App() {
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
   const [shells, setShells] = useState<ShellProfile[]>([]);
@@ -72,8 +108,16 @@ export function App() {
   const [newTerminalOpen, setNewTerminalOpen] = useState(false);
   const [sftpOpen, setSftpOpen] = useState(false);
   const [providerModalOpen, setProviderModalOpen] = useState(false);
+  const [providerSettingsSection, setProviderSettingsSection] = useState<'codex' | 'generic'>('codex');
   const [editingProvider, setEditingProvider] = useState<ProviderProfile | null>(null);
   const [providerMessage, setProviderMessage] = useState<string | null>(null);
+  const [codexAppServer, setCodexAppServer] = useState<CodexAppServerSnapshot | null>(null);
+  const [codexMessage, setCodexMessage] = useState<CodexUiMessage | null>(null);
+  const [codexActionPending, setCodexActionPending] = useState(false);
+  const [codexModelId, setCodexModelId] = useState('');
+  const [codexReasoningEffort, setCodexReasoningEffort] = useState('');
+  const codexActionLock = useRef(false);
+  const providerModalRef = useRef<HTMLDivElement>(null);
   const [agentStates, setAgentStates] = useState<Record<string, AgentSessionView>>({});
   const [agentPrompt, setAgentPrompt] = useState('');
   const [editedApprovalCommand, setEditedApprovalCommand] = useState('');
@@ -96,6 +140,11 @@ export function App() {
     void window.aiTerminal.providers.list().then(setProviders).catch((error) => {
       setStartupError(errorMessage(error));
     });
+    void window.aiTerminal.codexAppServer.getState().then((state) => {
+      setCodexAppServer((current) => mergeCodexAppServerState(current, state));
+    }).catch((error) => {
+      setStartupError(errorMessage(error));
+    });
     const removeExitListener = window.aiTerminal.terminal.onExit((event) => {
       setTabs((current) => current.map((tab) => (
         tab.id === event.terminalId ? { ...tab, status: 'exited' } : tab
@@ -107,6 +156,9 @@ export function App() {
       setTabs((current) => current.map((tab) => (
         tab.id === state.terminalId ? { ...tab, sessionId: state.sessionId } : tab
       )));
+    });
+    const removeCodexAppServerListener = window.aiTerminal.codexAppServer.onStateChanged((state) => {
+      setCodexAppServer((current) => mergeCodexAppServerState(current, state));
     });
 
     let cancelled = false;
@@ -130,8 +182,49 @@ export function App() {
       cancelled = true;
       removeExitListener();
       removeAgentListener();
+      removeCodexAppServerListener();
     };
   }, []);
+
+  useEffect(() => {
+    if (!codexAppServer) return;
+    const { models, selection } = codexAppServer;
+    if (models.length === 0) {
+      setCodexModelId('');
+      setCodexReasoningEffort('');
+      return;
+    }
+    const currentModel = models.find((model) => model.id === codexModelId);
+    const selectedModel = models.find((model) => model.id === selection?.modelId);
+    const nextModel = currentModel
+      ?? selectedModel
+      ?? models.find((model) => model.isDefault)
+      ?? models[0];
+    const preferredEffort = currentModel
+      ? codexReasoningEffort
+      : nextModel.id === selection?.modelId
+        ? selection.reasoningEffort
+        : undefined;
+    const nextEffort = preferredCodexReasoningEffort(nextModel, preferredEffort);
+    if (nextModel.id !== codexModelId) setCodexModelId(nextModel.id);
+    if (nextEffort !== codexReasoningEffort) setCodexReasoningEffort(nextEffort);
+  }, [codexAppServer?.revision]);
+
+  useEffect(() => {
+    if (!providerModalOpen) return undefined;
+    const previouslyFocused = document.activeElement;
+    providerModalRef.current?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setProviderModalOpen(false);
+      setCodexMessage(null);
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      if (previouslyFocused instanceof HTMLElement) previouslyFocused.focus();
+    };
+  }, [providerModalOpen]);
 
   useEffect(() => {
     const handleOpenedTerminal = (event: Event) => {
@@ -153,6 +246,29 @@ export function App() {
     ? sessions.filter((session) => session.hostId === selectedHost.id)
     : [];
   const defaultProvider = providers.find((provider) => provider.isDefault) ?? null;
+  const selectedCodexModel = codexAppServer?.models.find((model) => (
+    model.id === codexModelId
+  ));
+  const codexBusy = codexActionPending
+    || Boolean(codexAppServer && codexAppServer.operation !== 'idle');
+  const savedCodexEffort = selectedCodexModel?.supportedReasoningEfforts.length
+    ? codexAppServer?.selection?.reasoningEffort ?? ''
+    : '';
+  const draftCodexEffort = selectedCodexModel?.supportedReasoningEfforts.length
+    ? codexReasoningEffort
+    : '';
+  const codexDraftMatchesSaved = Boolean(
+    selectedCodexModel
+    && codexAppServer?.selection?.modelId === codexModelId
+    && savedCodexEffort === draftCodexEffort,
+  );
+  const codexSelectionSaved = Boolean(codexAppServer?.bound && codexDraftMatchesSaved);
+  const codexSelectionDirty = Boolean(selectedCodexModel && !codexSelectionSaved);
+  const codexOperationText = codexAppServer && codexAppServer.operation !== 'idle'
+    ? codexAppServerOperationLabel(codexAppServer.operation)
+    : codexActionPending
+      ? '正在处理界面操作'
+      : null;
   const activeAgent = activeTab ? agentStates[activeTab.id] : undefined;
   const activeInputMode = activeAgent?.terminalInputMode ?? 'human';
   const foregroundRunning = activeAgent?.state === 'PAUSED'
@@ -211,6 +327,53 @@ export function App() {
 
   async function refreshProviders() {
     setProviders(await window.aiTerminal.providers.list());
+  }
+
+  function applyCodexState(state: CodexAppServerSnapshot) {
+    setCodexAppServer((current) => mergeCodexAppServerState(current, state));
+  }
+
+  async function runCodexAction(
+    action: () => Promise<CodexAppServerSnapshot>,
+    successMessage?: string,
+  ) {
+    if (codexActionLock.current) return;
+    codexActionLock.current = true;
+    setCodexActionPending(true);
+    setCodexMessage(null);
+    try {
+      const state = await action();
+      applyCodexState(state);
+      if (state.error) {
+        setCodexMessage({ tone: 'error', text: state.error });
+      } else if (successMessage) {
+        setCodexMessage({ tone: 'success', text: successMessage });
+      }
+    } catch (error) {
+      setCodexMessage({ tone: 'error', text: errorMessage(error) });
+    } finally {
+      codexActionLock.current = false;
+      setCodexActionPending(false);
+    }
+  }
+
+  function selectCodexModel(modelId: string) {
+    setCodexModelId(modelId);
+    const model = codexAppServer?.models.find((candidate) => candidate.id === modelId);
+    setCodexReasoningEffort(model ? preferredCodexReasoningEffort(model) : '');
+  }
+
+  async function saveCodexSelection() {
+    if (!selectedCodexModel || !codexSelectionDirty) return;
+    await runCodexAction(
+      () => window.aiTerminal.codexAppServer.saveSelection({
+        modelId: codexModelId,
+        reasoningEffort: selectedCodexModel.supportedReasoningEfforts.length
+          ? codexReasoningEffort || undefined
+          : undefined,
+      }),
+      'App Server 首选模型已保存。',
+    );
   }
 
   async function saveProvider(event: FormEvent<HTMLFormElement>) {
@@ -474,9 +637,11 @@ export function App() {
         >⇅</button>
         <button className="activity" title="历史记录">◷</button>
         <div className="activity-spacer" />
-        <button className="activity" title="Provider 设置" onClick={() => {
+        <button className="activity" title="AI 服务设置" data-action="open-provider-settings" onClick={() => {
+          setProviderSettingsSection('codex');
           setEditingProvider(defaultProvider);
           setProviderMessage(null);
+          setCodexMessage(null);
           setProviderModalOpen(true);
         }}>⚙</button>
       </aside>
@@ -695,12 +860,14 @@ export function App() {
               <strong>理解终端上下文的 AI 助手</strong>
               <p>智能体会读取当前会话，并在向这个可见终端发送每条命令前请求你的批准。</p>
               <div className="guardrail"><span>✓</span> 默认逐条审批命令</div>
-              <button className="provider-configure" onClick={() => {
+              <button className="provider-configure" data-action="open-agent-provider-settings" onClick={() => {
+                setProviderSettingsSection('generic');
                 setEditingProvider(defaultProvider);
                 setProviderMessage(null);
+                setCodexMessage(null);
                 setProviderModalOpen(true);
               }}>
-                {defaultProvider ? '管理 Provider' : '配置 Provider'}
+                {defaultProvider ? '管理智能体 Provider' : '配置智能体 Provider'}
               </button>
               {activeTab && !activeTab.sessionId && (
                 <button className="activate-session" onClick={() => void activateAiSession()}>
@@ -855,74 +1022,395 @@ export function App() {
 
       {providerModalOpen && (
         <div className="modal-backdrop">
-          <div className="modal provider-modal">
+          <div
+            ref={providerModalRef}
+            className="modal provider-modal"
+            data-testid="provider-settings-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="provider-settings-title"
+            tabIndex={-1}
+          >
             <div className="modal-header">
-              <strong>AI Provider 设置</strong>
-              <button type="button" onClick={() => setProviderModalOpen(false)}>×</button>
+              <strong id="provider-settings-title">AI 服务设置</strong>
+              <button type="button" aria-label="关闭 AI 服务设置" onClick={() => {
+                setProviderModalOpen(false);
+                setCodexMessage(null);
+              }}>×</button>
             </div>
-            <section className="codex-app-server-note">
-              <strong>Codex App Server（尚未接入）</strong>
-              <p>当前 Alpha 仅支持 OpenAI 兼容 API。下方“可用”只表示模型接口测试通过，不代表 Codex 或 ChatGPT 已登录；请勿在 API Key 输入框中粘贴 ChatGPT 登录凭据。</p>
-              <small>后续将由主进程通过官方 <code>codex app-server</code> stdio 协议接入登录、Thread、流事件和审批。</small>
-            </section>
-            <div className="provider-layout">
-              <div className="provider-list">
-                {providers.map((provider) => (
-                  <button
-                    className={editingProvider?.id === provider.id ? 'active' : ''}
-                    key={provider.id}
-                    onClick={() => {
-                      setEditingProvider(provider);
-                      setProviderMessage(null);
-                    }}
+            <div className="provider-kind-tabs" role="tablist" aria-label="AI 服务类型">
+              <button
+                id="provider-kind-codex"
+                type="button"
+                className={providerSettingsSection === 'codex' ? 'active' : ''}
+                data-testid="provider-kind-codex"
+                onClick={() => {
+                  setProviderSettingsSection('codex');
+                  setCodexMessage(null);
+                }}
+                role="tab"
+                aria-selected={providerSettingsSection === 'codex'}
+                aria-controls="provider-panel-codex"
+              >Codex App Server</button>
+              <button
+                id="provider-kind-generic"
+                type="button"
+                className={providerSettingsSection === 'generic' ? 'active' : ''}
+                data-testid="provider-kind-generic"
+                onClick={() => {
+                  setProviderSettingsSection('generic');
+                  setCodexMessage(null);
+                }}
+                role="tab"
+                aria-selected={providerSettingsSection === 'generic'}
+                aria-controls="provider-panel-generic"
+              >OpenAI 兼容 API</button>
+            </div>
+
+            {providerSettingsSection === 'codex' && codexMessage && (
+              <div
+                className={`provider-message codex-ui-message ${codexMessage.tone}`}
+                role={codexMessage.tone === 'error' ? 'alert' : 'status'}
+                aria-live={codexMessage.tone === 'error' ? 'assertive' : 'polite'}
+              >{codexMessage.text}</div>
+            )}
+
+            {providerSettingsSection === 'codex' && (
+              <div
+                id="provider-panel-codex"
+                className="codex-app-server-panel"
+                data-testid="codex-app-server-panel"
+                role="tabpanel"
+                aria-labelledby="provider-kind-codex"
+                aria-busy={codexBusy}
+              >
+                <section className="codex-setup-section">
+                  <div className="codex-section-heading">
+                    <span>1</span>
+                    <div><strong>App Server 服务</strong><small>由主进程启动官方 codex app-server，不解析命令行界面。</small></div>
+                  </div>
+                  <div
+                    className="codex-status-row"
+                    data-testid="codex-service-status"
+                    role="status"
+                    aria-live="polite"
                   >
-                    <strong>{provider.name}</strong>
-                    <small>{provider.modelId}</small>
-                    <span className={`provider-status ${provider.status}`}>{providerStatusLabel(provider.status)}</span>
-                  </button>
-                ))}
-                <button className="add-provider" onClick={() => {
-                  setEditingProvider(null);
-                  setProviderMessage(null);
-                }}>＋ 添加 Provider</button>
-              </div>
-              <form className="provider-form" onSubmit={(event) => void saveProvider(event)}>
-                <label>名称<input name="name" required defaultValue={editingProvider?.name ?? 'OpenAI 兼容 API'} key={`name-${editingProvider?.id ?? 'new'}`} /></label>
-                <label>基础 URL<input name="baseUrl" type="url" required placeholder="https://api.example.com/v1" defaultValue={editingProvider?.baseUrl ?? ''} key={`url-${editingProvider?.id ?? 'new'}`} /></label>
-                <label>模型 ID<input name="modelId" required placeholder="model-id" defaultValue={editingProvider?.modelId ?? ''} key={`model-${editingProvider?.id ?? 'new'}`} /></label>
-                <label>
-                  API Key
-                  <input
-                    name="apiKey"
-                    type="password"
-                    required={!editingProvider?.apiKeyConfigured}
-                    autoComplete="new-password"
-                    placeholder={editingProvider?.apiKeyConfigured ? '已保存到 Windows 凭据管理器' : '必填'}
-                  />
-                </label>
-                <label className="check-label">
-                  <input name="makeDefault" type="checkbox" defaultChecked={editingProvider?.isDefault ?? providers.length === 0} />
-                  设为默认 Provider
-                </label>
-                <p className="secure-note">API Key 作为 Windows 通用凭据保存；Provider JSON 只保存凭据引用。</p>
-                {providerMessage && <div className="provider-message">{providerMessage}</div>}
-                <div className="provider-actions">
-                  {editingProvider && (
-                    <>
-                      <button type="button" onClick={() => void testProvider(editingProvider.id)}>测试连接</button>
-                      {!editingProvider.isDefault && (
-                        <button type="button" onClick={async () => {
-                          await window.aiTerminal.providers.setDefault(editingProvider.id);
-                          await refreshProviders();
-                        }}>设为默认</button>
-                      )}
-                      <button className="danger-text" type="button" onClick={() => void removeProvider(editingProvider)}>删除</button>
-                    </>
+                    <div>
+                      <span
+                        className={`codex-state-dot ${codexAppServer?.phase ?? 'stopped'}`}
+                        aria-hidden="true"
+                      />
+                      <span className="codex-status-copy">
+                        <strong>{codexAppServer
+                          ? codexAppServerPhaseLabel(codexAppServer.phase)
+                          : '正在读取状态'}</strong>
+                        {codexOperationText && <small>{codexOperationText}…</small>}
+                      </span>
+                    </div>
+                    {codexAppServer?.executable && (
+                      <small className="codex-status-version">{codexAppServer.executable.version}</small>
+                    )}
+                  </div>
+                  {codexAppServer?.executable && (
+                    <code className="codex-executable-path" title={codexAppServer.executable.path}>
+                      {codexAppServer.executable.path}
+                    </code>
                   )}
-                  <button className="primary" type="submit">保存 Provider</button>
+                  <div className="codex-actions">
+                    {codexAppServer?.phase !== 'ready' ? (
+                      <button
+                        className="primary"
+                        data-action="codex-start"
+                        disabled={codexBusy}
+                        onClick={() => void runCodexAction(
+                          () => window.aiTerminal.codexAppServer.start(),
+                        )}
+                      >自动检测并启动</button>
+                    ) : (
+                      <>
+                        <button
+                          data-action="codex-refresh"
+                          disabled={codexBusy}
+                          onClick={() => void runCodexAction(
+                            () => window.aiTerminal.codexAppServer.refresh(),
+                            '账号与模型状态已刷新。',
+                          )}
+                        >刷新状态</button>
+                        <button
+                          data-action="codex-restart"
+                          disabled={codexBusy}
+                          onClick={() => void runCodexAction(
+                            () => window.aiTerminal.codexAppServer.restart(),
+                          )}
+                        >重启服务</button>
+                      </>
+                    )}
+                    <button
+                      data-action="codex-choose-executable"
+                      disabled={codexBusy}
+                      onClick={() => void runCodexAction(
+                        () => window.aiTerminal.codexAppServer.chooseExecutable(),
+                      )}
+                    >选择 codex 可执行文件…</button>
+                  </div>
+                  {codexAppServer?.error && (
+                    <div className="codex-error" data-testid="codex-error" role="alert">
+                      {codexAppServer.error}
+                    </div>
+                  )}
+                </section>
+
+                <section className="codex-setup-section">
+                  <div className="codex-section-heading">
+                    <span>2</span>
+                    <div><strong>ChatGPT 账号</strong><small>登录和 token 刷新由 App Server 管理；AI Terminal 不读取或保存 token。</small></div>
+                  </div>
+                  {codexAppServer?.phase !== 'ready' && (
+                    <p className="codex-empty-state">启动服务后即可在这里完成登录。</p>
+                  )}
+                  {codexAppServer?.phase === 'ready' && codexAppServer.pendingLogin && (
+                    <div
+                      className="codex-login-pending"
+                      data-testid="codex-login-pending"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      <strong>{codexAppServer.pendingLogin.type === 'browser'
+                        ? '等待浏览器完成 ChatGPT 登录'
+                        : '使用设备码完成登录'}</strong>
+                      {codexAppServer.pendingLogin.type === 'device-code' && (
+                        <div className="codex-device-code" data-testid="codex-device-code">
+                          {codexAppServer.pendingLogin.userCode}
+                        </div>
+                      )}
+                      <p>完成授权后，本页会自动刷新账号和模型，无需粘贴任何凭据。</p>
+                      <div className="codex-actions">
+                        <button
+                          className="primary"
+                          data-action="codex-open-auth"
+                          disabled={codexBusy}
+                          onClick={() => void runCodexAction(
+                            () => window.aiTerminal.codexAppServer.reopenLogin(),
+                          )}
+                        >{codexAppServer.pendingLogin.type === 'browser'
+                            ? '重新打开登录页'
+                            : '打开验证页面'}</button>
+                        <button
+                          data-action="codex-cancel-login"
+                          disabled={codexBusy}
+                          onClick={() => void runCodexAction(
+                            () => window.aiTerminal.codexAppServer.cancelLogin(),
+                          )}
+                        >取消登录</button>
+                      </div>
+                    </div>
+                  )}
+                  {codexAppServer?.phase === 'ready'
+                    && !codexAppServer.pendingLogin
+                    && codexAppServer.account && (
+                    <div className="codex-account-card" data-testid="codex-account-status">
+                      <div>
+                        <strong>{codexAppServer.account.email ?? '已登录账号'}</strong>
+                        <span>{codexAppServer.account.type === 'chatgpt' ? 'ChatGPT' : codexAppServer.account.type}
+                          {codexAppServer.account.planType
+                            ? ` · ${codexPlanTypeLabel(codexAppServer.account.planType)}`
+                            : ''}</span>
+                      </div>
+                      <button
+                        className="danger-text"
+                        data-action="codex-logout"
+                        disabled={codexBusy}
+                        onClick={() => void runCodexAction(
+                          () => window.aiTerminal.codexAppServer.logout(),
+                          '已退出 App Server 账号。',
+                        )}
+                      >退出登录</button>
+                    </div>
+                  )}
+                  {codexAppServer?.phase === 'ready'
+                    && !codexAppServer.pendingLogin
+                    && !codexAppServer.account
+                    && codexAppServer.requiresOpenaiAuth === true && (
+                    <div className="codex-login-options" data-testid="codex-account-status">
+                      <p>尚未登录。请选择一种完全由界面引导的方式：</p>
+                      <div className="codex-actions">
+                        <button
+                          className="primary"
+                          data-action="codex-login-browser"
+                          disabled={codexBusy}
+                          onClick={() => void runCodexAction(
+                            () => window.aiTerminal.codexAppServer.loginBrowser(),
+                          )}
+                        >使用 ChatGPT 登录</button>
+                        <button
+                          data-action="codex-login-device"
+                          disabled={codexBusy}
+                          onClick={() => void runCodexAction(
+                            () => window.aiTerminal.codexAppServer.loginDeviceCode(),
+                          )}
+                        >使用设备码登录</button>
+                      </div>
+                    </div>
+                  )}
+                  {codexAppServer?.phase === 'ready'
+                    && !codexAppServer.account
+                    && codexAppServer.requiresOpenaiAuth === false && (
+                    <div className="codex-account-card" data-testid="codex-account-status">
+                      <div><strong>当前配置无需 OpenAI 登录</strong><span>App Server 报告可直接使用当前模型提供方。</span></div>
+                    </div>
+                  )}
+                  {codexAppServer?.phase === 'ready'
+                    && !codexAppServer.pendingLogin
+                    && !codexAppServer.account
+                    && codexAppServer.requiresOpenaiAuth === undefined && (
+                    <p className="codex-empty-state">
+                      账号状态尚未加载。请刷新状态；若持续失败，请重启服务。
+                    </p>
+                  )}
+                </section>
+
+                <section className="codex-setup-section">
+                  <div className="codex-section-heading">
+                    <span>3</span>
+                    <div>
+                      <strong>模型与首选项</strong>
+                      <small>模型来自当前 App Server；保存后下次自动恢复，当前不接入终端智能体。</small>
+                    </div>
+                  </div>
+                  {codexAppServer?.models.length ? (
+                    <div className="codex-model-grid">
+                      <label>模型
+                        <select
+                          data-testid="codex-model-select"
+                          value={codexModelId}
+                          onChange={(event) => selectCodexModel(event.target.value)}
+                          disabled={codexBusy}
+                        >
+                          {codexAppServer.models.map((model) => (
+                            <option key={model.id} value={model.id}>{model.displayName}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>推理强度
+                        <select
+                          data-testid="codex-effort-select"
+                          value={codexReasoningEffort}
+                          onChange={(event) => setCodexReasoningEffort(event.target.value)}
+                          disabled={codexBusy || !selectedCodexModel?.supportedReasoningEfforts.length}
+                        >
+                          {!selectedCodexModel?.supportedReasoningEfforts.length && (
+                            <option value="">使用模型默认值</option>
+                          )}
+                          {selectedCodexModel?.supportedReasoningEfforts.map((effort) => (
+                            <option key={effort.reasoningEffort} value={effort.reasoningEffort}>
+                              {codexReasoningEffortLabel(effort.reasoningEffort)}
+                              {effort.description ? ` · ${effort.description}` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        className="primary codex-bind"
+                        data-action="codex-bind"
+                        disabled={codexBusy || !selectedCodexModel || !codexSelectionDirty}
+                        onClick={() => void saveCodexSelection()}
+                      >保存 App Server 首选模型</button>
+                      {codexSelectionSaved && (
+                        <span className="codex-bound-badge" role="status">当前选择已保存</span>
+                      )}
+                      {codexSelectionDirty && (
+                        <span className="codex-dirty-badge" role="status">有未保存更改</span>
+                      )}
+                    </div>
+                  ) : (
+                    <p className="codex-empty-state">{codexAppServer?.phase !== 'ready'
+                      ? '服务就绪后将在这里显示可选模型。'
+                      : codexAppServer.requiresOpenaiAuth === true && !codexAppServer.account
+                        ? '登录完成后将自动加载可选模型。'
+                        : codexAppServer.requiresOpenaiAuth === undefined
+                          ? '模型状态尚未加载。请刷新状态。'
+                          : 'App Server 当前没有返回可选模型。请刷新状态或检查 Codex 配置。'}</p>
+                  )}
+                  <div className="codex-safety-boundary">
+                    <strong>共享终端安全边界</strong>
+                    <p>{codexAppServer?.terminalAgentReason ?? '正在读取安全能力状态。'}</p>
+                    <small>App Server 的启动、登录和首选模型设置可全程在界面完成；在官方协议能硬性禁用内建 Shell/File 工具前，本应用不会让它绕过可见终端执行命令。</small>
+                  </div>
+                </section>
+              </div>
+            )}
+
+            {providerSettingsSection === 'generic' && (
+              <div
+                id="provider-panel-generic"
+                className="generic-provider-panel"
+                role="tabpanel"
+                aria-labelledby="provider-kind-generic"
+              >
+                <section className="codex-app-server-note generic-provider-note">
+                  <strong>OpenAI 兼容 API</strong>
+                  <p>“可用”表示 Base URL、API Key 与模型列表测试通过。请勿在 API Key 输入框中粘贴 ChatGPT 登录凭据。</p>
+                </section>
+                <div className="provider-layout">
+                  <div className="provider-list">
+                    {providers.map((provider) => (
+                      <button
+                        className={editingProvider?.id === provider.id ? 'active' : ''}
+                        key={provider.id}
+                        onClick={() => {
+                          setEditingProvider(provider);
+                          setProviderMessage(null);
+                        }}
+                      >
+                        <strong>{provider.name}</strong>
+                        <small>{provider.modelId}</small>
+                        <span className={`provider-status ${provider.status}`}>{providerStatusLabel(provider.status)}</span>
+                      </button>
+                    ))}
+                    <button className="add-provider" onClick={() => {
+                      setEditingProvider(null);
+                      setProviderMessage(null);
+                    }}>＋ 添加 Provider</button>
+                  </div>
+                  <form className="provider-form" onSubmit={(event) => void saveProvider(event)}>
+                    <label>名称<input name="name" required defaultValue={editingProvider?.name ?? 'OpenAI 兼容 API'} key={`name-${editingProvider?.id ?? 'new'}`} /></label>
+                    <label>基础 URL<input name="baseUrl" type="url" required placeholder="https://api.example.com/v1" defaultValue={editingProvider?.baseUrl ?? ''} key={`url-${editingProvider?.id ?? 'new'}`} /></label>
+                    <label>模型 ID<input name="modelId" required placeholder="model-id" defaultValue={editingProvider?.modelId ?? ''} key={`model-${editingProvider?.id ?? 'new'}`} /></label>
+                    <label>
+                      API Key
+                      <input
+                        name="apiKey"
+                        type="password"
+                        required={!editingProvider?.apiKeyConfigured}
+                        autoComplete="new-password"
+                        placeholder={editingProvider?.apiKeyConfigured ? '已保存到 Windows 凭据管理器' : '必填'}
+                      />
+                    </label>
+                    <label className="check-label">
+                      <input name="makeDefault" type="checkbox" defaultChecked={editingProvider?.isDefault ?? providers.length === 0} />
+                      设为默认 Provider
+                    </label>
+                    <p className="secure-note">API Key 作为 Windows 通用凭据保存；Provider JSON 只保存凭据引用。</p>
+                    {providerMessage && <div className="provider-message">{providerMessage}</div>}
+                    <div className="provider-actions">
+                      {editingProvider && (
+                        <>
+                          <button type="button" onClick={() => void testProvider(editingProvider.id)}>测试连接</button>
+                          {!editingProvider.isDefault && (
+                            <button type="button" onClick={async () => {
+                              await window.aiTerminal.providers.setDefault(editingProvider.id);
+                              await refreshProviders();
+                            }}>设为默认</button>
+                          )}
+                          <button className="danger-text" type="button" onClick={() => void removeProvider(editingProvider)}>删除</button>
+                        </>
+                      )}
+                      <button className="primary" type="submit">保存 Provider</button>
+                    </div>
+                  </form>
                 </div>
-              </form>
-            </div>
+              </div>
+            )}
           </div>
         </div>
       )}

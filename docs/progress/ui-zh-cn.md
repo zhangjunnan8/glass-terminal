@@ -12,7 +12,7 @@ UI-ZH-CN — Alpha 中文界面与大字号可读性。
 - xterm 字号由 13px 提升到 15px，行高由 1.18 提升到 1.28，并增加中文字体回退。
 - 按钮、输入框、工具栏、弹窗和窄屏 Provider 布局同步放大与防溢出。
 - Smoke 测试改用稳定 `data-action`/`data-testid`，不再依赖英文按钮文案。
-- Provider 设置明确标注 Codex App Server 尚未接入，并增加独立接入说明。
+- Provider 设置在当时明确标注 Codex App Server 尚未接入，并增加独立接入说明；后续 Milestone 7A 已提供中文 UI 控制面。
 
 ## Files changed
 
@@ -48,7 +48,7 @@ UI-ZH-CN — Alpha 中文界面与大字号可读性。
 
 - Terminal、Agent 回复、命令、路径、模型名等动态内容按原文显示。
 - 部分来自底层库的自由格式错误仍可能是英文，后续应改为稳定错误码加本地化文案。
-- Codex App Server 仍属于后续 M7，不包含在本次 UI 改造中。
+- Codex App Server 不属于本次 UI-ZH-CN 提交；其后续 UI 控制面见 `milestone-7a.md`。
 
 ## Git commit
 

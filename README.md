@@ -8,8 +8,9 @@ visible PTY or SSH shell.
 > persistence, and linked SFTP are working and tested. This is not yet the
 > finished Core Demo; see `docs/progress/alpha-vertical-slice.md`.
 
-当前界面已提供简体中文并采用放大字号。Codex App Server 尚未接入；其官方
-使用方式与本项目接入边界见 `docs/codex-app-server.md`。
+当前界面已提供简体中文并采用放大字号。Codex App Server 的启动、ChatGPT
+登录、账号、模型与首选项保存已可全程在 UI 中完成；共享终端 Agent 数据面仍因内建
+工具隔离限制而保持禁用。使用方式与边界见 `docs/codex-app-server.md`。
 
 ## Design invariants
 
@@ -40,6 +41,10 @@ npm run typecheck
 npm test
 npm run build
 ```
+
+当前 `npm run build` 只生成 renderer 与 Electron main/preload 的编译产物，
+不会生成 `.exe` 或 Windows Portable 目录。Portable 打包、Codex CLI 资源复制、
+签名与干净 Windows 环境验收仍属于后续发布工作。
 
 ## Repository map
 

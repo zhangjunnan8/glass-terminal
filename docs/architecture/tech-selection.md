@@ -43,11 +43,16 @@ Core dependencies are permissively licensed:
 | xterm.js | MIT | Terminal emulator |
 | node-pty | MIT | Local PTY / Windows ConPTY |
 | ssh2 | MIT | SSH/SFTP transport |
+| @openai/codex | Apache-2.0 | Official Codex CLI and App Server runtime |
 
 The project itself uses MIT. Chromium and transitive Electron components carry
 their own permissive notices and must be included in release attribution.
 No GPL/AGPL core dependency is intentionally introduced. Package versions and
-licenses must be re-audited before a public binary release.
+licenses must be re-audited before a public binary release. A redistributed
+Codex CLI binary must be accompanied by the Apache-2.0 license and any upstream
+NOTICE content that applies; the release process must generate and verify the
+complete third-party attribution bundle rather than relying only on npm package
+metadata.
 
 ## Architectural boundaries
 

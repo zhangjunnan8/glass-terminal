@@ -36,6 +36,10 @@ import type {
   SetFullTakeoverRequest,
   TakeoverRequest,
 } from './agent';
+import type {
+  CodexAppServerSnapshot,
+  SaveCodexAppServerSelectionRequest,
+} from './codex-app-server';
 
 export interface RuntimeInfo {
   platform: NodeJS.Platform;
@@ -84,6 +88,22 @@ export interface DesktopBridge {
     remove(providerId: string): Promise<void>;
     setDefault(providerId: string): Promise<ProviderProfile>;
     testConnection(providerId: string): Promise<ProviderConnectionResult>;
+  };
+  codexAppServer: {
+    getState(): Promise<CodexAppServerSnapshot>;
+    start(): Promise<CodexAppServerSnapshot>;
+    chooseExecutable(): Promise<CodexAppServerSnapshot>;
+    restart(): Promise<CodexAppServerSnapshot>;
+    refresh(): Promise<CodexAppServerSnapshot>;
+    loginBrowser(): Promise<CodexAppServerSnapshot>;
+    loginDeviceCode(): Promise<CodexAppServerSnapshot>;
+    reopenLogin(): Promise<CodexAppServerSnapshot>;
+    cancelLogin(): Promise<CodexAppServerSnapshot>;
+    logout(): Promise<CodexAppServerSnapshot>;
+    saveSelection(
+      request: SaveCodexAppServerSelectionRequest,
+    ): Promise<CodexAppServerSnapshot>;
+    onStateChanged(listener: (state: CodexAppServerSnapshot) => void): () => void;
   };
   agent: {
     sendPrompt(request: SendAgentPromptRequest): Promise<AgentSessionView>;

@@ -16,7 +16,8 @@ Windows ConPTY and the designated Ubuntu SSH target:
 7. Persist Host, Session, terminal log, AI Thread, and Audit across restart.
 
 This is an **Alpha vertical slice**, not the completed Core Demo. In
-particular, official Codex App Server/Auth integration (M7), ProxyJump,
+particular, the Codex App Server Thread/Turn Agent data plane (the UI startup,
+Auth, account and model control plane is available as M7A), ProxyJump,
 complete cwd/effective-user restoration, manual Secure Input fallback,
 arbitrary interactive/full-screen programs, Portable packaging, and the full
 30-step release acceptance remain open.

@@ -35,5 +35,5 @@
   controls in Milestones 10–11.
 - Structured envelopes cannot guarantee an end sentinel if a command exits the
   parent shell deliberately; terminal exit is recorded as a failed execution.
-- Official Codex App Server remains Milestone 7 and is not represented by the
-  Generic mock Provider.
+- Codex App Server startup/Auth/account/model UI is available in Milestone 7A,
+  but its Thread/Turn Agent data plane is not represented by the Generic mock Provider.

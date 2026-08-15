@@ -286,12 +286,53 @@ async function runLocalSmoke(window: BrowserWindow): Promise<boolean> {
       const uiReadable = sectionLabel && searchInput
         && Number.parseFloat(getComputedStyle(sectionLabel).fontSize) >= 12
         && Number.parseFloat(getComputedStyle(searchInput).fontSize) >= 14;
+      const providerSettingsButton = document.querySelector('[data-action="open-provider-settings"]');
+      if (!(providerSettingsButton instanceof HTMLButtonElement)) return false;
+      providerSettingsButton.click();
+      const providerSettingsReady = await waitFor(
+        () => document.querySelector('[data-testid="codex-app-server-panel"]'),
+      );
+      const codexPanel = document.querySelector('[data-testid="codex-app-server-panel"]');
+      const providerModal = document.querySelector('[data-testid="provider-settings-modal"]');
+      const codexHeading = codexPanel?.querySelector('.codex-section-heading small');
+      const codexSafetyText = codexPanel?.querySelector('.codex-safety-boundary small');
+      const codexUiReadable = providerSettingsReady
+        && codexPanel?.textContent?.includes('App Server 服务')
+        && codexPanel?.textContent?.includes('自动检测并启动')
+        && codexPanel?.textContent?.includes('选择 codex 可执行文件')
+        && codexPanel?.textContent?.includes('模型与首选项')
+        && codexPanel?.textContent?.includes('当前不接入终端智能体')
+        && providerModal?.getAttribute('role') === 'dialog'
+        && providerModal?.getAttribute('aria-modal') === 'true'
+        && codexHeading
+        && codexSafetyText
+        && Number.parseFloat(getComputedStyle(codexHeading).fontSize) >= 14
+        && Number.parseFloat(getComputedStyle(codexSafetyText).fontSize) >= 14;
+      const providerClose = document.querySelector('.provider-modal .modal-header button');
+      if (providerClose instanceof HTMLButtonElement) providerClose.click();
+      await waitFor(() => !document.querySelector('[data-testid="provider-settings-modal"]'));
+      const agentProviderButton = document.querySelector('[data-action="open-agent-provider-settings"]');
+      let agentProviderRoutesToGeneric = false;
+      if (agentProviderButton instanceof HTMLButtonElement) {
+        agentProviderButton.click();
+        const genericPanelReady = await waitFor(
+          () => document.querySelector('#provider-panel-generic'),
+        );
+        const genericTab = document.querySelector('[data-testid="provider-kind-generic"]');
+        agentProviderRoutesToGeneric = Boolean(
+          genericPanelReady && genericTab?.getAttribute('aria-selected') === 'true',
+        );
+        const secondProviderClose = document.querySelector('.provider-modal .modal-header button');
+        if (secondProviderClose instanceof HTMLButtonElement) secondProviderClose.click();
+      }
       await window.aiTerminal.terminal.close(terminalId);
       await new Promise((resolve) => setTimeout(resolve, 250));
       return commandSeen
         && sessionListed
         && uiLocalized
         && uiReadable
+        && codexUiReadable
+        && agentProviderRoutesToGeneric
         && persistedHistory.includes('__AI_TERMINAL_PTY_SMOKE__');
     })()`,
   );
