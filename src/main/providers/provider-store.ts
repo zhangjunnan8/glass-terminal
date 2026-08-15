@@ -4,11 +4,15 @@ import { dirname } from 'node:path';
 import type {
   ProviderConnectionResult,
   ProviderInput,
+  ProviderModelDiscoveryInput,
+  ProviderModelDiscoveryResult,
   ProviderProfile,
 } from '../../shared/provider';
 import type { SecretStore } from './secret-store';
 
 type FetchImplementation = typeof fetch;
+const MAX_MODELS_RESPONSE_BYTES = 1024 * 1024;
+const MAX_DISCOVERED_MODELS = 500;
 interface StoredProviderProfile extends ProviderProfile {
   apiKeyReference: string;
 }
@@ -43,6 +47,53 @@ function normalizedBaseUrl(value: unknown): string {
   if (url.username || url.password) throw new Error('Base URL 不得包含登录凭据。');
   if (url.search || url.hash) throw new Error('Base URL 不得包含查询参数或片段。');
   return url.toString().replace(/\/+$/, '');
+}
+
+async function readBoundedJson(response: Response): Promise<unknown> {
+  const declaredLength = Number(response.headers.get('content-length') ?? 0);
+  if (declaredLength > MAX_MODELS_RESPONSE_BYTES) {
+    throw new Error('Provider 返回的模型列表过大。');
+  }
+  const reader = response.body?.getReader();
+  if (!reader) return JSON.parse(await response.text());
+  const decoder = new TextDecoder();
+  let receivedBytes = 0;
+  let text = '';
+  try {
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      receivedBytes += chunk.value.byteLength;
+      if (receivedBytes > MAX_MODELS_RESPONSE_BYTES) {
+        throw new Error('Provider 返回的模型列表过大。');
+      }
+      text += decoder.decode(chunk.value, { stream: true });
+    }
+    text += decoder.decode();
+    return JSON.parse(text);
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // The stream may already be closed; cancellation is best-effort cleanup.
+    }
+    reader.releaseLock();
+  }
+}
+
+function modelIdsFromPayload(payload: unknown): string[] {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('Provider 返回了无效的模型列表。');
+  }
+  const data = (payload as { data?: unknown }).data;
+  if (!Array.isArray(data)) throw new Error('Provider 返回了无效的模型列表。');
+  const models = [...new Set(data.flatMap((item) => {
+    if (!item || typeof item !== 'object') return [];
+    const id = (item as { id?: unknown }).id;
+    return typeof id === 'string' && id.trim() && id.length <= 256 ? [id] : [];
+  }))].slice(0, MAX_DISCOVERED_MODELS).sort((left, right) => left.localeCompare(right));
+  if (models.length === 0) throw new Error('Provider 没有返回可用模型；你仍可手动输入模型 ID。');
+  return models;
 }
 
 function parseProfiles(value: unknown): StoredProviderProfile[] {
@@ -190,8 +241,8 @@ export class ProviderStore {
         redirect: 'error',
       });
       if (!response.ok) throw new Error(`Provider 返回 HTTP ${response.status}。`);
-      const payload = await response.json() as { data?: Array<{ id?: string }> };
-      if (!Array.isArray(payload.data) || !payload.data.some((model) => model.id === provider.modelId)) {
+      const models = modelIdsFromPayload(await readBoundedJson(response));
+      if (!models.includes(provider.modelId)) {
         throw new Error(`Provider 返回的模型列表中没有“${provider.modelId}”。`);
       }
       result = {
@@ -224,6 +275,38 @@ export class ProviderStore {
     ));
     this.write();
     return result;
+  }
+
+  async discoverModels(
+    input: ProviderModelDiscoveryInput,
+  ): Promise<ProviderModelDiscoveryResult> {
+    const baseUrl = normalizedBaseUrl(input.baseUrl);
+    const suppliedKey = typeof input.apiKey === 'string' && input.apiKey.trim()
+      ? input.apiKey
+      : undefined;
+    const apiKey = suppliedKey ?? (input.providerId ? await this.apiKey(input.providerId) : undefined);
+    if (!apiKey) throw new Error('请先输入 API Key，再自动检索模型。');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+    try {
+      const response = await this.fetchImplementation(`${baseUrl}/models`, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+        signal: controller.signal,
+        redirect: 'error',
+      });
+      if (!response.ok) throw new Error(`Provider 返回 HTTP ${response.status}。`);
+      const models = modelIdsFromPayload(await readBoundedJson(response));
+      return {
+        models,
+        message: `已检索到 ${models.length} 个可用模型。`,
+      };
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error('检索模型超时，请检查网络与 API 地址。');
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 
   private getStored(providerId: string): StoredProviderProfile {

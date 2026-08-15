@@ -33,10 +33,22 @@ export interface ProviderConnectionResult {
   testedAt: string;
 }
 
+export interface ProviderModelDiscoveryInput {
+  baseUrl: string;
+  apiKey?: string;
+  providerId?: string;
+}
+
+export interface ProviderModelDiscoveryResult {
+  models: string[];
+  message: string;
+}
+
 export const PROVIDER_CHANNELS = {
   list: 'provider:list',
   save: 'provider:save',
   remove: 'provider:remove',
   setDefault: 'provider:set-default',
   testConnection: 'provider:test-connection',
+  discoverModels: 'provider:discover-models',
 } as const;

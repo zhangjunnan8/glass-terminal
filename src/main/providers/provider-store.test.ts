@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ProviderStore } from './provider-store';
 import { MemorySecretStore } from './secret-store';
+import { PROVIDER_TEMPLATES, providerTemplateForBaseUrl } from '../../shared/provider-templates';
 
 const roots: string[] = [];
 
@@ -22,6 +23,19 @@ afterEach(() => {
 });
 
 describe('ProviderStore', () => {
+  it('ships stable presets while preserving a custom endpoint option', () => {
+    expect(PROVIDER_TEMPLATES.map((template) => template.id)).toEqual([
+      'openai',
+      'deepseek',
+      'zhipu',
+      'minimax-cn',
+      'minimax-global',
+      'custom',
+    ]);
+    expect(providerTemplateForBaseUrl('https://api.deepseek.com/').id).toBe('deepseek');
+    expect(providerTemplateForBaseUrl('https://private.example/v1').id).toBe('custom');
+  });
+
   it('persists only a Credential Manager reference, never the API key', async () => {
     const { path, secrets, store } = fixture();
     const profile = await store.save({
@@ -120,5 +134,56 @@ describe('ProviderStore', () => {
     const store = new ProviderStore(path, secrets);
     expect(store.list()[0]).not.toHaveProperty('apiKey');
     expect(JSON.stringify(store.list())).not.toContain('must-not-cross-the-store-boundary');
+  });
+
+  it('discovers, deduplicates, and sorts models without persisting a supplied key', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      data: [{ id: 'model-z' }, { id: 'model-a' }, { id: 'model-z' }, { ignored: true }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    const { path, store } = fixture(fetchMock);
+
+    await expect(store.discoverModels({
+      baseUrl: 'https://provider.example/v1/',
+      apiKey: 'discovery-secret',
+    })).resolves.toEqual({
+      models: ['model-a', 'model-z'],
+      message: '已检索到 2 个可用模型。',
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://provider.example/v1/models',
+      expect.objectContaining({
+        redirect: 'error',
+        headers: expect.objectContaining({ Authorization: 'Bearer discovery-secret' }),
+      }),
+    );
+    expect(() => readFileSync(path, 'utf8')).toThrow();
+  });
+
+  it('can discover with an existing saved key and keeps manual entry as the safe fallback', async () => {
+    const fetchMock = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: 'saved-model' }] }), { status: 200 }));
+    const { store } = fixture(fetchMock);
+    const profile = await store.save({
+      name: 'Existing',
+      baseUrl: 'https://provider.example/v1',
+      modelId: 'manual-model',
+      apiKey: 'saved-secret',
+    });
+
+    await expect(store.discoverModels({
+      baseUrl: profile.baseUrl,
+      providerId: profile.id,
+    })).rejects.toThrow('仍可手动输入模型 ID');
+    await expect(store.discoverModels({
+      baseUrl: profile.baseUrl,
+      providerId: profile.id,
+    })).resolves.toMatchObject({ models: ['saved-model'] });
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      'https://provider.example/v1/models',
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer saved-secret' }),
+      }),
+    );
   });
 });
