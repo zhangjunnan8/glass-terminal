@@ -79,6 +79,7 @@ interface FullTakeoverChallenge {
 }
 
 type AgentBackendKind = AgentBackendRef['kind'];
+type SidebarView = 'terminals' | 'hosts' | 'history';
 
 const CODEX_AGENT_BACKEND: AgentBackendRef = {
   kind: CODEX_APP_SERVER_AGENT_BACKEND,
@@ -133,6 +134,8 @@ export function App() {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
+  const [sidebarView, setSidebarView] = useState<SidebarView>('terminals');
+  const [sidebarSearch, setSidebarSearch] = useState('');
   const [newTerminalOpen, setNewTerminalOpen] = useState(false);
   const [sftpOpen, setSftpOpen] = useState(false);
   const [providerModalOpen, setProviderModalOpen] = useState(false);
@@ -297,6 +300,25 @@ export function App() {
   const selectedHostSessions = selectedHost
     ? sessions.filter((session) => session.hostId === selectedHost.id)
     : [];
+  const normalizedSidebarSearch = sidebarSearch.trim().toLocaleLowerCase('zh-CN');
+  const filteredShells = normalizedSidebarSearch
+    ? shells.filter((shell) => `${shell.label} ${shell.detail}`.toLocaleLowerCase('zh-CN')
+      .includes(normalizedSidebarSearch))
+    : shells;
+  const filteredTabs = normalizedSidebarSearch
+    ? tabs.filter((tab) => tab.title.toLocaleLowerCase('zh-CN').includes(normalizedSidebarSearch))
+    : tabs;
+  const filteredHosts = normalizedSidebarSearch
+    ? hosts.filter((host) => `${host.name} ${host.username} ${host.hostname} ${host.group ?? ''}`
+      .toLocaleLowerCase('zh-CN').includes(normalizedSidebarSearch))
+    : hosts;
+  const filteredSessions = normalizedSidebarSearch
+    ? sessions.filter((session) => {
+      const host = session.hostId ? hosts.find((candidate) => candidate.id === session.hostId) : null;
+      return `${session.name} ${host?.name ?? ''} ${session.effectiveUser ?? ''} ${session.lastKnownCwd ?? ''}`
+        .toLocaleLowerCase('zh-CN').includes(normalizedSidebarSearch);
+    })
+    : sessions;
   const defaultProvider = providers.find((provider) => provider.isDefault) ?? null;
   const selectedCodexModel = codexAppServer?.models.find((model) => (
     model.id === codexModelId
@@ -902,15 +924,42 @@ export function App() {
       </header>
 
       <aside className="activitybar" aria-label="主导航">
-        <button className="activity active" title="终端">⌁</button>
-        <button className="activity" title="主机">▦</button>
+        <button
+          className={`activity ${sidebarView === 'terminals' ? 'active' : ''}`}
+          title="终端"
+          data-action="show-terminals"
+          aria-pressed={sidebarView === 'terminals'}
+          onClick={() => {
+            setSidebarView('terminals');
+            setSidebarSearch('');
+          }}
+        >⌁</button>
+        <button
+          className={`activity ${sidebarView === 'hosts' ? 'active' : ''}`}
+          title="SSH 主机"
+          data-action="show-hosts"
+          aria-pressed={sidebarView === 'hosts'}
+          onClick={() => {
+            setSidebarView('hosts');
+            setSidebarSearch('');
+          }}
+        >▦</button>
         <button
           className={`activity ${sftpOpen ? 'active' : ''}`}
           title="SFTP 文件与传输"
           data-action="toggle-sftp"
           onClick={() => setSftpOpen((open) => !open)}
         >⇅</button>
-        <button className="activity" title="历史记录">◷</button>
+        <button
+          className={`activity ${sidebarView === 'history' ? 'active' : ''}`}
+          title="会话历史"
+          data-action="show-history"
+          aria-pressed={sidebarView === 'history'}
+          onClick={() => {
+            setSidebarView('history');
+            setSidebarSearch('');
+          }}
+        >◷</button>
         <div className="activity-spacer" />
         <button className="activity" title="AI 服务设置" data-action="open-provider-settings" onClick={() => {
           setProviderSettingsSection('codex');
@@ -923,50 +972,87 @@ export function App() {
 
       <aside className="sidebar">
         <div className="panel-heading">
-          <span>终端</span>
-          <button title="添加 SSH 主机" onClick={() => setEditingHost(null)}>＋</button>
+          <span>{sidebarView === 'terminals'
+            ? '终端'
+            : sidebarView === 'hosts' ? 'SSH 主机' : '会话历史'}</span>
+          {sidebarView === 'hosts' && (
+            <button title="添加 SSH 主机" onClick={() => setEditingHost(null)}>＋</button>
+          )}
         </div>
         <label className="search-box">
           <span>⌕</span>
-          <input aria-label="搜索主机和 Shell" placeholder="搜索主机和 Shell" />
+          <input
+            aria-label="筛选当前列表"
+            placeholder={sidebarView === 'terminals'
+              ? '搜索 Shell 或终端'
+              : sidebarView === 'hosts' ? '搜索 SSH 主机' : '搜索会话历史'}
+            value={sidebarSearch}
+            onChange={(event) => setSidebarSearch(event.target.value)}
+          />
         </label>
 
-        <div className="section-label">本地 SHELL</div>
-        <div className="host-list compact">
-          {shells.map((shell) => (
-            <button className="host-row" key={shell.id} onClick={() => void openTerminal(shell.id)}>
-              <span className="host-icon">{shell.kind === 'wsl' ? '◈' : '⌘'}</span>
-              <span>
-                <strong>{shell.label}</strong>
-                <small>{shell.detail}</small>
-              </span>
-            </button>
-          ))}
-        </div>
+        <div className="sidebar-view-body" data-sidebar-view={sidebarView}>
+          {sidebarView === 'terminals' && (
+            <>
+              <div className="section-label">本地 SHELL</div>
+              <div className="host-list compact">
+                {filteredShells.map((shell) => (
+                  <button className="host-row" key={shell.id} onClick={() => void openTerminal(shell.id)}>
+                    <span className="host-icon">{shell.kind === 'wsl' ? '◈' : '⌘'}</span>
+                    <span>
+                      <strong>{shell.label}</strong>
+                      <small>{shell.detail}</small>
+                    </span>
+                  </button>
+                ))}
+                {filteredShells.length === 0 && <div className="empty-list">没有匹配的本地 Shell</div>}
+              </div>
+              <div className="section-label">已打开终端</div>
+              <div className="host-list open-terminal-list">
+                {filteredTabs.map((tab) => (
+                  <button
+                    className={`host-row ${tab.id === activeId ? 'active' : ''}`}
+                    key={tab.id}
+                    onClick={() => setActiveId(tab.id)}
+                  >
+                    <span className="host-icon">{tab.transport === 'ssh' ? '◇' : '⌘'}</span>
+                    <span>
+                      <strong>{tab.title}</strong>
+                      <small>{tab.transport === 'ssh' ? 'SSH' : '本地'} · {tab.status === 'connected' ? '已连接' : '已退出'}</small>
+                    </span>
+                  </button>
+                ))}
+                {filteredTabs.length === 0 && <div className="empty-list">没有匹配的已打开终端</div>}
+              </div>
+            </>
+          )}
 
-        <div className="section-label section-with-action">
-          <span>SSH 主机</span>
-          <button onClick={() => setEditingHost(null)}>添加</button>
-        </div>
-        <div className="host-list">
-          {hosts.map((host) => (
-            <button
-              className={`host-row ${selectedHostId === host.id ? 'active' : ''}`}
-              key={host.id}
-              onClick={() => setSelectedHostId(host.id)}
-            >
-              <span className="host-icon">{host.favorite ? '★' : '◇'}</span>
-              <span>
-                <strong>{host.name}</strong>
-                <small>{host.username}@{host.hostname}:{host.port}</small>
-              </span>
-            </button>
-          ))}
-          {hosts.length === 0 && <div className="empty-list">尚未添加 SSH 主机</div>}
-        </div>
+          {sidebarView === 'hosts' && (
+            <>
+              <div className="section-label section-with-action">
+                <span>SSH 主机</span>
+                <button onClick={() => setEditingHost(null)}>添加</button>
+              </div>
+              <div className="host-list">
+                {filteredHosts.map((host) => (
+                  <button
+                    className={`host-row ${selectedHostId === host.id ? 'active' : ''}`}
+                    key={host.id}
+                    aria-expanded={selectedHostId === host.id}
+                    onClick={() => setSelectedHostId((current) => current === host.id ? null : host.id)}
+                  >
+                    <span className="host-icon">{host.favorite ? '★' : '◇'}</span>
+                    <span>
+                      <strong>{host.name}</strong>
+                      <small>{host.username}@{host.hostname}:{host.port}</small>
+                    </span>
+                  </button>
+                ))}
+                {filteredHosts.length === 0 && <div className="empty-list">没有匹配的 SSH 主机</div>}
+              </div>
 
-        {selectedHost && (
-          <div className="selected-host-card">
+              {selectedHost && (
+                <div className="selected-host-card">
             <strong>{selectedHost.name}</strong>
             <span>{authMethodLabel(selectedHost.authMethod)} · {selectedHost.hostKeyFingerprint ? '已信任' : '未验证'}</span>
             <div>
@@ -1024,9 +1110,51 @@ export function App() {
               ))}
               {selectedHostSessions.length === 0 && <small>尚无正式会话。</small>}
             </div>
-          </div>
-        )}
-        <div className="sidebar-footer">无遥测 · SSH 凭据可选保存到 Windows 凭据管理器</div>
+                </div>
+              )}
+            </>
+          )}
+
+          {sidebarView === 'history' && (
+            <div className="history-sidebar-list">
+              {filteredSessions.map((session) => {
+                const host = session.hostId
+                  ? hosts.find((candidate) => candidate.id === session.hostId)
+                  : undefined;
+                const runtimeTab = tabs.find((tab) => (
+                  tab.sessionId === session.id || tab.id === session.runtimeTerminalId
+                ));
+                return (
+                  <article className="history-sidebar-row" key={session.id}>
+                    <button
+                      className="history-session-main"
+                      disabled={!runtimeTab && !host}
+                      onClick={() => {
+                        if (runtimeTab) setActiveId(runtimeTab.id);
+                        else if (host) openSshConnection(host, session.id);
+                      }}
+                    >
+                      <strong>{session.name}</strong>
+                      <small>{host?.name ?? (session.transport === 'ssh' ? 'SSH 主机' : '本地 Shell')}</small>
+                      <small>{sessionStatusLabel(session.status)} · {new Date(session.updatedAt).toLocaleString('zh-CN')}</small>
+                    </button>
+                    <div className="history-session-actions">
+                      <button onClick={() => openSessionRename(session)}>重命名</button>
+                      {host && (
+                        <button
+                          disabled={sshConnectionPending}
+                          onClick={() => openSshConnection(host, session.id)}
+                        >重连</button>
+                      )}
+                    </div>
+                  </article>
+                );
+              })}
+              {filteredSessions.length === 0 && <div className="empty-list">没有匹配的正式会话</div>}
+            </div>
+          )}
+        </div>
+        <div className="sidebar-footer">无遥测 · 主机、会话与终端互相独立</div>
       </aside>
 
       <main className="workspace">

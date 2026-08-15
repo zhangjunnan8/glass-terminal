@@ -168,6 +168,10 @@ describe('renderer host and session dialogs', () => {
     await act(async () => root.render(<App />));
     await settle();
 
+    const hostsActivity = container.querySelector<HTMLButtonElement>('[data-action="show-hosts"]');
+    expect(hostsActivity).not.toBeNull();
+    await act(async () => hostsActivity!.click());
+
     const hostButton = container.querySelector<HTMLButtonElement>('.host-list:not(.compact) .host-row');
     expect(hostButton).not.toBeNull();
     await act(async () => hostButton!.click());
@@ -221,6 +225,33 @@ describe('renderer host and session dialogs', () => {
     expect(container.querySelector('[data-testid="rename-session-dialog"]')).not.toBeNull();
     expect(container.querySelector('[data-testid="rename-session-error"]')?.textContent)
       .toContain('无法保存会话名称');
+  });
+
+  it('switches the host and history activity views and collapses a selected host', async () => {
+    const bridge = bridgeWith(vi.fn());
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    expect(container.querySelector('[data-sidebar-view="terminals"]')).not.toBeNull();
+    const hostsActivity = container.querySelector<HTMLButtonElement>('[data-action="show-hosts"]')!;
+    await act(async () => hostsActivity.click());
+    expect(container.querySelector('[data-sidebar-view="hosts"]')).not.toBeNull();
+
+    const hostButton = container.querySelector<HTMLButtonElement>(
+      '[data-sidebar-view="hosts"] .host-row',
+    )!;
+    await act(async () => hostButton.click());
+    expect(hostButton.getAttribute('aria-expanded')).toBe('true');
+    expect(container.querySelector('.selected-host-card')).not.toBeNull();
+    await act(async () => hostButton.click());
+    expect(hostButton.getAttribute('aria-expanded')).toBe('false');
+    expect(container.querySelector('.selected-host-card')).toBeNull();
+
+    const historyActivity = container.querySelector<HTMLButtonElement>('[data-action="show-history"]')!;
+    await act(async () => historyActivity.click());
+    expect(container.querySelector('[data-sidebar-view="history"]')).not.toBeNull();
+    expect(container.querySelector('.history-sidebar-row strong')?.textContent).toBe(session.name);
   });
 
   it('requires an unsaved password and leaves credential saving unchecked by default', async () => {
