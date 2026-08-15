@@ -9,8 +9,9 @@ visible PTY or SSH shell.
 > finished Core Demo; see `docs/progress/alpha-vertical-slice.md`.
 
 当前界面已提供简体中文并采用放大字号。Codex App Server 的启动、ChatGPT
-登录、账号、模型与首选项保存已可全程在 UI 中完成；共享终端 Agent 数据面仍因内建
-工具隔离限制而保持禁用。使用方式与边界见 `docs/codex-app-server.md`。
+登录、账号、模型、首选项与实验隔离 Agent 启用均可全程在 UI 中完成。实验后端使用
+空 environment、私有只读运行目录和三个 `terminal_*` 动态工具，并将命令复用到现有
+逐条审批与同一可见 PTY 链路；具体边界见 `docs/codex-app-server.md`。
 
 ## Design invariants
 

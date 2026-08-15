@@ -295,13 +295,22 @@ async function runLocalSmoke(window: BrowserWindow): Promise<boolean> {
       const codexPanel = document.querySelector('[data-testid="codex-app-server-panel"]');
       const providerModal = document.querySelector('[data-testid="provider-settings-modal"]');
       const codexHeading = codexPanel?.querySelector('.codex-section-heading small');
-      const codexSafetyText = codexPanel?.querySelector('.codex-safety-boundary small');
+      const codexIsolationCard = codexPanel?.querySelector('[data-testid="codex-agent-isolation-card"]');
+      const codexAvailability = codexPanel?.querySelector('[data-testid="codex-agent-availability"]');
+      const codexSafetyText = codexPanel?.querySelector('[data-testid="codex-agent-boundary"] li');
       const codexUiReadable = providerSettingsReady
         && codexPanel?.textContent?.includes('App Server 服务')
         && codexPanel?.textContent?.includes('自动检测并启动')
         && codexPanel?.textContent?.includes('选择 codex 可执行文件')
         && codexPanel?.textContent?.includes('模型与首选项')
-        && codexPanel?.textContent?.includes('当前不接入终端智能体')
+        && codexPanel?.textContent?.includes('隔离 App Server Agent（实验）')
+        && codexPanel?.textContent?.includes('environments=[]')
+        && codexPanel?.textContent?.includes('不是“内建工具已被硬性关闭”')
+        && codexPanel?.textContent?.includes('结果标记为未知')
+        && ['unavailable', 'eligible', 'enabled', 'blocked'].includes(
+          codexIsolationCard?.getAttribute('data-isolation-state') ?? '',
+        )
+        && codexAvailability?.getAttribute('role') === 'status'
         && providerModal?.getAttribute('role') === 'dialog'
         && providerModal?.getAttribute('aria-modal') === 'true'
         && codexHeading
@@ -311,6 +320,10 @@ async function runLocalSmoke(window: BrowserWindow): Promise<boolean> {
       const providerClose = document.querySelector('.provider-modal .modal-header button');
       if (providerClose instanceof HTMLButtonElement) providerClose.click();
       await waitFor(() => !document.querySelector('[data-testid="provider-settings-modal"]'));
+      const agentBackendSelect = document.querySelector('[data-testid="agent-backend-select"]');
+      const genericBackendSelected = agentBackendSelect instanceof HTMLSelectElement
+        && agentBackendSelect.value === 'generic-provider'
+        && agentBackendSelect.getAttribute('data-backend-kind') === 'generic-provider';
       const agentProviderButton = document.querySelector('[data-action="open-agent-provider-settings"]');
       let agentProviderRoutesToGeneric = false;
       if (agentProviderButton instanceof HTMLButtonElement) {
@@ -332,6 +345,7 @@ async function runLocalSmoke(window: BrowserWindow): Promise<boolean> {
         && uiLocalized
         && uiReadable
         && codexUiReadable
+        && genericBackendSelected
         && agentProviderRoutesToGeneric
         && persistedHistory.includes('__AI_TERMINAL_PTY_SMOKE__');
     })()`,

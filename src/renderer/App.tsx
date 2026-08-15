@@ -5,7 +5,15 @@ import type { RuntimeInfo } from '../shared/ipc';
 import { PRODUCT_NAME } from '../shared/product';
 import type { SessionRecord } from '../shared/session';
 import type { ProviderInput, ProviderProfile } from '../shared/provider';
-import type { AgentRuntimeState, AgentSessionView } from '../shared/agent';
+import {
+  CODEX_APP_SERVER_AGENT_BACKEND,
+  CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+} from '../shared/agent';
+import type {
+  AgentBackendRef,
+  AgentRuntimeState,
+  AgentSessionView,
+} from '../shared/agent';
 import type {
   CodexAppServerSnapshot,
   CodexModelInfo,
@@ -17,6 +25,8 @@ import { SftpDrawer } from './components/SftpDrawer';
 import {
   agentStateLabel,
   authMethodLabel,
+  codexAgentIsolationAvailabilityLabel,
+  codexAgentIsolationViolationKindLabel,
   codexAppServerOperationLabel,
   codexAppServerPhaseLabel,
   codexPlanTypeLabel,
@@ -52,10 +62,18 @@ interface TrustChallenge {
 interface FullTakeoverChallenge {
   terminalId: string;
   target: string;
+  backend: AgentBackendRef;
   approvalId?: string;
   command?: string;
   editedCommand?: string;
 }
+
+type AgentBackendKind = AgentBackendRef['kind'];
+
+const CODEX_AGENT_BACKEND: AgentBackendRef = {
+  kind: CODEX_APP_SERVER_AGENT_BACKEND,
+  policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+};
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -116,9 +134,13 @@ export function App() {
   const [codexActionPending, setCodexActionPending] = useState(false);
   const [codexModelId, setCodexModelId] = useState('');
   const [codexReasoningEffort, setCodexReasoningEffort] = useState('');
+  const [codexAgentEnableChallenge, setCodexAgentEnableChallenge] = useState(false);
+  const [codexAgentBoundaryAcknowledged, setCodexAgentBoundaryAcknowledged] = useState(false);
   const codexActionLock = useRef(false);
   const providerModalRef = useRef<HTMLDivElement>(null);
+  const codexAgentConfirmationRef = useRef<HTMLDivElement>(null);
   const [agentStates, setAgentStates] = useState<Record<string, AgentSessionView>>({});
+  const [agentBackendChoices, setAgentBackendChoices] = useState<Record<string, AgentBackendKind>>({});
   const [agentPrompt, setAgentPrompt] = useState('');
   const [editedApprovalCommand, setEditedApprovalCommand] = useState('');
   const [editingHost, setEditingHost] = useState<HostProfile | null | undefined>(undefined);
@@ -216,6 +238,11 @@ export function App() {
     providerModalRef.current?.focus();
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
+      if (codexAgentEnableChallenge) {
+        setCodexAgentEnableChallenge(false);
+        setCodexAgentBoundaryAcknowledged(false);
+        return;
+      }
       setProviderModalOpen(false);
       setCodexMessage(null);
     };
@@ -224,7 +251,11 @@ export function App() {
       document.removeEventListener('keydown', handleKeyDown);
       if (previouslyFocused instanceof HTMLElement) previouslyFocused.focus();
     };
-  }, [providerModalOpen]);
+  }, [providerModalOpen, codexAgentEnableChallenge]);
+
+  useEffect(() => {
+    if (codexAgentEnableChallenge) codexAgentConfirmationRef.current?.focus();
+  }, [codexAgentEnableChallenge]);
 
   useEffect(() => {
     const handleOpenedTerminal = (event: Event) => {
@@ -270,6 +301,38 @@ export function App() {
       ? '正在处理界面操作'
       : null;
   const activeAgent = activeTab ? agentStates[activeTab.id] : undefined;
+  const explicitAgentBackendKind = activeTab
+    ? agentBackendChoices[activeTab.id]
+    : undefined;
+  const selectedAgentBackendKind = explicitAgentBackendKind
+    ?? activeAgent?.backend.kind
+    ?? 'generic-provider';
+  const selectedGenericProvider = defaultProvider;
+  const selectedAgentBackend: AgentBackendRef | undefined = selectedAgentBackendKind
+    === CODEX_APP_SERVER_AGENT_BACKEND
+    ? CODEX_AGENT_BACKEND
+    : selectedGenericProvider
+      ? { kind: 'generic-provider', providerId: selectedGenericProvider.id }
+      : undefined;
+  const codexIsolation = codexAppServer?.agentIsolation;
+  const codexAgentEnabled = Boolean(
+    codexAppServer?.terminalAgentEnabled
+    && codexIsolation?.availability === 'enabled',
+  );
+  const codexAgentCanRequestEnable = codexIsolation?.availability === 'eligible'
+    || codexIsolation?.availability === 'blocked';
+  const selectedAgentBackendReady = selectedAgentBackendKind
+    === CODEX_APP_SERVER_AGENT_BACKEND
+    ? codexAgentEnabled
+    : selectedGenericProvider?.status === 'ready';
+  const selectedAgentBackendStatus = selectedAgentBackendKind
+    === CODEX_APP_SERVER_AGENT_BACKEND
+    ? codexIsolation
+      ? `${codexAgentIsolationAvailabilityLabel(codexIsolation.availability)} · ${codexIsolation.reason}`
+      : '正在读取隔离 App Server Agent 状态。'
+    : selectedGenericProvider
+      ? `${selectedGenericProvider.name} · ${providerStatusLabel(selectedGenericProvider.status)}`
+      : '尚未配置默认 Provider。';
   const activeInputMode = activeAgent?.terminalInputMode ?? 'human';
   const foregroundRunning = activeAgent?.state === 'PAUSED'
     && activeAgent.activeExecution?.status === 'running';
@@ -376,6 +439,35 @@ export function App() {
     );
   }
 
+  function openAgentBackendSettings() {
+    setProviderSettingsSection(
+      selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND ? 'codex' : 'generic',
+    );
+    setEditingProvider(defaultProvider);
+    setProviderMessage(null);
+    setCodexMessage(null);
+    setProviderModalOpen(true);
+  }
+
+  function requestCodexAgentEnable() {
+    setCodexAgentBoundaryAcknowledged(false);
+    setCodexAgentEnableChallenge(true);
+  }
+
+  async function setCodexAgentEnabled(enabled: boolean) {
+    if (enabled && !codexAgentBoundaryAcknowledged) return;
+    setCodexAgentEnableChallenge(false);
+    setCodexAgentBoundaryAcknowledged(false);
+    await runCodexAction(
+      () => window.aiTerminal.codexAppServer.setTerminalAgentEnabled(enabled
+        ? { enabled: true, acknowledgementVersion: 1 }
+        : { enabled: false }),
+      enabled
+        ? '隔离 App Server Agent（实验）已为本次应用运行启用。请在智能体区域选择此后端。'
+        : '隔离 App Server Agent 已停用。',
+    );
+  }
+
   async function saveProvider(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const data = new FormData(event.currentTarget);
@@ -419,14 +511,16 @@ export function App() {
 
   async function sendAgentPrompt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!activeTab || !agentPrompt.trim()) return;
+    if (!activeTab || !agentPrompt.trim() || !selectedAgentBackend || !selectedAgentBackendReady) {
+      return;
+    }
     const prompt = agentPrompt.trim();
     setAgentPrompt('');
     try {
       const state = await window.aiTerminal.agent.sendPrompt({
         terminalId: activeTab.id,
         prompt,
-        providerId: defaultProvider?.id,
+        backend: selectedAgentBackend,
       });
       setAgentStates((current) => mergeAgentState(current, state));
       setTabs((current) => current.map((tab) => (
@@ -458,13 +552,14 @@ export function App() {
     terminalId = activeTab?.id,
     approvalId?: string,
     editedCommand?: string,
+    backend: AgentBackendRef | undefined = activeAgent?.backend ?? selectedAgentBackend,
   ) {
-    if (!terminalId) return;
+    if (!terminalId || !backend) return;
     try {
       const state = await window.aiTerminal.agent.setFullTakeover({
         terminalId,
         enabled,
-        providerId: defaultProvider?.id,
+        backend,
         approvalId,
         editedCommand,
       });
@@ -820,13 +915,39 @@ export function App() {
 
       <aside className="agent-panel">
         <div className="agent-header">
-          <div>
+          <div className="agent-heading">
             <strong>AI 智能体</strong>
-            <span>
-              当前 Provider：{defaultProvider
-                ? `${defaultProvider.name} · ${providerStatusLabel(defaultProvider.status)}`
-                : '未配置'}
-            </span>
+            <label className="agent-backend-picker">
+              <span>当前智能体后端</span>
+              <select
+                aria-describedby="agent-backend-status"
+                data-testid="agent-backend-select"
+                data-backend-kind={selectedAgentBackendKind}
+                value={selectedAgentBackendKind}
+                disabled={!activeTab || composerBlocked || activeAgent?.fullTakeover}
+                onChange={(event) => {
+                  if (!activeTab) return;
+                  const kind = event.target.value as AgentBackendKind;
+                  setAgentBackendChoices((current) => ({
+                    ...current,
+                    [activeTab.id]: kind,
+                  }));
+                }}
+              >
+                <option value="generic-provider">
+                  默认 Provider{defaultProvider ? ` · ${defaultProvider.name}` : '（未配置）'}
+                </option>
+                <option value={CODEX_APP_SERVER_AGENT_BACKEND}>
+                  Codex App Server · 隔离实验
+                </option>
+              </select>
+            </label>
+            <span
+              id="agent-backend-status"
+              className={`agent-backend-status ${selectedAgentBackendReady ? 'ready' : 'unavailable'}`}
+              data-testid="agent-backend-status"
+              role="status"
+            >{selectedAgentBackendStatus}</span>
           </div>
           <div className="agent-controls">
             {activeAgent?.fullTakeover && <span className="takeover-badge">AI 全接管</span>}
@@ -838,15 +959,27 @@ export function App() {
             >人工接管</button>
             <button
               className={activeAgent?.fullTakeover ? 'full-takeover-enabled' : ''}
-              disabled={!activeTab || !defaultProvider || defaultProvider.status !== 'ready' || agentTurnBusy(activeAgent?.state)}
+              disabled={
+                !activeTab
+                || agentTurnBusy(activeAgent?.state)
+                || (!activeAgent?.fullTakeover
+                  && (!selectedAgentBackend || !selectedAgentBackendReady))
+              }
               onClick={() => {
                 if (!activeTab) return;
                 if (activeAgent?.fullTakeover) {
-                  void setFullTakeover(false, activeTab.id);
-                } else {
+                  void setFullTakeover(
+                    false,
+                    activeTab.id,
+                    undefined,
+                    undefined,
+                    activeAgent.backend,
+                  );
+                } else if (selectedAgentBackend) {
                   setFullTakeoverChallenge({
                     terminalId: activeTab.id,
                     target: activeTab.title,
+                    backend: selectedAgentBackend,
                   });
                 }
               }}
@@ -854,20 +987,34 @@ export function App() {
           </div>
         </div>
         <div className="agent-body">
+          {selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND && (
+            <section
+              className={`agent-backend-notice ${codexIsolation?.availability ?? 'unavailable'}`}
+              data-testid="agent-codex-boundary"
+              data-isolation-state={codexIsolation?.availability ?? 'unavailable'}
+            >
+              <strong>隔离 App Server Agent（实验）</strong>
+              <p>{codexAgentEnabled
+                ? '当前只把 terminal_read、terminal_state、terminal_execute 接入这个可见终端。App Server 内建请求不受“全接管”影响。'
+                : selectedAgentBackendStatus}</p>
+              <button data-action="open-codex-agent-settings" onClick={openAgentBackendSettings}>
+                {codexAgentEnabled ? '查看隔离边界' : '打开 App Server 设置'}
+              </button>
+            </section>
+          )}
           {!activeAgent?.messages.length && (
             <div className="agent-empty">
               <div className="agent-glyph">✦</div>
               <strong>理解终端上下文的 AI 助手</strong>
               <p>智能体会读取当前会话，并在向这个可见终端发送每条命令前请求你的批准。</p>
               <div className="guardrail"><span>✓</span> 默认逐条审批命令</div>
-              <button className="provider-configure" data-action="open-agent-provider-settings" onClick={() => {
-                setProviderSettingsSection('generic');
-                setEditingProvider(defaultProvider);
-                setProviderMessage(null);
-                setCodexMessage(null);
-                setProviderModalOpen(true);
-              }}>
-                {defaultProvider ? '管理智能体 Provider' : '配置智能体 Provider'}
+              <button
+                className="provider-configure"
+                data-action="open-agent-provider-settings"
+                data-testid="open-agent-backend-settings"
+                onClick={openAgentBackendSettings}
+              >
+                管理智能体后端
               </button>
               {activeTab && !activeTab.sessionId && (
                 <button className="activate-session" onClick={() => void activateAiSession()}>
@@ -902,6 +1049,7 @@ export function App() {
                   setFullTakeoverChallenge({
                     terminalId: activeTab.id,
                     target: activeTab.title,
+                    backend: activeAgent.backend,
                     approvalId: activeAgent.pendingApproval.id,
                     command: activeAgent.pendingApproval.command,
                     editedCommand: editedApprovalCommand,
@@ -943,15 +1091,20 @@ export function App() {
             placeholder="让智能体检查或操作当前终端…"
             value={agentPrompt}
             onChange={(event) => setAgentPrompt(event.target.value)}
-            disabled={defaultProvider?.status !== 'ready' || !activeTab || activeTab.status !== 'connected' || composerBlocked}
+            disabled={!selectedAgentBackendReady || !activeTab || activeTab.status !== 'connected' || composerBlocked}
           />
           <div>
-            <span>{defaultProvider?.status === 'ready'
-              ? activeAgent ? agentStateLabel(activeAgent.state) : '已就绪 · 命令需审批'
-              : '请先配置并测试 Provider'}</span>
+            <span>{selectedAgentBackendReady
+              ? activeAgent
+                ? agentStateLabel(activeAgent.state)
+                : selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND
+                  ? '隔离实验已就绪 · terminal_execute 默认逐条审批'
+                  : '已就绪 · 命令需审批'
+              : selectedAgentBackendStatus}</span>
             <button
               type="submit"
-              disabled={!agentPrompt.trim() || defaultProvider?.status !== 'ready' || !activeTab || composerBlocked}
+              aria-label="发送消息"
+              disabled={!agentPrompt.trim() || !selectedAgentBackendReady || !activeTab || composerBlocked}
             >↑</button>
           </div>
         </form>
@@ -1029,6 +1182,7 @@ export function App() {
             role="dialog"
             aria-modal="true"
             aria-labelledby="provider-settings-title"
+            aria-hidden={codexAgentEnableChallenge || undefined}
             tabIndex={-1}
           >
             <div className="modal-header">
@@ -1036,6 +1190,8 @@ export function App() {
               <button type="button" aria-label="关闭 AI 服务设置" onClick={() => {
                 setProviderModalOpen(false);
                 setCodexMessage(null);
+                setCodexAgentEnableChallenge(false);
+                setCodexAgentBoundaryAcknowledged(false);
               }}>×</button>
             </div>
             <div className="provider-kind-tabs" role="tablist" aria-label="AI 服务类型">
@@ -1274,7 +1430,7 @@ export function App() {
                     <span>3</span>
                     <div>
                       <strong>模型与首选项</strong>
-                      <small>模型来自当前 App Server；保存后下次自动恢复，当前不接入终端智能体。</small>
+                      <small>模型来自当前 App Server；保存后可供隔离实验后端使用，并在下次启动时恢复。</small>
                     </div>
                   </div>
                   {codexAppServer?.models.length ? (
@@ -1331,10 +1487,100 @@ export function App() {
                           ? '模型状态尚未加载。请刷新状态。'
                           : 'App Server 当前没有返回可选模型。请刷新状态或检查 Codex 配置。'}</p>
                   )}
-                  <div className="codex-safety-boundary">
-                    <strong>共享终端安全边界</strong>
-                    <p>{codexAppServer?.terminalAgentReason ?? '正在读取安全能力状态。'}</p>
-                    <small>App Server 的启动、登录和首选模型设置可全程在界面完成；在官方协议能硬性禁用内建 Shell/File 工具前，本应用不会让它绕过可见终端执行命令。</small>
+                </section>
+
+                <section
+                  className={`codex-setup-section codex-agent-isolation-card ${codexIsolation?.availability ?? 'unavailable'}`}
+                  data-testid="codex-agent-isolation-card"
+                  data-isolation-state={codexIsolation?.availability ?? 'unavailable'}
+                >
+                  <div className="codex-section-heading">
+                    <span>4</span>
+                    <div>
+                      <strong>隔离 App Server Agent（实验）</strong>
+                      <small>每次启动应用都需从界面重新确认隔离边界，之后才能把 App Server 选作当前智能体后端。</small>
+                    </div>
+                  </div>
+                  <div
+                    className="codex-agent-availability"
+                    data-testid="codex-agent-availability"
+                    data-isolation-state={codexIsolation?.availability ?? 'unavailable'}
+                    role="status"
+                    aria-live="polite"
+                  >
+                    <span className="codex-agent-state-dot" aria-hidden="true" />
+                    <span>
+                      <strong>{codexIsolation
+                        ? codexAgentIsolationAvailabilityLabel(codexIsolation.availability)
+                        : '正在读取状态'}</strong>
+                      <small>{codexIsolation?.reason ?? '正在读取隔离能力状态。'}</small>
+                    </span>
+                  </div>
+
+                  <div
+                    id="codex-agent-boundary-description"
+                    className="codex-safety-boundary codex-agent-boundary"
+                    data-testid="codex-agent-boundary"
+                  >
+                    <strong>实际边界，不是“内建工具已被硬性关闭”</strong>
+                    <p>
+                      实验线程使用 <code>environments=[]</code>，并且客户端只注册
+                      {' '}<code>{codexIsolation?.acceptedClientTools.join(' · ')
+                        ?? 'terminal_read · terminal_state · terminal_execute'}</code>。
+                    </p>
+                    <ul>
+                      <li>只有这些 <code>terminal_*</code> 动态工具会进入当前可见终端。</li>
+                      <li>收到 App Server 内建命令、文件修改或权限请求时，客户端会拒绝并中断该轮。</li>
+                      <li>官方协议并未保证模型不会尝试内建工具；若观察到越界执行事件，实验模式会锁停，执行结果标记为未知。</li>
+                    </ul>
+                  </div>
+
+                  {codexIsolation?.lastViolation && (
+                    <div
+                      className="codex-agent-violation"
+                      data-testid="codex-agent-violation"
+                      role="alert"
+                    >
+                      <strong>检测到隔离边界违规，已锁停</strong>
+                      <dl>
+                        <div><dt>类型</dt><dd>{codexAgentIsolationViolationKindLabel(
+                          codexIsolation.lastViolation.kind,
+                        )}</dd></div>
+                        <div><dt>时间</dt><dd><time dateTime={codexIsolation.lastViolation.detectedAt}>
+                          {new Date(codexIsolation.lastViolation.detectedAt).toLocaleString('zh-CN')}
+                        </time></dd></div>
+                      </dl>
+                      <p>{codexIsolation.lastViolation.detail}</p>
+                      <small>已观察到边界事件，但无法据此证明是否产生副作用；结果按“未知”处理。</small>
+                    </div>
+                  )}
+
+                  <div className="codex-actions codex-agent-actions">
+                    {codexAgentEnabled ? (
+                      <button
+                        className="danger-text"
+                        type="button"
+                        data-action="codex-agent-disable"
+                        disabled={codexBusy}
+                        onClick={() => void setCodexAgentEnabled(false)}
+                      >停用隔离实验后端</button>
+                    ) : (
+                      <button
+                        className="primary"
+                        type="button"
+                        data-action={codexIsolation?.availability === 'blocked'
+                          ? 'codex-agent-review-violation'
+                          : 'codex-agent-enable'}
+                        disabled={codexBusy || codexSelectionDirty || !codexAgentCanRequestEnable}
+                        aria-describedby="codex-agent-boundary-description"
+                        onClick={requestCodexAgentEnable}
+                      >{codexIsolation?.availability === 'blocked'
+                          ? '审阅并重新确认…'
+                          : '启用实验模式…'}</button>
+                    )}
+                    {codexSelectionDirty && (
+                      <span className="codex-agent-action-note">请先保存上方模型更改。</span>
+                    )}
                   </div>
                 </section>
               </div>
@@ -1415,6 +1661,72 @@ export function App() {
         </div>
       )}
 
+      {codexAgentEnableChallenge && (
+        <div className="modal-backdrop codex-agent-confirmation-backdrop">
+          <div
+            ref={codexAgentConfirmationRef}
+            className="modal compact-modal codex-agent-confirmation"
+            data-testid="codex-agent-confirmation"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="codex-agent-confirmation-title"
+            aria-describedby="codex-agent-confirmation-description"
+            tabIndex={-1}
+          >
+            <div className="modal-header">
+              <strong id="codex-agent-confirmation-title">
+                {codexIsolation?.availability === 'blocked'
+                  ? '重新启用隔离 App Server Agent？'
+                  : '启用隔离 App Server Agent（实验）？'}
+              </strong>
+            </div>
+            <div id="codex-agent-confirmation-description">
+              <p>启用后，AI Terminal 会按以下实验边界处理 App Server 智能体：</p>
+              <ul>
+                <li>向线程发送 <code>environments=[]</code>，并且只注册三个 <code>terminal_*</code> 动态工具。</li>
+                <li>动态终端命令仍进入当前可见终端，并遵循逐条审批或你明确开启的“AI 全接管”。</li>
+                <li>内建命令、文件修改和权限请求会被拒绝并中断；“AI 全接管”不会批准这些内建请求。</li>
+                <li>协议没有提供“模型绝不会尝试内建工具”的保证。若观察到越界事件，模式会锁停，结果记为未知。</li>
+                <li>实验授权只在本次应用运行内有效；重新启动后必须再次确认。</li>
+              </ul>
+              {codexIsolation?.lastViolation && (
+                <p className="codex-agent-confirmation-warning">
+                  上次违规：{codexAgentIsolationViolationKindLabel(
+                    codexIsolation.lastViolation.kind,
+                  )}。重新启用会清除锁停记录，但不会把未知结果改写为“已阻止”。
+                </p>
+              )}
+            </div>
+            <label className="codex-agent-confirm-check">
+              <input
+                type="checkbox"
+                data-testid="codex-agent-opt-in"
+                checked={codexAgentBoundaryAcknowledged}
+                onChange={(event) => setCodexAgentBoundaryAcknowledged(event.target.checked)}
+              />
+              <span>我已理解这是实验隔离策略，而不是协议层硬性禁用全部内建工具。</span>
+            </label>
+            <div className="modal-actions">
+              <button onClick={() => {
+                setCodexAgentEnableChallenge(false);
+                setCodexAgentBoundaryAcknowledged(false);
+              }}>取消</button>
+              <button
+                className="danger-action"
+                data-action="confirm-codex-agent-enable"
+                disabled={
+                  !codexAgentBoundaryAcknowledged
+                  || codexBusy
+                  || !codexAgentCanRequestEnable
+                  || codexSelectionDirty
+                }
+                onClick={() => void setCodexAgentEnabled(true)}
+              >确认并启用实验模式</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {activeAgent?.pendingTakeover && (
         <div className="modal-backdrop">
           <div
@@ -1450,6 +1762,9 @@ export function App() {
                 ? '确认后会立即执行下方命令；在关闭全接管或人工接管前，后续命令都不会再次询问。'
                 : ''}
               仅对你信任的终端和任务启用。遇到认证提示时仍会暂停，并让你直接安全输入。
+              {fullTakeoverChallenge.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
+                ? ' 对隔离 App Server 后端，“全接管”只作用于 terminal_execute；内建请求仍会被拒绝并中断。'
+                : ''}
             </p>
             {fullTakeoverChallenge.command && (
               <code>{fullTakeoverChallenge.editedCommand ?? fullTakeoverChallenge.command}</code>
@@ -1464,6 +1779,7 @@ export function App() {
                   fullTakeoverChallenge.terminalId,
                   fullTakeoverChallenge.approvalId,
                   fullTakeoverChallenge.editedCommand,
+                  fullTakeoverChallenge.backend,
                 )}
               >{fullTakeoverChallenge.approvalId
                   ? '启用并执行当前命令'
