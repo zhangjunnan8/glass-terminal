@@ -10,6 +10,14 @@ import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
 import { mergeAgentState } from './agent-state';
 import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
+import {
+  agentStateLabel,
+  authMethodLabel,
+  executionStatusLabel,
+  providerStatusLabel,
+  roleLabel,
+  sessionStatusLabel,
+} from './ui-text';
 
 interface TerminalTab extends TerminalDescriptor {
   createdAt: number;
@@ -106,7 +114,7 @@ export function App() {
       .then(async (profiles) => {
         if (cancelled) return;
         setShells(profiles);
-        if (profiles.length === 0) throw new Error('No supported shell was detected.');
+        if (profiles.length === 0) throw new Error('未检测到受支持的本地 Shell。');
         const descriptor = await window.aiTerminal.terminal.create({
           profileId: profiles[0].id,
         });
@@ -222,14 +230,14 @@ export function App() {
       const saved = await window.aiTerminal.providers.save(input);
       await refreshProviders();
       setEditingProvider(saved);
-      setProviderMessage('Saved. Run Test Connection before using this Provider.');
+      setProviderMessage('已保存。请先测试连接，再使用此 Provider。');
     } catch (error) {
       setProviderMessage(errorMessage(error));
     }
   }
 
   async function testProvider(providerId: string) {
-    setProviderMessage('Testing connection…');
+    setProviderMessage('正在测试连接…');
     try {
       const result = await window.aiTerminal.providers.testConnection(providerId);
       await refreshProviders();
@@ -240,7 +248,7 @@ export function App() {
   }
 
   async function removeProvider(provider: ProviderProfile) {
-    if (!window.confirm(`Delete Provider “${provider.name}” and its stored credential?`)) return;
+    if (!window.confirm(`确定删除 Provider“${provider.name}”及其已保存的凭据吗？`)) return;
     await window.aiTerminal.providers.remove(provider.id);
     setEditingProvider(null);
     await refreshProviders();
@@ -359,7 +367,7 @@ export function App() {
   }
 
   async function renameSession(session: SessionRecord) {
-    const name = window.prompt('Session name', session.name);
+    const name = window.prompt('会话名称', session.name);
     if (!name || name.trim() === session.name) return;
     try {
       await window.aiTerminal.sessions.rename({ sessionId: session.id, name });
@@ -394,7 +402,7 @@ export function App() {
   }
 
   async function removeHost(host: HostProfile) {
-    if (!window.confirm(`Delete host “${host.name}”?`)) return;
+    if (!window.confirm(`确定删除主机“${host.name}”吗？`)) return;
     await window.aiTerminal.hosts.remove(host.id);
     if (selectedHostId === host.id) setSelectedHostId(null);
     await refreshHosts();
@@ -441,31 +449,32 @@ export function App() {
   }
 
   return (
-    <div className="app-shell">
+    <div className="app-shell" data-locale="zh-CN">
       <header className="titlebar">
         <div className="brand-mark" aria-hidden="true">&gt;_</div>
         <div className="brand-copy">
           <strong>{PRODUCT_NAME}</strong>
-          <span>shared terminal agent</span>
+          <span>共享终端智能体</span>
         </div>
-        <div className="workspace-title">Local workspace</div>
+        <div className="workspace-title">本地工作区</div>
         <div className="runtime-pill">
           <span className="status-dot" />
-          {runtime ? `${runtime.platform} · ${runtime.arch}` : 'starting…'}
+          {runtime ? `${runtime.platform} · ${runtime.arch}` : '正在启动…'}
         </div>
       </header>
 
-      <aside className="activitybar" aria-label="Primary navigation">
-        <button className="activity active" title="Terminals">⌁</button>
-        <button className="activity" title="Hosts">▦</button>
+      <aside className="activitybar" aria-label="主导航">
+        <button className="activity active" title="终端">⌁</button>
+        <button className="activity" title="主机">▦</button>
         <button
           className={`activity ${sftpOpen ? 'active' : ''}`}
-          title="SFTP files and transfers"
+          title="SFTP 文件与传输"
+          data-action="toggle-sftp"
           onClick={() => setSftpOpen((open) => !open)}
         >⇅</button>
-        <button className="activity" title="History">◷</button>
+        <button className="activity" title="历史记录">◷</button>
         <div className="activity-spacer" />
-        <button className="activity" title="Provider settings" onClick={() => {
+        <button className="activity" title="Provider 设置" onClick={() => {
           setEditingProvider(defaultProvider);
           setProviderMessage(null);
           setProviderModalOpen(true);
@@ -474,15 +483,15 @@ export function App() {
 
       <aside className="sidebar">
         <div className="panel-heading">
-          <span>TERMINALS</span>
-          <button title="Add SSH host" onClick={() => setEditingHost(null)}>＋</button>
+          <span>终端</span>
+          <button title="添加 SSH 主机" onClick={() => setEditingHost(null)}>＋</button>
         </div>
         <label className="search-box">
           <span>⌕</span>
-          <input aria-label="Search hosts and shells" placeholder="Search hosts and shells" />
+          <input aria-label="搜索主机和 Shell" placeholder="搜索主机和 Shell" />
         </label>
 
-        <div className="section-label">LOCAL SHELLS</div>
+        <div className="section-label">本地 SHELL</div>
         <div className="host-list compact">
           {shells.map((shell) => (
             <button className="host-row" key={shell.id} onClick={() => void openTerminal(shell.id)}>
@@ -496,8 +505,8 @@ export function App() {
         </div>
 
         <div className="section-label section-with-action">
-          <span>SSH HOSTS</span>
-          <button onClick={() => setEditingHost(null)}>Add</button>
+          <span>SSH 主机</span>
+          <button onClick={() => setEditingHost(null)}>添加</button>
         </div>
         <div className="host-list">
           {hosts.map((host) => (
@@ -513,47 +522,47 @@ export function App() {
               </span>
             </button>
           ))}
-          {hosts.length === 0 && <div className="empty-list">No SSH hosts yet</div>}
+          {hosts.length === 0 && <div className="empty-list">尚未添加 SSH 主机</div>}
         </div>
 
         {selectedHost && (
           <div className="selected-host-card">
             <strong>{selectedHost.name}</strong>
-            <span>{selectedHost.authMethod} · {selectedHost.hostKeyFingerprint ? 'trusted' : 'unverified'}</span>
+            <span>{authMethodLabel(selectedHost.authMethod)} · {selectedHost.hostKeyFingerprint ? '已信任' : '未验证'}</span>
             <div>
               <button onClick={() => {
                 setReconnectingSessionId(null);
                 setConnectingHost(selectedHost);
-              }}>Connect</button>
-              <button onClick={() => setEditingHost(selectedHost)}>Edit</button>
-              <button className="danger-text" onClick={() => void removeHost(selectedHost)}>Delete</button>
+              }}>连接</button>
+              <button onClick={() => setEditingHost(selectedHost)}>编辑</button>
+              <button className="danger-text" onClick={() => void removeHost(selectedHost)}>删除</button>
             </div>
             <div className="host-session-history">
-              <small>SESSION HISTORY</small>
+              <small>会话历史</small>
               {selectedHostSessions.map((session) => (
                 <div className="session-history-row" key={session.id}>
                   <span>
                     <strong>{session.name}</strong>
-                    <small>{session.status} · {new Date(session.updatedAt).toLocaleString()}</small>
+                    <small>{sessionStatusLabel(session.status)} · {new Date(session.updatedAt).toLocaleString('zh-CN')}</small>
                   </span>
                   <span className="session-history-actions">
-                    <button title="Rename Session" onClick={() => void renameSession(session)}>Rename</button>
+                    <button title="重命名会话" onClick={() => void renameSession(session)}>重命名</button>
                     <button onClick={() => {
                       setReconnectingSessionId(session.id);
                       setConnectingHost(selectedHost);
-                    }}>Reconnect</button>
+                    }}>重连</button>
                   </span>
                 </div>
               ))}
-              {selectedHostSessions.length === 0 && <small>No formal Sessions yet.</small>}
+              {selectedHostSessions.length === 0 && <small>尚无正式会话。</small>}
             </div>
           </div>
         )}
-        <div className="sidebar-footer">No telemetry · Passwords stay in memory</div>
+        <div className="sidebar-footer">无遥测 · 密码仅保留在内存中</div>
       </aside>
 
       <main className="workspace">
-        <nav className="tabs" aria-label="Terminal tabs">
+        <nav className="tabs" aria-label="终端标签页">
           {tabs.map((tab) => (
             <button
               className={`tab ${tab.id === activeId ? 'active' : ''}`}
@@ -574,7 +583,7 @@ export function App() {
             </button>
           ))}
           <div className="new-tab-wrap">
-            <button className="new-tab" title="New terminal" onClick={() => setNewTerminalOpen((open) => !open)}>＋</button>
+            <button className="new-tab" title="新建终端" onClick={() => setNewTerminalOpen((open) => !open)}>＋</button>
             {newTerminalOpen && (
               <div className="shell-menu">
                 {shells.map((shell) => (
@@ -601,11 +610,13 @@ export function App() {
         >
           <div className="terminal-toolbar">
             <span>
-              {activeAgent?.state.replaceAll('_', ' ') ?? 'USER CONTROL'}
-              {activeAgent?.fullTakeover ? ' · FULL TAKEOVER' : ''}
+              {activeAgent ? agentStateLabel(activeAgent.state) : '用户控制'}
+              {activeAgent?.fullTakeover ? ' · AI 全接管' : ''}
             </span>
             <div className="terminal-actions">
-              <span>{activeTab?.status === 'exited' ? 'DISCONNECTED' : activeTab?.transport.toUpperCase() ?? 'NO TERMINAL'}</span>
+              <span>{activeTab?.status === 'exited'
+                ? '已断开'
+                : activeTab?.transport === 'ssh' ? 'SSH' : activeTab ? '本地' : '无终端'}</span>
               {activeTab?.status === 'exited' && activeTab.hostId && (
                 <button onClick={() => {
                   const host = hosts.find((item) => item.id === activeTab.hostId);
@@ -613,10 +624,10 @@ export function App() {
                     setReconnectingSessionId(activeTab.sessionId ?? null);
                     setConnectingHost(host);
                   }
-                }}>Reconnect</button>
+                }}>重连</button>
               )}
-              <button title="Search terminal">⌕</button>
-              <button title="Terminal actions">⋯</button>
+              <button title="搜索终端">⌕</button>
+              <button title="终端操作">⋯</button>
             </div>
           </div>
           <div className="terminal-stack">
@@ -629,14 +640,14 @@ export function App() {
               />
             ))}
             {tabs.length === 0 && !startupError && (
-              <div className="terminal-placeholder">Choose a local shell or SSH host to open a terminal.</div>
+              <div className="terminal-placeholder">请选择本地 Shell 或 SSH 主机以打开终端。</div>
             )}
             {startupError && <div className="terminal-error">{startupError}</div>}
           </div>
           <footer className="terminal-statusbar">
             <span>UTF-8</span>
             <span>{activeTab?.transport === 'ssh' ? 'SSH PTY' : 'ConPTY'}</span>
-            <span>{activeTab?.sessionId ? 'Formal Session' : 'Temporary terminal'}</span>
+            <span>{activeTab?.sessionId ? '正式会话' : '临时终端'}</span>
           </footer>
         </section>
         {sftpOpen && <SftpDrawer terminal={activeTab} onClose={() => setSftpOpen(false)} />}
@@ -645,20 +656,21 @@ export function App() {
       <aside className="agent-panel">
         <div className="agent-header">
           <div>
-            <strong>AI Agent</strong>
+            <strong>AI 智能体</strong>
             <span>
-              Current Provider: {defaultProvider
-                ? `${defaultProvider.name} · ${defaultProvider.status}`
-                : 'Not configured'}
+              当前 Provider：{defaultProvider
+                ? `${defaultProvider.name} · ${providerStatusLabel(defaultProvider.status)}`
+                : '未配置'}
             </span>
           </div>
           <div className="agent-controls">
-            {activeAgent?.fullTakeover && <span className="takeover-badge">FULL TAKEOVER</span>}
+            {activeAgent?.fullTakeover && <span className="takeover-badge">AI 全接管</span>}
             <button
               className="take-control"
+              data-action="take-control"
               disabled={!agentTurnBusy(activeAgent?.state) || activeAgent?.state === 'TAKEOVER_PENDING'}
               onClick={() => void requestAgentTakeover()}
-            >Take Control</button>
+            >人工接管</button>
             <button
               className={activeAgent?.fullTakeover ? 'full-takeover-enabled' : ''}
               disabled={!activeTab || !defaultProvider || defaultProvider.status !== 'ready' || agentTurnBusy(activeAgent?.state)}
@@ -673,51 +685,51 @@ export function App() {
                   });
                 }
               }}
-            >{activeAgent?.fullTakeover ? 'Disable' : 'Full Takeover'}</button>
+            >{activeAgent?.fullTakeover ? '关闭全接管' : 'AI 全接管'}</button>
           </div>
         </div>
         <div className="agent-body">
           {!activeAgent?.messages.length && (
             <div className="agent-empty">
               <div className="agent-glyph">✦</div>
-              <strong>Terminal-aware assistance</strong>
-              <p>The agent reads this Session and asks before sending every command into the visible terminal.</p>
-              <div className="guardrail"><span>✓</span> Approval required by default</div>
+              <strong>理解终端上下文的 AI 助手</strong>
+              <p>智能体会读取当前会话，并在向这个可见终端发送每条命令前请求你的批准。</p>
+              <div className="guardrail"><span>✓</span> 默认逐条审批命令</div>
               <button className="provider-configure" onClick={() => {
                 setEditingProvider(defaultProvider);
                 setProviderMessage(null);
                 setProviderModalOpen(true);
               }}>
-                {defaultProvider ? 'Manage Provider' : 'Configure Provider'}
+                {defaultProvider ? '管理 Provider' : '配置 Provider'}
               </button>
               {activeTab && !activeTab.sessionId && (
                 <button className="activate-session" onClick={() => void activateAiSession()}>
-                  Activate AI Session
+                  启用 AI 会话
                 </button>
               )}
             </div>
           )}
           {activeAgent?.messages.map((message) => (
             <article className={`agent-message ${message.role}`} key={message.id}>
-              <span>{message.role === 'assistant' ? 'AI' : message.role.toUpperCase()}</span>
+              <span>{roleLabel(message.role)}</span>
               <p>{message.content}</p>
             </article>
           ))}
           {activeAgent?.pendingApproval?.status === 'waiting' && (
             <section className="approval-card">
               <div>
-                <strong>Command approval</strong>
-                <span>{activeAgent.pendingApproval.reason ?? 'Agent requested terminal execution'}</span>
+                <strong>命令审批</strong>
+                <span>{activeAgent.pendingApproval.reason ?? '智能体请求在终端中执行命令'}</span>
               </div>
               <textarea
-                aria-label="Proposed command"
+                aria-label="待审批命令"
                 value={editedApprovalCommand}
                 onChange={(event) => setEditedApprovalCommand(event.target.value)}
                 spellCheck={false}
               />
               <div className="approval-actions">
-                <button onClick={() => void resolveAgentApproval('reject')}>Reject</button>
-                <button onClick={() => void resolveAgentApproval('edit')}>Edit &amp; Execute</button>
+                <button data-action="reject-command" onClick={() => void resolveAgentApproval('reject')}>拒绝</button>
+                <button data-action="edit-command" onClick={() => void resolveAgentApproval('edit')}>编辑并执行</button>
                 <button onClick={() => {
                   if (!activeTab || !activeAgent.pendingApproval) return;
                   setFullTakeoverChallenge({
@@ -727,23 +739,23 @@ export function App() {
                     command: activeAgent.pendingApproval.command,
                     editedCommand: editedApprovalCommand,
                   });
-                }}>Switch to Full Takeover…</button>
-                <button className="execute" onClick={() => void resolveAgentApproval('execute')}>Execute</button>
+                }} data-action="switch-full-takeover">切换为 AI 全接管…</button>
+                <button className="execute" data-action="execute-command" onClick={() => void resolveAgentApproval('execute')}>执行</button>
               </div>
             </section>
           )}
           {activeAgent?.authRequest && (
             <section className="auth-card" data-auth-interaction={activeAgent.authRequest.id}>
-              <strong>Authentication required</strong>
-              <p>Type the credential directly in this terminal and press Enter. The Agent resumes automatically. Input after the first Enter is discarded, and the credential is excluded from AI context, Session log, structured output, and Audit.</p>
+              <strong>需要安全认证</strong>
+              <p>请直接在当前终端输入凭据并按 Enter。智能体随后会自动继续。首个 Enter 后的同次粘贴内容会被丢弃；凭据不会进入 AI 上下文、会话日志、结构化输出或审计记录。</p>
             </section>
           )}
           {activeAgent?.activeExecution && (
             <section className={`execution-card ${activeAgent.activeExecution.status}`}>
-              <strong>{activeAgent.activeExecution.status.toUpperCase()}</strong>
+              <strong>{executionStatusLabel(activeAgent.activeExecution.status)}</strong>
               <code>{activeAgent.activeExecution.command}</code>
               {activeAgent.activeExecution.exitCode !== undefined && (
-                <span>exit {activeAgent.activeExecution.exitCode} · {activeAgent.activeExecution.durationMs ?? 0} ms</span>
+                <span>退出码 {activeAgent.activeExecution.exitCode} · {activeAgent.activeExecution.durationMs ?? 0} 毫秒</span>
               )}
               {activeAgent.state === 'PAUSED'
                 && activeAgent.activeExecution.status === 'running'
@@ -751,7 +763,7 @@ export function App() {
                 <button onClick={() => void confirmShellReady(
                   activeAgent.terminalId,
                   activeAgent.activeExecution!.id,
-                )}>I can see the shell prompt · release tracking</button>
+                )} data-action="confirm-shell-ready">已看到 Shell 提示符 · 解除运行跟踪</button>
               )}
             </section>
           )}
@@ -759,16 +771,17 @@ export function App() {
         </div>
         <form className="composer" onSubmit={(event) => void sendAgentPrompt(event)}>
           <textarea
-            aria-label="Message AI"
-            placeholder="Ask the agent to inspect or operate this terminal…"
+            aria-label="向 AI 发送消息"
+            data-testid="agent-composer"
+            placeholder="让智能体检查或操作当前终端…"
             value={agentPrompt}
             onChange={(event) => setAgentPrompt(event.target.value)}
             disabled={defaultProvider?.status !== 'ready' || !activeTab || activeTab.status !== 'connected' || composerBlocked}
           />
           <div>
             <span>{defaultProvider?.status === 'ready'
-              ? activeAgent?.state.replaceAll('_', ' ') ?? 'Ready · approval required'
-              : 'Configure and test a Provider to begin'}</span>
+              ? activeAgent ? agentStateLabel(activeAgent.state) : '已就绪 · 命令需审批'
+              : '请先配置并测试 Provider'}</span>
             <button
               type="submit"
               disabled={!agentPrompt.trim() || defaultProvider?.status !== 'ready' || !activeTab || composerBlocked}
@@ -781,30 +794,30 @@ export function App() {
         <div className="modal-backdrop">
           <form className="modal" onSubmit={(event) => void saveHost(event)}>
             <div className="modal-header">
-              <strong>{editingHost ? 'Edit SSH Host' : 'Add SSH Host'}</strong>
+              <strong>{editingHost ? '编辑 SSH 主机' : '添加 SSH 主机'}</strong>
               <button type="button" onClick={() => setEditingHost(undefined)}>×</button>
             </div>
             <div className="form-grid">
-              <label className="span-2">Display name<input name="name" required defaultValue={editingHost?.name ?? 'Ubuntu Lab'} /></label>
-              <label className="span-2">Hostname or IP<input name="hostname" required defaultValue={editingHost?.hostname ?? ''} /></label>
-              <label>Port<input name="port" type="number" min="1" max="65535" required defaultValue={editingHost?.port ?? 22} /></label>
-              <label>Username<input name="username" required defaultValue={editingHost?.username ?? ''} /></label>
-              <label className="span-2">Authentication
+              <label className="span-2">显示名称<input name="name" required defaultValue={editingHost?.name ?? 'Ubuntu 测试机'} /></label>
+              <label className="span-2">主机名或 IP 地址<input name="hostname" required defaultValue={editingHost?.hostname ?? ''} /></label>
+              <label>端口<input name="port" type="number" min="1" max="65535" required defaultValue={editingHost?.port ?? 22} /></label>
+              <label>用户名<input name="username" required defaultValue={editingHost?.username ?? ''} /></label>
+              <label className="span-2">认证方式
                 <select name="authMethod" defaultValue={editingHost?.authMethod ?? 'password'}>
-                  <option value="password">Username + password</option>
-                  <option value="keyboard-interactive">Keyboard interactive</option>
-                  <option value="private-key">Private key</option>
-                  <option value="agent">Windows OpenSSH / Pageant agent</option>
+                  <option value="password">用户名和密码</option>
+                  <option value="keyboard-interactive">键盘交互认证</option>
+                  <option value="private-key">私钥</option>
+                  <option value="agent">Windows OpenSSH / Pageant 代理</option>
                 </select>
               </label>
-              <label className="span-2">Private key path (when used)<input name="privateKeyPath" defaultValue={editingHost?.privateKeyPath ?? ''} /></label>
-              <label>Group<input name="group" defaultValue={editingHost?.group ?? ''} /></label>
-              <label className="check-label"><input name="favorite" type="checkbox" defaultChecked={editingHost?.favorite} /> Favorite</label>
+              <label className="span-2">私钥路径（使用私钥时）<input name="privateKeyPath" defaultValue={editingHost?.privateKeyPath ?? ''} /></label>
+              <label>分组<input name="group" defaultValue={editingHost?.group ?? ''} /></label>
+              <label className="check-label"><input name="favorite" type="checkbox" defaultChecked={editingHost?.favorite} /> 收藏</label>
             </div>
             {connectionError && <div className="form-error">{connectionError}</div>}
             <div className="modal-actions">
-              <button type="button" onClick={() => setEditingHost(undefined)}>Cancel</button>
-              <button className="primary" type="submit">Save Host</button>
+              <button type="button" onClick={() => setEditingHost(undefined)}>取消</button>
+              <button className="primary" type="submit">保存主机</button>
             </div>
           </form>
         </div>
@@ -814,7 +827,7 @@ export function App() {
         <div className="modal-backdrop">
           <form className="modal compact-modal" onSubmit={submitConnection}>
             <div className="modal-header">
-              <strong>Connect to {connectingHost.name}</strong>
+              <strong>连接到 {connectingHost.name}</strong>
               <button type="button" onClick={() => {
                 setConnectingHost(null);
                 setReconnectingSessionId(null);
@@ -822,19 +835,19 @@ export function App() {
             </div>
             <div className="connection-summary">{connectingHost.username}@{connectingHost.hostname}:{connectingHost.port}</div>
             {(connectingHost.authMethod === 'password' || connectingHost.authMethod === 'keyboard-interactive') && (
-              <label>Password<input name="password" type="password" autoFocus autoComplete="off" /></label>
+              <label>密码<input name="password" type="password" autoFocus autoComplete="off" /></label>
             )}
             {connectingHost.authMethod === 'private-key' && (
-              <label>Private-key passphrase<input name="passphrase" type="password" autoFocus autoComplete="off" /></label>
+              <label>私钥口令<input name="passphrase" type="password" autoFocus autoComplete="off" /></label>
             )}
-            <p className="secure-note">The credential is used for this connection only and is not persisted.</p>
+            <p className="secure-note">凭据仅用于本次连接，不会持久化保存。</p>
             {connectionError && <div className="form-error">{connectionError}</div>}
             <div className="modal-actions">
               <button type="button" onClick={() => {
                 setConnectingHost(null);
                 setReconnectingSessionId(null);
-              }}>Cancel</button>
-              <button className="primary" type="submit">Connect</button>
+              }}>取消</button>
+              <button className="primary" type="submit">连接</button>
             </div>
           </form>
         </div>
@@ -844,9 +857,14 @@ export function App() {
         <div className="modal-backdrop">
           <div className="modal provider-modal">
             <div className="modal-header">
-              <strong>AI Providers</strong>
+              <strong>AI Provider 设置</strong>
               <button type="button" onClick={() => setProviderModalOpen(false)}>×</button>
             </div>
+            <section className="codex-app-server-note">
+              <strong>Codex App Server（尚未接入）</strong>
+              <p>当前 Alpha 仅支持 OpenAI 兼容 API。下方“可用”只表示模型接口测试通过，不代表 Codex 或 ChatGPT 已登录；请勿在 API Key 输入框中粘贴 ChatGPT 登录凭据。</p>
+              <small>后续将由主进程通过官方 <code>codex app-server</code> stdio 协议接入登录、Thread、流事件和审批。</small>
+            </section>
             <div className="provider-layout">
               <div className="provider-list">
                 {providers.map((provider) => (
@@ -860,48 +878,48 @@ export function App() {
                   >
                     <strong>{provider.name}</strong>
                     <small>{provider.modelId}</small>
-                    <span className={`provider-status ${provider.status}`}>{provider.status}</span>
+                    <span className={`provider-status ${provider.status}`}>{providerStatusLabel(provider.status)}</span>
                   </button>
                 ))}
                 <button className="add-provider" onClick={() => {
                   setEditingProvider(null);
                   setProviderMessage(null);
-                }}>+ Add Provider</button>
+                }}>＋ 添加 Provider</button>
               </div>
               <form className="provider-form" onSubmit={(event) => void saveProvider(event)}>
-                <label>Name<input name="name" required defaultValue={editingProvider?.name ?? 'OpenAI-compatible API'} key={`name-${editingProvider?.id ?? 'new'}`} /></label>
-                <label>Base URL<input name="baseUrl" type="url" required placeholder="https://api.example.com/v1" defaultValue={editingProvider?.baseUrl ?? ''} key={`url-${editingProvider?.id ?? 'new'}`} /></label>
-                <label>Model ID<input name="modelId" required placeholder="model-id" defaultValue={editingProvider?.modelId ?? ''} key={`model-${editingProvider?.id ?? 'new'}`} /></label>
+                <label>名称<input name="name" required defaultValue={editingProvider?.name ?? 'OpenAI 兼容 API'} key={`name-${editingProvider?.id ?? 'new'}`} /></label>
+                <label>基础 URL<input name="baseUrl" type="url" required placeholder="https://api.example.com/v1" defaultValue={editingProvider?.baseUrl ?? ''} key={`url-${editingProvider?.id ?? 'new'}`} /></label>
+                <label>模型 ID<input name="modelId" required placeholder="model-id" defaultValue={editingProvider?.modelId ?? ''} key={`model-${editingProvider?.id ?? 'new'}`} /></label>
                 <label>
-                  API key
+                  API Key
                   <input
                     name="apiKey"
                     type="password"
                     required={!editingProvider?.apiKeyConfigured}
                     autoComplete="new-password"
-                    placeholder={editingProvider?.apiKeyConfigured ? 'Stored in Windows Credential Manager' : 'Required'}
+                    placeholder={editingProvider?.apiKeyConfigured ? '已保存到 Windows 凭据管理器' : '必填'}
                   />
                 </label>
                 <label className="check-label">
                   <input name="makeDefault" type="checkbox" defaultChecked={editingProvider?.isDefault ?? providers.length === 0} />
-                  Use as default Provider
+                  设为默认 Provider
                 </label>
-                <p className="secure-note">The API key is stored as a Windows Generic Credential. Provider JSON contains only its reference.</p>
+                <p className="secure-note">API Key 作为 Windows 通用凭据保存；Provider JSON 只保存凭据引用。</p>
                 {providerMessage && <div className="provider-message">{providerMessage}</div>}
                 <div className="provider-actions">
                   {editingProvider && (
                     <>
-                      <button type="button" onClick={() => void testProvider(editingProvider.id)}>Test Connection</button>
+                      <button type="button" onClick={() => void testProvider(editingProvider.id)}>测试连接</button>
                       {!editingProvider.isDefault && (
                         <button type="button" onClick={async () => {
                           await window.aiTerminal.providers.setDefault(editingProvider.id);
                           await refreshProviders();
-                        }}>Set Default</button>
+                        }}>设为默认</button>
                       )}
-                      <button className="danger-text" type="button" onClick={() => void removeProvider(editingProvider)}>Delete</button>
+                      <button className="danger-text" type="button" onClick={() => void removeProvider(editingProvider)}>删除</button>
                     </>
                   )}
-                  <button className="primary" type="submit">Save Provider</button>
+                  <button className="primary" type="submit">保存 Provider</button>
                 </div>
               </form>
             </div>
@@ -917,12 +935,12 @@ export function App() {
             data-takeover-id={activeAgent.pendingTakeover.id}
             data-execution-id={activeAgent.pendingTakeover.executionId}
           >
-            <div className="modal-header"><strong>Take control of the terminal</strong></div>
-            <p>The Agent is paused. Choose what to do with the command that is still in the foreground.</p>
-            <code>{activeAgent.activeExecution?.command ?? 'Foreground command'}</code>
+            <div className="modal-header"><strong>人工接管终端</strong></div>
+            <p>智能体已暂停。请选择如何处理仍在前台运行的命令。</p>
+            <code>{activeAgent.activeExecution?.command ?? '前台命令'}</code>
             <div className="modal-actions split-actions">
-              <button onClick={() => void resolveAgentTakeover('keep')}>Keep process running</button>
-              <button className="danger-action" onClick={() => void resolveAgentTakeover('interrupt')}>Send Ctrl+C</button>
+              <button data-action="keep-process" onClick={() => void resolveAgentTakeover('keep')}>保持进程运行</button>
+              <button className="danger-action" data-action="interrupt-process" onClick={() => void resolveAgentTakeover('interrupt')}>发送 Ctrl+C</button>
             </div>
           </div>
         </div>
@@ -935,23 +953,24 @@ export function App() {
             data-terminal-id={fullTakeoverChallenge.terminalId}
             data-approval-id={fullTakeoverChallenge.approvalId ?? ''}
           >
-            <div className="modal-header"><strong>Enable Full Takeover?</strong></div>
+            <div className="modal-header"><strong>启用 AI 全接管？</strong></div>
             <p>
-              Target: <b>{fullTakeoverChallenge.target}</b>. The Agent may run consecutive commands—including deletion, disk, network, service, or restart commands—without asking again. Take Control remains available and immediately pauses the Agent.
+              目标：<b>{fullTakeoverChallenge.target}</b>。智能体将可以连续运行命令，包括删除、磁盘、网络、服务或重启命令，不再逐条询问。你仍可随时点击“人工接管”立即暂停智能体。
             </p>
             <p className="risk-note">
               {fullTakeoverChallenge.approvalId
-                ? 'Confirming immediately executes the command below; later commands in this terminal will not ask again until Full Takeover is disabled or you Take Control. '
+                ? '确认后会立即执行下方命令；在关闭全接管或人工接管前，后续命令都不会再次询问。'
                 : ''}
-              Only enable this for a terminal and task you trust. Authentication still pauses for direct secure input.
+              仅对你信任的终端和任务启用。遇到认证提示时仍会暂停，并让你直接安全输入。
             </p>
             {fullTakeoverChallenge.command && (
               <code>{fullTakeoverChallenge.editedCommand ?? fullTakeoverChallenge.command}</code>
             )}
             <div className="modal-actions">
-              <button autoFocus onClick={() => setFullTakeoverChallenge(null)}>Cancel</button>
+              <button autoFocus onClick={() => setFullTakeoverChallenge(null)}>取消</button>
               <button
                 className="danger-action"
+                data-action="confirm-full-takeover"
                 onClick={() => void setFullTakeover(
                   true,
                   fullTakeoverChallenge.terminalId,
@@ -959,8 +978,8 @@ export function App() {
                   fullTakeoverChallenge.editedCommand,
                 )}
               >{fullTakeoverChallenge.approvalId
-                  ? 'Enable & execute this command'
-                  : 'Enable Full Takeover'}</button>
+                  ? '启用并执行当前命令'
+                  : '启用 AI 全接管'}</button>
             </div>
           </div>
         </div>
@@ -969,20 +988,20 @@ export function App() {
       {trustChallenge && (
         <div className="modal-backdrop">
           <div className="modal compact-modal">
-            <div className="modal-header"><strong>Trust this SSH host?</strong></div>
-            <p>This is the first connection to {trustChallenge.host.hostname}. Verify the server fingerprint before continuing.</p>
+            <div className="modal-header"><strong>信任此 SSH 主机？</strong></div>
+            <p>这是首次连接到 {trustChallenge.host.hostname}。继续前请核对服务器指纹。</p>
             <code className="fingerprint">{trustChallenge.fingerprint}</code>
             <div className="modal-actions">
               <button onClick={() => {
                 setTrustChallenge(null);
                 setReconnectingSessionId(null);
-              }}>Cancel</button>
+              }}>取消</button>
               <button className="primary" onClick={() => void establishSsh(
                 trustChallenge.host,
                 trustChallenge.secret,
                 trustChallenge.fingerprint,
                 trustChallenge.sessionId,
-              )}>Trust &amp; Connect</button>
+              )}>信任并连接</button>
             </div>
           </div>
         </div>

@@ -98,7 +98,7 @@ async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<bo
         'value',
       )?.set;
       const sendPrompt = (prompt) => {
-        const textarea = document.querySelector('textarea[aria-label="Message AI"]');
+        const textarea = document.querySelector('textarea[data-testid="agent-composer"]');
         if (!(textarea instanceof HTMLTextAreaElement) || textarea.disabled) {
           throw new Error('Agent composer is not ready.');
         }
@@ -112,8 +112,7 @@ async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<bo
       if (pane?.textContent?.includes('__AI_AGENT_APPROVED__')) {
         throw new Error('Command executed before approval.');
       }
-      const execute = [...document.querySelectorAll('.approval-actions button')]
-        .find((button) => button.textContent === 'Execute');
+      const execute = document.querySelector('[data-action="execute-command"]');
       if (!(execute instanceof HTMLButtonElement)) throw new Error('Execute button is missing.');
       execute.click();
       const markerVisible = await waitFor(
@@ -128,8 +127,7 @@ async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<bo
       const takeoverApprovalReady = await waitFor(() => document.querySelector('.approval-card'));
       if (!takeoverApprovalReady) throw new Error('Full Takeover command approval did not appear.');
       const takeoverApprovalState = await window.aiTerminal.agent.getState(terminalId);
-      const switchToFull = [...document.querySelectorAll('.approval-actions button')]
-        .find((button) => button.textContent?.startsWith('Switch to Full Takeover'));
+      const switchToFull = document.querySelector('[data-action="switch-full-takeover"]');
       if (!(switchToFull instanceof HTMLButtonElement)) {
         throw new Error('Approval card Full Takeover action is missing.');
       }
@@ -144,8 +142,7 @@ async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<bo
       if (pane?.textContent?.includes('__AI_FULL_TAKEOVER_ONE__')) {
         throw new Error('Full Takeover command ran before risk confirmation.');
       }
-      const enableFull = [...document.querySelectorAll('.full-takeover-modal button')]
-        .find((button) => button.textContent === 'Enable & execute this command');
+      const enableFull = document.querySelector('.full-takeover-modal [data-action="confirm-full-takeover"]');
       if (!(enableFull instanceof HTMLButtonElement)) throw new Error('Full Takeover confirmation is missing.');
       enableFull.click();
       const fullEnabled = await waitFor(
@@ -195,8 +192,7 @@ async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<bo
         () => document.querySelector('.terminal-stage')?.getAttribute('data-agent-state') === 'RUNNING',
       );
       if (!running) throw new Error('Manual Takeover command did not start.');
-      const takeControl = [...document.querySelectorAll('.agent-controls button')]
-        .find((button) => button.textContent === 'Take Control');
+      const takeControl = document.querySelector('[data-action="take-control"]');
       if (!(takeControl instanceof HTMLButtonElement)) throw new Error('Take Control button is missing.');
       takeControl.click();
       const takeoverVisible = await waitFor(() => document.querySelector('.takeover-modal'));
@@ -208,21 +204,18 @@ async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<bo
         || takeoverModal?.getAttribute('data-takeover-id') !== pendingTakeoverState?.pendingTakeover?.id
         || takeoverModal?.getAttribute('data-execution-id') !== pendingTakeoverState?.pendingTakeover?.executionId
       ) throw new Error('Takeover modal is not bound to the exact foreground execution.');
-      const interrupt = [...document.querySelectorAll('.takeover-modal button')]
-        .find((button) => button.textContent === 'Send Ctrl+C');
+      const interrupt = document.querySelector('.takeover-modal [data-action="interrupt-process"]');
       if (!(interrupt instanceof HTMLButtonElement)) throw new Error('Takeover Ctrl+C action is missing.');
       interrupt.click();
       const paused = await waitFor(
         () => document.querySelector('.terminal-stage')?.getAttribute('data-agent-state') === 'PAUSED',
       );
       const shellReadyVisible = await waitFor(
-        () => [...document.querySelectorAll('.execution-card button')]
-          .some((button) => button.textContent?.startsWith('I can see the shell prompt')),
+        () => Boolean(document.querySelector('.execution-card [data-action="confirm-shell-ready"]')),
         1500,
       );
       if (shellReadyVisible) {
-        const shellReady = [...document.querySelectorAll('.execution-card button')]
-          .find((button) => button.textContent?.startsWith('I can see the shell prompt'));
+        const shellReady = document.querySelector('.execution-card [data-action="confirm-shell-ready"]');
         if (shellReady instanceof HTMLButtonElement) shellReady.click();
       }
       const trackingSettled = await waitFor(
@@ -286,10 +279,19 @@ async function runLocalSmoke(window: BrowserWindow): Promise<boolean> {
       const sessionListed = (await window.aiTerminal.sessions.list()).some(
         (item) => item.id === session.id,
       );
+      const sectionLabel = document.querySelector('.section-label');
+      const searchInput = document.querySelector('.search-box input');
+      const uiLocalized = document.querySelector('.app-shell')?.getAttribute('data-locale') === 'zh-CN'
+        && document.body.textContent?.includes('本地 SHELL');
+      const uiReadable = sectionLabel && searchInput
+        && Number.parseFloat(getComputedStyle(sectionLabel).fontSize) >= 12
+        && Number.parseFloat(getComputedStyle(searchInput).fontSize) >= 14;
       await window.aiTerminal.terminal.close(terminalId);
       await new Promise((resolve) => setTimeout(resolve, 250));
       return commandSeen
         && sessionListed
+        && uiLocalized
+        && uiReadable
         && persistedHistory.includes('__AI_TERMINAL_PTY_SMOKE__');
     })()`,
   );
@@ -351,7 +353,7 @@ async function runSshSmoke(window: BrowserWindow): Promise<boolean> {
       );
       if (!paneReady) throw new Error('SSH terminal pane did not attach.');
       const pane = document.querySelector('[data-terminal-id="' + descriptor.id + '"]');
-      document.querySelector('[title="SFTP files and transfers"]')?.click();
+      document.querySelector('[data-action="toggle-sftp"]')?.click();
       const sftpReady = await waitFor(
         () => document.querySelector('[data-sftp-ready="true"]'),
       );

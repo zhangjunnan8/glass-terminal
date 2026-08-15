@@ -60,7 +60,7 @@ function discoverWslProfiles(): ShellProfile[] {
       command: wsl,
       args: [],
       kind: 'wsl',
-      detail: 'Default WSL distribution',
+      detail: '默认 WSL 发行版',
     }];
   }
 
@@ -128,7 +128,7 @@ export function discoverShells(): ShellProfile[] {
   if (commandPrompt) {
     profiles.push({
       id: 'command-prompt',
-      label: 'Command Prompt',
+      label: '命令提示符',
       command: commandPrompt,
       args: [],
       kind: 'cmd',
@@ -150,7 +150,7 @@ export function discoverShells(): ShellProfile[] {
       command: gitBash,
       args: ['--login', '-i'],
       kind: 'git-bash',
-      detail: 'Git for Windows',
+      detail: '适用于 Windows 的 Git',
     });
   }
 

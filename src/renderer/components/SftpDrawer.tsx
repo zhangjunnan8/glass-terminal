@@ -4,6 +4,7 @@ import type {
   SftpEntry,
   TransferJobSnapshot,
 } from '../../shared/sftp';
+import { transferStatusLabel } from '../ui-text';
 
 interface SftpTerminal {
   id: string;
@@ -116,17 +117,17 @@ export function SftpDrawer({ terminal, onClose }: SftpDrawerProps) {
   }
 
   return (
-    <aside className="sftp-drawer" aria-label="SFTP files and transfers">
+    <aside className="sftp-drawer" aria-label="SFTP 文件与传输">
       <header>
         <span>
           <strong>SFTP</strong>
-          <small>{terminal?.title ?? 'No terminal'}</small>
+          <small>{terminal?.title ?? '未选择终端'}</small>
         </span>
-        <button onClick={onClose} aria-label="Close SFTP panel">×</button>
+        <button onClick={onClose} aria-label="关闭 SFTP 面板">×</button>
       </header>
 
       {!available && (
-        <div className="sftp-unavailable">Select a connected SSH terminal to browse files.</div>
+        <div className="sftp-unavailable">请选择一个已连接的 SSH 终端以浏览文件。</div>
       )}
 
       {available && (
@@ -135,21 +136,21 @@ export function SftpDrawer({ terminal, onClose }: SftpDrawerProps) {
             event.preventDefault();
             void loadDirectory(pathInput);
           }}>
-            <button type="button" title="Parent directory" onClick={() => {
+            <button type="button" title="上级目录" onClick={() => {
               if (listing) void loadDirectory(parentPath(listing.path));
             }}>↑</button>
             <input
-              aria-label="Remote directory"
+              aria-label="远程目录"
               value={pathInput}
               onChange={(event) => setPathInput(event.target.value)}
             />
-            <button type="submit" title="Go">Go</button>
-            <button type="button" title="Refresh" onClick={() => void loadDirectory(listing?.path)}>↻</button>
-            <button type="button" className="sftp-upload" onClick={() => void upload()}>Upload</button>
+            <button type="submit" title="前往">前往</button>
+            <button type="button" title="刷新" onClick={() => void loadDirectory(listing?.path)}>↻</button>
+            <button type="button" className="sftp-upload" onClick={() => void upload()}>上传</button>
           </form>
           {error && <div className="sftp-error">{error}</div>}
           <div className="sftp-file-list" data-sftp-ready={listing ? 'true' : 'false'}>
-            {loading && <div className="sftp-loading">Loading…</div>}
+            {loading && <div className="sftp-loading">正在加载…</div>}
             {!loading && listing?.entries.map((entry) => (
               <div className="sftp-entry" key={entry.path}>
                 <button
@@ -164,21 +165,21 @@ export function SftpDrawer({ terminal, onClose }: SftpDrawerProps) {
                   <span className="sftp-entry-icon">{entry.type === 'directory' ? '▣' : '▤'}</span>
                   <span>
                     <strong>{entry.name}</strong>
-                    <small>{entry.type === 'directory' ? 'Directory' : humanBytes(entry.size)}</small>
+                    <small>{entry.type === 'directory' ? '目录' : humanBytes(entry.size)}</small>
                   </span>
                 </button>
                 {entry.type === 'file' && (
-                  <button className="sftp-download" onClick={() => void download(entry)}>Download</button>
+                  <button className="sftp-download" onClick={() => void download(entry)}>下载</button>
                 )}
               </div>
             ))}
             {!loading && listing?.entries.length === 0 && (
-              <div className="sftp-loading">This directory is empty.</div>
+              <div className="sftp-loading">此目录为空。</div>
             )}
           </div>
 
           <section className="transfer-queue">
-            <div className="transfer-heading">TRANSFERS <span>{visibleTransfers.length}</span></div>
+            <div className="transfer-heading">传输任务 <span>{visibleTransfers.length}</span></div>
             {visibleTransfers.map((job) => {
               const percentage = job.totalBytes > 0
                 ? Math.min(100, (job.bytesTransferred / job.totalBytes) * 100)
@@ -187,7 +188,7 @@ export function SftpDrawer({ terminal, onClose }: SftpDrawerProps) {
                 <div className="transfer-job" key={job.id}>
                   <div>
                     <strong>{job.direction === 'upload' ? '↑' : '↓'} {job.displayName}</strong>
-                    <span className={`transfer-status ${job.status}`}>{job.status}</span>
+                    <span className={`transfer-status ${job.status}`}>{transferStatusLabel(job.status)}</span>
                   </div>
                   <div className="transfer-track"><span style={{ width: `${percentage}%` }} /></div>
                   <small>
@@ -195,15 +196,15 @@ export function SftpDrawer({ terminal, onClose }: SftpDrawerProps) {
                     {job.error ? ` · ${job.error}` : ''}
                   </small>
                   {(job.status === 'queued' || job.status === 'running') && (
-                    <button onClick={() => void window.aiTerminal.sftp.cancelTransfer(job.id)}>Cancel</button>
+                    <button onClick={() => void window.aiTerminal.sftp.cancelTransfer(job.id)}>取消</button>
                   )}
                   {(job.status === 'failed' || job.status === 'cancelled') && (
-                    <button onClick={() => void window.aiTerminal.sftp.retryTransfer(job.id)}>Retry</button>
+                    <button onClick={() => void window.aiTerminal.sftp.retryTransfer(job.id)}>重试</button>
                   )}
                 </div>
               );
             })}
-            {visibleTransfers.length === 0 && <div className="transfer-empty">No transfers yet.</div>}
+            {visibleTransfers.length === 0 && <div className="transfer-empty">暂无传输任务。</div>}
           </section>
         </>
       )}

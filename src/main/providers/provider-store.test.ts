@@ -90,7 +90,7 @@ describe('ProviderStore', () => {
     expect(store.list()[0].id).toBe(second.id);
     const result = await store.testConnection(second.id);
     expect(result).toMatchObject({ ok: false, status: 'error' });
-    expect(result.message).toBe('Provider returned HTTP 401.');
+    expect(result.message).toBe('Provider 返回 HTTP 401。');
     expect(readFileSync(path, 'utf8')).not.toContain('second-secret');
 
     store.setDefault(first.id);

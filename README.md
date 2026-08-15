@@ -8,6 +8,9 @@ visible PTY or SSH shell.
 > persistence, and linked SFTP are working and tested. This is not yet the
 > finished Core Demo; see `docs/progress/alpha-vertical-slice.md`.
 
+当前界面已提供简体中文并采用放大字号。Codex App Server 尚未接入；其官方
+使用方式与本项目接入边界见 `docs/codex-app-server.md`。
+
 ## Design invariants
 
 - One terminal session owns exactly one terminal and one active AI thread.

@@ -19,7 +19,7 @@ function publicProfile(profile: StoredProviderProfile): ProviderProfile {
 }
 
 function requiredText(value: unknown, field: string): string {
-  if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} is required.`);
+  if (typeof value !== 'string' || !value.trim()) throw new Error(`请填写${field}。`);
   return value.trim();
 }
 
@@ -29,26 +29,26 @@ function normalizedBaseUrl(value: unknown): string {
   try {
     url = new URL(text);
   } catch {
-    throw new Error('Base URL must be a valid absolute URL.');
+    throw new Error('Base URL 必须是有效的绝对 URL。');
   }
   if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-    throw new Error('Base URL must use HTTP or HTTPS.');
+    throw new Error('Base URL 必须使用 HTTP 或 HTTPS。');
   }
   const localHttp = url.hostname === 'localhost'
     || url.hostname === '127.0.0.1'
     || url.hostname === '[::1]';
   if (url.protocol === 'http:' && !localHttp) {
-    throw new Error('Remote Provider URLs must use HTTPS.');
+    throw new Error('远程 Provider URL 必须使用 HTTPS。');
   }
-  if (url.username || url.password) throw new Error('Base URL must not contain credentials.');
-  if (url.search || url.hash) throw new Error('Base URL must not contain a query or fragment.');
+  if (url.username || url.password) throw new Error('Base URL 不得包含登录凭据。');
+  if (url.search || url.hash) throw new Error('Base URL 不得包含查询参数或片段。');
   return url.toString().replace(/\/+$/, '');
 }
 
 function parseProfiles(value: unknown): StoredProviderProfile[] {
-  if (!Array.isArray(value)) throw new Error('Provider metadata must be an array.');
+  if (!Array.isArray(value)) throw new Error('Provider 元数据必须是数组。');
   return value.map((item) => {
-    if (!item || typeof item !== 'object') throw new Error('Invalid Provider metadata.');
+    if (!item || typeof item !== 'object') throw new Error('Provider 元数据无效。');
     const profile = item as Partial<StoredProviderProfile>;
     if (
       typeof profile.id !== 'string'
@@ -58,7 +58,7 @@ function parseProfiles(value: unknown): StoredProviderProfile[] {
       || typeof profile.modelId !== 'string'
       || typeof profile.apiKeyReference !== 'string'
     ) {
-      throw new Error('Unsupported Provider metadata.');
+      throw new Error('Provider 元数据格式不受支持。');
     }
     const status = profile.status === 'ready' || profile.status === 'error'
       ? profile.status
@@ -106,7 +106,7 @@ export class ProviderStore {
   async apiKey(providerId: string): Promise<string> {
     const provider = this.getStored(providerId);
     const secret = await this.secrets.get(provider.apiKeyReference);
-    if (!secret) throw new Error(`API key is not configured for ${provider.name}.`);
+    if (!secret) throw new Error(`${provider.name} 尚未配置 API Key。`);
     return secret;
   }
 
@@ -115,10 +115,10 @@ export class ProviderStore {
     const existing = input.id
       ? this.profiles.find((profile) => profile.id === input.id)
       : undefined;
-    if (input.id && !existing) throw new Error(`Provider not found: ${input.id}`);
+    if (input.id && !existing) throw new Error(`找不到 Provider：${input.id}`);
     const id = existing?.id ?? randomUUID();
     const baseUrl = normalizedBaseUrl(input.baseUrl);
-    const modelId = requiredText(input.modelId, 'Model ID');
+    const modelId = requiredText(input.modelId, '模型 ID');
     const apiKeyReference = existing?.apiKeyReference ?? `AI Terminal/provider/${id}`;
     let apiKeyConfigured = existing?.apiKeyConfigured ?? false;
     const suppliedKey = input.apiKey && input.apiKey.trim() ? input.apiKey : undefined;
@@ -134,7 +134,7 @@ export class ProviderStore {
       || existing?.isDefault === true;
     const profile: StoredProviderProfile = {
       id,
-      name: requiredText(input.name, 'Provider name'),
+      name: requiredText(input.name, 'Provider 名称'),
       kind: 'generic-openai-compatible',
       baseUrl,
       modelId,
@@ -189,15 +189,15 @@ export class ProviderStore {
         signal: controller.signal,
         redirect: 'error',
       });
-      if (!response.ok) throw new Error(`Provider returned HTTP ${response.status}.`);
+      if (!response.ok) throw new Error(`Provider 返回 HTTP ${response.status}。`);
       const payload = await response.json() as { data?: Array<{ id?: string }> };
       if (!Array.isArray(payload.data) || !payload.data.some((model) => model.id === provider.modelId)) {
-        throw new Error(`Model “${provider.modelId}” was not returned by the Provider.`);
+        throw new Error(`Provider 返回的模型列表中没有“${provider.modelId}”。`);
       }
       result = {
         ok: true,
         status: 'ready',
-        message: 'Connection successful.',
+        message: '连接成功。',
         testedAt,
       };
     } catch (error) {
@@ -228,7 +228,7 @@ export class ProviderStore {
 
   private getStored(providerId: string): StoredProviderProfile {
     const provider = this.profiles.find((profile) => profile.id === providerId);
-    if (!provider) throw new Error(`Provider not found: ${providerId}`);
+    if (!provider) throw new Error(`找不到 Provider：${providerId}`);
     return provider;
   }
 
@@ -237,7 +237,7 @@ export class ProviderStore {
       return parseProfiles(JSON.parse(readFileSync(this.filePath, 'utf8')));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-      throw new Error(`Unable to read Provider store: ${(error as Error).message}`);
+      throw new Error(`无法读取 Provider 存储：${(error as Error).message}`);
     }
   }
 

@@ -30,9 +30,9 @@ export function TerminalPane({
       disableStdin: inputModeRef.current === 'locked',
       cursorBlink: true,
       cursorStyle: 'block',
-      fontFamily: 'Cascadia Mono, Cascadia Code, Consolas, monospace',
-      fontSize: 13,
-      lineHeight: 1.18,
+      fontFamily: 'Cascadia Mono, Cascadia Code, Consolas, "Microsoft YaHei UI", "Microsoft YaHei", monospace',
+      fontSize: 15,
+      lineHeight: 1.28,
       scrollback: 10_000,
       theme: {
         background: '#080c12',
@@ -90,7 +90,7 @@ export function TerminalPane({
     });
     const removeExitListener = window.aiTerminal.terminal.onExit((event) => {
       if (event.terminalId !== terminalId) return;
-      terminal.write(`\r\n\x1b[90m[Process exited with code ${event.exitCode}]\x1b[0m\r\n`);
+      terminal.write(`\r\n\x1b[90m[进程已退出，退出码 ${event.exitCode}]\x1b[0m\r\n`);
     });
     void window.aiTerminal.terminal.attach(terminalId).then((pendingOutput) => {
       if (!pendingOutput) return;

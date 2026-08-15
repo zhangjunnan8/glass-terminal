@@ -203,9 +203,9 @@ ipcMain.handle(
   SFTP_CHANNELS.chooseUpload,
   async (event, request: UploadSelectionRequest) => {
     const ownerWindow = BrowserWindow.fromWebContents(event.sender);
-    if (!ownerWindow) throw new Error('Upload window is unavailable.');
+    if (!ownerWindow) throw new Error('无法打开上传窗口。');
     const selection = await dialog.showOpenDialog(ownerWindow, {
-      title: 'Upload files',
+      title: '选择要上传的文件',
       properties: ['openFile', 'multiSelections'],
     });
     if (selection.canceled) return [];
@@ -221,12 +221,12 @@ ipcMain.handle(
   SFTP_CHANNELS.chooseDownload,
   async (event, request: DownloadSelectionRequest) => {
     const ownerWindow = BrowserWindow.fromWebContents(event.sender);
-    if (!ownerWindow) throw new Error('Download window is unavailable.');
+    if (!ownerWindow) throw new Error('无法打开下载窗口。');
     const safeName = request.suggestedName
       .replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_')
       .replace(/[. ]+$/g, '') || 'download';
     const selection = await dialog.showSaveDialog(ownerWindow, {
-      title: 'Download file',
+      title: '保存下载文件',
       defaultPath: join(app.getPath('downloads'), safeName),
     });
     if (selection.canceled || !selection.filePath) return null;
