@@ -67,6 +67,7 @@ export interface DesktopBridge {
     list(): Promise<HostProfile[]>;
     save(input: HostInput): Promise<HostProfile>;
     remove(hostId: string): Promise<void>;
+    forgetCredential(hostId: string): Promise<void>;
   };
   sessions: {
     list(hostId?: string): Promise<SessionRecord[]>;

@@ -62,6 +62,7 @@ describe.runIf(enabled)('real SFTP over the visible SSH connection', () => {
       username: process.env.AI_TERMINAL_SSH_TEST_USER!,
       authMethod: 'password',
       favorite: false,
+      credentialConfigured: false,
       createdAt: new Date(0).toISOString(),
       updatedAt: new Date(0).toISOString(),
     };

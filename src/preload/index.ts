@@ -49,6 +49,7 @@ const hostBridge: DesktopBridge['hosts'] = {
   list: () => ipcRenderer.invoke(HOST_CHANNELS.list),
   save: (input) => ipcRenderer.invoke(HOST_CHANNELS.save, input),
   remove: (hostId) => ipcRenderer.invoke(HOST_CHANNELS.remove, hostId),
+  forgetCredential: (hostId) => ipcRenderer.invoke(HOST_CHANNELS.forgetCredential, hostId),
 };
 
 const sessionBridge: DesktopBridge['sessions'] = {

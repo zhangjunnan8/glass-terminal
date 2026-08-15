@@ -68,7 +68,7 @@ public static class AiTerminalCredentialManager {
       CREDENTIAL credential = new CREDENTIAL {
         Type = 1,
         TargetName = target,
-        UserName = "AI Terminal Provider",
+        UserName = "AI Terminal",
         CredentialBlob = blob,
         CredentialBlobSize = (UInt32)bytes.Length,
         Persist = 2
@@ -140,9 +140,9 @@ export class WindowsCredentialStore implements SecretStore {
   }
 
   async set(reference: string, secret: string): Promise<void> {
-    if (!secret) throw new Error('API key cannot be empty.');
+    if (!secret) throw new Error('Credential cannot be empty.');
     if (Buffer.byteLength(secret, 'utf16le') > 2_560) {
-      throw new Error('API key exceeds the Windows Generic Credential size limit.');
+      throw new Error('Credential exceeds the Windows Generic Credential size limit.');
     }
     await this.execute({ operation: 'set', reference, secret });
   }
@@ -156,8 +156,8 @@ export class WindowsCredentialStore implements SecretStore {
       return Promise.reject(new Error('Windows Credential Manager is only available on Windows.'));
     }
     const encodedScript = Buffer.from(CREDENTIAL_SCRIPT, 'utf16le').toString('base64');
-    if (!/^AI Terminal\/provider\/[0-9a-f-]{36}$/i.test(payload.reference)) {
-      return Promise.reject(new Error('Invalid Provider credential reference.'));
+    if (!isAllowedCredentialReference(payload.reference)) {
+      return Promise.reject(new Error('Invalid credential reference.'));
     }
     return new Promise((resolve, reject) => {
       const powershellPath = join(
@@ -202,4 +202,10 @@ export class WindowsCredentialStore implements SecretStore {
       child.stdin.end(JSON.stringify(payload));
     });
   }
+}
+
+const CREDENTIAL_REFERENCE_PATTERN = /^AI Terminal\/(?:provider|ssh)\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function isAllowedCredentialReference(reference: string): boolean {
+  return CREDENTIAL_REFERENCE_PATTERN.test(reference);
 }

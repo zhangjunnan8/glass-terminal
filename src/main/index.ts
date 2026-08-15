@@ -3,7 +3,7 @@ import type { IpcMainInvokeEvent } from 'electron';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PRODUCT_NAME } from '../shared/product';
-import { HOST_CHANNELS, SSH_ERROR_CODES } from '../shared/host';
+import { HOST_CHANNELS } from '../shared/host';
 import type { HostInput, SshConnectRequest } from '../shared/host';
 import { TERMINAL_CHANNELS } from '../shared/terminal';
 import type { CreateTerminalRequest } from '../shared/terminal';
@@ -28,6 +28,8 @@ import type {
   SetCodexTerminalAgentEnabledRequest,
 } from '../shared/codex-app-server';
 import { HostStore } from './hosts/host-store';
+import { HostCredentialStore } from './hosts/host-credential-store';
+import { HostService } from './hosts/host-service';
 import { SessionManager } from './sessions/session-manager';
 import { SessionStore } from './sessions/session-store';
 import { SftpService } from './sftp/sftp-service';
@@ -59,6 +61,7 @@ const terminalService = new TerminalService();
 const sftpService = new SftpService(terminalService);
 const transferQueue = new TransferQueue(terminalService);
 let hostStore: HostStore | undefined;
+let hostService: HostService | undefined;
 let sessionManager: SessionManager | undefined;
 let providerStore: ProviderStore | undefined;
 let agentService: AgentService | undefined;
@@ -73,6 +76,11 @@ if (isSmokeTest) {
 function requireHostStore(): HostStore {
   if (!hostStore) throw new Error('Host store is not ready.');
   return hostStore;
+}
+
+function requireHostService(): HostService {
+  if (!hostService) throw new Error('Host service is not ready.');
+  return hostService;
 }
 
 function requireSessionManager(): SessionManager {
@@ -188,37 +196,19 @@ handleTrusted(TERMINAL_CHANNELS.close, (event, terminalId: string) => {
   terminalService.close(event.sender, terminalId);
 });
 
-handleTrusted(HOST_CHANNELS.list, () => requireHostStore().list());
+handleTrusted(HOST_CHANNELS.list, () => requireHostService().list());
 handleTrusted(HOST_CHANNELS.save, (_event, input: HostInput) => (
-  requireHostStore().save(input)
+  requireHostService().save(input)
 ));
-handleTrusted(HOST_CHANNELS.remove, (_event, hostId: string) => {
-  requireHostStore().remove(hostId);
-});
-handleTrusted(HOST_CHANNELS.connect, async (event, request: SshConnectRequest) => {
-  const store = requireHostStore();
-  const host = store.get(request.hostId);
-  try {
-    const result = await terminalService.createSsh(event.sender, host, request);
-    if (!host.hostKeyFingerprint) {
-      store.trustFingerprint(host.id, result.fingerprint);
-    }
-    if (request.sessionId) {
-      requireSessionManager().reconnect(event.sender, result.descriptor, request.sessionId);
-    }
-    return { status: 'connected', terminal: result.descriptor };
-  } catch (error) {
-    const message = (error as Error).message;
-    const marker = `${SSH_ERROR_CODES.hostKeyRequired}:`;
-    if (message.startsWith(marker)) {
-      return {
-        status: 'host-key-required',
-        fingerprint: message.slice(marker.length),
-      };
-    }
-    throw error;
-  }
-});
+handleTrusted(HOST_CHANNELS.remove, (_event, hostId: string) => (
+  requireHostService().remove(hostId)
+));
+handleTrusted(HOST_CHANNELS.forgetCredential, (_event, hostId: string) => (
+  requireHostService().forgetCredential(hostId)
+));
+handleTrusted(HOST_CHANNELS.connect, (event, request: SshConnectRequest) => (
+  requireHostService().connect(event.sender, request)
+));
 
 handleTrusted(SESSION_CHANNELS.list, (_event, hostId?: string) => (
   requireSessionManager().list(hostId)
@@ -404,14 +394,13 @@ handleTrusted(
 
 app.whenReady().then(async () => {
   hostStore = new HostStore(join(app.getPath('userData'), 'config', 'hosts.json'));
+  const secretStore = isSmokeTest ? new MemorySecretStore() : new WindowsCredentialStore();
   if (smokeMode === 'agent' || smokeMode === 'agent-ssh') {
     agentSmokeProvider = await startAgentSmokeProvider(smokeMode === 'agent-ssh');
   }
   providerStore = new ProviderStore(
     join(app.getPath('userData'), 'config', 'providers.json'),
-    smokeMode === 'agent' || smokeMode === 'agent-ssh'
-      ? new MemorySecretStore()
-      : new WindowsCredentialStore(),
+    secretStore,
   );
   if (agentSmokeProvider) {
     const profile = await providerStore.save({
@@ -428,6 +417,12 @@ app.whenReady().then(async () => {
     new SessionStore(join(app.getPath('userData'), 'sessions')),
     terminalService,
     hostStore,
+  );
+  hostService = new HostService(
+    hostStore,
+    new HostCredentialStore(secretStore),
+    terminalService,
+    sessionManager,
   );
   codexAppServerService = new CodexAppServerService(
     join(app.getPath('userData'), 'config', 'codex-app-server.json'),

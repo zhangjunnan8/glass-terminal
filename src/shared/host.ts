@@ -15,6 +15,7 @@ export interface HostProfile {
   hostKeyFingerprint?: string;
   group?: string;
   favorite: boolean;
+  credentialConfigured: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -36,19 +37,25 @@ export interface SshConnectRequest {
   sessionId?: string;
   password?: string;
   passphrase?: string;
+  saveCredential?: boolean;
   trustHostKey?: string;
   cols?: number;
   rows?: number;
 }
 
 export type SshConnectResult =
-  | { status: 'connected'; terminal: import('./terminal').TerminalDescriptor }
+  | {
+    status: 'connected';
+    terminal: import('./terminal').TerminalDescriptor;
+    credentialWarning?: string;
+  }
   | { status: 'host-key-required'; fingerprint: string };
 
 export const HOST_CHANNELS = {
   list: 'host:list',
   save: 'host:save',
   remove: 'host:remove',
+  forgetCredential: 'host:forget-credential',
   connect: 'terminal:connect-ssh',
 } as const;
 
