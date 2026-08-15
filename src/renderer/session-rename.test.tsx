@@ -370,6 +370,13 @@ describe('renderer host and session dialogs', () => {
     const savedHost = { ...host, credentialConfigured: true };
     const bridge = bridgeWith(vi.fn());
     vi.mocked(bridge.hosts.list).mockResolvedValue([savedHost]);
+    vi.mocked(bridge.terminal.create).mockResolvedValue({
+      id: 'local-terminal',
+      title: 'Shell',
+      profileId: 'shell-1',
+      shellKind: 'posix',
+      transport: 'local',
+    });
     vi.mocked(bridge.terminal.connectSsh).mockResolvedValue({
       status: 'connected',
       terminal: {
@@ -397,6 +404,19 @@ describe('renderer host and session dialogs', () => {
       trustHostKey: undefined,
     });
     expect(container.querySelector('[data-testid="ssh-connect-dialog"]')).toBeNull();
+  });
+
+  it('opens an already connected session instead of creating a duplicate terminal', async () => {
+    const bridge = bridgeWith(vi.fn());
+    await renderSelectedHost(bridge);
+
+    const open = container.querySelector<HTMLButtonElement>(
+      `[data-action="reconnect-session"][data-session-id="${session.id}"]`,
+    );
+    expect(open?.textContent).toBe('打开');
+    await act(async () => open!.click());
+
+    expect(bridge.terminal.connectSsh).not.toHaveBeenCalled();
   });
 
   it('falls back to the credential dialog when a saved credential cannot connect', async () => {

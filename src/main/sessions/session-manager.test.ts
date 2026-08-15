@@ -82,6 +82,17 @@ class FakeTerminals {
       data,
     });
   }
+  emitExit(terminalId: string) {
+    const sessionId = this.bindings.get(terminalId);
+    if (!sessionId) throw new Error('terminal is not bound');
+    this.journalListener?.(terminalId, sessionId, {
+      version: 1,
+      sequence: 3,
+      timestamp: new Date(2).toISOString(),
+      kind: 'exit',
+      exitCode: 0,
+    });
+  }
 }
 
 afterEach(() => {
@@ -97,14 +108,15 @@ describe('SessionManager reconnect restoration', () => {
       'old-terminal',
       snapshot('old-terminal', 'zjn@ubuntu:~$ sudo -i\r\nroot@ubuntu:/srv/project# '),
     );
-    const hosts = {
-      get: vi.fn(() => ({
+    let currentHost = {
         id: 'host',
         name: 'Ubuntu',
         hostname: '192.0.2.10',
         port: 22,
         username: 'zjn',
-      })),
+      };
+    const hosts = {
+      get: vi.fn(() => currentHost),
     } as unknown as HostStore;
     const manager = new SessionManager(
       new SessionStore(join(root, 'sessions')),
@@ -121,6 +133,7 @@ describe('SessionManager reconnect restoration', () => {
       cwd: '/opt/new-project',
       effectiveUser: 'root',
     });
+    terminals.emitExit('old-terminal');
 
     terminals.snapshots.set('new-terminal', snapshot('new-terminal', 'zjn@ubuntu:~$ '));
     const reconnected = manager.reconnect(browser, descriptor('new-terminal'), session.id);
@@ -130,6 +143,24 @@ describe('SessionManager reconnect restoration', () => {
     expect(terminals.writes[0]).toContain("sudo -iu 'root'");
     expect(terminals.writes[0]).toContain('/opt/new-project');
     expect(manager.sessionForTerminal(browser, 'new-terminal')?.id).toBe(session.id);
+
+    terminals.snapshots.set('duplicate-terminal', snapshot('duplicate-terminal', 'zjn@ubuntu:~$ '));
+    expect(() => manager.reconnect(
+      browser,
+      descriptor('duplicate-terminal'),
+      session.id,
+    )).toThrow('仍有活动终端');
+    expect(terminals.bindings.has('duplicate-terminal')).toBe(false);
+
+    terminals.emitExit('new-terminal');
+    currentHost = { ...currentHost, hostname: '192.0.2.99' };
+    terminals.snapshots.set('changed-target-terminal', snapshot('changed-target-terminal', 'zjn@ubuntu:~$ '));
+    expect(() => manager.reconnect(
+      browser,
+      descriptor('changed-target-terminal'),
+      session.id,
+    )).toThrow('主机地址、端口或用户名已变更');
+    expect(terminals.bindings.has('changed-target-terminal')).toBe(false);
     manager.close();
   });
 });

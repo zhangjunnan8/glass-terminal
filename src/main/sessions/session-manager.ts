@@ -107,6 +107,23 @@ export class SessionManager {
     if (session.transport !== terminal.transport || session.hostId !== terminal.hostId) {
       throw new Error('Session target does not match the connected terminal.');
     }
+    if (session.transport === 'ssh' && session.hostId) {
+      const host = this.hosts.get(session.hostId);
+      const target = session.targetSnapshot;
+      if (
+        target.hostname !== host.hostname
+        || target.port !== host.port
+        || target.username !== host.username
+      ) {
+        throw new Error('主机地址、端口或用户名已变更；为避免将旧会话上下文发送到新目标，请新建会话。');
+      }
+    }
+    if (
+      session.connectionState === 'connected'
+      && session.runtimeTerminalId !== terminal.id
+    ) {
+      throw new Error('该会话仍有活动终端；请先打开现有终端或关闭它后再重连。');
+    }
     const snapshot = this.terminals.snapshot(owner, terminal.id);
     this.store.appendTerminalEvents(sessionId, snapshot.history);
     this.terminals.bindSession(owner, terminal.id, sessionId);

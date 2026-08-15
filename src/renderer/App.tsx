@@ -1336,7 +1336,12 @@ export function App() {
             )}
             <div className="host-session-history">
               <small>会话历史</small>
-              {selectedHostSessions.map((session) => (
+              {selectedHostSessions.map((session) => {
+                const liveTab = tabs.find((tab) => (
+                  tab.status === 'connected'
+                  && (tab.sessionId === session.id || tab.id === session.runtimeTerminalId)
+                ));
+                return (
                 <div className="session-history-row" key={session.id}>
                   <span>
                     <strong>{session.name}</strong>
@@ -1354,11 +1359,15 @@ export function App() {
                       data-action="reconnect-session"
                       data-session-id={session.id}
                       disabled={sshConnectionPending}
-                      onClick={() => openSshConnection(selectedHost, session.id)}
-                    >重连</button>
+                      onClick={() => {
+                        if (liveTab) setActiveId(liveTab.id);
+                        else openSshConnection(selectedHost, session.id);
+                      }}
+                    >{liveTab ? '打开' : '重连'}</button>
                   </span>
                 </div>
-              ))}
+                );
+              })}
               {selectedHostSessions.length === 0 && <small>尚无正式会话。</small>}
             </div>
                 </div>
@@ -1373,7 +1382,8 @@ export function App() {
                   ? hosts.find((candidate) => candidate.id === session.hostId)
                   : undefined;
                 const runtimeTab = tabs.find((tab) => (
-                  tab.sessionId === session.id || tab.id === session.runtimeTerminalId
+                  tab.status === 'connected'
+                  && (tab.sessionId === session.id || tab.id === session.runtimeTerminalId)
                 ));
                 return (
                   <article className="history-sidebar-row" key={session.id}>
@@ -1394,8 +1404,11 @@ export function App() {
                       {host && (
                         <button
                           disabled={sshConnectionPending}
-                          onClick={() => openSshConnection(host, session.id)}
-                        >重连</button>
+                          onClick={() => {
+                            if (runtimeTab) setActiveId(runtimeTab.id);
+                            else openSshConnection(host, session.id);
+                          }}
+                        >{runtimeTab ? '打开' : '重连'}</button>
                       )}
                     </div>
                   </article>
