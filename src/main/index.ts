@@ -46,6 +46,7 @@ import {
   isTrustedRendererUrl,
   resolveDevelopmentRendererUrl,
 } from './security/renderer-trust';
+import { acquireSingleInstance } from './single-instance';
 
 const developmentRendererUrl = resolveDevelopmentRendererUrl(
   process.env.VITE_DEV_SERVER_URL,
@@ -68,6 +69,10 @@ let agentService: AgentService | undefined;
 let codexAppServerService: CodexAppServerService | undefined;
 let agentSmokeProvider: AgentSmokeProvider | undefined;
 const trustedRendererContents = new Set<number>();
+const ownsSingleInstance = acquireSingleInstance(
+  app,
+  () => BrowserWindow.getAllWindows(),
+);
 
 if (isSmokeTest) {
   app.setPath('userData', join(process.cwd(), '.smoke-data', smokeMode!));
@@ -392,7 +397,7 @@ handleTrusted(
   (_event, sessionId: string) => requireSessionManager().readTerminalHistory(sessionId),
 );
 
-app.whenReady().then(async () => {
+if (ownsSingleInstance) void app.whenReady().then(async () => {
   hostStore = new HostStore(join(app.getPath('userData'), 'config', 'hosts.json'));
   const secretStore = isSmokeTest ? new MemorySecretStore() : new WindowsCredentialStore();
   if (smokeMode === 'agent' || smokeMode === 'agent-ssh') {
@@ -458,7 +463,7 @@ app.whenReady().then(async () => {
   });
 });
 
-app.on('before-quit', () => {
+if (ownsSingleInstance) app.on('before-quit', () => {
   transferQueue.close();
   agentService?.close();
   codexAppServerService?.close();
@@ -466,6 +471,6 @@ app.on('before-quit', () => {
   void agentSmokeProvider?.close();
 });
 
-app.on('window-all-closed', () => {
+if (ownsSingleInstance) app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
