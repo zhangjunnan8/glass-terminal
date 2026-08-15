@@ -14,8 +14,10 @@ import type {
   CommandApproval,
   CommandExecution,
   ConfirmShellReadyRequest,
+  InterruptAgentTurnRequest,
   ResolveApprovalRequest,
   ResolveTakeoverRequest,
+  ReviseAgentPromptRequest,
   SendAgentPromptRequest,
   SetFullTakeoverRequest,
   TakeoverRequest,
@@ -107,6 +109,102 @@ function safePriorMessages(value: unknown): AgentMessage[] {
   ));
 }
 
+interface ReplayedConversation {
+  messages: AgentChatItem[];
+  priorMessages: AgentMessage[];
+  providerThreadId?: string;
+}
+
+const MAX_CODEX_RESEEDED_HISTORY_CHARS = 24_000;
+
+function codexPromptWithLocalHistory(
+  messages: AgentChatItem[],
+  prompt: string,
+  hasProviderThread: boolean,
+): string {
+  if (hasProviderThread || messages.length <= 1) return prompt;
+  const history = messages.slice(0, -1).map((message) => {
+    const role = message.role === 'user'
+      ? '用户'
+      : message.role === 'assistant' ? '助手' : '系统';
+    return `[${role}]\n${message.content}`;
+  }).join('\n\n');
+  if (!history) return prompt;
+  const boundedHistory = history.slice(-MAX_CODEX_RESEEDED_HISTORY_CHARS);
+  return [
+    '下面是 AI Terminal 从本地会话记录恢复的较早对话，仅用于延续上下文。',
+    '<local_conversation_history>',
+    boundedHistory,
+    '</local_conversation_history>',
+    '',
+    '当前用户消息：',
+    prompt,
+  ].join('\n');
+}
+
+function safeChatItem(value: unknown): AgentChatItem | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const item = value as Partial<AgentChatItem>;
+  if (
+    typeof item.id !== 'string'
+    || !['user', 'assistant', 'system'].includes(item.role ?? '')
+    || typeof item.content !== 'string'
+    || typeof item.createdAt !== 'string'
+  ) return undefined;
+  return item as AgentChatItem;
+}
+
+/** Replays append-only chat events, including later user retractions/replacements. */
+function replayConversation(
+  events: Array<Record<string, unknown>>,
+  fallbackProviderThreadId?: string,
+): ReplayedConversation {
+  let chats: Array<{ item: AgentChatItem; eventIndex: number }> = [];
+  let turns: Array<{ messages: AgentMessage[]; eventIndex: number }> = [];
+  let providerThreadId = fallbackProviderThreadId;
+
+  events.forEach((event, eventIndex) => {
+    if (event.type === 'chat') {
+      const item = safeChatItem(event.item);
+      if (item) chats.push({ item, eventIndex });
+      return;
+    }
+    if (event.type === 'turn') {
+      turns.push({ messages: safePriorMessages(event.messages), eventIndex });
+      return;
+    }
+    if (event.type === 'codex_app_server_turn' && typeof event.providerThreadId === 'string') {
+      providerThreadId = event.providerThreadId;
+      return;
+    }
+    if (
+      event.type !== 'chat_action'
+      || (event.action !== 'retract' && event.action !== 'replace')
+      || typeof event.targetMessageId !== 'string'
+    ) return;
+    const targetIndex = chats.findIndex(({ item }) => item.id === event.targetMessageId);
+    if (targetIndex < 0 || chats[targetIndex].item.role !== 'user') return;
+    const cutoffEventIndex = chats[targetIndex].eventIndex;
+    chats = chats.slice(0, targetIndex);
+    turns = turns.filter((turn) => turn.eventIndex < cutoffEventIndex);
+    const replacementItem = event.action === 'replace'
+      ? safeChatItem(event.replacementItem)
+      : undefined;
+    if (replacementItem?.role === 'user') {
+      chats.push({ item: replacementItem, eventIndex });
+    }
+    // App Server threads are stateful and cannot be rewound. A later turn must
+    // start a new native thread instead of silently reusing the retracted one.
+    providerThreadId = undefined;
+  });
+
+  return {
+    messages: chats.map(({ item }) => item),
+    priorMessages: turns.at(-1)?.messages ?? [],
+    providerThreadId,
+  };
+}
+
 export class AgentService {
   private readonly runtimes = new Map<string, AgentRuntimeRecord>();
   private readonly revisionCounters = new Map<string, number>();
@@ -155,24 +253,168 @@ export class AgentService {
     }
 
     const runtime = this.ensureRuntime(owner, request.terminalId, backend);
+    this.addChat(runtime, 'user', prompt);
+    return this.startPersistedPrompt(runtime, prompt);
+  }
+
+  interruptTurn(owner: WebContents, request: InterruptAgentTurnRequest): AgentSessionView {
+    const runtime = this.requireOwned(owner, request.terminalId);
+    this.requireLatestUserMessage(runtime, request.messageId);
+    if (runtime.backendTurnDraining) {
+      throw new Error('正在等待 Codex App Server 安全停止当前轮次。');
+    }
+    const foregroundExecution = this.terminals.currentExecution(owner, request.terminalId);
+    if (!BUSY_STATES.has(runtime.state) && !foregroundExecution) {
+      throw new Error('最近一条消息已经停止运行。');
+    }
+    runtime.error = undefined;
+
+    if (runtime.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND) {
+      // A process explicitly kept during Takeover remains attached to the same
+      // visible terminal after the planner is paused. Let the message-level
+      // stop button send Ctrl+C to that exact execution as well.
+      if (!BUSY_STATES.has(runtime.state) && foregroundExecution) {
+        const interrupted = this.terminals.interruptExecution(
+          owner,
+          request.terminalId,
+          foregroundExecution.id,
+        );
+        runtime.activeExecution = interrupted ?? foregroundExecution;
+        runtime.pendingTakeover = undefined;
+        this.setHumanState(runtime, 'PAUSED');
+        this.appendControlAudit(runtime, 'agent_paused', 'user', {
+          processAction: 'interrupt_latest_message',
+          executionId: foregroundExecution.id,
+          applied: Boolean(interrupted),
+        });
+        this.emit(runtime);
+        return cloneView(runtime);
+      }
+      const paused = this.takeover(owner, { terminalId: request.terminalId });
+      if (!paused.pendingTakeover) return paused;
+      return this.resolveTakeover(owner, {
+        terminalId: request.terminalId,
+        takeoverId: paused.pendingTakeover.id,
+        executionId: paused.pendingTakeover.executionId,
+        action: 'interrupt',
+      });
+    }
+
+    const partial = runtime.streamingMessageId
+      ? runtime.messages.find((message) => message.id === runtime.streamingMessageId)
+      : undefined;
+    if (partial?.content) {
+      try { this.persistChatItem(runtime, partial); } catch { /* interruption must continue */ }
+    }
+    runtime.streamingMessageId = undefined;
+    this.cancelStreamEmit(runtime);
     runtime.turnToken += 1;
-    const token = runtime.turnToken;
-    runtime.abortController = new AbortController();
+    runtime.abortController?.abort();
+    runtime.abortController = undefined;
+    runtime.backendTurnDraining = true;
+    this.setIndependentCodexState(runtime, 'PAUSED');
+    try {
+      this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
+        type: 'turn_interrupted',
+        timestamp: new Date().toISOString(),
+        targetMessageId: request.messageId,
+      });
+    } catch (error) {
+      runtime.error = `轮次已停止，但中断记录保存失败：${error instanceof Error ? error.message : String(error)}`;
+    }
+    this.emit(runtime);
+
+    const interruptedRuntime = runtime;
+    void this.codexAppServer?.interruptTerminalAgentTurn()
+      .then(() => {
+        if (this.runtimes.get(request.terminalId) !== interruptedRuntime) return;
+        interruptedRuntime.backendTurnDraining = false;
+        this.emit(interruptedRuntime);
+      })
+      .catch((error) => {
+        if (this.runtimes.get(request.terminalId) !== interruptedRuntime) return;
+        // The old native turn may still be alive. Keep this runtime blocked
+        // until an explicit App Server restart replaces the child process.
+        interruptedRuntime.error = error instanceof Error ? error.message : String(error);
+        interruptedRuntime.backendTurnDraining = true;
+        this.emit(interruptedRuntime);
+      });
+    return cloneView(runtime);
+  }
+
+  handleCodexAppServerRestarted(): void {
+    for (const runtime of this.runtimes.values()) {
+      if (
+        runtime.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND
+        || !runtime.backendTurnDraining
+      ) continue;
+      runtime.backendTurnDraining = false;
+      runtime.error = undefined;
+      this.setIndependentCodexState(runtime, 'PAUSED');
+      this.emit(runtime);
+    }
+  }
+
+  revisePrompt(owner: WebContents, request: ReviseAgentPromptRequest): AgentSessionView {
+    const runtime = this.requireOwned(owner, request.terminalId);
+    this.requireLatestUserMessage(runtime, request.messageId);
+    if (BUSY_STATES.has(runtime.state) || runtime.backendTurnDraining) {
+      throw new Error('运行中的消息只能先打断。');
+    }
+    if (this.terminals.currentExecution(owner, request.terminalId)) {
+      throw new Error('终端前台进程仍在运行，无法撤回或修改消息。');
+    }
+    const replacement = request.action === 'replace' ? request.prompt?.trim() ?? '' : '';
+    if (request.action === 'replace' && !replacement) {
+      throw new Error('修改后的消息不能为空。');
+    }
+    if (replacement.length > 20_000) {
+      throw new Error('Agent prompt exceeds 20,000 characters.');
+    }
+
+    const replacementItem: AgentChatItem | undefined = request.action === 'replace'
+      ? {
+        id: randomUUID(),
+        role: 'user',
+        content: replacement,
+        createdAt: new Date().toISOString(),
+      }
+      : undefined;
+    const actionEvent = {
+      type: 'chat_action',
+      action: request.action,
+      timestamp: new Date().toISOString(),
+      targetMessageId: request.messageId,
+      ...(replacementItem ? { replacementItem } : {}),
+      // This operation changes conversation context only. Terminal output,
+      // command executions, and audits remain append-only and untouched.
+      executionHistoryPreserved: true,
+    };
+    this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, actionEvent);
+    const replayed = replayConversation(
+      this.sessions.readThreadEvents(runtime.sessionId, runtime.threadId),
+      runtime.providerThreadId,
+    );
+    runtime.messages = replayed.messages;
+    runtime.priorMessages = replayed.priorMessages;
+    if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
+      runtime.providerThreadId = replayed.providerThreadId;
+    }
     runtime.error = undefined;
     runtime.activeExecution = undefined;
     runtime.pendingTakeover = undefined;
-    runtime.authRequest = undefined;
     runtime.streamingMessageId = undefined;
-    this.addChat(runtime, 'user', prompt);
-    if (backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
-      runtime.controlLeaseId = undefined;
-      this.setIndependentCodexState(runtime, 'THINKING');
+    this.clearFullTakeover(runtime, 'conversation_revised');
+    if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
+      this.setIndependentCodexState(runtime, 'USER_CONTROL');
     } else {
-      runtime.controlLeaseId = this.terminals.acquireAgentControl(owner, request.terminalId);
-      this.setLockedState(runtime, 'THINKING');
+      this.setHumanState(runtime, 'USER_CONTROL');
+    }
+
+    if (request.action === 'replace') {
+      return this.startPersistedPrompt(runtime, replacement);
     }
     this.emit(runtime);
-    void this.runTurn(runtime, token, prompt, runtime.controlLeaseId);
     return cloneView(runtime);
   }
 
@@ -620,8 +862,13 @@ export class AgentService {
 
     let streamedMessage: AgentChatItem | undefined;
     try {
-      const result = await service.runTerminalAgentTurn({
+      const upstreamPrompt = codexPromptWithLocalHistory(
+        runtime.messages,
         prompt,
+        Boolean(runtime.providerThreadId),
+      );
+      const result = await service.runTerminalAgentTurn({
+        prompt: upstreamPrompt,
         model: selection.modelId,
         reasoningEffort: selection.reasoningEffort,
         threadId: runtime.providerThreadId,
@@ -1023,11 +1270,7 @@ export class AgentService {
       }
     }
     const persisted = this.sessions.readThreadEvents(session.id, threadId);
-    const chats = persisted
-      .filter((event) => event.type === 'chat')
-      .map((event) => event.item as AgentChatItem)
-      .filter((item) => item && typeof item.content === 'string');
-    const lastTurn = [...persisted].reverse().find((event) => event.type === 'turn');
+    const replayed = replayConversation(persisted, session.providerThreadId);
     const runtime: AgentRuntimeRecord = {
       revision: this.revisionCounters.get(terminalId) ?? 0,
       owner,
@@ -1042,10 +1285,10 @@ export class AgentService {
       state: 'USER_CONTROL',
       terminalInputMode: 'human',
       fullTakeover: false,
-      messages: chats,
-      priorMessages: safePriorMessages(lastTurn?.messages),
+      messages: replayed.messages,
+      priorMessages: replayed.priorMessages,
       providerThreadId: canReuseThread && backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
-        ? session.providerThreadId
+        ? replayed.providerThreadId
         : undefined,
       turnToken: 0,
     };
@@ -1290,6 +1533,53 @@ export class AgentService {
     const runtime = this.runtimes.get(terminalId);
     if (!runtime || runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
     return runtime;
+  }
+
+  private requireLatestUserMessage(
+    runtime: AgentRuntimeRecord,
+    messageId: string,
+  ): AgentChatItem {
+    const message = [...runtime.messages].reverse().find((item) => item.role === 'user');
+    if (!message || message.id !== messageId) {
+      throw new Error('只能处理当前会话的最后一条用户消息。');
+    }
+    return message;
+  }
+
+  private startPersistedPrompt(
+    runtime: AgentRuntimeRecord,
+    prompt: string,
+  ): AgentSessionView {
+    runtime.turnToken += 1;
+    const token = runtime.turnToken;
+    runtime.abortController = new AbortController();
+    runtime.error = undefined;
+    runtime.activeExecution = undefined;
+    runtime.pendingTakeover = undefined;
+    runtime.authRequest = undefined;
+    runtime.streamingMessageId = undefined;
+    if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
+      runtime.controlLeaseId = undefined;
+      this.setIndependentCodexState(runtime, 'THINKING');
+    } else {
+      try {
+        runtime.controlLeaseId = this.terminals.acquireAgentControl(
+          runtime.owner,
+          runtime.terminalId,
+        );
+      } catch (error) {
+        runtime.abortController = undefined;
+        runtime.error = error instanceof Error ? error.message : String(error);
+        runtime.state = 'FAILED';
+        runtime.terminalInputMode = 'human';
+        this.emit(runtime);
+        throw error;
+      }
+      this.setLockedState(runtime, 'THINKING');
+    }
+    this.emit(runtime);
+    void this.runTurn(runtime, token, prompt, runtime.controlLeaseId);
+    return cloneView(runtime);
   }
 
   private emit(runtime: AgentRuntimeRecord): void {

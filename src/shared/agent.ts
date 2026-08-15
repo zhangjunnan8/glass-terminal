@@ -111,6 +111,18 @@ export interface SendAgentPromptRequest {
   providerId?: string;
 }
 
+export interface InterruptAgentTurnRequest {
+  terminalId: string;
+  messageId: string;
+}
+
+export interface ReviseAgentPromptRequest {
+  terminalId: string;
+  messageId: string;
+  action: 'retract' | 'replace';
+  prompt?: string;
+}
+
 export interface ResolveApprovalRequest {
   terminalId: string;
   approvalId: string;
@@ -146,6 +158,8 @@ export interface ConfirmShellReadyRequest {
 
 export const AGENT_CHANNELS = {
   sendPrompt: 'agent:send-prompt',
+  interruptTurn: 'agent:interrupt-turn',
+  revisePrompt: 'agent:revise-prompt',
   getState: 'agent:get-state',
   resolveApproval: 'agent:resolve-approval',
   setFullTakeover: 'agent:set-full-takeover',

@@ -307,7 +307,7 @@ export class CodexAppServerTurnRunner {
     if (!connection) return Promise.reject(new Error('Codex App Server 尚未连接。'));
     if (this.quarantinedAttachmentGeneration === this.attachmentGeneration) {
       return Promise.reject(new Error(
-        'Codex App Server 连接已因协议错误被隔离；请重启并重新连接。',
+        'Codex App Server 连接已隔离，因为上一轮状态无法安全确认；请重启并重新连接。',
       ));
     }
     if (this.active) return Promise.reject(new Error('同一时间只能运行一个 Codex App Server Turn。'));
@@ -927,14 +927,22 @@ export class CodexAppServerTurnRunner {
       || !active.turnId
       || !this.isActive(active)
     ) return;
-    active.interruptRequest = active.connection.request('turn/interrupt', {
-      threadId: active.threadId,
-      turnId: active.turnId,
-    }).then(() => undefined).catch((error) => {
-      // A rejected interrupt is an RPC/application error, not evidence that
-      // subsequent messages on this connection are structurally unsafe.
-      this.failActive(active, error);
-      throw error;
+    // Treat a non-conforming connection implementation that throws before
+    // returning its Promise exactly like an asynchronously rejected RPC.
+    active.interruptRequest = Promise.resolve().then(() => active.connection.request(
+      'turn/interrupt',
+      {
+        threadId: active.threadId,
+        turnId: active.turnId,
+      },
+    )).then(() => undefined).catch((error) => {
+      // Once the server rejects an exact interrupt request we cannot prove the
+      // old native turn has stopped. Quarantine this attachment so a late tool
+      // request from that turn can never be routed into a later user message.
+      const failure = error instanceof Error ? error : new Error(String(error));
+      this.quarantinedAttachmentGeneration = active.attachmentGeneration;
+      this.failActive(active, failure, true);
+      throw failure;
     });
     void active.interruptRequest.catch(() => undefined);
   }
@@ -959,14 +967,16 @@ export class CodexAppServerTurnRunner {
     active.interruptDone.resolve();
   }
 
-  private failActive(active: ActiveTurn, error: unknown): void {
+  private failActive(active: ActiveTurn, error: unknown, interruptFailed = false): void {
     if (active.settled) return;
+    const failure = error instanceof Error ? error : new Error(String(error));
     active.settled = true;
     active.removeExternalAbort();
-    active.controller.abort(error instanceof Error ? error : undefined);
+    active.controller.abort(failure);
     if (this.active === active) this.active = undefined;
-    active.completion.reject(error instanceof Error ? error : new Error(String(error)));
-    active.interruptDone.resolve();
+    active.completion.reject(failure);
+    if (interruptFailed) active.interruptDone.reject(failure);
+    else active.interruptDone.resolve();
   }
 
   private assertActive(active: ActiveTurn): void {

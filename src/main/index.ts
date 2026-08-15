@@ -23,8 +23,10 @@ import type { ProviderInput, ProviderModelDiscoveryInput } from '../shared/provi
 import { AGENT_CHANNELS } from '../shared/agent';
 import type {
   ConfirmShellReadyRequest,
+  InterruptAgentTurnRequest,
   ResolveApprovalRequest,
   ResolveTakeoverRequest,
+  ReviseAgentPromptRequest,
   SendAgentPromptRequest,
   SetFullTakeoverRequest,
   TakeoverRequest,
@@ -362,9 +364,11 @@ handleTrusted(CODEX_APP_SERVER_CHANNELS.chooseExecutable, async (event) => {
     selection.filePaths[0],
   );
 });
-handleTrusted(CODEX_APP_SERVER_CHANNELS.restart, () => (
-  requireCodexAppServerService().restart()
-));
+handleTrusted(CODEX_APP_SERVER_CHANNELS.restart, async () => {
+  const state = await requireCodexAppServerService().restart();
+  agentService?.handleCodexAppServerRestarted();
+  return state;
+});
 handleTrusted(CODEX_APP_SERVER_CHANNELS.refresh, () => (
   requireCodexAppServerService().refresh()
 ));
@@ -404,6 +408,14 @@ handleTrusted(
 handleTrusted(AGENT_CHANNELS.sendPrompt, (event, request: SendAgentPromptRequest) => {
   if (!agentService) throw new Error('Agent service is not ready.');
   return agentService.sendPrompt(event.sender, request);
+});
+handleTrusted(AGENT_CHANNELS.interruptTurn, (event, request: InterruptAgentTurnRequest) => {
+  if (!agentService) throw new Error('Agent service is not ready.');
+  return agentService.interruptTurn(event.sender, request);
+});
+handleTrusted(AGENT_CHANNELS.revisePrompt, (event, request: ReviseAgentPromptRequest) => {
+  if (!agentService) throw new Error('Agent service is not ready.');
+  return agentService.revisePrompt(event.sender, request);
 });
 handleTrusted(AGENT_CHANNELS.getState, (event, terminalId: string) => {
   if (!agentService) throw new Error('Agent service is not ready.');

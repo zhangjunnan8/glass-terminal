@@ -279,6 +279,26 @@ describe('CodexAppServerTurnRunner native mode', () => {
     await expect(resultPromise).resolves.toMatchObject({ status: 'interrupted' });
   });
 
+  it('rejects the interrupt and quarantines the connection when stop is not acknowledged', async () => {
+    const connection = new FakeConnection();
+    connection.responder = (method) => {
+      if (method === 'thread/start') return { thread: { id: 'thread-new' } };
+      if (method === 'turn/start') {
+        return { turn: { id: 'turn-1', status: 'inProgress', items: [] } };
+      }
+      if (method === 'turn/interrupt') throw new Error('interrupt rejected');
+      throw new Error(`Unexpected request: ${method}`);
+    };
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));
+    runner.attach(connection);
+    const resultPromise = runner.run(createInput());
+    await waitForRequest(connection, 'turn/start');
+
+    await expect(runner.interrupt()).rejects.toThrow('interrupt rejected');
+    await expect(resultPromise).rejects.toThrow('interrupt rejected');
+    await expect(runner.run(createInput())).rejects.toThrow('上一轮状态无法安全确认');
+  });
+
   it('keeps the connection reusable after an ordinary JSON-RPC request rejection', async () => {
     const connection = new FakeConnection();
     const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));

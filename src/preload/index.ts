@@ -140,6 +140,8 @@ const codexAppServerBridge: DesktopBridge['codexAppServer'] = {
 
 const agentBridge: DesktopBridge['agent'] = {
   sendPrompt: (request) => ipcRenderer.invoke(AGENT_CHANNELS.sendPrompt, request),
+  interruptTurn: (request) => ipcRenderer.invoke(AGENT_CHANNELS.interruptTurn, request),
+  revisePrompt: (request) => ipcRenderer.invoke(AGENT_CHANNELS.revisePrompt, request),
   getState: (terminalId) => ipcRenderer.invoke(AGENT_CHANNELS.getState, terminalId),
   resolveApproval: (request) => ipcRenderer.invoke(AGENT_CHANNELS.resolveApproval, request),
   setFullTakeover: (request) => ipcRenderer.invoke(AGENT_CHANNELS.setFullTakeover, request),

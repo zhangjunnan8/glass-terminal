@@ -127,6 +127,7 @@ class FakeSessions {
   appendThreadEvent(_sessionId: string, _threadId: string, event: Record<string, unknown>) {
     if (this.failThreadEvents) throw new Error('thread persistence failed');
     this.threadEvents.push(event);
+    this.persistedThreadEvents.push(event);
   }
   readTerminalHistory() { return 'tester@host:~$ '; }
   appendAudit(
@@ -243,6 +244,13 @@ class DeferredStreamingCodexAppServer {
     });
     this.resolveInterrupt?.();
     this.resolveInterrupt = undefined;
+  }
+}
+
+class RejectingInterruptCodexAppServer extends DeferredStreamingCodexAppServer {
+  override interruptTerminalAgentTurn(): Promise<void> {
+    this.interruptRequested = true;
+    return Promise.reject(new Error('interrupt rejected; connection quarantined'));
   }
 }
 
@@ -983,7 +991,7 @@ describe('AgentService shared-terminal controls', () => {
       .toHaveLength(1);
   });
 
-  it('keeps a foreground process while stale completion cannot resume the Agent', async () => {
+  it('can interrupt a kept foreground process from the latest message without resuming the Agent', async () => {
     let finish!: (execution: CommandExecution) => void;
     const deferred = new Promise<CommandExecution>((resolve) => { finish = resolve; });
     const provider = new FakeProvider([
@@ -1020,6 +1028,20 @@ describe('AgentService shared-terminal controls', () => {
     });
     expect(service.getState(owner, 'terminal')?.state).toBe('PAUSED');
     expect(terminals.keepCount).toBe(1);
+
+    const latestUserMessage = [...service.getState(owner, 'terminal')!.messages]
+      .reverse().find((message) => message.role === 'user')!;
+    const interrupted = service.interruptTurn(owner, {
+      terminalId: 'terminal',
+      messageId: latestUserMessage.id,
+    });
+    expect(terminals.interruptCount).toBe(1);
+    expect(interrupted).toMatchObject({
+      state: 'PAUSED',
+      terminalInputMode: 'human',
+      activeExecution: { id: pending.executionId },
+    });
+    expect(interrupted.activeExecution?.interruptRequestedAt).toBeTruthy();
 
     const started = terminals.current!;
     finish({
@@ -1175,6 +1197,187 @@ describe('AgentService shared-terminal controls', () => {
       audit.type === 'interactive_auth'
       && audit.details?.phase === 'execution_ended_without_submission'
     ))).toBe(true);
+  });
+
+  it('interrupts only the latest running user message and ignores stale completion', async () => {
+    const provider = new DeferredStreamingProvider();
+    const sessions = new FakeSessions();
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      () => provider,
+    );
+
+    const running = service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Long task.' });
+    const messageId = running.messages.at(-1)!.id;
+    await waitFor(() => Boolean(provider.request));
+
+    expect(() => service.interruptTurn(owner, {
+      terminalId: 'terminal',
+      messageId: 'stale-message',
+    })).toThrow('最后一条用户消息');
+    const interrupted = service.interruptTurn(owner, { terminalId: 'terminal', messageId });
+    expect(interrupted.state).toBe('PAUSED');
+    expect(interrupted.terminalInputMode).toBe('human');
+    expect(provider.request?.signal.aborted).toBe(true);
+
+    const revision = interrupted.revision;
+    provider.finish('must be ignored');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(service.getState(owner, 'terminal')).toMatchObject({ state: 'PAUSED', revision });
+    expect(service.getState(owner, 'terminal')?.messages.some((item) => (
+      item.content === 'must be ignored'
+    ))).toBe(false);
+  });
+
+  it('replaces only the latest completed prompt using append-only conversation actions', async () => {
+    const provider = new FakeProvider([
+      { message: { role: 'assistant', content: 'First answer.' } },
+      { message: { role: 'assistant', content: 'Old second answer.' } },
+      { message: { role: 'assistant', content: 'Revised answer.' } },
+    ]);
+    const sessions = new FakeSessions();
+    const terminals = new FakeTerminals();
+    const owner = browserOwner();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      () => provider,
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'First prompt.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    const firstMessageId = service.getState(owner, 'terminal')!.messages
+      .find((item) => item.role === 'user')!.id;
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Old second prompt.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    const oldMessageId = [...service.getState(owner, 'terminal')!.messages]
+      .reverse().find((item) => item.role === 'user')!.id;
+
+    expect(() => service.revisePrompt(owner, {
+      terminalId: 'terminal',
+      messageId: firstMessageId,
+      action: 'retract',
+    })).toThrow('最后一条用户消息');
+    service.revisePrompt(owner, {
+      terminalId: 'terminal',
+      messageId: oldMessageId,
+      action: 'replace',
+      prompt: 'Revised second prompt.',
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    const completed = service.getState(owner, 'terminal')!;
+    expect(completed.messages.map((item) => item.content)).toEqual([
+      'First prompt.',
+      'First answer.',
+      'Revised second prompt.',
+      'Revised answer.',
+    ]);
+    expect(provider.requests[2].messages.some((message) => (
+      message.role === 'user' && message.content.startsWith('First prompt.')
+    ))).toBe(true);
+    expect(provider.requests[2].messages.some((message) => (
+      message.role === 'user' && message.content.includes('Old second prompt.')
+    ))).toBe(false);
+    expect(sessions.threadEvents).toContainEqual(expect.objectContaining({
+      type: 'chat_action',
+      action: 'replace',
+      targetMessageId: oldMessageId,
+      executionHistoryPreserved: true,
+    }));
+
+    service.close();
+    const restored = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      () => provider,
+    ).getState(owner, 'terminal');
+    expect(restored?.messages.map((item) => item.content)).toEqual([
+      'First prompt.',
+      'First answer.',
+      'Revised second prompt.',
+      'Revised answer.',
+    ]);
+  });
+
+  it('drains an interrupted native Codex turn without taking terminal control', async () => {
+    const codex = new DeferredStreamingCodexAppServer();
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      () => { throw new Error('Generic Provider must not be used.'); },
+      codex as unknown as CodexAppServerService,
+    );
+    const running = service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Native long task.',
+      backend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      },
+    });
+    await waitFor(() => Boolean(codex.input));
+
+    const interrupted = service.interruptTurn(owner, {
+      terminalId: 'terminal',
+      messageId: running.messages.at(-1)!.id,
+    });
+    expect(interrupted).toMatchObject({
+      state: 'PAUSED',
+      terminalInputMode: 'human',
+      backendTurnDraining: true,
+    });
+    expect(codex.interruptRequested).toBe(true);
+    codex.finishInterrupt();
+    await waitFor(() => service.getState(owner, 'terminal')?.backendTurnDraining === false);
+    expect(service.getState(owner, 'terminal')?.state).toBe('PAUSED');
+  });
+
+  it('reports a rejected native interrupt instead of presenting it as safely stopped', async () => {
+    const codex = new RejectingInterruptCodexAppServer();
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      () => { throw new Error('Generic Provider must not be used.'); },
+      codex as unknown as CodexAppServerService,
+    );
+    const running = service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Native long task.',
+      backend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      },
+    });
+    await waitFor(() => Boolean(codex.input));
+
+    service.interruptTurn(owner, {
+      terminalId: 'terminal',
+      messageId: running.messages.at(-1)!.id,
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.error !== undefined);
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      state: 'PAUSED',
+      terminalInputMode: 'human',
+      backendTurnDraining: true,
+      error: 'interrupt rejected; connection quarantined',
+    });
+    service.handleCodexAppServerRestarted();
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      state: 'PAUSED',
+      terminalInputMode: 'human',
+      backendTurnDraining: false,
+      error: undefined,
+    });
   });
 
   it('keeps renderer revisions increasing when the Provider creates a new runtime', async () => {
