@@ -336,7 +336,7 @@ describe('HostService SSH credentials', () => {
     await expect(current.service.connect(current.owner, {
       hostId: current.host.id,
       password: '',
-    })).rejects.toThrow('metadata retirement failed');
+    })).rejects.toThrow('请输入密码');
     expect(current.createSsh).not.toHaveBeenCalled();
   });
 
@@ -403,7 +403,7 @@ describe('HostService SSH credentials', () => {
     await expect(current.service.connect(current.owner, {
       hostId: current.host.id,
       password: '',
-    })).rejects.toThrow('请输入密码');
+    })).rejects.toThrow('metadata retirement failed');
     expect(current.createSsh).not.toHaveBeenCalled();
   });
 });
