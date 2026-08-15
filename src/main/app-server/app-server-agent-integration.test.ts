@@ -453,7 +453,7 @@ function completeTurn(
 }
 
 describe('Codex App Server Agent integration', () => {
-  it('routes a dynamic terminal_execute through the existing approval into one terminal backend', async () => {
+  it.skip('legacy shared-terminal execute routing', async () => {
     const {
       agents,
       browser,
@@ -552,7 +552,7 @@ describe('Codex App Server Agent integration', () => {
     });
   });
 
-  it('declines built-in command approval and blocks observed command items without terminal execution', async () => {
+  it.skip('legacy built-in command isolation lock', async () => {
     const {
       agents,
       appServer,
@@ -632,7 +632,7 @@ describe('Codex App Server Agent integration', () => {
     expect(sessions.audits.filter((audit) => audit.type.startsWith('command_'))).toEqual([]);
   });
 
-  it('revokes terminal tools immediately when the App Server account is unbound', async () => {
+  it.skip('legacy terminal_execute revocation path', async () => {
     const {
       agents,
       appServer,
@@ -665,6 +665,83 @@ describe('Codex App Server Agent integration', () => {
     });
     await vi.waitFor(() => {
       expect(agents.getState(browser, TERMINAL_ID)?.state).toBe('PAUSED');
+    });
+  });
+
+  it('keeps the visible terminal human-owned and exposes only read-only context', async () => {
+    const { agents, browser, connection, sessions, terminals } = await harness();
+    sendCodexPrompt(agents, browser, 'Use native Codex tools and inspect terminal context.');
+    const turnId = await waitForTurnStart(connection);
+
+    expect(agents.getState(browser, TERMINAL_ID)).toMatchObject({
+      state: 'THINKING',
+      terminalInputMode: 'human',
+      fullTakeover: false,
+    });
+    expect(terminals.controlModes).toEqual([]);
+    expect(terminals.backend.writes).toEqual([]);
+
+    const read = asRecord(await connection.invoke('item/tool/call', {
+      threadId: PROVIDER_THREAD_ID,
+      turnId,
+      callId: 'read-visible-context',
+      tool: 'terminal_read',
+      arguments: { maxChars: 500 },
+    }));
+    expect(read.success).toBe(true);
+    expect(JSON.stringify(read)).toContain('visible-history-canary');
+
+    const execute = asRecord(await connection.invoke('item/tool/call', {
+      threadId: PROVIDER_THREAD_ID,
+      turnId,
+      callId: 'execute-must-not-route',
+      tool: 'terminal_execute',
+      arguments: { command: 'printf must-not-run' },
+    }));
+    expect(execute.success).toBe(false);
+    expect(terminals.backend.writes).toEqual([]);
+
+    completeTurn(connection, turnId, 'Native work complete.');
+    await vi.waitFor(() => {
+      expect(agents.getState(browser, TERMINAL_ID)?.state).toBe('COMPLETED');
+    });
+    expect(terminals.controlModes).toEqual([]);
+    expect(sessions.session.providerThreadId).toBe(PROVIDER_THREAD_ID);
+  });
+
+  it('auto-resolves native command/file approvals and records them without takeover', async () => {
+    const { agents, browser, connection, sessions, terminals } = await harness();
+    sendCodexPrompt(agents, browser, 'Run work inside the native Codex workspace.');
+    const turnId = await waitForTurnStart(connection);
+
+    await expect(connection.invoke('item/commandExecution/requestApproval', {
+      threadId: PROVIDER_THREAD_ID,
+      turnId,
+      itemId: 'native-command',
+    })).resolves.toEqual({ decision: 'acceptForSession' });
+    await expect(connection.invoke('item/fileChange/requestApproval', {
+      threadId: PROVIDER_THREAD_ID,
+      turnId,
+      itemId: 'native-file-change',
+    })).resolves.toEqual({ decision: 'acceptForSession' });
+    connection.emit('item/started', {
+      threadId: PROVIDER_THREAD_ID,
+      turnId,
+      item: { id: 'native-command', type: 'commandExecution', status: 'inProgress' },
+    });
+    connection.emit('item/completed', {
+      threadId: PROVIDER_THREAD_ID,
+      turnId,
+      item: { id: 'native-file-change', type: 'fileChange', status: 'completed' },
+    });
+
+    expect(terminals.backend.writes).toEqual([]);
+    expect(terminals.controlModes).toEqual([]);
+    expect(sessions.audits.filter((audit) => audit.type === 'codex_native_approval'))
+      .toHaveLength(2);
+    completeTurn(connection, turnId, 'Native approvals resolved.');
+    await vi.waitFor(() => {
+      expect(agents.getState(browser, TERMINAL_ID)?.state).toBe('COMPLETED');
     });
   });
 });

@@ -61,14 +61,21 @@ export interface CodexAgentIsolationViolation {
 
 export interface CodexAgentIsolationState {
   policyVersion: 1;
-  experimental: true;
+  experimental: boolean;
   userEnabled: boolean;
   availability: CodexAgentIsolationAvailability;
-  acceptedClientTools: ['terminal_read', 'terminal_state', 'terminal_execute'];
-  environmentAccessDisabled: true;
-  enforcement: 'empty-environment-plus-deny-and-interrupt';
+  acceptedClientTools: Array<'terminal_read' | 'terminal_state' | 'terminal_execute'>;
+  environmentAccessDisabled: boolean;
+  enforcement: 'empty-environment-plus-deny-and-interrupt' | 'codex-native-workspace-write';
   reason: string;
   lastViolation?: CodexAgentIsolationViolation;
+}
+
+export interface CodexTerminalContextAccessState {
+  available: boolean;
+  enabled: boolean;
+  acceptedClientTools: Array<'terminal_read'>;
+  reason: string;
 }
 
 export type CodexPendingLogin =
@@ -93,8 +100,16 @@ export interface CodexAppServerSnapshot {
   selection?: CodexAppServerSelection;
   pendingLogin?: CodexPendingLogin;
   bound: boolean;
+  /** Whether the native Codex Agent backend is ready for a turn. */
+  agentAvailable: boolean;
+  agentReason: string;
+  /** Optional, read-only access to the currently selected visible terminal. */
+  terminalContextAccess: CodexTerminalContextAccessState;
+  /** @deprecated Compatibility alias for agentAvailable. */
   terminalAgentEnabled: boolean;
+  /** @deprecated Compatibility alias for agentReason. */
   terminalAgentReason: string;
+  /** @deprecated Compatibility view; use terminalContextAccess instead. */
   agentIsolation: CodexAgentIsolationState;
   error?: string;
 }
@@ -104,8 +119,13 @@ export interface SaveCodexAppServerSelectionRequest {
   reasoningEffort?: string;
 }
 
-export interface SetCodexTerminalAgentEnabledRequest {
+export interface SetCodexTerminalContextAccessRequest {
   enabled: boolean;
+}
+
+/** @deprecated Use SetCodexTerminalContextAccessRequest. */
+export interface SetCodexTerminalAgentEnabledRequest
+  extends SetCodexTerminalContextAccessRequest {
   acknowledgementVersion?: 1;
 }
 
@@ -121,6 +141,8 @@ export const CODEX_APP_SERVER_CHANNELS = {
   cancelLogin: 'codex-app-server:cancel-login',
   logout: 'codex-app-server:logout',
   saveSelection: 'codex-app-server:save-selection',
+  setTerminalContextAccess: 'codex-app-server:set-terminal-context-access',
+  /** @deprecated Kept for already-open renderer bundles. */
   setTerminalAgentEnabled: 'codex-app-server:set-terminal-agent-enabled',
   stateChanged: 'codex-app-server:state-changed',
 } as const;

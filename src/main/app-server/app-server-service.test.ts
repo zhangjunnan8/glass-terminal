@@ -134,7 +134,7 @@ afterEach(() => {
 });
 
 describe('CodexAppServerService', () => {
-  it('requires a fresh process opt-in and persists a violation lock', async () => {
+  it.skip('legacy isolation policy: replaced by native App Server mode', async () => {
     const {
       root,
       connection,
@@ -272,7 +272,7 @@ describe('CodexAppServerService', () => {
     blockedAfterRestart.close();
   });
 
-  it('rejects enabling the terminal Agent without acknowledgement or prerequisites', () => {
+  it.skip('legacy acknowledgement gate: replaced by terminal context access', () => {
     const { service } = fixture();
 
     expect(() => service.setTerminalAgentEnabled({ enabled: true })).toThrow(
@@ -291,7 +291,7 @@ describe('CodexAppServerService', () => {
     });
   });
 
-  it('cannot auto-enable after a violation write failure', async () => {
+  it.skip('legacy violation lock: native command/file events are allowed', async () => {
     const { root, connection, launch, openExternal, probe, service } = fixture();
     const configPath = join(root, 'config.json');
     connection.account = { type: 'chatgpt', email: 'agent@example.com', planType: 'plus' };
@@ -328,7 +328,7 @@ describe('CodexAppServerService', () => {
     restarted.close();
   });
 
-  it('disables and interrupts immediately even when config persistence fails', async () => {
+  it.skip('legacy process-scoped switch: terminal context is now persisted', async () => {
     const { connection, service } = fixture();
     connection.account = { type: 'chatgpt', email: 'agent@example.com', planType: 'plus' };
     await service.start();
@@ -351,6 +351,57 @@ describe('CodexAppServerService', () => {
       agentIsolation: { userEnabled: false, availability: 'eligible' },
     });
     expect(disabled.error).toContain('已在当前进程停用');
+  });
+
+  it('makes the native Agent available independently and persists terminal read access', async () => {
+    const { root, connection, service } = fixture();
+    connection.account = { type: 'chatgpt', email: 'agent@example.com', planType: 'plus' };
+    await service.start();
+    const ready = service.saveSelection({ modelId: 'gpt-test', reasoningEffort: 'low' });
+    expect(ready).toMatchObject({
+      agentAvailable: true,
+      terminalContextAccess: {
+        available: true,
+        enabled: false,
+        acceptedClientTools: [],
+      },
+    });
+
+    const enabled = service.setTerminalContextAccess({ enabled: true });
+    expect(enabled).toMatchObject({
+      agentAvailable: true,
+      terminalContextAccess: {
+        enabled: true,
+        acceptedClientTools: ['terminal_read'],
+      },
+      agentIsolation: {
+        enforcement: 'codex-native-workspace-write',
+        experimental: false,
+      },
+    });
+    expect(JSON.parse(readFileSync(join(root, 'config.json'), 'utf8'))).toMatchObject({
+      bound: true,
+      terminalContextAccessEnabled: true,
+    });
+    service.close();
+  });
+
+  it('requires prerequisites for terminal context and revokes it immediately', async () => {
+    const { connection, service } = fixture();
+    expect(() => service.setTerminalContextAccess({ enabled: true }))
+      .toThrow('请先启动 App Server');
+    connection.account = { type: 'chatgpt', email: 'agent@example.com', planType: 'plus' };
+    await service.start();
+    service.saveSelection({ modelId: 'gpt-test', reasoningEffort: 'low' });
+    service.setTerminalContextAccess({ enabled: true });
+    const interrupt = vi.fn(async () => undefined);
+    const testable = service as unknown as { turnRunner: { interrupt(): Promise<void> } };
+    testable.turnRunner.interrupt = interrupt;
+    const disabled = service.setTerminalContextAccess({ enabled: false });
+    expect(interrupt).toHaveBeenCalledOnce();
+    expect(disabled.terminalContextAccess.enabled).toBe(false);
+    expect(disabled.agentAvailable).toBe(true);
+    service.close();
   });
 
   it('starts, logs in through the browser, loads models, and persists no auth data', async () => {

@@ -85,7 +85,8 @@ export interface SessionAuditEvent {
     | 'agent_paused'
     | 'full_takeover_changed'
     | 'interactive_auth'
-    | 'interactive_response';
+    | 'interactive_response'
+    | 'codex_native_approval';
   actor: 'user' | 'system' | 'ai';
   timestamp: string;
   details: Record<string, unknown>;

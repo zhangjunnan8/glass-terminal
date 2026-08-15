@@ -113,6 +113,10 @@ const codexAppServerBridge: DesktopBridge['codexAppServer'] = {
     CODEX_APP_SERVER_CHANNELS.saveSelection,
     request,
   ),
+  setTerminalContextAccess: (request) => ipcRenderer.invoke(
+    CODEX_APP_SERVER_CHANNELS.setTerminalContextAccess,
+    request,
+  ),
   setTerminalAgentEnabled: (request) => ipcRenderer.invoke(
     CODEX_APP_SERVER_CHANNELS.setTerminalAgentEnabled,
     request,

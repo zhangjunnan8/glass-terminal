@@ -147,7 +147,10 @@ export class AgentService {
     if (existing && (BUSY_STATES.has(existing.state) || existing.backendTurnDraining)) {
       throw new Error('The Agent is already working in this terminal.');
     }
-    if (this.terminals.currentExecution(owner, request.terminalId)) {
+    if (
+      backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND
+      && this.terminals.currentExecution(owner, request.terminalId)
+    ) {
       throw new Error('A foreground process retained by Takeover is still running.');
     }
 
@@ -161,8 +164,13 @@ export class AgentService {
     runtime.authRequest = undefined;
     runtime.streamingMessageId = undefined;
     this.addChat(runtime, 'user', prompt);
-    runtime.controlLeaseId = this.terminals.acquireAgentControl(owner, request.terminalId);
-    this.setLockedState(runtime, 'THINKING');
+    if (backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
+      runtime.controlLeaseId = undefined;
+      this.setIndependentCodexState(runtime, 'THINKING');
+    } else {
+      runtime.controlLeaseId = this.terminals.acquireAgentControl(owner, request.terminalId);
+      this.setLockedState(runtime, 'THINKING');
+    }
     this.emit(runtime);
     void this.runTurn(runtime, token, prompt, runtime.controlLeaseId);
     return cloneView(runtime);
@@ -232,6 +240,23 @@ export class AgentService {
   setFullTakeover(owner: WebContents, request: SetFullTakeoverRequest): AgentSessionView {
     let runtime = this.runtimes.get(request.terminalId);
     if (runtime && runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
+    if (
+      request.backend?.kind === CODEX_APP_SERVER_AGENT_BACKEND
+      || runtime?.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
+    ) {
+      if (!runtime) {
+        runtime = this.ensureRuntime(
+          owner,
+          request.terminalId,
+          this.selectBackend(request.backend, request.providerId),
+        );
+      }
+      if (request.enabled) {
+        throw new Error('Codex App Server 使用独立内建执行环境，不使用 Full Takeover。');
+      }
+      runtime.fullTakeover = false;
+      return cloneView(runtime);
+    }
     if (
       runtime
       && request.approvalId
@@ -326,13 +351,14 @@ export class AgentService {
 
   takeover(owner: WebContents, request: TakeoverRequest): AgentSessionView {
     const runtime = this.requireOwned(owner, request.terminalId);
+    if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
+      throw new Error('Codex App Server 不操作用户终端，无需人工接管。');
+    }
     if (runtime.state === 'TAKEOVER_PENDING') return cloneView(runtime);
     if (!BUSY_STATES.has(runtime.state) && !runtime.fullTakeover) {
       return cloneView(runtime);
     }
 
-    const drainAppServerTurn = runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
-      && BUSY_STATES.has(runtime.state);
     const partial = runtime.streamingMessageId
       ? runtime.messages.find((message) => message.id === runtime.streamingMessageId)
       : undefined;
@@ -344,18 +370,6 @@ export class AgentService {
     runtime.turnToken += 1;
     runtime.abortController?.abort();
     runtime.abortController = undefined;
-    if (drainAppServerTurn) {
-      runtime.backendTurnDraining = true;
-      const drain = Promise.resolve().then(() => {
-        if (!this.codexAppServer) throw new Error('Codex App Server Agent Runtime 未初始化。');
-        return this.codexAppServer.interruptTerminalAgentTurn();
-      });
-      void drain.catch(() => undefined).finally(() => {
-        if (this.runtimes.get(runtime.terminalId) !== runtime || !runtime.backendTurnDraining) return;
-        runtime.backendTurnDraining = false;
-        this.emit(runtime);
-      });
-    }
     if (runtime.pendingApproval) {
       this.appendControlAudit(runtime, 'command_rejected', 'user', {
         approvalId: runtime.pendingApproval.id,
@@ -493,12 +507,13 @@ export class AgentService {
     runtime: AgentRuntimeRecord,
     token: number,
     prompt: string,
-    controlLeaseId: string,
+    controlLeaseId?: string,
   ): Promise<void> {
     if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
       await this.runCodexTurn(runtime, token, prompt, controlLeaseId);
       return;
     }
+    if (!controlLeaseId) throw new Error('Generic Agent control lease is missing.');
     const signal = runtime.abortController!.signal;
     const provider = this.providerFactory(runtime.providerId);
     let streamedMessage: AgentChatItem | undefined;
@@ -584,21 +599,21 @@ export class AgentService {
     runtime: AgentRuntimeRecord,
     token: number,
     prompt: string,
-    controlLeaseId: string,
+    _controlLeaseId?: string,
   ): Promise<void> {
     const service = this.codexAppServer;
     const signal = runtime.abortController!.signal;
     if (!service) {
       runtime.error = 'Codex App Server Agent Runtime 未初始化。';
-      this.setHumanState(runtime, 'FAILED', controlLeaseId);
+      this.setIndependentCodexState(runtime, 'FAILED');
       this.emit(runtime);
       return;
     }
     const snapshot = service.getState();
     const selection = snapshot.selection;
-    if (!snapshot.terminalAgentEnabled || !selection) {
-      runtime.error = snapshot.terminalAgentReason;
-      this.setHumanState(runtime, 'FAILED', controlLeaseId);
+    if (!snapshot.agentAvailable || !selection) {
+      runtime.error = snapshot.agentReason;
+      this.setIndependentCodexState(runtime, 'FAILED');
       this.emit(runtime);
       return;
     }
@@ -611,17 +626,11 @@ export class AgentService {
         reasoningEffort: selection.reasoningEffort,
         threadId: runtime.providerThreadId,
         signal,
+        terminalContextAccess: snapshot.terminalContextAccess.enabled,
         tools: {
           readTerminal: async ({ maxChars }) => (
             this.sessions.readTerminalHistory(runtime.sessionId).slice(-maxChars)
           ),
-          getTerminalState: async () => ({
-            ...this.terminals.state(runtime.owner, runtime.terminalId),
-            sessionId: runtime.sessionId,
-            controlState: runtime.state,
-            fullTakeover: runtime.fullTakeover,
-          }),
-          executeCommand: (request) => this.requestCommand(runtime, token, request),
         },
         onThreadBound: (threadId) => {
           if (!this.isCurrentTurn(runtime, token)) {
@@ -646,6 +655,13 @@ export class AgentService {
           }
           streamedMessage.content += delta;
           this.queueStreamEmit(runtime, token);
+        },
+        onNativeApproval: (approval) => {
+          if (!this.isCurrentTurn(runtime, token)) return;
+          this.sessions.appendAudit(runtime.sessionId, 'codex_native_approval', 'system', {
+            ...approval,
+            policy: 'native-workspace-no-visible-terminal',
+          });
         },
       });
       if (!this.isCurrentTurn(runtime, token)) return;
@@ -679,7 +695,7 @@ export class AgentService {
       });
       runtime.pendingApproval = undefined;
       runtime.activeExecution = undefined;
-      this.setHumanState(runtime, 'COMPLETED', controlLeaseId);
+      this.setIndependentCodexState(runtime, 'COMPLETED');
       this.emit(runtime);
     } catch (error) {
       if (!this.isCurrentTurn(runtime, token)) return;
@@ -708,33 +724,10 @@ export class AgentService {
       resolveApproval?.({ decision: 'reject', command: '' });
       this.resolveAuth(runtime);
       runtime.error = error instanceof Error ? error.message : String(error);
-      this.clearFullTakeover(runtime, wasAborted ? 'turn_paused' : 'turn_failed');
-
-      const foreground = this.terminals.currentExecution(runtime.owner, runtime.terminalId);
-      if (foreground) {
-        runtime.activeExecution = foreground;
-        runtime.pendingTakeover = {
-          id: randomUUID(),
-          executionId: foreground.id,
-          requestedAt: new Date().toISOString(),
-        };
-        this.setLockedState(runtime, 'TAKEOVER_PENDING');
-        this.appendControlAudit(runtime, 'agent_paused', 'system', {
-          processAction: 'app-server-ended-with-foreground-process',
-          executionId: foreground.id,
-        });
-      } else {
-        runtime.activeExecution = undefined;
-        if (runtime.sensitiveLeaseId) {
-          this.terminals.endSensitiveMode(
-            runtime.owner,
-            runtime.terminalId,
-            runtime.sensitiveLeaseId,
-          );
-          runtime.sensitiveLeaseId = undefined;
-        }
-        this.setHumanState(runtime, wasAborted ? 'PAUSED' : 'FAILED', controlLeaseId);
-      }
+      runtime.fullTakeover = false;
+      runtime.activeExecution = undefined;
+      runtime.pendingTakeover = undefined;
+      this.setIndependentCodexState(runtime, wasAborted ? 'PAUSED' : 'FAILED');
       this.emit(runtime);
     }
   }
@@ -1073,8 +1066,8 @@ export class AgentService {
         throw new Error('Codex App Server Agent 隔离策略版本不受支持。');
       }
       const state = this.codexAppServer?.getState();
-      if (!state || !state.terminalAgentEnabled) {
-        throw new Error(state?.terminalAgentReason ?? 'Codex App Server Agent 尚未启用。');
+      if (!state || !state.agentAvailable) {
+        throw new Error(state?.agentReason ?? 'Codex App Server Agent 尚未就绪。');
       }
       return {
         kind: CODEX_APP_SERVER_AGENT_BACKEND,
@@ -1115,6 +1108,24 @@ export class AgentService {
         runtime.controlLeaseId,
         'locked',
       );
+    }
+  }
+
+  private setIndependentCodexState(
+    runtime: AgentRuntimeRecord,
+    state: AgentRuntimeState,
+  ): void {
+    runtime.state = state;
+    runtime.terminalInputMode = 'human';
+    // Defensive cleanup for sessions created by the legacy shared-terminal
+    // App Server mode. Native Codex must never retain a terminal control lease.
+    if (runtime.controlLeaseId) {
+      this.terminals.releaseAgentControl(
+        runtime.owner,
+        runtime.terminalId,
+        runtime.controlLeaseId,
+      );
+      runtime.controlLeaseId = undefined;
     }
   }
 
@@ -1186,6 +1197,13 @@ export class AgentService {
   private handleTerminalExit(terminalId: string, ownerId: number): void {
     const runtime = this.runtimes.get(terminalId);
     if (!runtime || runtime.ownerId !== ownerId) return;
+    if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
+      // The native App Server turn is independent from the visible terminal.
+      // A disconnected shell only removes future terminal_read context.
+      runtime.terminalInputMode = 'human';
+      this.emit(runtime);
+      return;
+    }
     this.invalidateRuntime(runtime);
     runtime.pendingTakeover = undefined;
     runtime.error = 'Terminal disconnected.';

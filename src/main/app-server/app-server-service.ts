@@ -12,13 +12,12 @@ import {
 import { dirname, isAbsolute, join } from 'node:path';
 import type {
   CodexAccountInfo,
-  CodexAgentIsolationState,
-  CodexAgentIsolationViolation,
   CodexAppServerSelection,
   CodexAppServerSnapshot,
   CodexExecutableInfo,
   CodexModelInfo,
   SaveCodexAppServerSelectionRequest,
+  SetCodexTerminalContextAccessRequest,
   SetCodexTerminalAgentEnabledRequest,
 } from '../../shared/codex-app-server';
 import {
@@ -35,7 +34,8 @@ import type {
   RunCodexTurnResult,
 } from './app-server-turn-runner';
 
-const TERMINAL_AGENT_POLICY_REASON = '实验隔离模式强制使用空 environments，并只向 App Server 暴露 terminal_read、terminal_state、terminal_execute；任何内建命令或文件事件都会中断并锁停。';
+const NATIVE_AGENT_READY_REASON = 'Codex App Server 已就绪；内建 Shell/File 在独立的 Codex 工作区内运行。';
+const TERMINAL_CONTEXT_ENABLED_REASON = '已允许 Codex 以只读方式获取当前可见终端的近期内容。';
 const PROBE_TIMEOUT_MS = 5_000;
 
 interface StoredAppServerConfig {
@@ -43,8 +43,7 @@ interface StoredAppServerConfig {
   modelId?: string;
   reasoningEffort?: string;
   bound: boolean;
-  terminalAgentEnabled: boolean;
-  lastAgentViolation?: CodexAgentIsolationViolation;
+  terminalContextAccessEnabled: boolean;
 }
 
 interface ExecutableCandidate {
@@ -106,33 +105,14 @@ function cloneSnapshot(snapshot: CodexAppServerSnapshot): CodexAppServerSnapshot
     })),
     selection: snapshot.selection ? { ...snapshot.selection } : undefined,
     pendingLogin: snapshot.pendingLogin ? { ...snapshot.pendingLogin } : undefined,
+    terminalContextAccess: {
+      ...snapshot.terminalContextAccess,
+      acceptedClientTools: [...snapshot.terminalContextAccess.acceptedClientTools],
+    },
     agentIsolation: {
       ...snapshot.agentIsolation,
       acceptedClientTools: [...snapshot.agentIsolation.acceptedClientTools],
-      lastViolation: snapshot.agentIsolation.lastViolation
-        ? { ...snapshot.agentIsolation.lastViolation }
-        : undefined,
     },
-  };
-}
-
-function parseAgentViolation(value: unknown): CodexAgentIsolationViolation | undefined {
-  if (!isRecord(value)) return undefined;
-  const kinds: CodexAgentIsolationViolation['kind'][] = [
-    'command-execution',
-    'file-change',
-    'permission-request',
-    'protocol',
-  ];
-  if (
-    typeof value.detectedAt !== 'string'
-    || typeof value.detail !== 'string'
-    || !kinds.includes(value.kind as CodexAgentIsolationViolation['kind'])
-  ) return undefined;
-  return {
-    detectedAt: value.detectedAt,
-    kind: value.kind as CodexAgentIsolationViolation['kind'],
-    detail: value.detail.slice(0, 1_000),
   };
 }
 
@@ -143,10 +123,7 @@ function parseConfig(value: unknown): StoredAppServerConfig {
     modelId: optionalText(value.modelId),
     reasoningEffort: optionalText(value.reasoningEffort),
     bound: value.bound === true,
-    // Experimental terminal access is intentionally process-scoped. A stale
-    // file must never auto-enable it after a crash or failed violation write.
-    terminalAgentEnabled: false,
-    lastAgentViolation: parseAgentViolation(value.lastAgentViolation),
+    terminalContextAccessEnabled: value.terminalContextAccessEnabled === true,
   };
 }
 
@@ -342,12 +319,7 @@ export class CodexAppServerService {
     this.config = this.readConfig();
     this.runtimeRoot = join(dirname(configPath), 'codex-app-server-runtime');
     this.turnRunner = new CodexAppServerTurnRunner(
-      join(this.runtimeRoot, 'agent-sandbox'),
-      {
-        onIsolationViolation: ({ kind, detail }) => {
-          this.recordAgentIsolationViolation({ kind, detail });
-        },
-      },
+      join(this.runtimeRoot, 'agent-workspace'),
     );
     this.dependencies = {
       ...defaultDependencies(applicationRoot, resourcesPath, clientVersion, openExternal),
@@ -367,20 +339,25 @@ export class CodexAppServerService {
       selection,
       bound: this.config.bound,
       error: this.initialConfigError,
+      agentAvailable: false,
+      agentReason: '请先启动 App Server、完成登录并保存模型。',
+      terminalContextAccess: {
+        available: false,
+        enabled: false,
+        acceptedClientTools: [],
+        reason: '请先启动 App Server、完成登录并保存模型。',
+      },
       terminalAgentEnabled: false,
       terminalAgentReason: '请先启动 App Server、完成登录并保存模型。',
       agentIsolation: {
         policyVersion: 1,
-        experimental: true,
-        userEnabled: this.config.terminalAgentEnabled,
-        availability: this.config.lastAgentViolation ? 'blocked' : 'unavailable',
-        acceptedClientTools: ['terminal_read', 'terminal_state', 'terminal_execute'],
-        environmentAccessDisabled: true,
-        enforcement: 'empty-environment-plus-deny-and-interrupt',
-        reason: this.config.lastAgentViolation
-          ? '检测到 App Server 越过隔离边界；必须由用户重新确认后才能启用。'
-          : '请先启动 App Server、完成登录并保存模型。',
-        lastViolation: this.config.lastAgentViolation,
+        experimental: false,
+        userEnabled: this.config.terminalContextAccessEnabled,
+        availability: 'unavailable',
+        acceptedClientTools: [],
+        environmentAccessDisabled: false,
+        enforcement: 'codex-native-workspace-write',
+        reason: '请先启动 App Server、完成登录并保存模型。',
       },
     };
   }
@@ -390,10 +367,14 @@ export class CodexAppServerService {
   }
 
   runTerminalAgentTurn(input: RunCodexTurnInput): Promise<RunCodexTurnResult> {
-    if (!this.snapshot.terminalAgentEnabled) {
-      return Promise.reject(new Error(this.snapshot.terminalAgentReason));
+    if (!this.snapshot.agentAvailable) {
+      return Promise.reject(new Error(this.snapshot.agentReason));
     }
-    return this.turnRunner.run(input);
+    return this.turnRunner.run({
+      ...input,
+      terminalContextAccess: this.snapshot.terminalContextAccess.enabled,
+      canReadTerminal: () => this.snapshot.terminalContextAccess.enabled,
+    });
   }
 
   interruptTerminalAgentTurn(): Promise<void> {
@@ -631,7 +612,7 @@ export class CodexAppServerService {
       const nextConfig = {
         ...this.config,
         bound: false,
-        terminalAgentEnabled: false,
+        terminalContextAccessEnabled: false,
       };
       let persistenceError: string | undefined;
       try {
@@ -685,41 +666,35 @@ export class CodexAppServerService {
     return this.getState();
   }
 
-  setTerminalAgentEnabled(
-    request: SetCodexTerminalAgentEnabledRequest,
+  setTerminalContextAccess(
+    request: SetCodexTerminalContextAccessRequest,
   ): CodexAppServerSnapshot {
     if (this.disposed) throw new Error('Codex App Server 服务已关闭。');
     if (!request || typeof request.enabled !== 'boolean') {
-      throw new Error('App Server Agent 隔离设置无效。');
-    }
-    if (request.enabled && request.acknowledgementVersion !== 1) {
-      throw new Error('启用实验模式前必须确认当前隔离边界。');
+      throw new Error('App Server 终端上下文设置无效。');
     }
     if (request.enabled && !this.agentPrerequisitesReady()) {
       throw new Error('请先启动 App Server、完成登录并保存当前模型。');
     }
     const nextConfig: StoredAppServerConfig = {
       ...this.config,
-      terminalAgentEnabled: request.enabled,
-      lastAgentViolation: request.enabled ? undefined : this.config.lastAgentViolation,
+      terminalContextAccessEnabled: request.enabled,
     };
     if (!request.enabled) {
-      // Disabling is a fail-closed runtime action. Revoke the capability and
-      // abort the active turn before attempting any fallible persistence so a
-      // read-only/full disk cannot keep the Agent alive against the user's
-      // explicit request. The durable form is false regardless.
+      // Revocation is immediate: an in-flight turn may have already received
+      // terminal_read in its dynamic tool set, so interrupt it before writing.
       this.config = nextConfig;
       this.update({ error: undefined });
       void this.turnRunner.interrupt().catch((error) => {
         this.update({
-          error: `实验后端已停用，但中断当前 App Server Turn 失败：${this.actionError(error)}`,
+          error: `终端内容读取权限已撤销，但中断当前 App Server Turn 失败：${this.actionError(error)}`,
         });
       });
       try {
         this.writeConfig(nextConfig);
       } catch (error) {
         this.update({
-          error: `实验后端已在当前进程停用，但配置写入失败：${this.actionError(error)}`,
+          error: `终端内容读取权限已在当前进程撤销，但配置写入失败：${this.actionError(error)}`,
         });
       }
       return this.getState();
@@ -731,26 +706,20 @@ export class CodexAppServerService {
     return this.getState();
   }
 
-  recordAgentIsolationViolation(
-    violation: Omit<CodexAgentIsolationViolation, 'detectedAt'> & { detectedAt?: string },
-  ): void {
-    const recorded: CodexAgentIsolationViolation = {
-      detectedAt: violation.detectedAt ?? new Date().toISOString(),
-      kind: violation.kind,
-      detail: violation.detail.slice(0, 1_000),
-    };
-    const nextConfig: StoredAppServerConfig = {
-      ...this.config,
-      terminalAgentEnabled: false,
-      lastAgentViolation: recorded,
-    };
-    try {
-      this.writeConfig(nextConfig);
-    } catch (error) {
-      console.error('Unable to persist App Server isolation violation:', error);
-    }
-    this.config = nextConfig;
-    this.update({ error: `App Server Agent 已因隔离违规锁停：${recorded.detail}` });
+  /** @deprecated The legacy switch now controls read-only terminal context. */
+  setTerminalAgentEnabled(
+    request: SetCodexTerminalAgentEnabledRequest,
+  ): CodexAppServerSnapshot {
+    return this.setTerminalContextAccess(request);
+  }
+
+  /** @deprecated Native command/file items are valid and no longer lock the backend. */
+  recordAgentIsolationViolation(_violation: {
+    detectedAt?: string;
+    kind: 'command-execution' | 'file-change' | 'permission-request' | 'protocol';
+    detail: string;
+  }): void {
+    // Intentionally ignored for compatibility with older callers.
   }
 
   close(): void {
@@ -827,10 +796,10 @@ export class CodexAppServerService {
     try {
       const codexHome = join(this.runtimeRoot, 'codex-home');
       const workingDirectory = join(this.runtimeRoot, 'server-cwd');
-      const agentSandbox = join(this.runtimeRoot, 'agent-sandbox');
+      const agentWorkspace = join(this.runtimeRoot, 'agent-workspace');
       mkdirSync(codexHome, { recursive: true, mode: 0o700 });
       mkdirSync(workingDirectory, { recursive: true, mode: 0o700 });
-      mkdirSync(agentSandbox, { recursive: true, mode: 0o700 });
+      mkdirSync(agentWorkspace, { recursive: true, mode: 0o700 });
       const connection = await this.dependencies.launch(
         selected.path,
         this.dependencies.clientVersion,
@@ -927,7 +896,7 @@ export class CodexAppServerService {
     const bound = Boolean(account || !requiresOpenaiAuth)
       && Boolean(configured)
       && this.config.bound;
-    if (this.snapshot.terminalAgentEnabled && !bound) {
+    if (this.snapshot.agentAvailable && !bound) {
       void this.turnRunner.interrupt().catch(() => undefined);
     }
     this.update({
@@ -1172,12 +1141,46 @@ export class CodexAppServerService {
       ...patch,
       revision: this.snapshot.revision + 1,
     };
-    const agentIsolation = this.agentIsolationState(next);
+    const agentAvailable = this.agentPrerequisitesReady(next);
+    const agentReason = agentAvailable
+      ? NATIVE_AGENT_READY_REASON
+      : '请先启动 App Server、完成所需登录并保存当前模型。';
+    const terminalContextEnabled = agentAvailable
+      && this.config.terminalContextAccessEnabled;
+    const terminalContextReason = !agentAvailable
+      ? agentReason
+      : terminalContextEnabled
+        ? TERMINAL_CONTEXT_ENABLED_REASON
+        : 'Codex 使用独立工作区，当前不能读取可见终端内容。';
+    const terminalContextAccess = {
+      available: agentAvailable,
+      enabled: terminalContextEnabled,
+      acceptedClientTools: terminalContextEnabled
+        ? ['terminal_read' as const]
+        : [],
+      reason: terminalContextReason,
+    };
     this.snapshot = {
       ...next,
-      terminalAgentEnabled: agentIsolation.availability === 'enabled',
-      terminalAgentReason: agentIsolation.reason,
-      agentIsolation,
+      agentAvailable,
+      agentReason,
+      terminalContextAccess,
+      // Compatibility fields for older renderer bundles. They no longer gate
+      // native Agent availability and must not be interpreted as Takeover.
+      terminalAgentEnabled: agentAvailable,
+      terminalAgentReason: agentReason,
+      agentIsolation: {
+        policyVersion: 1,
+        experimental: false,
+        userEnabled: this.config.terminalContextAccessEnabled,
+        availability: !agentAvailable
+          ? 'unavailable'
+          : terminalContextEnabled ? 'enabled' : 'eligible',
+        acceptedClientTools: [...terminalContextAccess.acceptedClientTools],
+        environmentAccessDisabled: false,
+        enforcement: 'codex-native-workspace-write',
+        reason: terminalContextReason,
+      },
     };
     const cloned = this.getState();
     for (const listener of this.listeners) {
@@ -1196,59 +1199,15 @@ export class CodexAppServerService {
       && (Boolean(snapshot.account) || snapshot.requiresOpenaiAuth === false);
   }
 
-  private agentIsolationState(
-    snapshot: CodexAppServerSnapshot,
-  ): CodexAgentIsolationState {
-    const base = {
-      policyVersion: 1 as const,
-      experimental: true as const,
-      userEnabled: this.config.terminalAgentEnabled,
-      acceptedClientTools: [
-        'terminal_read',
-        'terminal_state',
-        'terminal_execute',
-      ] as ['terminal_read', 'terminal_state', 'terminal_execute'],
-      environmentAccessDisabled: true as const,
-      enforcement: 'empty-environment-plus-deny-and-interrupt' as const,
-      lastViolation: this.config.lastAgentViolation,
-    };
-    if (this.config.lastAgentViolation) {
-      return {
-        ...base,
-        availability: 'blocked',
-        reason: '检测到 App Server 越过隔离边界；请审阅记录并重新确认后再启用。',
-      };
-    }
-    if (!this.agentPrerequisitesReady(snapshot)) {
-      return {
-        ...base,
-        availability: 'unavailable',
-        reason: '请先启动 App Server、完成所需登录并保存当前模型。',
-      };
-    }
-    if (this.config.terminalAgentEnabled) {
-      return {
-        ...base,
-        availability: 'enabled',
-        reason: TERMINAL_AGENT_POLICY_REASON,
-      };
-    }
-    return {
-      ...base,
-      availability: 'eligible',
-      reason: '服务与模型已就绪；确认实验隔离边界后可启用终端智能体。',
-    };
-  }
-
   private readConfig(): StoredAppServerConfig {
     try {
       return parseConfig(JSON.parse(readFileSync(this.configPath, 'utf8')));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return { bound: false, terminalAgentEnabled: false };
+        return { bound: false, terminalContextAccessEnabled: false };
       }
       this.initialConfigError = `App Server 配置已损坏并被忽略，可从界面重新绑定：${this.actionError(error)}`;
-      return { bound: false, terminalAgentEnabled: false };
+      return { bound: false, terminalContextAccessEnabled: false };
     }
   }
 
@@ -1260,10 +1219,7 @@ export class CodexAppServerService {
       modelId: config.modelId,
       reasoningEffort: config.reasoningEffort,
       bound: config.bound,
-      // Requiring a fresh UI acknowledgement on each app launch is the
-      // durable fail-closed fallback if a violation cannot be persisted.
-      terminalAgentEnabled: false,
-      lastAgentViolation: config.lastAgentViolation,
+      terminalContextAccessEnabled: config.terminalContextAccessEnabled,
     };
     writeFileSync(temporaryPath, `${JSON.stringify(persisted, null, 2)}\n`, {
       encoding: 'utf8',

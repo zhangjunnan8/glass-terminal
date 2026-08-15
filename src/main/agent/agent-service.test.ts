@@ -145,6 +145,14 @@ class FakeCodexAppServer {
 
   getState() {
     return {
+      agentAvailable: true,
+      agentReason: 'ready',
+      terminalContextAccess: {
+        available: true,
+        enabled: true,
+        acceptedClientTools: ['terminal_read'],
+        reason: 'allowed',
+      },
       terminalAgentEnabled: true,
       terminalAgentReason: 'ready',
       selection: { modelId: 'gpt-codex', reasoningEffort: 'high' },
@@ -155,14 +163,7 @@ class FakeCodexAppServer {
     this.turns.push(input);
     input.onThreadBound?.('provider-thread-1');
     const history = await input.tools.readTerminal({ maxChars: 500 });
-    const state = await input.tools.getTerminalState();
-    const execution = await input.tools.executeCommand({
-      command: 'printf from-codex',
-      reason: 'integration proof',
-    }, input.signal);
-    const finalText = `${history.includes('tester@host') ? 'history-ok' : 'history-missing'}; ${
-      state.transport === 'ssh' ? 'state-ok' : 'state-missing'
-    }; ${execution.output}`;
+    const finalText = history.includes('tester@host') ? 'history-ok' : 'history-missing';
     input.onDelta?.(finalText);
     return {
       threadId: 'provider-thread-1',
@@ -186,6 +187,14 @@ class DeferredStreamingCodexAppServer {
 
   getState() {
     return {
+      agentAvailable: true,
+      agentReason: 'ready',
+      terminalContextAccess: {
+        available: true,
+        enabled: true,
+        acceptedClientTools: ['terminal_read'],
+        reason: 'allowed',
+      },
       terminalAgentEnabled: true,
       terminalAgentReason: 'ready',
       selection: { modelId: 'gpt-codex', reasoningEffort: 'high' },
@@ -508,11 +517,12 @@ describe('AgentService shared-terminal controls', () => {
     });
   });
 
-  it('blocks a new App Server prompt until manual takeover finishes draining the old turn', async () => {
+  it('keeps the visible terminal human-owned and disables manual takeover for App Server', async () => {
     const codex = new DeferredStreamingCodexAppServer();
+    const terminals = new FakeTerminals();
     const owner = browserOwner();
     const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
+      terminals as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
       () => { throw new Error('Generic Provider must not be used.'); },
@@ -529,20 +539,16 @@ describe('AgentService shared-terminal controls', () => {
 
     service.sendPrompt(owner, request);
     await waitFor(() => Boolean(codex.input));
-    const paused = service.takeover(owner, { terminalId: 'terminal' });
-    expect(paused).toMatchObject({ state: 'PAUSED', backendTurnDraining: true });
-    expect(() => service.sendPrompt(owner, { ...request, prompt: 'Must wait.' }))
-      .toThrow('already working');
-    expect(service.getState(owner, 'terminal')?.messages.filter((item) => item.role === 'user'))
-      .toHaveLength(1);
-
-    await waitFor(() => codex.interruptRequested);
-    codex.finishInterrupt();
-    await waitFor(() => service.getState(owner, 'terminal')?.backendTurnDraining === false);
-    expect(service.getState(owner, 'terminal')).toMatchObject({
-      state: 'PAUSED',
-      backendTurnDraining: false,
-    });
+    expect(service.getState(owner, 'terminal')?.terminalInputMode).toBe('human');
+    expect(terminals.controlModes).toEqual([]);
+    expect(() => service.takeover(owner, { terminalId: 'terminal' }))
+      .toThrow('无需人工接管');
+    expect(() => service.setFullTakeover(owner, {
+      terminalId: 'terminal', enabled: true,
+    })).toThrow('Full Takeover');
+    codex.finish('done');
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    expect(terminals.controlModes).toEqual([]);
   });
 
   it('publishes partial Generic Provider output and finalizes one persisted chat item', async () => {
@@ -620,7 +626,7 @@ describe('AgentService shared-terminal controls', () => {
     expect(service.getState(owner, 'terminal')?.state).toBe('PAUSED');
   });
 
-  it('routes an isolated App Server turn through the existing approval and terminal path', async () => {
+  it('runs App Server independently without routing commands into the visible terminal', async () => {
     const sessions = new FakeSessions();
     const terminals = new FakeTerminals();
     const codex = new FakeCodexAppServer();
@@ -635,20 +641,11 @@ describe('AgentService shared-terminal controls', () => {
 
     service.sendPrompt(owner, {
       terminalId: 'terminal',
-      prompt: 'Use the shared terminal.',
+      prompt: 'Use native Codex tools.',
       backend: {
         kind: CODEX_APP_SERVER_AGENT_BACKEND,
         policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
       },
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
-    expect(terminals.executions).toEqual([]);
-    const approval = service.getState(owner, 'terminal')!.pendingApproval!;
-    service.resolveApproval(owner, {
-      terminalId: 'terminal',
-      approvalId: approval.id,
-      decision: 'edit',
-      editedCommand: 'printf visible-codex',
     });
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
 
@@ -657,12 +654,11 @@ describe('AgentService shared-terminal controls', () => {
       kind: CODEX_APP_SERVER_AGENT_BACKEND,
       policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
     });
-    expect(terminals.executions).toEqual([{
-      command: 'printf visible-codex',
-      actor: 'user_modified_ai_command',
-    }]);
+    expect(terminals.executions).toEqual([]);
+    expect(terminals.controlModes).toEqual([]);
+    expect(view.terminalInputMode).toBe('human');
     expect(sessions.session.providerThreadId).toBe('provider-thread-1');
-    expect(view.messages.at(-1)?.content).toContain('tester');
+    expect(view.messages.at(-1)?.content).toBe('history-ok');
     expect(sessions.threadEvents.some((event) => (
       event.type === 'codex_app_server_turn'
       && event.providerTurnId === 'provider-turn-1'

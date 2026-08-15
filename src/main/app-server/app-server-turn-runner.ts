@@ -1,5 +1,4 @@
 import { isAbsolute, resolve } from 'node:path';
-import type { AgentCommandResult } from '../agent/agent-loop';
 import type {
   AppServerConnection,
   AppServerNotification,
@@ -8,8 +7,6 @@ import type {
 
 const DEFAULT_TERMINAL_READ_CHARS = 8_000;
 const MAX_TERMINAL_READ_CHARS = 30_000;
-const MAX_COMMAND_CHARS = 20_000;
-const MAX_REASON_CHARS = 1_000;
 const MAX_ASSISTANT_TEXT_CHARS = 100_000;
 const MAX_ASSISTANT_MESSAGE_ITEMS = 64;
 const MAX_TOOL_CALL_IDS = 256;
@@ -17,67 +14,49 @@ const MAX_PENDING_NOTIFICATIONS = 256;
 const MAX_PENDING_NOTIFICATION_BYTES = 512 * 1024;
 const MAX_PROTOCOL_ID_CHARS = 256;
 
-const DEVELOPER_INSTRUCTIONS = `You and the human operate the exact same visible terminal session.
-Use only terminal_read, terminal_state, and terminal_execute for terminal or filesystem work.
-Never claim that a command ran unless terminal_execute returned its result.
+const DEVELOPER_INSTRUCTIONS = `You are the native Codex agent embedded in AI Terminal.
+Use Codex's built-in shell and file tools inside the Codex-managed workspace for all execution and filesystem work.
+You do not control the user's visible terminal and must never claim that commands ran there.
+When terminal_read is available, it is read-only context from the user's currently selected terminal; do not treat it as an execution channel.
 Never ask the user to paste passwords, API keys, passphrases, OTPs, or other credentials into chat.
-Authentication is entered by the user directly in the visible terminal.
-Do not use or request any built-in shell, command execution, or file-change capability.`;
+Keep secrets out of chat and command output.`;
 
+export const CODEX_TERMINAL_READ_DYNAMIC_TOOL = {
+  type: 'function',
+  name: 'terminal_read',
+  description: 'Read a bounded recent portion of the user-selected visible terminal history as context only.',
+  deferLoading: false,
+  inputSchema: {
+    type: 'object',
+    properties: {
+      maxChars: {
+        type: 'integer',
+        minimum: 100,
+        maximum: MAX_TERMINAL_READ_CHARS,
+        default: DEFAULT_TERMINAL_READ_CHARS,
+      },
+    },
+    additionalProperties: false,
+  },
+} as const;
+
+/** @deprecated App Server no longer receives a visible-terminal execution tool. */
 export const CODEX_TERMINAL_DYNAMIC_TOOLS = [
   {
-    type: 'function',
-    name: 'terminal_read',
-    description: 'Read a bounded recent portion of the exact visible terminal history.',
-    deferLoading: false,
-    inputSchema: {
-      type: 'object',
-      properties: {
-        maxChars: {
-          type: 'integer',
-          minimum: 100,
-          maximum: MAX_TERMINAL_READ_CHARS,
-          default: DEFAULT_TERMINAL_READ_CHARS,
-        },
-      },
-      additionalProperties: false,
-    },
-  },
-  {
-    type: 'function',
-    name: 'terminal_state',
-    description: 'Read the transport and control state of the exact visible terminal.',
-    deferLoading: false,
-    inputSchema: {
-      type: 'object',
-      properties: {},
-      additionalProperties: false,
-    },
-  },
-  {
-    type: 'function',
-    name: 'terminal_execute',
-    description: 'Request one command in the exact visible terminal. Existing approval and Full Takeover rules apply.',
-    deferLoading: false,
-    inputSchema: {
-      type: 'object',
-      required: ['command'],
-      properties: {
-        command: { type: 'string', minLength: 1, maxLength: MAX_COMMAND_CHARS },
-        reason: { type: 'string', maxLength: MAX_REASON_CHARS },
-      },
-      additionalProperties: false,
-    },
+    ...CODEX_TERMINAL_READ_DYNAMIC_TOOL,
   },
 ] as const;
 
 export interface CodexAppServerTurnTools {
   readTerminal(request: { maxChars: number }): Promise<string>;
-  getTerminalState(): Promise<Record<string, unknown>>;
-  executeCommand(
-    request: { command: string; reason?: string },
-    signal: AbortSignal,
-  ): Promise<AgentCommandResult>;
+}
+
+export interface CodexNativeApprovalEvent {
+  kind: 'command-execution' | 'file-change' | 'permission-request';
+  decision: 'acceptForSession' | 'decline-extra-permissions';
+  threadId?: string;
+  turnId?: string;
+  itemId?: string;
 }
 
 export interface RunCodexTurnInput {
@@ -88,8 +67,11 @@ export interface RunCodexTurnInput {
   threadId?: string;
   signal: AbortSignal;
   tools: CodexAppServerTurnTools;
+  terminalContextAccess: boolean;
+  canReadTerminal?(): boolean;
   onThreadBound?(threadId: string): void;
   onDelta?(delta: string): void;
+  onNativeApproval?(event: CodexNativeApprovalEvent): void;
 }
 
 export interface RunCodexTurnResult {
@@ -98,15 +80,6 @@ export interface RunCodexTurnResult {
   status: 'completed' | 'interrupted' | 'failed';
   finalText: string;
   error?: string;
-}
-
-export interface CodexAppServerIsolationViolation {
-  kind: 'command-execution' | 'file-change' | 'permission-request';
-  detail: string;
-}
-
-export interface CodexAppServerTurnRunnerOptions {
-  onIsolationViolation?(violation: CodexAppServerIsolationViolation): void;
 }
 
 interface Deferred<T> {
@@ -138,8 +111,6 @@ interface ActiveTurn {
   seenCallIds: Set<string>;
   pendingNotifications: AppServerNotification[];
   pendingNotificationBytes: number;
-  pendingIsolationByTurnId: Map<string, CodexAppServerIsolationViolation>;
-  executeInFlight: boolean;
   settled: boolean;
 }
 
@@ -239,26 +210,6 @@ function turnError(turn: Record<string, unknown>): string | undefined {
   return optionalText(turn.error.message);
 }
 
-function forbiddenItemKind(
-  item: Record<string, unknown>,
-): CodexAppServerIsolationViolation['kind'] | undefined {
-  if (item.type === 'commandExecution') return 'command-execution';
-  if (item.type === 'fileChange') return 'file-change';
-  return undefined;
-}
-
-function forbiddenTurnItemKind(
-  turn: Record<string, unknown>,
-): CodexAppServerIsolationViolation['kind'] | undefined {
-  if (!Array.isArray(turn.items)) return undefined;
-  for (const item of turn.items) {
-    if (!isRecord(item)) continue;
-    const kind = forbiddenItemKind(item);
-    if (kind) return kind;
-  }
-  return undefined;
-}
-
 function isHandledTurnNotification(method: string): boolean {
   return method === 'turn/started'
     || method === 'turn/completed'
@@ -280,8 +231,7 @@ function notificationTurnId(notification: AppServerNotification): string | undef
 }
 
 export class CodexAppServerTurnRunner {
-  private readonly sandboxRoot: string;
-  private readonly options: CodexAppServerTurnRunnerOptions;
+  private readonly workspaceRoot: string;
   private connection?: AppServerConnection;
   private attachmentGeneration = 0;
   private sequence = 0;
@@ -292,15 +242,11 @@ export class CodexAppServerTurnRunner {
   private removeRequestHandler?: () => void;
   private removeExitListener?: () => void;
 
-  constructor(
-    sandboxRoot: string,
-    options: CodexAppServerTurnRunnerOptions = {},
-  ) {
-    if (!sandboxRoot.trim() || !isAbsolute(sandboxRoot)) {
-      throw new Error('App Server Agent sandboxRoot 必须是绝对路径。');
+  constructor(workspaceRoot: string) {
+    if (!workspaceRoot.trim() || !isAbsolute(workspaceRoot)) {
+      throw new Error('App Server Agent workspaceRoot 必须是绝对路径。');
     }
-    this.sandboxRoot = resolve(sandboxRoot);
-    this.options = options;
+    this.workspaceRoot = resolve(workspaceRoot);
   }
 
   attach(connection: AppServerConnection): void {
@@ -358,7 +304,7 @@ export class CodexAppServerTurnRunner {
     if (!connection) return Promise.reject(new Error('Codex App Server 尚未连接。'));
     if (this.quarantinedAttachmentGeneration === this.attachmentGeneration) {
       return Promise.reject(new Error(
-        'Codex App Server 连接已因协议或资源边界违规被隔离；请重启并重新连接。',
+        'Codex App Server 连接已因协议错误被隔离；请重启并重新连接。',
       ));
     }
     if (this.active) return Promise.reject(new Error('同一时间只能运行一个 Codex App Server Turn。'));
@@ -397,8 +343,6 @@ export class CodexAppServerTurnRunner {
       seenCallIds: new Set(),
       pendingNotifications: [],
       pendingNotificationBytes: 0,
-      pendingIsolationByTurnId: new Map(),
-      executeInFlight: false,
       settled: false,
     };
     const onAbort = () => {
@@ -443,11 +387,19 @@ export class CodexAppServerTurnRunner {
     const response = await active.connection.request<TurnStartResponse>('turn/start', {
       threadId,
       input: [{ type: 'text', text: active.input.prompt }],
-      cwd: this.sandboxRoot,
-      runtimeWorkspaceRoots: [],
-      environments: [],
-      approvalPolicy: 'untrusted',
-      sandboxPolicy: { type: 'readOnly', networkAccess: false },
+      cwd: this.workspaceRoot,
+      runtimeWorkspaceRoots: [this.workspaceRoot],
+      approvalPolicy: 'never',
+      sandboxPolicy: {
+        type: 'workspaceWrite',
+        writableRoots: [this.workspaceRoot],
+        readOnlyAccess: {
+          type: 'restricted',
+          includePlatformDefaults: true,
+          readableRoots: [this.workspaceRoot],
+        },
+        networkAccess: false,
+      },
       model: active.input.model,
       ...(active.input.reasoningEffort
         ? { effort: active.input.reasoningEffort }
@@ -460,14 +412,8 @@ export class CodexAppServerTurnRunner {
     const turnId = protocolId(response.turn.id, 'App Server turn/start 响应 turn.id');
     if (active.turnId) throw new Error('App Server Turn 在 turn/start 响应前已被错误绑定。');
     active.turnId = turnId;
-    const forbiddenKind = forbiddenTurnItemKind(response.turn);
-    if (forbiddenKind) {
-      this.failIsolation(active, forbiddenKind, 'turn/start 响应包含被禁用的内建项目。');
-      return;
-    }
     this.recordTurnMessageItems(active, response.turn);
     active.turnStartAcknowledged = true;
-    if (this.settlePendingIsolation(active)) return;
     const status = optionalText(response.turn.status);
     if (status && status !== 'inProgress') this.observeCompletion(active, response.turn);
     this.replayPendingNotifications(active);
@@ -479,13 +425,15 @@ export class CodexAppServerTurnRunner {
   private async startThread(active: ActiveTurn): Promise<string> {
     const response = await active.connection.request<ThreadResponse>('thread/start', {
       model: active.input.model,
-      cwd: this.sandboxRoot,
-      runtimeWorkspaceRoots: [],
-      environments: [],
-      approvalPolicy: 'untrusted',
-      sandbox: 'read-only',
+      cwd: this.workspaceRoot,
+      runtimeWorkspaceRoots: [this.workspaceRoot],
+      approvalPolicy: 'never',
+      sandbox: 'workspaceWrite',
       developerInstructions: DEVELOPER_INSTRUCTIONS,
-      dynamicTools: CODEX_TERMINAL_DYNAMIC_TOOLS,
+      dynamicTools: active.input.terminalContextAccess
+        ? [CODEX_TERMINAL_READ_DYNAMIC_TOOL]
+        : [],
+      serviceName: 'ai_terminal',
     });
     this.assertActive(active);
     return this.parseThreadId(response, 'thread/start');
@@ -495,11 +443,15 @@ export class CodexAppServerTurnRunner {
     const response = await active.connection.request<ThreadResponse>('thread/resume', {
       threadId: expectedThreadId,
       model: active.input.model,
-      cwd: this.sandboxRoot,
-      runtimeWorkspaceRoots: [],
-      approvalPolicy: 'untrusted',
-      sandbox: 'read-only',
+      cwd: this.workspaceRoot,
+      runtimeWorkspaceRoots: [this.workspaceRoot],
+      approvalPolicy: 'never',
+      sandbox: 'workspaceWrite',
       developerInstructions: DEVELOPER_INSTRUCTIONS,
+      dynamicTools: active.input.terminalContextAccess
+        ? [CODEX_TERMINAL_READ_DYNAMIC_TOOL]
+        : [],
+      serviceName: 'ai_terminal',
     });
     this.assertActive(active);
     const threadId = this.parseThreadId(response, 'thread/resume');
@@ -567,19 +519,12 @@ export class CodexAppServerTurnRunner {
     const params = notification.params;
 
     if (notification.method.startsWith('item/commandExecution/')) {
-      this.failIsolation(
-        active,
-        'command-execution',
-        `观察到被禁用的内建事件：${notification.method}`,
-      );
+      // Native Codex command execution is intentionally independent from the
+      // visible terminal. Its lifecycle is owned and sandboxed by App Server.
       return;
     }
     if (notification.method.startsWith('item/fileChange/')) {
-      this.failIsolation(
-        active,
-        'file-change',
-        `观察到被禁用的内建事件：${notification.method}`,
-      );
+      // Native Codex file changes are valid App Server items.
       return;
     }
 
@@ -589,11 +534,6 @@ export class CodexAppServerTurnRunner {
         return;
       }
       try {
-        const forbiddenKind = forbiddenTurnItemKind(params.turn);
-        if (forbiddenKind) {
-          this.failIsolation(active, forbiddenKind, 'turn/started 包含被禁用的内建项目。');
-          return;
-        }
         this.recordTurnMessageItems(active, params.turn);
         this.maybeSendInterrupt(active);
       } catch (error) {
@@ -633,15 +573,6 @@ export class CodexAppServerTurnRunner {
         if (!isRecord(params.item)) {
           throw new Error(`App Server ${notification.method} 通知缺少有效 item。`);
         }
-        const forbiddenKind = forbiddenItemKind(params.item);
-        if (forbiddenKind) {
-          this.failIsolation(
-            active,
-            forbiddenKind,
-            `观察到被禁用的内建项目：${String(params.item.type)}`,
-          );
-          return;
-        }
         if (params.item.type === 'agentMessage') {
           const itemId = protocolId(params.item.id, 'App Server agentMessage item.id');
           const phase = agentMessagePhase(params.item.phase);
@@ -667,11 +598,6 @@ export class CodexAppServerTurnRunner {
         return;
       }
       try {
-        const forbiddenKind = forbiddenTurnItemKind(params.turn);
-        if (forbiddenKind) {
-          this.failIsolation(active, forbiddenKind, 'turn/completed 包含被禁用的内建项目。');
-          return;
-        }
         this.recordTurnMessageItems(active, params.turn);
         this.observeCompletion(active, params.turn);
         this.maybeComplete(active);
@@ -687,35 +613,32 @@ export class CodexAppServerTurnRunner {
       || request.method === 'item/fileChange/requestApproval'
     ) {
       const active = this.active;
-      if (active) {
-        const violation: CodexAppServerIsolationViolation = {
-          kind: request.method === 'item/commandExecution/requestApproval'
-            ? 'command-execution'
-            : 'file-change',
-          detail: `收到被禁用的内建审批：${request.method}`,
-        };
-        if (this.requestTargetsActiveTurn(request.params, active)) {
-          this.failIsolation(active, violation.kind, violation.detail);
-        } else {
-          this.rememberPendingIsolation(active, request.params, violation);
-        }
+      if (!active || !this.requestTargetsCurrentTurn(request.params, active)) {
+        return { decision: 'decline' };
       }
-      return { decision: 'decline' };
+      this.recordNativeApproval(
+        active,
+        request.params,
+        request.method === 'item/commandExecution/requestApproval'
+          ? 'command-execution'
+          : 'file-change',
+        'acceptForSession',
+      );
+      return { decision: 'acceptForSession' };
     }
     if (request.method === 'item/permissions/requestApproval') {
       const active = this.active;
-      if (active) {
-        const violation: CodexAppServerIsolationViolation = {
-          kind: 'permission-request',
-          detail: '收到被禁用的权限审批：item/permissions/requestApproval',
-        };
-        if (this.requestTargetsActiveTurn(request.params, active)) {
-          this.failIsolation(active, violation.kind, violation.detail);
-        } else {
-          this.rememberPendingIsolation(active, request.params, violation);
-        }
+      if (active && this.requestTargetsCurrentTurn(request.params, active)) {
+        this.recordNativeApproval(
+          active,
+          request.params,
+          'permission-request',
+          'decline-extra-permissions',
+        );
       }
-      return { permissions: {} };
+      // The native workspaceWrite sandbox is the hard boundary. Requests to
+      // expand beyond it are resolved without involving the visible terminal.
+      return { permissions: {}, scope: 'turn' };
     }
     if (request.method === 'mcpServer/elicitation/request') {
       return { action: 'cancel', content: null };
@@ -759,16 +682,14 @@ export class CodexAppServerTurnRunner {
     active.seenCallIds.add(callId);
 
     try {
-      switch (tool) {
-        case 'terminal_read':
-          return await this.handleTerminalRead(active, params.arguments);
-        case 'terminal_state':
-          return await this.handleTerminalState(active, params.arguments);
-        case 'terminal_execute':
-          return await this.handleTerminalExecute(active, params.arguments);
-        default:
-          throw new Error(`未允许的 App Server 动态工具：${tool}`);
+      if (
+        tool !== 'terminal_read'
+        || !active.input.terminalContextAccess
+        || active.input.canReadTerminal?.() === false
+      ) {
+        throw new Error(`未允许的 App Server 动态工具：${tool}`);
       }
+      return await this.handleTerminalRead(active, params.arguments);
     } catch (error) {
       if (active.controller.signal.aborted || !this.isActive(active)) throw error;
       return dynamicToolResult({ ok: false, error: errorMessage(error) }, false);
@@ -793,43 +714,6 @@ export class CodexAppServerTurnRunner {
     );
     if (typeof output !== 'string') throw new Error('terminal_read 返回值必须是字符串。');
     return dynamicToolResult({ ok: true, output });
-  }
-
-  private async handleTerminalState(
-    active: ActiveTurn,
-    args: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
-    assertOnlyKeys(args, [], 'terminal_state');
-    const state = await this.abortable(active, () => active.input.tools.getTerminalState());
-    if (!isRecord(state)) throw new Error('terminal_state 返回值必须是对象。');
-    return dynamicToolResult({ ok: true, state });
-  }
-
-  private async handleTerminalExecute(
-    active: ActiveTurn,
-    args: Record<string, unknown>,
-  ): Promise<Record<string, unknown>> {
-    assertOnlyKeys(args, ['command', 'reason'], 'terminal_execute');
-    if (
-      typeof args.command !== 'string'
-      || !args.command.trim()
-      || args.command.length > MAX_COMMAND_CHARS
-    ) throw new Error('terminal_execute.command 必须是非空且不超过 20000 字符的字符串。');
-    if (args.reason !== undefined && (
-      typeof args.reason !== 'string'
-      || args.reason.length > MAX_REASON_CHARS
-    )) throw new Error('terminal_execute.reason 必须是不超过 1000 字符的字符串。');
-    if (active.executeInFlight) throw new Error('已有 terminal_execute 正在运行。');
-    active.executeInFlight = true;
-    try {
-      const result = await this.abortable(active, () => active.input.tools.executeCommand({
-        command: args.command as string,
-        ...(typeof args.reason === 'string' ? { reason: args.reason } : {}),
-      }, active.controller.signal));
-      return dynamicToolResult({ ok: true, result });
-    } finally {
-      active.executeInFlight = false;
-    }
   }
 
   private abortable<T>(active: ActiveTurn, operation: () => Promise<T>): Promise<T> {
@@ -881,34 +765,6 @@ export class CodexAppServerTurnRunner {
       if (!this.isActive(active)) return;
       if (notificationTurnId(notification) !== active.turnId) continue;
       this.handleConfirmedNotification(active, notification);
-    }
-  }
-
-  private rememberPendingIsolation(
-    active: ActiveTurn,
-    params: unknown,
-    violation: CodexAppServerIsolationViolation,
-  ): void {
-    if (
-      active.turnStartAcknowledged
-      || !active.turnStartIssued
-      || !isRecord(params)
-      || optionalText(params.threadId) !== active.threadId
-    ) return;
-    const turnId = optionalText(params.turnId);
-    if (!turnId || turnId.length > MAX_PROTOCOL_ID_CHARS) return;
-    if (
-      !active.pendingIsolationByTurnId.has(turnId)
-      && active.pendingIsolationByTurnId.size >= MAX_ASSISTANT_MESSAGE_ITEMS
-    ) {
-      this.failProtocol(
-        active,
-        new Error('App Server turn/start 响应前的隔离事件超过安全上限。'),
-      );
-      return;
-    }
-    if (!active.pendingIsolationByTurnId.has(turnId)) {
-      active.pendingIsolationByTurnId.set(turnId, violation);
     }
   }
 
@@ -993,14 +849,32 @@ export class CodexAppServerTurnRunner {
     }
   }
 
-  private requestTargetsActiveTurn(params: unknown, active: ActiveTurn): boolean {
+  private requestTargetsCurrentTurn(params: unknown, active: ActiveTurn): boolean {
     if (!isRecord(params)) return false;
     const threadId = optionalText(params.threadId);
     const turnId = optionalText(params.turnId);
-    return active.turnStartAcknowledged
-      && Boolean(active.turnId)
-      && threadId === active.threadId
-      && turnId === active.turnId;
+    if (!active.turnStartIssued || threadId !== active.threadId || !turnId) return false;
+    return !active.turnId || turnId === active.turnId;
+  }
+
+  private recordNativeApproval(
+    active: ActiveTurn,
+    params: unknown,
+    kind: CodexNativeApprovalEvent['kind'],
+    decision: CodexNativeApprovalEvent['decision'],
+  ): void {
+    const record = isRecord(params) ? params : {};
+    try {
+      active.input.onNativeApproval?.({
+        kind,
+        decision,
+        threadId: optionalText(record.threadId),
+        turnId: optionalText(record.turnId),
+        itemId: optionalText(record.itemId),
+      });
+    } catch {
+      // Audit/UI callbacks must not prevent App Server from resolving a request.
+    }
   }
 
   private validateNotificationTurn(
@@ -1054,30 +928,6 @@ export class CodexAppServerTurnRunner {
       throw error;
     });
     void active.interruptRequest.catch(() => undefined);
-  }
-
-  private failIsolation(
-    active: ActiveTurn,
-    kind: CodexAppServerIsolationViolation['kind'],
-    detail: string,
-  ): void {
-    if (active.settled) return;
-    const error = new Error(`App Server Agent 隔离违规：${detail}`);
-    try { this.options.onIsolationViolation?.({ kind, detail }); } catch { /* host callback isolation */ }
-    active.interruptRequested = true;
-    active.controller.abort(error);
-    this.maybeSendInterrupt(active);
-    this.failActive(active, error);
-  }
-
-  private settlePendingIsolation(active: ActiveTurn): boolean {
-    const turnId = active.turnId;
-    if (!turnId || active.settled) return false;
-    const violation = active.pendingIsolationByTurnId.get(turnId);
-    active.pendingIsolationByTurnId.clear();
-    if (!violation) return false;
-    this.failIsolation(active, violation.kind, violation.detail);
-    return true;
   }
 
   private failProtocol(active: ActiveTurn, error: unknown): void {

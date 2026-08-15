@@ -25,6 +25,7 @@ import type {
 import { CODEX_APP_SERVER_CHANNELS } from '../shared/codex-app-server';
 import type {
   SaveCodexAppServerSelectionRequest,
+  SetCodexTerminalContextAccessRequest,
   SetCodexTerminalAgentEnabledRequest,
 } from '../shared/codex-app-server';
 import { HostStore } from './hosts/host-store';
@@ -354,6 +355,12 @@ handleTrusted(
   CODEX_APP_SERVER_CHANNELS.saveSelection,
   (_event, request: SaveCodexAppServerSelectionRequest) => (
     requireCodexAppServerService().saveSelection(request)
+  ),
+);
+handleTrusted(
+  CODEX_APP_SERVER_CHANNELS.setTerminalContextAccess,
+  (_event, request: SetCodexTerminalContextAccessRequest) => (
+    requireCodexAppServerService().setTerminalContextAccess(request)
   ),
 );
 handleTrusted(

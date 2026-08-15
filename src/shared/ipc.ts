@@ -39,6 +39,7 @@ import type {
 import type {
   CodexAppServerSnapshot,
   SaveCodexAppServerSelectionRequest,
+  SetCodexTerminalContextAccessRequest,
   SetCodexTerminalAgentEnabledRequest,
 } from './codex-app-server';
 
@@ -107,6 +108,10 @@ export interface DesktopBridge {
     saveSelection(
       request: SaveCodexAppServerSelectionRequest,
     ): Promise<CodexAppServerSnapshot>;
+    setTerminalContextAccess(
+      request: SetCodexTerminalContextAccessRequest,
+    ): Promise<CodexAppServerSnapshot>;
+    /** @deprecated Use setTerminalContextAccess. */
     setTerminalAgentEnabled(
       request: SetCodexTerminalAgentEnabledRequest,
     ): Promise<CodexAppServerSnapshot>;
