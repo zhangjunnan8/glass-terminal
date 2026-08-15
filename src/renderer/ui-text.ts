@@ -6,8 +6,6 @@ import type {
 import type { SshAuthMethod } from '../shared/host';
 import type { ProviderStatus } from '../shared/provider';
 import type {
-  CodexAgentIsolationAvailability,
-  CodexAgentIsolationViolation,
   CodexAppServerOperation,
   CodexAppServerPhase,
 } from '../shared/codex-app-server';
@@ -50,26 +48,6 @@ const codexAppServerOperationLabels: Record<CodexAppServerOperation, string> = {
   'logging-in': '正在准备登录',
   'logging-out': '正在退出登录',
   saving: '正在保存首选模型',
-};
-
-const codexAgentIsolationAvailabilityLabels: Record<
-CodexAgentIsolationAvailability,
-string
-> = {
-  unavailable: '当前不可用',
-  eligible: '可以启用',
-  enabled: '隔离实验已启用',
-  blocked: '检测到违规，已锁停',
-};
-
-const codexAgentIsolationViolationKindLabels: Record<
-CodexAgentIsolationViolation['kind'],
-string
-> = {
-  'command-execution': '内建命令执行事件',
-  'file-change': '内建文件修改事件',
-  'permission-request': '额外权限请求',
-  protocol: '协议边界异常',
 };
 
 const codexReasoningEffortLabels: Record<string, string> = {
@@ -136,12 +114,9 @@ export const codexAppServerPhaseLabel = (phase: CodexAppServerPhase) => (
 export const codexAppServerOperationLabel = (operation: CodexAppServerOperation) => (
   codexAppServerOperationLabels[operation]
 );
-export const codexAgentIsolationAvailabilityLabel = (
-  availability: CodexAgentIsolationAvailability,
-) => codexAgentIsolationAvailabilityLabels[availability];
-export const codexAgentIsolationViolationKindLabel = (
-  kind: CodexAgentIsolationViolation['kind'],
-) => codexAgentIsolationViolationKindLabels[kind];
+export const codexNativeAgentAvailabilityLabel = (available: boolean) => (
+  available ? '原生模式可用' : '原生模式不可用'
+);
 export const codexReasoningEffortLabel = (effort: string) => (
   codexReasoningEffortLabels[effort.toLowerCase()] ?? effort
 );

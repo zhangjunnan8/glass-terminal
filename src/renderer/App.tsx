@@ -42,8 +42,7 @@ import { mergeProviderModelOptions } from './provider-ui';
 import {
   agentStateLabel,
   authMethodLabel,
-  codexAgentIsolationAvailabilityLabel,
-  codexAgentIsolationViolationKindLabel,
+  codexNativeAgentAvailabilityLabel,
   codexAppServerOperationLabel,
   codexAppServerPhaseLabel,
   codexPlanTypeLabel,
@@ -170,8 +169,6 @@ export function App() {
   const [codexActionPending, setCodexActionPending] = useState(false);
   const [codexModelId, setCodexModelId] = useState('');
   const [codexReasoningEffort, setCodexReasoningEffort] = useState('');
-  const [codexAgentEnableChallenge, setCodexAgentEnableChallenge] = useState(false);
-  const [codexAgentBoundaryAcknowledged, setCodexAgentBoundaryAcknowledged] = useState(false);
   const codexActionLock = useRef(false);
   const providerModalRef = useRef<HTMLDivElement>(null);
   const providerNameInputRef = useRef<HTMLInputElement>(null);
@@ -180,7 +177,6 @@ export function App() {
   const providerApiKeyInputRef = useRef<HTMLInputElement>(null);
   const providerDiscoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const providerDiscoveryGenerationRef = useRef(0);
-  const codexAgentConfirmationRef = useRef<HTMLDivElement>(null);
   const agentBodyRef = useRef<HTMLDivElement>(null);
   const agentStickToBottomRef = useRef(true);
   const agentResizeCleanupRef = useRef<(() => void) | null>(null);
@@ -294,11 +290,6 @@ export function App() {
     providerModalRef.current?.focus();
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
-      if (codexAgentEnableChallenge) {
-        setCodexAgentEnableChallenge(false);
-        setCodexAgentBoundaryAcknowledged(false);
-        return;
-      }
       setProviderModalOpen(false);
       setCodexMessage(null);
     };
@@ -307,7 +298,7 @@ export function App() {
       document.removeEventListener('keydown', handleKeyDown);
       if (previouslyFocused instanceof HTMLElement) previouslyFocused.focus();
     };
-  }, [providerModalOpen, codexAgentEnableChallenge]);
+  }, [providerModalOpen]);
 
   useEffect(() => {
     if (!providerModalOpen || providerSettingsSection !== 'generic') {
@@ -334,10 +325,6 @@ export function App() {
   ]);
 
   useEffect(() => cancelPendingProviderDiscovery, []);
-
-  useEffect(() => {
-    if (codexAgentEnableChallenge) codexAgentConfirmationRef.current?.focus();
-  }, [codexAgentEnableChallenge]);
 
   useEffect(() => {
     const handleOpenedTerminal = (event: Event) => {
@@ -418,22 +405,18 @@ export function App() {
     : selectedGenericProvider
       ? { kind: 'generic-provider', providerId: selectedGenericProvider.id }
       : undefined;
-  const codexIsolation = codexAppServer?.agentIsolation;
-  const codexAgentEnabled = Boolean(
-    codexAppServer?.terminalAgentEnabled
-    && codexIsolation?.availability === 'enabled',
-  );
-  const codexAgentCanRequestEnable = codexIsolation?.availability === 'eligible'
-    || codexIsolation?.availability === 'blocked';
+  const codexAgentAvailable = codexAppServer?.agentAvailable === true;
+  const codexTerminalContextAccess = codexAppServer?.terminalContextAccess;
+  const codexBackendSelected = selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND;
   const selectedAgentBackendReady = selectedAgentBackendKind
     === CODEX_APP_SERVER_AGENT_BACKEND
-    ? codexAgentEnabled
+    ? codexAgentAvailable
     : selectedGenericProvider?.status === 'ready';
   const selectedAgentBackendStatus = selectedAgentBackendKind
     === CODEX_APP_SERVER_AGENT_BACKEND
-    ? codexIsolation
-      ? `${codexAgentIsolationAvailabilityLabel(codexIsolation.availability)} · ${codexIsolation.reason}`
-      : '正在读取隔离 App Server Agent 状态。'
+    ? codexAppServer
+      ? `${codexNativeAgentAvailabilityLabel(codexAppServer.agentAvailable)} · ${codexAppServer.agentReason}`
+      : '正在读取 Codex App Server 状态。'
     : selectedGenericProvider
       ? `${selectedGenericProvider.name} · ${providerStatusLabel(selectedGenericProvider.status)}`
       : '尚未配置默认 Provider。';
@@ -654,22 +637,12 @@ export function App() {
     setProviderModalOpen(true);
   }
 
-  function requestCodexAgentEnable() {
-    setCodexAgentBoundaryAcknowledged(false);
-    setCodexAgentEnableChallenge(true);
-  }
-
-  async function setCodexAgentEnabled(enabled: boolean) {
-    if (enabled && !codexAgentBoundaryAcknowledged) return;
-    setCodexAgentEnableChallenge(false);
-    setCodexAgentBoundaryAcknowledged(false);
+  async function setCodexTerminalContextAccess(enabled: boolean) {
     await runCodexAction(
-      () => window.aiTerminal.codexAppServer.setTerminalAgentEnabled(enabled
-        ? { enabled: true, acknowledgementVersion: 1 }
-        : { enabled: false }),
+      () => window.aiTerminal.codexAppServer.setTerminalContextAccess({ enabled }),
       enabled
-        ? '隔离 App Server Agent（实验）已为本次应用运行启用。请在智能体区域选择此后端。'
-        : '隔离 App Server Agent 已停用。',
+        ? '已允许 Codex 以只读方式获取当前可见终端的近期内容。'
+        : '已关闭 Codex 对当前终端内容的读取权限。',
     );
   }
 
@@ -1572,7 +1545,7 @@ export function App() {
                   默认 Provider{defaultProvider ? ` · ${defaultProvider.name}` : '（未配置）'}
                 </option>
                 <option value={CODEX_APP_SERVER_AGENT_BACKEND}>
-                  Codex App Server · 隔离实验
+                  Codex App Server · 原生模式
                 </option>
               </select>
             </label>
@@ -1583,42 +1556,44 @@ export function App() {
               role="status"
             >{selectedAgentBackendStatus}</span>
           </div>
-          <div className="agent-controls">
-            {activeAgent?.fullTakeover && <span className="takeover-badge">AI 全接管</span>}
-            <button
-              className="take-control"
-              data-action="take-control"
-              disabled={!agentTurnBusy(activeAgent?.state) || activeAgent?.state === 'TAKEOVER_PENDING'}
-              onClick={() => void requestAgentTakeover()}
-            >人工接管</button>
-            <button
-              className={activeAgent?.fullTakeover ? 'full-takeover-enabled' : ''}
-              disabled={
-                !activeTab
-                || agentTurnBusy(activeAgent?.state)
-                || (!activeAgent?.fullTakeover
-                  && (!selectedAgentBackend || !selectedAgentBackendReady))
-              }
-              onClick={() => {
-                if (!activeTab) return;
-                if (activeAgent?.fullTakeover) {
-                  void setFullTakeover(
-                    false,
-                    activeTab.id,
-                    undefined,
-                    undefined,
-                    activeAgent.backend,
-                  );
-                } else if (selectedAgentBackend) {
-                  setFullTakeoverChallenge({
-                    terminalId: activeTab.id,
-                    target: activeTab.title,
-                    backend: selectedAgentBackend,
-                  });
+          {!codexBackendSelected && (
+            <div className="agent-controls">
+              {activeAgent?.fullTakeover && <span className="takeover-badge">AI 全接管</span>}
+              <button
+                className="take-control"
+                data-action="take-control"
+                disabled={!agentTurnBusy(activeAgent?.state) || activeAgent?.state === 'TAKEOVER_PENDING'}
+                onClick={() => void requestAgentTakeover()}
+              >人工接管</button>
+              <button
+                className={activeAgent?.fullTakeover ? 'full-takeover-enabled' : ''}
+                disabled={
+                  !activeTab
+                  || agentTurnBusy(activeAgent?.state)
+                  || (!activeAgent?.fullTakeover
+                    && (!selectedAgentBackend || !selectedAgentBackendReady))
                 }
-              }}
-            >{activeAgent?.fullTakeover ? '关闭全接管' : 'AI 全接管'}</button>
-          </div>
+                onClick={() => {
+                  if (!activeTab) return;
+                  if (activeAgent?.fullTakeover) {
+                    void setFullTakeover(
+                      false,
+                      activeTab.id,
+                      undefined,
+                      undefined,
+                      activeAgent.backend,
+                    );
+                  } else if (selectedAgentBackend) {
+                    setFullTakeoverChallenge({
+                      terminalId: activeTab.id,
+                      target: activeTab.title,
+                      backend: selectedAgentBackend,
+                    });
+                  }
+                }}
+              >{activeAgent?.fullTakeover ? '关闭全接管' : 'AI 全接管'}</button>
+            </div>
+          )}
         </div>
         <div className="agent-body-shell">
           <div
@@ -1629,16 +1604,18 @@ export function App() {
           >
           {selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND && (
             <section
-              className={`agent-backend-notice ${codexIsolation?.availability ?? 'unavailable'}`}
+              className={`agent-backend-notice ${codexAgentAvailable ? 'ready' : 'unavailable'}`}
               data-testid="agent-codex-boundary"
-              data-isolation-state={codexIsolation?.availability ?? 'unavailable'}
+              data-agent-available={codexAgentAvailable ? 'true' : 'false'}
             >
-              <strong>隔离 App Server Agent（实验）</strong>
-              <p>{codexAgentEnabled
-                ? '当前只把 terminal_read、terminal_state、terminal_execute 接入这个可见终端。App Server 内建请求不受“全接管”影响。'
+              <strong>Codex App Server · 原生模式</strong>
+              <p>{codexAgentAvailable
+                ? `Codex 的内建 Shell/File 在应用独立工作区内执行，不与当前 SSH/本地 Shell 共用。${codexTerminalContextAccess?.enabled
+                  ? '已允许它只读获取当前终端的近期内容。'
+                  : '当前未允许它读取终端内容。'}当前终端始终由你控制。`
                 : selectedAgentBackendStatus}</p>
               <button data-action="open-codex-agent-settings" onClick={openAgentBackendSettings}>
-                {codexAgentEnabled ? '查看隔离边界' : '打开 App Server 设置'}
+                打开 App Server 设置
               </button>
             </section>
           )}
@@ -1646,8 +1623,12 @@ export function App() {
             <div className="agent-empty">
               <div className="agent-glyph">✦</div>
               <strong>理解终端上下文的 AI 助手</strong>
-              <p>智能体会读取当前会话，并在向这个可见终端发送每条命令前请求你的批准。</p>
-              <div className="guardrail"><span>✓</span> 默认逐条审批命令</div>
+              <p>{codexBackendSelected
+                ? 'Codex 使用应用独立工作区完成任务；只有开启读取权限后，它才能获取当前终端的近期文本。'
+                : '智能体会读取当前会话，并在向这个可见终端发送每条命令前请求你的批准。'}</p>
+              <div className="guardrail"><span>✓</span> {codexBackendSelected
+                ? '当前终端始终由你控制'
+                : '默认逐条审批命令'}</div>
               <button
                 className="provider-configure"
                 data-action="open-agent-provider-settings"
@@ -1673,7 +1654,8 @@ export function App() {
               />
             </article>
           ))}
-          {activeAgent?.pendingApproval?.status === 'waiting' && (
+          {activeAgent?.pendingApproval?.status === 'waiting'
+            && activeAgent.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND && (
             <section className="approval-card">
               <div>
                 <strong>命令审批</strong>
@@ -1753,7 +1735,7 @@ export function App() {
               ? activeAgent
                 ? agentStateLabel(activeAgent.state)
                 : selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND
-                  ? '隔离实验已就绪 · terminal_execute 默认逐条审批'
+                  ? '原生 Codex 已就绪 · 不控制当前终端'
                   : '已就绪 · 命令需审批'
               : selectedAgentBackendStatus}</span>
             <button
@@ -1950,7 +1932,6 @@ export function App() {
             role="dialog"
             aria-modal="true"
             aria-labelledby="provider-settings-title"
-            aria-hidden={codexAgentEnableChallenge || undefined}
             tabIndex={-1}
           >
             <div className="modal-header">
@@ -1958,8 +1939,6 @@ export function App() {
               <button type="button" aria-label="关闭 AI 服务设置" onClick={() => {
                 setProviderModalOpen(false);
                 setCodexMessage(null);
-                setCodexAgentEnableChallenge(false);
-                setCodexAgentBoundaryAcknowledged(false);
               }}>×</button>
             </div>
             <div className="provider-kind-tabs" role="tablist" aria-label="AI 服务类型">
@@ -2198,7 +2177,7 @@ export function App() {
                     <span>3</span>
                     <div>
                       <strong>模型与首选项</strong>
-                      <small>模型来自当前 App Server；保存后可供隔离实验后端使用，并在下次启动时恢复。</small>
+                      <small>模型来自当前 App Server；保存后可供原生 Codex 后端使用，并在下次启动时恢复。</small>
                     </div>
                   </div>
                   {codexAppServer?.models.length ? (
@@ -2258,98 +2237,76 @@ export function App() {
                 </section>
 
                 <section
-                  className={`codex-setup-section codex-agent-isolation-card ${codexIsolation?.availability ?? 'unavailable'}`}
-                  data-testid="codex-agent-isolation-card"
-                  data-isolation-state={codexIsolation?.availability ?? 'unavailable'}
+                  className={`codex-setup-section codex-terminal-context-card ${
+                    codexTerminalContextAccess?.enabled ? 'enabled' : 'disabled'
+                  }`}
+                  data-testid="codex-terminal-context-card"
+                  data-context-enabled={codexTerminalContextAccess?.enabled ? 'true' : 'false'}
                 >
                   <div className="codex-section-heading">
                     <span>4</span>
                     <div>
-                      <strong>隔离 App Server Agent（实验）</strong>
-                      <small>每次启动应用都需从界面重新确认隔离边界，之后才能把 App Server 选作当前智能体后端。</small>
+                      <strong>允许 AI 读取当前终端内容</strong>
+                      <small>这是可选的只读上下文权限；它不决定 Codex 原生后端是否可用。</small>
                     </div>
                   </div>
                   <div
                     className="codex-agent-availability"
-                    data-testid="codex-agent-availability"
-                    data-isolation-state={codexIsolation?.availability ?? 'unavailable'}
+                    data-testid="codex-terminal-context-status"
+                    data-context-state={!codexTerminalContextAccess?.available
+                      ? 'unavailable'
+                      : codexTerminalContextAccess.enabled ? 'enabled' : 'disabled'}
                     role="status"
                     aria-live="polite"
                   >
                     <span className="codex-agent-state-dot" aria-hidden="true" />
                     <span>
-                      <strong>{codexIsolation
-                        ? codexAgentIsolationAvailabilityLabel(codexIsolation.availability)
-                        : '正在读取状态'}</strong>
-                      <small>{codexIsolation?.reason ?? '正在读取隔离能力状态。'}</small>
+                      <strong>{!codexTerminalContextAccess
+                        ? '正在读取状态'
+                        : !codexTerminalContextAccess.available
+                          ? '当前不可用'
+                          : codexTerminalContextAccess.enabled
+                            ? '已允许只读访问'
+                            : '未允许读取'}</strong>
+                      <small>{codexTerminalContextAccess?.reason
+                        ?? '正在读取终端上下文权限。'}</small>
                     </span>
                   </div>
 
                   <div
-                    id="codex-agent-boundary-description"
-                    className="codex-safety-boundary codex-agent-boundary"
-                    data-testid="codex-agent-boundary"
+                    id="codex-terminal-context-description"
+                    className="codex-safety-boundary codex-agent-boundary codex-native-boundary"
+                    data-testid="codex-native-boundary"
                   >
-                    <strong>实际边界，不是“内建工具已被硬性关闭”</strong>
+                    <strong>Codex 原生模式与当前终端相互独立</strong>
                     <p>
-                      实验线程使用 <code>environments=[]</code>，并且客户端只注册
-                      {' '}<code>{codexIsolation?.acceptedClientTools.join(' · ')
-                        ?? 'terminal_read · terminal_state · terminal_execute'}</code>。
+                      Codex 的内建 <code>Shell</code>/<code>File</code> 工具在 AI Terminal
+                      为它分配的应用独立工作区内执行，不会进入当前 SSH 或本地 Shell。
                     </p>
                     <ul>
-                      <li>只有这些 <code>terminal_*</code> 动态工具会进入当前可见终端。</li>
-                      <li>收到 App Server 内建命令、文件修改或权限请求时，客户端会拒绝并中断该轮。</li>
-                      <li>官方协议并未保证模型不会尝试内建工具；若观察到越界执行事件，实验模式会锁停，执行结果标记为未知。</li>
+                      <li>当前终端始终由你控制；Codex 原生模式不提供任何终端控制功能。</li>
+                      <li>开启这个开关只会提供 <code>terminal_read</code>，让 Codex 读取当前可见终端的近期文本；它不能向终端写入或执行命令。</li>
+                      <li>关闭读取权限后，Codex 仍可以在自己的独立工作区中工作。</li>
                     </ul>
                   </div>
 
-                  {codexIsolation?.lastViolation && (
-                    <div
-                      className="codex-agent-violation"
-                      data-testid="codex-agent-violation"
-                      role="alert"
-                    >
-                      <strong>检测到隔离边界违规，已锁停</strong>
-                      <dl>
-                        <div><dt>类型</dt><dd>{codexAgentIsolationViolationKindLabel(
-                          codexIsolation.lastViolation.kind,
-                        )}</dd></div>
-                        <div><dt>时间</dt><dd><time dateTime={codexIsolation.lastViolation.detectedAt}>
-                          {new Date(codexIsolation.lastViolation.detectedAt).toLocaleString('zh-CN')}
-                        </time></dd></div>
-                      </dl>
-                      <p>{codexIsolation.lastViolation.detail}</p>
-                      <small>已观察到边界事件，但无法据此证明是否产生副作用；结果按“未知”处理。</small>
-                    </div>
-                  )}
-
-                  <div className="codex-actions codex-agent-actions">
-                    {codexAgentEnabled ? (
-                      <button
-                        className="danger-text"
-                        type="button"
-                        data-action="codex-agent-disable"
-                        disabled={codexBusy}
-                        onClick={() => void setCodexAgentEnabled(false)}
-                      >停用隔离实验后端</button>
-                    ) : (
-                      <button
-                        className="primary"
-                        type="button"
-                        data-action={codexIsolation?.availability === 'blocked'
-                          ? 'codex-agent-review-violation'
-                          : 'codex-agent-enable'}
-                        disabled={codexBusy || codexSelectionDirty || !codexAgentCanRequestEnable}
-                        aria-describedby="codex-agent-boundary-description"
-                        onClick={requestCodexAgentEnable}
-                      >{codexIsolation?.availability === 'blocked'
-                          ? '审阅并重新确认…'
-                          : '启用实验模式…'}</button>
-                    )}
-                    {codexSelectionDirty && (
-                      <span className="codex-agent-action-note">请先保存上方模型更改。</span>
-                    )}
-                  </div>
+                  <label className="codex-context-toggle">
+                    <input
+                      type="checkbox"
+                      data-testid="codex-terminal-context-toggle"
+                      checked={codexTerminalContextAccess?.enabled === true}
+                      disabled={codexBusy || !codexTerminalContextAccess?.available}
+                      aria-describedby="codex-terminal-context-description"
+                      onChange={(event) => void setCodexTerminalContextAccess(event.target.checked)}
+                    />
+                    <span className="codex-context-toggle-track" aria-hidden="true">
+                      <span />
+                    </span>
+                    <span className="codex-context-toggle-copy">
+                      <strong>{codexTerminalContextAccess?.enabled ? '允许读取' : '不允许读取'}</strong>
+                      <small>只读权限，不包含终端输入或控制能力。</small>
+                    </span>
+                  </label>
                 </section>
               </div>
             )}
@@ -2499,73 +2456,8 @@ export function App() {
         </div>
       )}
 
-      {codexAgentEnableChallenge && (
-        <div className="modal-backdrop codex-agent-confirmation-backdrop">
-          <div
-            ref={codexAgentConfirmationRef}
-            className="modal compact-modal codex-agent-confirmation"
-            data-testid="codex-agent-confirmation"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="codex-agent-confirmation-title"
-            aria-describedby="codex-agent-confirmation-description"
-            tabIndex={-1}
-          >
-            <div className="modal-header">
-              <strong id="codex-agent-confirmation-title">
-                {codexIsolation?.availability === 'blocked'
-                  ? '重新启用隔离 App Server Agent？'
-                  : '启用隔离 App Server Agent（实验）？'}
-              </strong>
-            </div>
-            <div id="codex-agent-confirmation-description">
-              <p>启用后，AI Terminal 会按以下实验边界处理 App Server 智能体：</p>
-              <ul>
-                <li>向线程发送 <code>environments=[]</code>，并且只注册三个 <code>terminal_*</code> 动态工具。</li>
-                <li>动态终端命令仍进入当前可见终端，并遵循逐条审批或你明确开启的“AI 全接管”。</li>
-                <li>内建命令、文件修改和权限请求会被拒绝并中断；“AI 全接管”不会批准这些内建请求。</li>
-                <li>协议没有提供“模型绝不会尝试内建工具”的保证。若观察到越界事件，模式会锁停，结果记为未知。</li>
-                <li>实验授权只在本次应用运行内有效；重新启动后必须再次确认。</li>
-              </ul>
-              {codexIsolation?.lastViolation && (
-                <p className="codex-agent-confirmation-warning">
-                  上次违规：{codexAgentIsolationViolationKindLabel(
-                    codexIsolation.lastViolation.kind,
-                  )}。重新启用会清除锁停记录，但不会把未知结果改写为“已阻止”。
-                </p>
-              )}
-            </div>
-            <label className="codex-agent-confirm-check">
-              <input
-                type="checkbox"
-                data-testid="codex-agent-opt-in"
-                checked={codexAgentBoundaryAcknowledged}
-                onChange={(event) => setCodexAgentBoundaryAcknowledged(event.target.checked)}
-              />
-              <span>我已理解这是实验隔离策略，而不是协议层硬性禁用全部内建工具。</span>
-            </label>
-            <div className="modal-actions">
-              <button onClick={() => {
-                setCodexAgentEnableChallenge(false);
-                setCodexAgentBoundaryAcknowledged(false);
-              }}>取消</button>
-              <button
-                className="danger-action"
-                data-action="confirm-codex-agent-enable"
-                disabled={
-                  !codexAgentBoundaryAcknowledged
-                  || codexBusy
-                  || !codexAgentCanRequestEnable
-                  || codexSelectionDirty
-                }
-                onClick={() => void setCodexAgentEnabled(true)}
-              >确认并启用实验模式</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {activeAgent?.pendingTakeover && (
+      {activeAgent?.pendingTakeover
+        && activeAgent.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND && (
         <div className="modal-backdrop">
           <div
             className="modal compact-modal takeover-modal"
@@ -2584,7 +2476,8 @@ export function App() {
         </div>
       )}
 
-      {fullTakeoverChallenge && (
+      {fullTakeoverChallenge
+        && fullTakeoverChallenge.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND && (
         <div className="modal-backdrop">
           <div
             className="modal compact-modal full-takeover-modal"
@@ -2600,9 +2493,6 @@ export function App() {
                 ? '确认后会立即执行下方命令；在关闭全接管或人工接管前，后续命令都不会再次询问。'
                 : ''}
               仅对你信任的终端和任务启用。遇到认证提示时仍会暂停，并让你直接安全输入。
-              {fullTakeoverChallenge.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
-                ? ' 对隔离 App Server 后端，“全接管”只作用于 terminal_execute；内建请求仍会被拒绝并中断。'
-                : ''}
             </p>
             {fullTakeoverChallenge.command && (
               <code>{fullTakeoverChallenge.editedCommand ?? fullTakeoverChallenge.command}</code>

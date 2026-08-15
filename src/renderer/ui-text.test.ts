@@ -2,8 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   agentStateLabel,
   authMethodLabel,
-  codexAgentIsolationAvailabilityLabel,
-  codexAgentIsolationViolationKindLabel,
+  codexNativeAgentAvailabilityLabel,
   executionStatusLabel,
   providerStatusLabel,
   codexAppServerOperationLabel,
@@ -21,10 +20,8 @@ describe('Chinese UI labels', () => {
     expect(providerStatusLabel('not-tested')).toBe('未测试');
     expect(codexAppServerPhaseLabel('detecting')).toBe('正在检测 Codex CLI');
     expect(codexAppServerOperationLabel('logging-in')).toBe('正在准备登录');
-    expect(codexAgentIsolationAvailabilityLabel('blocked')).toBe('检测到违规，已锁停');
-    expect(codexAgentIsolationViolationKindLabel('command-execution')).toBe(
-      '内建命令执行事件',
-    );
+    expect(codexNativeAgentAvailabilityLabel(true)).toBe('原生模式可用');
+    expect(codexNativeAgentAvailabilityLabel(false)).toBe('原生模式不可用');
     expect(codexReasoningEffortLabel('xhigh')).toBe('极高');
     expect(codexPlanTypeLabel('plus')).toBe('Plus 版');
     expect(sessionStatusLabel('disconnected')).toBe('已断开');
