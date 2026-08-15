@@ -154,6 +154,10 @@ export function App() {
   const [editingHost, setEditingHost] = useState<HostProfile | null | undefined>(undefined);
   const [connectingHost, setConnectingHost] = useState<HostProfile | null>(null);
   const [reconnectingSessionId, setReconnectingSessionId] = useState<string | null>(null);
+  const [renamingSession, setRenamingSession] = useState<SessionRecord | null>(null);
+  const [sessionRenameDraft, setSessionRenameDraft] = useState('');
+  const [sessionRenameError, setSessionRenameError] = useState<string | null>(null);
+  const [sessionRenamePending, setSessionRenamePending] = useState(false);
   const [trustChallenge, setTrustChallenge] = useState<TrustChallenge | null>(null);
   const [fullTakeoverChallenge, setFullTakeoverChallenge] = useState<FullTakeoverChallenge | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
@@ -667,14 +671,53 @@ export function App() {
     }
   }
 
-  async function renameSession(session: SessionRecord) {
-    const name = window.prompt('会话名称', session.name);
-    if (!name || name.trim() === session.name) return;
+  function openSessionRename(session: SessionRecord) {
+    setRenamingSession(session);
+    setSessionRenameDraft(session.name);
+    setSessionRenameError(null);
+  }
+
+  function closeSessionRename() {
+    if (sessionRenamePending) return;
+    setRenamingSession(null);
+    setSessionRenameDraft('');
+    setSessionRenameError(null);
+  }
+
+  async function renameSession(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!renamingSession || sessionRenamePending) return;
+    const name = sessionRenameDraft.trim();
+    if (!name) {
+      setSessionRenameError('请输入会话名称。');
+      return;
+    }
+    if (name === renamingSession.name) {
+      closeSessionRename();
+      return;
+    }
+    setSessionRenamePending(true);
+    setSessionRenameError(null);
     try {
-      await window.aiTerminal.sessions.rename({ sessionId: session.id, name });
+      const renamed = await window.aiTerminal.sessions.rename({
+        sessionId: renamingSession.id,
+        name,
+      });
+      setSessions((current) => current.map((session) => (
+        session.id === renamed.id ? renamed : session
+      )));
+      setTabs((current) => current.map((tab) => (
+        tab.sessionId === renamed.id || tab.id === renamed.runtimeTerminalId
+          ? { ...tab, title: renamed.name }
+          : tab
+      )));
       await refreshSessions();
+      setRenamingSession(null);
+      setSessionRenameDraft('');
     } catch (error) {
-      setConnectionError(errorMessage(error));
+      setSessionRenameError(errorMessage(error));
+    } finally {
+      setSessionRenamePending(false);
     }
   }
 
@@ -849,7 +892,13 @@ export function App() {
                     <small>{sessionStatusLabel(session.status)} · {new Date(session.updatedAt).toLocaleString('zh-CN')}</small>
                   </span>
                   <span className="session-history-actions">
-                    <button title="重命名会话" onClick={() => void renameSession(session)}>重命名</button>
+                    <button
+                      type="button"
+                      title="重命名会话"
+                      data-action="rename-session"
+                      data-session-id={session.id}
+                      onClick={() => openSessionRename(session)}
+                    >重命名</button>
                     <button onClick={() => {
                       setReconnectingSessionId(session.id);
                       setConnectingHost(selectedHost);
@@ -1172,6 +1221,73 @@ export function App() {
           </div>
         </form>
       </aside>
+
+      {renamingSession && (
+        <div className="modal-backdrop" data-testid="rename-session-backdrop">
+          <form
+            className="modal compact-modal session-rename-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="session-rename-title"
+            aria-busy={sessionRenamePending}
+            data-testid="rename-session-dialog"
+            onSubmit={(event) => void renameSession(event)}
+            onKeyDown={(event) => {
+              if (event.key !== 'Escape') return;
+              event.preventDefault();
+              closeSessionRename();
+            }}
+          >
+            <div className="modal-header">
+              <strong id="session-rename-title">重命名会话</strong>
+              <button
+                type="button"
+                aria-label="关闭重命名会话"
+                data-action="cancel-session-rename"
+                disabled={sessionRenamePending}
+                onClick={closeSessionRename}
+              >×</button>
+            </div>
+            <label htmlFor="session-rename-input">会话名称</label>
+            <input
+              id="session-rename-input"
+              name="sessionName"
+              value={sessionRenameDraft}
+              autoFocus
+              autoComplete="off"
+              aria-invalid={Boolean(sessionRenameError)}
+              aria-describedby={sessionRenameError ? 'session-rename-error' : undefined}
+              data-testid="rename-session-input"
+              onChange={(event) => {
+                setSessionRenameDraft(event.target.value);
+                if (sessionRenameError) setSessionRenameError(null);
+              }}
+            />
+            {sessionRenameError && (
+              <div
+                id="session-rename-error"
+                className="form-error"
+                role="alert"
+                data-testid="rename-session-error"
+              >{sessionRenameError}</div>
+            )}
+            <div className="modal-actions">
+              <button
+                type="button"
+                data-action="cancel-session-rename"
+                disabled={sessionRenamePending}
+                onClick={closeSessionRename}
+              >取消</button>
+              <button
+                className="primary"
+                type="submit"
+                data-action="confirm-session-rename"
+                disabled={sessionRenamePending}
+              >{sessionRenamePending ? '正在保存…' : '保存'}</button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {editingHost !== undefined && (
         <div className="modal-backdrop">

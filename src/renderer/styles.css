@@ -516,6 +516,9 @@ button { border: 0; }
   box-shadow: 0 22px 70px #000c;
 }
 .compact-modal { width: min(500px, calc(100vw - 40px)); }
+.session-rename-modal { width: min(440px, calc(100vw - 40px)); }
+.session-rename-modal > label { margin-bottom: 6px; }
+.session-rename-modal > input[aria-invalid="true"] { border-color: #b95b66; }
 .modal-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 15px; }
 .modal-header strong { font-size: 16px; }
 .modal-header button { min-width: 34px; min-height: 34px; color: #8c9aae; background: transparent; cursor: pointer; font-size: 21px; }
