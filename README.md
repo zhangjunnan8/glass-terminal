@@ -9,18 +9,20 @@ visible PTY or SSH shell.
 > finished Core Demo; see `docs/progress/alpha-vertical-slice.md`.
 
 当前界面已提供简体中文并采用放大字号。Codex App Server 的启动、ChatGPT
-登录、账号、模型、首选项与实验隔离 Agent 启用均可全程在 UI 中完成。实验后端使用
-空 environment、私有只读运行目录和三个 `terminal_*` 动态工具，并将命令复用到现有
-逐条审批与同一可见 PTY 链路；具体边界见 `docs/codex-app-server.md`。
+登录、账号、模型和首选项均可全程在 UI 中完成。Codex 模式使用官方
+App Server 的 Thread/Turn 与内建 Shell/File 逻辑，在本应用的独立工作区运行；它不与当前
+SSH/本地终端共用 Shell，只有用户开启权限时才能读取当前终端文字。具体边界见
+`docs/codex-app-server.md`。
 右侧 Agent 面板支持流式输出、安全 CommonMark/GFM 渲染与底部自动跟随；
 用户主动向上阅读时不会被新输出强制拉回底部。
 
 ## Design invariants
 
 - One terminal session owns exactly one terminal and one active AI thread.
-- Human input and agent input enter the same visible terminal transport.
-- Agent commands never execute in a hidden convenience shell.
-- Human approval is the default; full takeover is explicit and reversible.
+- Generic API Agent input enters the same visible terminal transport as the human;
+  approval is the default and Full Takeover is explicit and reversible.
+- Native Codex App Server turns run in a separate application workspace. They never
+  write to the selected terminal, and terminal text access is an explicit read-only option.
 - Credentials are excluded from model context and plaintext logs.
 - SSH passwords/private-key passphrases are session-only by default; an
   explicit UI option stores them in the current user's Windows Credential
