@@ -39,6 +39,7 @@ import type {
 import type {
   CodexAppServerSnapshot,
   SaveCodexAppServerSelectionRequest,
+  SetCodexTerminalAgentEnabledRequest,
 } from './codex-app-server';
 
 export interface RuntimeInfo {
@@ -102,6 +103,9 @@ export interface DesktopBridge {
     logout(): Promise<CodexAppServerSnapshot>;
     saveSelection(
       request: SaveCodexAppServerSelectionRequest,
+    ): Promise<CodexAppServerSnapshot>;
+    setTerminalAgentEnabled(
+      request: SetCodexTerminalAgentEnabledRequest,
     ): Promise<CodexAppServerSnapshot>;
     onStateChanged(listener: (state: CodexAppServerSnapshot) => void): () => void;
   };

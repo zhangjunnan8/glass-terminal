@@ -23,7 +23,10 @@ import type {
   TakeoverRequest,
 } from '../shared/agent';
 import { CODEX_APP_SERVER_CHANNELS } from '../shared/codex-app-server';
-import type { SaveCodexAppServerSelectionRequest } from '../shared/codex-app-server';
+import type {
+  SaveCodexAppServerSelectionRequest,
+  SetCodexTerminalAgentEnabledRequest,
+} from '../shared/codex-app-server';
 import { HostStore } from './hosts/host-store';
 import { SessionManager } from './sessions/session-manager';
 import { SessionStore } from './sessions/session-store';
@@ -344,6 +347,12 @@ handleTrusted(
     requireCodexAppServerService().saveSelection(request)
   ),
 );
+handleTrusted(
+  CODEX_APP_SERVER_CHANNELS.setTerminalAgentEnabled,
+  (_event, request: SetCodexTerminalAgentEnabledRequest) => (
+    requireCodexAppServerService().setTerminalAgentEnabled(request)
+  ),
+);
 handleTrusted(AGENT_CHANNELS.sendPrompt, (event, request: SendAgentPromptRequest) => {
   if (!agentService) throw new Error('Agent service is not ready.');
   return agentService.sendPrompt(event.sender, request);
@@ -440,7 +449,13 @@ app.whenReady().then(async () => {
       }
     }
   });
-  agentService = new AgentService(terminalService, sessionManager, providerStore);
+  agentService = new AgentService(
+    terminalService,
+    sessionManager,
+    providerStore,
+    undefined,
+    codexAppServerService,
+  );
   createMainWindow();
   void codexAppServerService.startIfBound();
   app.on('activate', () => {

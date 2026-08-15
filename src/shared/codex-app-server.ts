@@ -47,6 +47,30 @@ export interface CodexAppServerSelection {
   reasoningEffort?: string;
 }
 
+export type CodexAgentIsolationAvailability =
+  | 'unavailable'
+  | 'eligible'
+  | 'enabled'
+  | 'blocked';
+
+export interface CodexAgentIsolationViolation {
+  detectedAt: string;
+  kind: 'command-execution' | 'file-change' | 'permission-request' | 'protocol';
+  detail: string;
+}
+
+export interface CodexAgentIsolationState {
+  policyVersion: 1;
+  experimental: true;
+  userEnabled: boolean;
+  availability: CodexAgentIsolationAvailability;
+  acceptedClientTools: ['terminal_read', 'terminal_state', 'terminal_execute'];
+  environmentAccessDisabled: true;
+  enforcement: 'empty-environment-plus-deny-and-interrupt';
+  reason: string;
+  lastViolation?: CodexAgentIsolationViolation;
+}
+
 export type CodexPendingLogin =
   | {
     type: 'browser';
@@ -69,14 +93,20 @@ export interface CodexAppServerSnapshot {
   selection?: CodexAppServerSelection;
   pendingLogin?: CodexPendingLogin;
   bound: boolean;
-  terminalAgentEnabled: false;
+  terminalAgentEnabled: boolean;
   terminalAgentReason: string;
+  agentIsolation: CodexAgentIsolationState;
   error?: string;
 }
 
 export interface SaveCodexAppServerSelectionRequest {
   modelId: string;
   reasoningEffort?: string;
+}
+
+export interface SetCodexTerminalAgentEnabledRequest {
+  enabled: boolean;
+  acknowledgementVersion?: 1;
 }
 
 export const CODEX_APP_SERVER_CHANNELS = {
@@ -91,5 +121,6 @@ export const CODEX_APP_SERVER_CHANNELS = {
   cancelLogin: 'codex-app-server:cancel-login',
   logout: 'codex-app-server:logout',
   saveSelection: 'codex-app-server:save-selection',
+  setTerminalAgentEnabled: 'codex-app-server:set-terminal-agent-enabled',
   stateChanged: 'codex-app-server:state-changed',
 } as const;

@@ -1,4 +1,5 @@
 import type { TerminalDescriptor } from './terminal';
+import type { AgentBackendRef } from './agent';
 
 export type SessionNameSource = 'automatic' | 'manual';
 export type SessionConnectionState = 'connected' | 'disconnected';
@@ -51,6 +52,9 @@ export interface SessionRecord {
   cwd?: string;
   effectiveUser?: string;
   aiThreadId?: string;
+  agentBackend?: AgentBackendRef;
+  providerThreadId?: string;
+  /** @deprecated Kept for schema-v1 Generic Provider sessions. */
   providerId?: string;
   pinned: boolean;
   preludeTruncated: boolean;

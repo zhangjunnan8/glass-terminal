@@ -18,6 +18,7 @@ import type {
   SessionRecord,
   TerminalJournalEvent,
 } from '../../shared/session';
+import type { AgentBackendRef } from '../../shared/agent';
 import type { TerminalDescriptor } from '../../shared/terminal';
 
 const LOG_SCHEMA_VERSION = 1;
@@ -321,11 +322,25 @@ export class SessionStore {
   }
 
   bindAgentThread(sessionId: string, providerId: string, threadId: string): SessionRecord {
+    return this.bindAgentBackendThread(
+      sessionId,
+      { kind: 'generic-provider', providerId },
+      threadId,
+    );
+  }
+
+  bindAgentBackendThread(
+    sessionId: string,
+    backend: AgentBackendRef,
+    threadId: string,
+  ): SessionRecord {
     const current = this.get(sessionId);
     const updated: SessionRecord = {
       ...current,
       aiThreadId: threadId,
-      providerId,
+      agentBackend: backend,
+      providerThreadId: undefined,
+      providerId: backend.kind === 'generic-provider' ? backend.providerId : undefined,
       updatedAt: new Date().toISOString(),
     };
     this.save(updated);
@@ -334,7 +349,25 @@ export class SessionStore {
     if (!existsSync(threadPath)) {
       writeFileSync(threadPath, '', { encoding: 'utf8', mode: 0o600 });
     }
-    this.audit(sessionId, 'provider_changed', 'user', { providerId, threadId });
+    this.audit(sessionId, 'provider_changed', 'user', { backend, threadId });
+    return updated;
+  }
+
+  bindProviderThread(
+    sessionId: string,
+    localThreadId: string,
+    providerThreadId: string,
+  ): SessionRecord {
+    const current = this.get(sessionId);
+    if (current.aiThreadId !== localThreadId) {
+      throw new Error('AI Thread changed before the Provider thread could be bound.');
+    }
+    const updated: SessionRecord = {
+      ...current,
+      providerThreadId,
+      updatedAt: new Date().toISOString(),
+    };
+    this.save(updated);
     return updated;
   }
 

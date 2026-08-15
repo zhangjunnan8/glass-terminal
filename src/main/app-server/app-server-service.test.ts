@@ -134,6 +134,225 @@ afterEach(() => {
 });
 
 describe('CodexAppServerService', () => {
+  it('requires a fresh process opt-in and persists a violation lock', async () => {
+    const {
+      root,
+      connection,
+      launch,
+      openExternal,
+      probe,
+      service,
+    } = fixture();
+    const configPath = join(root, 'config.json');
+    expect(service.getState()).toMatchObject({
+      terminalAgentEnabled: false,
+      agentIsolation: {
+        policyVersion: 1,
+        userEnabled: false,
+        availability: 'unavailable',
+      },
+    });
+
+    connection.account = { type: 'chatgpt', email: 'agent@example.com', planType: 'plus' };
+    await service.start();
+    const eligible = service.saveSelection({
+      modelId: 'gpt-test',
+      reasoningEffort: 'low',
+    });
+    expect(eligible).toMatchObject({
+      bound: true,
+      terminalAgentEnabled: false,
+      agentIsolation: {
+        userEnabled: false,
+        availability: 'eligible',
+      },
+    });
+
+    const enabled = service.setTerminalAgentEnabled({
+      enabled: true,
+      acknowledgementVersion: 1,
+    });
+    expect(enabled).toMatchObject({
+      terminalAgentEnabled: true,
+      agentIsolation: {
+        userEnabled: true,
+        availability: 'enabled',
+      },
+    });
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({
+      bound: true,
+      terminalAgentEnabled: false,
+    });
+
+    service.close();
+    const restoredConnection = new FakeConnection();
+    restoredConnection.account = {
+      type: 'chatgpt', email: 'restored@example.com', planType: 'plus',
+    };
+    launch.mockResolvedValue(restoredConnection as AppServerConnection);
+    const restored = new CodexAppServerService(
+      configPath,
+      root,
+      root,
+      '0.1.0',
+      openExternal,
+      {
+        platform: 'win32',
+        arch: 'x64',
+        probe,
+        launch,
+      },
+    );
+    expect(restored.getState()).toMatchObject({
+      terminalAgentEnabled: false,
+      agentIsolation: {
+        userEnabled: false,
+        availability: 'unavailable',
+      },
+    });
+    await restored.start();
+    expect(restored.getState()).toMatchObject({
+      terminalAgentEnabled: false,
+      agentIsolation: {
+        userEnabled: false,
+        availability: 'eligible',
+      },
+    });
+    restored.setTerminalAgentEnabled({
+      enabled: true,
+      acknowledgementVersion: 1,
+    });
+
+    restored.recordAgentIsolationViolation({
+      detectedAt: '2026-08-15T10:00:00.000Z',
+      kind: 'command-execution',
+      detail: 'App Server requested a built-in command execution.',
+    });
+    expect(restored.getState()).toMatchObject({
+      terminalAgentEnabled: false,
+      agentIsolation: {
+        userEnabled: false,
+        availability: 'blocked',
+        lastViolation: {
+          detectedAt: '2026-08-15T10:00:00.000Z',
+          kind: 'command-execution',
+        },
+      },
+    });
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({
+      terminalAgentEnabled: false,
+      lastAgentViolation: {
+        kind: 'command-execution',
+        detail: 'App Server requested a built-in command execution.',
+      },
+    });
+
+    restored.close();
+    const blockedAfterRestart = new CodexAppServerService(
+      configPath,
+      root,
+      root,
+      '0.1.0',
+      openExternal,
+      {
+        platform: 'win32',
+        arch: 'x64',
+        probe,
+        launch,
+      },
+    );
+    expect(blockedAfterRestart.getState()).toMatchObject({
+      terminalAgentEnabled: false,
+      agentIsolation: {
+        userEnabled: false,
+        availability: 'blocked',
+        lastViolation: { kind: 'command-execution' },
+      },
+    });
+    blockedAfterRestart.close();
+  });
+
+  it('rejects enabling the terminal Agent without acknowledgement or prerequisites', () => {
+    const { service } = fixture();
+
+    expect(() => service.setTerminalAgentEnabled({ enabled: true })).toThrow(
+      '启用实验模式前必须确认当前隔离边界',
+    );
+    expect(() => service.setTerminalAgentEnabled({
+      enabled: true,
+      acknowledgementVersion: 1,
+    })).toThrow('请先启动 App Server、完成登录并保存当前模型');
+    expect(service.getState()).toMatchObject({
+      terminalAgentEnabled: false,
+      agentIsolation: {
+        userEnabled: false,
+        availability: 'unavailable',
+      },
+    });
+  });
+
+  it('cannot auto-enable after a violation write failure', async () => {
+    const { root, connection, launch, openExternal, probe, service } = fixture();
+    const configPath = join(root, 'config.json');
+    connection.account = { type: 'chatgpt', email: 'agent@example.com', planType: 'plus' };
+    await service.start();
+    service.saveSelection({ modelId: 'gpt-test', reasoningEffort: 'low' });
+    service.setTerminalAgentEnabled({ enabled: true, acknowledgementVersion: 1 });
+    const testable = service as unknown as {
+      writeConfig(config?: unknown): void;
+    };
+    testable.writeConfig = () => { throw new Error('disk unavailable'); };
+
+    service.recordAgentIsolationViolation({
+      kind: 'command-execution',
+      detail: 'blocked even without a durable violation record',
+    });
+    expect(service.getState().agentIsolation.availability).toBe('blocked');
+    expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({
+      terminalAgentEnabled: false,
+    });
+
+    service.close();
+    const restarted = new CodexAppServerService(
+      configPath,
+      root,
+      root,
+      '0.1.0',
+      openExternal,
+      { platform: 'win32', arch: 'x64', probe, launch },
+    );
+    expect(restarted.getState()).toMatchObject({
+      terminalAgentEnabled: false,
+      agentIsolation: { userEnabled: false, availability: 'unavailable' },
+    });
+    restarted.close();
+  });
+
+  it('disables and interrupts immediately even when config persistence fails', async () => {
+    const { connection, service } = fixture();
+    connection.account = { type: 'chatgpt', email: 'agent@example.com', planType: 'plus' };
+    await service.start();
+    service.saveSelection({ modelId: 'gpt-test', reasoningEffort: 'low' });
+    service.setTerminalAgentEnabled({ enabled: true, acknowledgementVersion: 1 });
+
+    const interrupt = vi.fn(async () => undefined);
+    const testable = service as unknown as {
+      turnRunner: { interrupt(): Promise<void> };
+      writeConfig(config?: unknown): void;
+    };
+    testable.turnRunner.interrupt = interrupt;
+    testable.writeConfig = () => { throw new Error('disk unavailable'); };
+
+    const disabled = service.setTerminalAgentEnabled({ enabled: false });
+
+    expect(interrupt).toHaveBeenCalledTimes(1);
+    expect(disabled).toMatchObject({
+      terminalAgentEnabled: false,
+      agentIsolation: { userEnabled: false, availability: 'eligible' },
+    });
+    expect(disabled.error).toContain('已在当前进程停用');
+  });
+
   it('starts, logs in through the browser, loads models, and persists no auth data', async () => {
     const { root, connection, launch, openExternal, service } = fixture();
     const started = await service.start();

@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import type { WebContents } from 'electron';
-import { AGENT_CHANNELS } from '../../shared/agent';
+import {
+  AGENT_CHANNELS,
+  CODEX_APP_SERVER_AGENT_BACKEND,
+  CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+} from '../../shared/agent';
 import type {
+  AgentBackendRef,
   AgentChatItem,
   AgentRuntimeState,
   AgentSessionView,
@@ -24,6 +29,7 @@ import type { TerminalService } from '../terminal/terminal-service';
 import { AgentLoop } from './agent-loop';
 import type { AgentCommandResult, AgentMessage, AgentProviderRuntime } from './agent-loop';
 import { GenericOpenAiProvider } from './generic-provider';
+import type { CodexAppServerService } from '../app-server/app-server-service';
 
 interface ApprovalResolution {
   decision: 'execute' | 'edit' | 'reject';
@@ -34,6 +40,7 @@ interface AgentRuntimeRecord extends AgentSessionView {
   owner: WebContents;
   ownerId: number;
   priorMessages: AgentMessage[];
+  providerThreadId?: string;
   abortController?: AbortController;
   turnToken: number;
   controlLeaseId?: string;
@@ -65,6 +72,7 @@ function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
     terminalId: runtime.terminalId,
     sessionId: runtime.sessionId,
     threadId: runtime.threadId,
+    backend: { ...runtime.backend },
     providerId: runtime.providerId,
     state: runtime.state,
     terminalInputMode: runtime.terminalInputMode,
@@ -76,6 +84,15 @@ function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
     activeExecution: runtime.activeExecution ? { ...runtime.activeExecution } : undefined,
     error: runtime.error,
   };
+}
+
+function sameBackend(left: AgentBackendRef | undefined, right: AgentBackendRef): boolean {
+  if (!left || left.kind !== right.kind) return false;
+  return left.kind === 'generic-provider'
+    ? left.providerId === (right as Extract<AgentBackendRef, { kind: 'generic-provider' }>).providerId
+    : left.policyVersion === (
+      right as Extract<AgentBackendRef, { kind: typeof CODEX_APP_SERVER_AGENT_BACKEND }>
+    ).policyVersion;
 }
 
 function safePriorMessages(value: unknown): AgentMessage[] {
@@ -100,6 +117,7 @@ export class AgentService {
     private readonly providerFactory: (providerId: string) => AgentProviderRuntime = (
       providerId,
     ) => new GenericOpenAiProvider(providerId, providers),
+    private readonly codexAppServer?: CodexAppServerService,
   ) {
     this.removeExitListener = terminals.onExit((terminalId, ownerId) => {
       this.handleTerminalExit(terminalId, ownerId);
@@ -118,7 +136,7 @@ export class AgentService {
     const prompt = request.prompt.trim();
     if (!prompt) throw new Error('Agent prompt cannot be empty.');
     if (prompt.length > 20_000) throw new Error('Agent prompt exceeds 20,000 characters.');
-    const provider = this.selectProvider(request.providerId);
+    const backend = this.selectBackend(request.backend, request.providerId);
     const existing = this.runtimes.get(request.terminalId);
     if (existing && existing.ownerId !== owner.id) {
       throw new Error('Agent Session ownership mismatch.');
@@ -130,7 +148,7 @@ export class AgentService {
       throw new Error('A foreground process retained by Takeover is still running.');
     }
 
-    const runtime = this.ensureRuntime(owner, request.terminalId, provider);
+    const runtime = this.ensureRuntime(owner, request.terminalId, backend);
     runtime.turnToken += 1;
     const token = runtime.turnToken;
     runtime.abortController = new AbortController();
@@ -202,6 +220,14 @@ export class AgentService {
   setFullTakeover(owner: WebContents, request: SetFullTakeoverRequest): AgentSessionView {
     let runtime = this.runtimes.get(request.terminalId);
     if (runtime && runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
+    if (
+      runtime
+      && request.approvalId
+      && request.backend
+      && !sameBackend(runtime.backend, request.backend)
+    ) {
+      throw new Error('Full Takeover 请求与当前智能体后端不匹配。');
+    }
     if (request.approvalId) {
       if (!request.enabled || !runtime) {
         throw new Error('Full Takeover approval is no longer pending.');
@@ -252,9 +278,23 @@ export class AgentService {
     if (runtime && this.terminals.currentExecution(owner, request.terminalId)) {
       throw new Error('A foreground process retained by Takeover is still running.');
     }
+    if (runtime && request.backend && !sameBackend(runtime.backend, request.backend)) {
+      if (!request.enabled) {
+        throw new Error('Full Takeover 请求与当前智能体后端不匹配。');
+      }
+      runtime = this.ensureRuntime(
+        owner,
+        request.terminalId,
+        this.selectBackend(request.backend, request.providerId),
+      );
+    }
     if (!runtime) {
       if (!request.enabled) throw new Error('Agent Session not found.');
-      runtime = this.ensureRuntime(owner, request.terminalId, this.selectProvider(request.providerId));
+      runtime = this.ensureRuntime(
+        owner,
+        request.terminalId,
+        this.selectBackend(request.backend, request.providerId),
+      );
     }
     if (runtime.fullTakeover === request.enabled) return cloneView(runtime);
     if (request.enabled) {
@@ -421,6 +461,10 @@ export class AgentService {
     prompt: string,
     controlLeaseId: string,
   ): Promise<void> {
+    if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
+      await this.runCodexTurn(runtime, token, prompt, controlLeaseId);
+      return;
+    }
     const signal = runtime.abortController!.signal;
     const provider = this.providerFactory(runtime.providerId);
     const loop = new AgentLoop(provider, {
@@ -468,6 +512,159 @@ export class AgentService {
       runtime.activeExecution = undefined;
       runtime.error = error instanceof Error ? error.message : String(error);
       this.setHumanState(runtime, signal.aborted ? 'PAUSED' : 'FAILED', controlLeaseId);
+      this.emit(runtime);
+    }
+  }
+
+  private async runCodexTurn(
+    runtime: AgentRuntimeRecord,
+    token: number,
+    prompt: string,
+    controlLeaseId: string,
+  ): Promise<void> {
+    const service = this.codexAppServer;
+    const signal = runtime.abortController!.signal;
+    if (!service) {
+      runtime.error = 'Codex App Server Agent Runtime 未初始化。';
+      this.setHumanState(runtime, 'FAILED', controlLeaseId);
+      this.emit(runtime);
+      return;
+    }
+    const snapshot = service.getState();
+    const selection = snapshot.selection;
+    if (!snapshot.terminalAgentEnabled || !selection) {
+      runtime.error = snapshot.terminalAgentReason;
+      this.setHumanState(runtime, 'FAILED', controlLeaseId);
+      this.emit(runtime);
+      return;
+    }
+
+    let streamedMessage: AgentChatItem | undefined;
+    try {
+      const result = await service.runTerminalAgentTurn({
+        prompt,
+        model: selection.modelId,
+        reasoningEffort: selection.reasoningEffort,
+        threadId: runtime.providerThreadId,
+        signal,
+        tools: {
+          readTerminal: async ({ maxChars }) => (
+            this.sessions.readTerminalHistory(runtime.sessionId).slice(-maxChars)
+          ),
+          getTerminalState: async () => ({
+            ...this.terminals.state(runtime.owner, runtime.terminalId),
+            sessionId: runtime.sessionId,
+            controlState: runtime.state,
+            fullTakeover: runtime.fullTakeover,
+          }),
+          executeCommand: (request) => this.requestCommand(runtime, token, request),
+        },
+        onThreadBound: (threadId) => {
+          if (!this.isCurrentTurn(runtime, token)) {
+            throw new Error('Codex App Server Thread 已失效。');
+          }
+          if (runtime.providerThreadId !== threadId) {
+            this.sessions.bindProviderThread(runtime.sessionId, runtime.threadId, threadId);
+            runtime.providerThreadId = threadId;
+          }
+        },
+        onDelta: (delta) => {
+          if (!delta || !this.isCurrentTurn(runtime, token)) return;
+          if (!streamedMessage) {
+            streamedMessage = {
+              id: randomUUID(),
+              role: 'assistant',
+              content: '',
+              createdAt: new Date().toISOString(),
+            };
+            runtime.messages.push(streamedMessage);
+          }
+          streamedMessage.content += delta;
+          this.emit(runtime);
+        },
+      });
+      if (!this.isCurrentTurn(runtime, token)) return;
+      if (result.status !== 'completed') {
+        const terminalError = new Error(
+          result.error ?? (result.status === 'interrupted'
+            ? 'Codex App Server Turn 已中断。'
+            : 'Codex App Server Turn 失败。'),
+        );
+        if (result.status === 'interrupted') terminalError.name = 'AbortError';
+        throw terminalError;
+      }
+      runtime.providerThreadId = result.threadId;
+      const finalText = result.finalText.trim();
+      if (streamedMessage) {
+        if (finalText) streamedMessage.content = result.finalText;
+        this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
+          type: 'chat',
+          timestamp: streamedMessage.createdAt,
+          item: streamedMessage,
+        });
+      } else if (finalText) {
+        this.addChat(runtime, 'assistant', result.finalText);
+      }
+      this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
+        type: 'codex_app_server_turn',
+        timestamp: new Date().toISOString(),
+        providerThreadId: result.threadId,
+        providerTurnId: result.turnId,
+        status: result.status,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      });
+      runtime.pendingApproval = undefined;
+      runtime.activeExecution = undefined;
+      this.setHumanState(runtime, 'COMPLETED', controlLeaseId);
+      this.emit(runtime);
+    } catch (error) {
+      if (!this.isCurrentTurn(runtime, token)) return;
+      const wasAborted = signal.aborted
+        || (error instanceof Error && error.name === 'AbortError');
+      runtime.turnToken += 1;
+      runtime.abortController?.abort();
+      runtime.abortController = undefined;
+      const pendingApproval = runtime.pendingApproval;
+      if (pendingApproval) {
+        this.appendControlAudit(runtime, 'command_rejected', 'system', {
+          approvalId: pendingApproval.id,
+          command: pendingApproval.command,
+          reason: 'app_server_turn_ended',
+        });
+      }
+      const resolveApproval = runtime.resolveApproval;
+      runtime.resolveApproval = undefined;
+      runtime.pendingApproval = undefined;
+      resolveApproval?.({ decision: 'reject', command: '' });
+      this.resolveAuth(runtime);
+      runtime.error = error instanceof Error ? error.message : String(error);
+      this.clearFullTakeover(runtime, wasAborted ? 'turn_paused' : 'turn_failed');
+
+      const foreground = this.terminals.currentExecution(runtime.owner, runtime.terminalId);
+      if (foreground) {
+        runtime.activeExecution = foreground;
+        runtime.pendingTakeover = {
+          id: randomUUID(),
+          executionId: foreground.id,
+          requestedAt: new Date().toISOString(),
+        };
+        this.setLockedState(runtime, 'TAKEOVER_PENDING');
+        this.appendControlAudit(runtime, 'agent_paused', 'system', {
+          processAction: 'app-server-ended-with-foreground-process',
+          executionId: foreground.id,
+        });
+      } else {
+        runtime.activeExecution = undefined;
+        if (runtime.sensitiveLeaseId) {
+          this.terminals.endSensitiveMode(
+            runtime.owner,
+            runtime.terminalId,
+            runtime.sensitiveLeaseId,
+          );
+          runtime.sensitiveLeaseId = undefined;
+        }
+        this.setHumanState(runtime, wasAborted ? 'PAUSED' : 'FAILED', controlLeaseId);
+      }
       this.emit(runtime);
     }
   }
@@ -730,12 +927,12 @@ export class AgentService {
   private ensureRuntime(
     owner: WebContents,
     terminalId: string,
-    provider: ProviderProfile,
+    backend: AgentBackendRef,
   ): AgentRuntimeRecord {
     const session = this.sessions.upgrade(owner, terminalId);
     const existing = this.runtimes.get(terminalId);
     if (existing && existing.ownerId !== owner.id) throw new Error('Agent Session ownership mismatch.');
-    if (existing && existing.providerId === provider.id && existing.sessionId === session.id) {
+    if (existing && sameBackend(existing.backend, backend) && existing.sessionId === session.id) {
       return existing;
     }
     if (existing) {
@@ -745,9 +942,19 @@ export class AgentService {
       this.invalidateRuntime(existing);
     }
 
-    const canReuseThread = session.providerId === provider.id && Boolean(session.aiThreadId);
+    const persistedBackend = session.agentBackend
+      ?? (session.providerId
+        ? { kind: 'generic-provider' as const, providerId: session.providerId }
+        : undefined);
+    const canReuseThread = sameBackend(persistedBackend, backend) && Boolean(session.aiThreadId);
     const threadId = canReuseThread ? session.aiThreadId! : randomUUID();
-    if (!canReuseThread) this.sessions.bindAgentThread(session.id, provider.id, threadId);
+    if (!canReuseThread) {
+      if (backend.kind === 'generic-provider') {
+        this.sessions.bindAgentThread(session.id, backend.providerId, threadId);
+      } else {
+        this.sessions.bindAgentBackendThread(session.id, backend, threadId);
+      }
+    }
     const persisted = this.sessions.readThreadEvents(session.id, threadId);
     const chats = persisted
       .filter((event) => event.type === 'chat')
@@ -761,16 +968,53 @@ export class AgentService {
       terminalId,
       sessionId: session.id,
       threadId,
-      providerId: provider.id,
+      backend,
+      providerId: backend.kind === 'generic-provider'
+        ? backend.providerId
+        : CODEX_APP_SERVER_AGENT_BACKEND,
       state: 'USER_CONTROL',
       terminalInputMode: 'human',
       fullTakeover: false,
       messages: chats,
       priorMessages: safePriorMessages(lastTurn?.messages),
+      providerThreadId: canReuseThread && backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
+        ? session.providerThreadId
+        : undefined,
       turnToken: 0,
     };
     this.runtimes.set(terminalId, runtime);
     return runtime;
+  }
+
+  private selectBackend(
+    requested?: AgentBackendRef,
+    legacyProviderId?: string,
+  ): AgentBackendRef {
+    if (requested && requested.kind !== 'generic-provider'
+      && requested.kind !== CODEX_APP_SERVER_AGENT_BACKEND) {
+      throw new Error('未知的智能体后端。');
+    }
+    if (requested?.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
+      if (requested.policyVersion !== CODEX_APP_SERVER_AGENT_POLICY_VERSION) {
+        throw new Error('Codex App Server Agent 隔离策略版本不受支持。');
+      }
+      const state = this.codexAppServer?.getState();
+      if (!state || !state.terminalAgentEnabled) {
+        throw new Error(state?.terminalAgentReason ?? 'Codex App Server Agent 尚未启用。');
+      }
+      return {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      };
+    }
+    if (
+      requested?.kind === 'generic-provider'
+      && (typeof requested.providerId !== 'string' || !requested.providerId.trim())
+    ) throw new Error('Generic Provider ID 无效。');
+    const provider = this.selectProvider(
+      requested?.kind === 'generic-provider' ? requested.providerId : legacyProviderId,
+    );
+    return { kind: 'generic-provider', providerId: provider.id };
   }
 
   private selectProvider(providerId?: string): ProviderProfile {

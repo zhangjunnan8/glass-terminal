@@ -1,9 +1,20 @@
 import type { WebContents } from 'electron';
 import { describe, expect, it, vi } from 'vitest';
-import type { CommandActor, CommandExecution, TerminalInputMode } from '../../shared/agent';
+import {
+  CODEX_APP_SERVER_AGENT_BACKEND,
+  CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+} from '../../shared/agent';
+import type {
+  AgentBackendRef,
+  CommandActor,
+  CommandExecution,
+  TerminalInputMode,
+} from '../../shared/agent';
 import type { ProviderProfile } from '../../shared/provider';
 import type { SessionRecord } from '../../shared/session';
 import type { ProviderStore } from '../providers/provider-store';
+import type { CodexAppServerService } from '../app-server/app-server-service';
+import type { RunCodexTurnInput } from '../app-server/app-server-turn-runner';
 import type { SessionManager } from '../sessions/session-manager';
 import type {
   StructuredExecutionHooks,
@@ -64,7 +75,28 @@ class FakeSessions {
 
   upgrade() { return this.session; }
   bindAgentThread(_sessionId: string, providerId: string, threadId: string) {
-    this.session = { ...this.session, providerId, aiThreadId: threadId };
+    this.session = {
+      ...this.session,
+      providerId,
+      agentBackend: { kind: 'generic-provider', providerId },
+      aiThreadId: threadId,
+      providerThreadId: undefined,
+    };
+    return this.session;
+  }
+  bindAgentBackendThread(_sessionId: string, backend: AgentBackendRef, threadId: string) {
+    this.session = {
+      ...this.session,
+      providerId: backend.kind === 'generic-provider' ? backend.providerId : undefined,
+      agentBackend: backend,
+      aiThreadId: threadId,
+      providerThreadId: undefined,
+    };
+    return this.session;
+  }
+  bindProviderThread(_sessionId: string, localThreadId: string, providerThreadId: string) {
+    if (this.session.aiThreadId !== localThreadId) throw new Error('stale local thread');
+    this.session = { ...this.session, providerThreadId };
     return this.session;
   }
   readThreadEvents() { return []; }
@@ -81,6 +113,39 @@ class FakeSessions {
   ) {
     if (this.failAuditTypes.has(type)) throw new Error(`audit failed: ${type}`);
     this.audits.push({ type, details });
+  }
+}
+
+class FakeCodexAppServer {
+  readonly turns: RunCodexTurnInput[] = [];
+
+  getState() {
+    return {
+      terminalAgentEnabled: true,
+      terminalAgentReason: 'ready',
+      selection: { modelId: 'gpt-codex', reasoningEffort: 'high' },
+    };
+  }
+
+  async runTerminalAgentTurn(input: RunCodexTurnInput) {
+    this.turns.push(input);
+    input.onThreadBound?.('provider-thread-1');
+    const history = await input.tools.readTerminal({ maxChars: 500 });
+    const state = await input.tools.getTerminalState();
+    const execution = await input.tools.executeCommand({
+      command: 'printf from-codex',
+      reason: 'integration proof',
+    }, input.signal);
+    const finalText = `${history.includes('tester@host') ? 'history-ok' : 'history-missing'}; ${
+      state.transport === 'ssh' ? 'state-ok' : 'state-missing'
+    }; ${execution.output}`;
+    input.onDelta?.(finalText);
+    return {
+      threadId: 'provider-thread-1',
+      turnId: 'provider-turn-1',
+      status: 'completed' as const,
+      finalText,
+    };
   }
 }
 
@@ -274,6 +339,55 @@ function toolCall(id: string, command: string): AgentCompletion {
 }
 
 describe('AgentService shared-terminal controls', () => {
+  it('routes an isolated App Server turn through the existing approval and terminal path', async () => {
+    const sessions = new FakeSessions();
+    const terminals = new FakeTerminals();
+    const codex = new FakeCodexAppServer();
+    const owner = browserOwner();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      () => { throw new Error('Generic Provider must not be used.'); },
+      codex as unknown as CodexAppServerService,
+    );
+
+    service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Use the shared terminal.',
+      backend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      },
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
+    expect(terminals.executions).toEqual([]);
+    const approval = service.getState(owner, 'terminal')!.pendingApproval!;
+    service.resolveApproval(owner, {
+      terminalId: 'terminal',
+      approvalId: approval.id,
+      decision: 'edit',
+      editedCommand: 'printf visible-codex',
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    const view = service.getState(owner, 'terminal')!;
+    expect(view.backend).toEqual({
+      kind: CODEX_APP_SERVER_AGENT_BACKEND,
+      policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+    });
+    expect(terminals.executions).toEqual([{
+      command: 'printf visible-codex',
+      actor: 'user_modified_ai_command',
+    }]);
+    expect(sessions.session.providerThreadId).toBe('provider-thread-1');
+    expect(view.messages.at(-1)?.content).toContain('tester');
+    expect(sessions.threadEvents.some((event) => (
+      event.type === 'codex_app_server_turn'
+      && event.providerTurnId === 'provider-turn-1'
+    ))).toBe(true);
+  });
+
   it('does not acquire terminal control when the initial prompt cannot be persisted', () => {
     const sessions = new FakeSessions();
     sessions.failThreadEvents = true;

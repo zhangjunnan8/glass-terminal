@@ -3,6 +3,7 @@ import type { WebContents } from 'electron';
 import type { HostStore } from '../hosts/host-store';
 import type { RenameSessionRequest, SessionRecord } from '../../shared/session';
 import type { SessionAuditEvent } from '../../shared/session';
+import type { AgentBackendRef } from '../../shared/agent';
 import type { TerminalDescriptor } from '../../shared/terminal';
 import type { TerminalService } from '../terminal/terminal-service';
 import { SessionStore } from './session-store';
@@ -91,6 +92,22 @@ export class SessionManager {
 
   bindAgentThread(sessionId: string, providerId: string, threadId: string): SessionRecord {
     return this.store.bindAgentThread(sessionId, providerId, threadId);
+  }
+
+  bindAgentBackendThread(
+    sessionId: string,
+    backend: AgentBackendRef,
+    threadId: string,
+  ): SessionRecord {
+    return this.store.bindAgentBackendThread(sessionId, backend, threadId);
+  }
+
+  bindProviderThread(
+    sessionId: string,
+    localThreadId: string,
+    providerThreadId: string,
+  ): SessionRecord {
+    return this.store.bindProviderThread(sessionId, localThreadId, providerThreadId);
   }
 
   appendThreadEvent(

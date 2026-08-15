@@ -12,11 +12,14 @@ import {
 import { dirname, isAbsolute, join } from 'node:path';
 import type {
   CodexAccountInfo,
+  CodexAgentIsolationState,
+  CodexAgentIsolationViolation,
   CodexAppServerSelection,
   CodexAppServerSnapshot,
   CodexExecutableInfo,
   CodexModelInfo,
   SaveCodexAppServerSelectionRequest,
+  SetCodexTerminalAgentEnabledRequest,
 } from '../../shared/codex-app-server';
 import {
   launchCodexAppServer,
@@ -26,8 +29,13 @@ import type {
   AppServerNotification,
   CodexAppServerLaunchOptions,
 } from './app-server-client';
+import { CodexAppServerTurnRunner } from './app-server-turn-runner';
+import type {
+  RunCodexTurnInput,
+  RunCodexTurnResult,
+} from './app-server-turn-runner';
 
-const TERMINAL_AGENT_BLOCK_REASON = 'App Server 暂时无法硬性关闭内建 Shell/File 工具；为保证所有命令只进入同一可见终端，终端 Agent 链路保持禁用。';
+const TERMINAL_AGENT_POLICY_REASON = '实验隔离模式强制使用空 environments，并只向 App Server 暴露 terminal_read、terminal_state、terminal_execute；任何内建命令或文件事件都会中断并锁停。';
 const PROBE_TIMEOUT_MS = 5_000;
 
 interface StoredAppServerConfig {
@@ -35,6 +43,8 @@ interface StoredAppServerConfig {
   modelId?: string;
   reasoningEffort?: string;
   bound: boolean;
+  terminalAgentEnabled: boolean;
+  lastAgentViolation?: CodexAgentIsolationViolation;
 }
 
 interface ExecutableCandidate {
@@ -96,6 +106,33 @@ function cloneSnapshot(snapshot: CodexAppServerSnapshot): CodexAppServerSnapshot
     })),
     selection: snapshot.selection ? { ...snapshot.selection } : undefined,
     pendingLogin: snapshot.pendingLogin ? { ...snapshot.pendingLogin } : undefined,
+    agentIsolation: {
+      ...snapshot.agentIsolation,
+      acceptedClientTools: [...snapshot.agentIsolation.acceptedClientTools],
+      lastViolation: snapshot.agentIsolation.lastViolation
+        ? { ...snapshot.agentIsolation.lastViolation }
+        : undefined,
+    },
+  };
+}
+
+function parseAgentViolation(value: unknown): CodexAgentIsolationViolation | undefined {
+  if (!isRecord(value)) return undefined;
+  const kinds: CodexAgentIsolationViolation['kind'][] = [
+    'command-execution',
+    'file-change',
+    'permission-request',
+    'protocol',
+  ];
+  if (
+    typeof value.detectedAt !== 'string'
+    || typeof value.detail !== 'string'
+    || !kinds.includes(value.kind as CodexAgentIsolationViolation['kind'])
+  ) return undefined;
+  return {
+    detectedAt: value.detectedAt,
+    kind: value.kind as CodexAgentIsolationViolation['kind'],
+    detail: value.detail.slice(0, 1_000),
   };
 }
 
@@ -106,6 +143,10 @@ function parseConfig(value: unknown): StoredAppServerConfig {
     modelId: optionalText(value.modelId),
     reasoningEffort: optionalText(value.reasoningEffort),
     bound: value.bound === true,
+    // Experimental terminal access is intentionally process-scoped. A stale
+    // file must never auto-enable it after a crash or failed violation write.
+    terminalAgentEnabled: false,
+    lastAgentViolation: parseAgentViolation(value.lastAgentViolation),
   };
 }
 
@@ -288,6 +329,7 @@ export class CodexAppServerService {
   private readonly listeners = new Set<(snapshot: CodexAppServerSnapshot) => void>();
   private readonly dependencies: CodexAppServerDependencies;
   private readonly runtimeRoot: string;
+  private readonly turnRunner: CodexAppServerTurnRunner;
 
   constructor(
     private readonly configPath: string,
@@ -299,6 +341,14 @@ export class CodexAppServerService {
   ) {
     this.config = this.readConfig();
     this.runtimeRoot = join(dirname(configPath), 'codex-app-server-runtime');
+    this.turnRunner = new CodexAppServerTurnRunner(
+      join(this.runtimeRoot, 'agent-sandbox'),
+      {
+        onIsolationViolation: ({ kind, detail }) => {
+          this.recordAgentIsolationViolation({ kind, detail });
+        },
+      },
+    );
     this.dependencies = {
       ...defaultDependencies(applicationRoot, resourcesPath, clientVersion, openExternal),
       ...dependencies,
@@ -318,12 +368,36 @@ export class CodexAppServerService {
       bound: this.config.bound,
       error: this.initialConfigError,
       terminalAgentEnabled: false,
-      terminalAgentReason: TERMINAL_AGENT_BLOCK_REASON,
+      terminalAgentReason: '请先启动 App Server、完成登录并保存模型。',
+      agentIsolation: {
+        policyVersion: 1,
+        experimental: true,
+        userEnabled: this.config.terminalAgentEnabled,
+        availability: this.config.lastAgentViolation ? 'blocked' : 'unavailable',
+        acceptedClientTools: ['terminal_read', 'terminal_state', 'terminal_execute'],
+        environmentAccessDisabled: true,
+        enforcement: 'empty-environment-plus-deny-and-interrupt',
+        reason: this.config.lastAgentViolation
+          ? '检测到 App Server 越过隔离边界；必须由用户重新确认后才能启用。'
+          : '请先启动 App Server、完成登录并保存模型。',
+        lastViolation: this.config.lastAgentViolation,
+      },
     };
   }
 
   getState(): CodexAppServerSnapshot {
     return cloneSnapshot(this.snapshot);
+  }
+
+  runTerminalAgentTurn(input: RunCodexTurnInput): Promise<RunCodexTurnResult> {
+    if (!this.snapshot.terminalAgentEnabled) {
+      return Promise.reject(new Error(this.snapshot.terminalAgentReason));
+    }
+    return this.turnRunner.run(input);
+  }
+
+  interruptTerminalAgentTurn(): Promise<void> {
+    return this.turnRunner.interrupt();
   }
 
   onStateChanged(listener: (snapshot: CodexAppServerSnapshot) => void): () => void {
@@ -548,12 +622,17 @@ export class CodexAppServerService {
     const connection = this.requireConnection();
     const generation = this.connectionGeneration;
     this.update({ operation: 'logging-out', error: undefined });
+    void this.turnRunner.interrupt().catch(() => undefined);
     try {
       await connection.request('account/logout');
       this.assertConnectionCurrent(connection, generation);
       this.pendingLoginId = undefined;
       this.pendingLoginUrl = undefined;
-      const nextConfig = { ...this.config, bound: false };
+      const nextConfig = {
+        ...this.config,
+        bound: false,
+        terminalAgentEnabled: false,
+      };
       let persistenceError: string | undefined;
       try {
         this.writeConfig(nextConfig);
@@ -606,10 +685,79 @@ export class CodexAppServerService {
     return this.getState();
   }
 
+  setTerminalAgentEnabled(
+    request: SetCodexTerminalAgentEnabledRequest,
+  ): CodexAppServerSnapshot {
+    if (this.disposed) throw new Error('Codex App Server 服务已关闭。');
+    if (!request || typeof request.enabled !== 'boolean') {
+      throw new Error('App Server Agent 隔离设置无效。');
+    }
+    if (request.enabled && request.acknowledgementVersion !== 1) {
+      throw new Error('启用实验模式前必须确认当前隔离边界。');
+    }
+    if (request.enabled && !this.agentPrerequisitesReady()) {
+      throw new Error('请先启动 App Server、完成登录并保存当前模型。');
+    }
+    const nextConfig: StoredAppServerConfig = {
+      ...this.config,
+      terminalAgentEnabled: request.enabled,
+      lastAgentViolation: request.enabled ? undefined : this.config.lastAgentViolation,
+    };
+    if (!request.enabled) {
+      // Disabling is a fail-closed runtime action. Revoke the capability and
+      // abort the active turn before attempting any fallible persistence so a
+      // read-only/full disk cannot keep the Agent alive against the user's
+      // explicit request. The durable form is false regardless.
+      this.config = nextConfig;
+      this.update({ error: undefined });
+      void this.turnRunner.interrupt().catch((error) => {
+        this.update({
+          error: `实验后端已停用，但中断当前 App Server Turn 失败：${this.actionError(error)}`,
+        });
+      });
+      try {
+        this.writeConfig(nextConfig);
+      } catch (error) {
+        this.update({
+          error: `实验后端已在当前进程停用，但配置写入失败：${this.actionError(error)}`,
+        });
+      }
+      return this.getState();
+    }
+
+    this.writeConfig(nextConfig);
+    this.config = nextConfig;
+    this.update({ error: undefined });
+    return this.getState();
+  }
+
+  recordAgentIsolationViolation(
+    violation: Omit<CodexAgentIsolationViolation, 'detectedAt'> & { detectedAt?: string },
+  ): void {
+    const recorded: CodexAgentIsolationViolation = {
+      detectedAt: violation.detectedAt ?? new Date().toISOString(),
+      kind: violation.kind,
+      detail: violation.detail.slice(0, 1_000),
+    };
+    const nextConfig: StoredAppServerConfig = {
+      ...this.config,
+      terminalAgentEnabled: false,
+      lastAgentViolation: recorded,
+    };
+    try {
+      this.writeConfig(nextConfig);
+    } catch (error) {
+      console.error('Unable to persist App Server isolation violation:', error);
+    }
+    this.config = nextConfig;
+    this.update({ error: `App Server Agent 已因隔离违规锁停：${recorded.detail}` });
+  }
+
   close(): void {
     if (this.disposed) return;
     this.disposed = true;
     this.refreshAgain = false;
+    this.turnRunner.close();
     this.disconnect();
     this.completedLogins.clear();
     this.update({
@@ -679,8 +827,10 @@ export class CodexAppServerService {
     try {
       const codexHome = join(this.runtimeRoot, 'codex-home');
       const workingDirectory = join(this.runtimeRoot, 'server-cwd');
+      const agentSandbox = join(this.runtimeRoot, 'agent-sandbox');
       mkdirSync(codexHome, { recursive: true, mode: 0o700 });
       mkdirSync(workingDirectory, { recursive: true, mode: 0o700 });
+      mkdirSync(agentSandbox, { recursive: true, mode: 0o700 });
       const connection = await this.dependencies.launch(
         selected.path,
         this.dependencies.clientVersion,
@@ -691,6 +841,7 @@ export class CodexAppServerService {
         connection.close();
         return this.getState();
       }
+      this.turnRunner.attach(connection);
       this.connection = connection;
       this.removeNotificationListener = connection.onNotification((notification) => {
         if (this.isGenerationCurrent(generation)) this.handleNotification(notification);
@@ -709,7 +860,9 @@ export class CodexAppServerService {
     } catch (error) {
       if (this.isGenerationCurrent(generation)) {
         if (launchedConnection) {
-          this.disconnect();
+          try { this.turnRunner.detach(); } catch { /* best-effort */ }
+          try { launchedConnection.close(); } catch { /* best-effort */ }
+          this.connection = undefined;
         }
         this.update({
           phase: 'error',
@@ -774,6 +927,9 @@ export class CodexAppServerService {
     const bound = Boolean(account || !requiresOpenaiAuth)
       && Boolean(configured)
       && this.config.bound;
+    if (this.snapshot.terminalAgentEnabled && !bound) {
+      void this.turnRunner.interrupt().catch(() => undefined);
+    }
     this.update({
       account,
       requiresOpenaiAuth,
@@ -869,6 +1025,11 @@ export class CodexAppServerService {
   private disconnect(): void {
     this.connectionGeneration += 1;
     try {
+      this.turnRunner.detach();
+    } catch {
+      // Runner invalidation is best effort during a lifecycle transition.
+    }
+    try {
       this.removeNotificationListener?.();
     } catch {
       // Listener cleanup must not prevent the child from being terminated.
@@ -960,6 +1121,7 @@ export class CodexAppServerService {
   ): void {
     if (!this.isGenerationCurrent(generation) || this.connection !== connection) return;
     this.connectionGeneration += 1;
+    try { this.turnRunner.detach(); } catch { /* the connection is already dead */ }
     try {
       this.removeNotificationListener?.();
     } catch {
@@ -1005,10 +1167,17 @@ export class CodexAppServerService {
   }
 
   private update(patch: Partial<CodexAppServerSnapshot>): void {
-    this.snapshot = {
+    const next = {
       ...this.snapshot,
       ...patch,
       revision: this.snapshot.revision + 1,
+    };
+    const agentIsolation = this.agentIsolationState(next);
+    this.snapshot = {
+      ...next,
+      terminalAgentEnabled: agentIsolation.availability === 'enabled',
+      terminalAgentReason: agentIsolation.reason,
+      agentIsolation,
     };
     const cloned = this.getState();
     for (const listener of this.listeners) {
@@ -1020,13 +1189,66 @@ export class CodexAppServerService {
     }
   }
 
+  private agentPrerequisitesReady(snapshot = this.snapshot): boolean {
+    return snapshot.phase === 'ready'
+      && snapshot.bound
+      && Boolean(snapshot.selection)
+      && (Boolean(snapshot.account) || snapshot.requiresOpenaiAuth === false);
+  }
+
+  private agentIsolationState(
+    snapshot: CodexAppServerSnapshot,
+  ): CodexAgentIsolationState {
+    const base = {
+      policyVersion: 1 as const,
+      experimental: true as const,
+      userEnabled: this.config.terminalAgentEnabled,
+      acceptedClientTools: [
+        'terminal_read',
+        'terminal_state',
+        'terminal_execute',
+      ] as ['terminal_read', 'terminal_state', 'terminal_execute'],
+      environmentAccessDisabled: true as const,
+      enforcement: 'empty-environment-plus-deny-and-interrupt' as const,
+      lastViolation: this.config.lastAgentViolation,
+    };
+    if (this.config.lastAgentViolation) {
+      return {
+        ...base,
+        availability: 'blocked',
+        reason: '检测到 App Server 越过隔离边界；请审阅记录并重新确认后再启用。',
+      };
+    }
+    if (!this.agentPrerequisitesReady(snapshot)) {
+      return {
+        ...base,
+        availability: 'unavailable',
+        reason: '请先启动 App Server、完成所需登录并保存当前模型。',
+      };
+    }
+    if (this.config.terminalAgentEnabled) {
+      return {
+        ...base,
+        availability: 'enabled',
+        reason: TERMINAL_AGENT_POLICY_REASON,
+      };
+    }
+    return {
+      ...base,
+      availability: 'eligible',
+      reason: '服务与模型已就绪；确认实验隔离边界后可启用终端智能体。',
+    };
+  }
+
   private readConfig(): StoredAppServerConfig {
     try {
       return parseConfig(JSON.parse(readFileSync(this.configPath, 'utf8')));
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { bound: false };
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { bound: false, terminalAgentEnabled: false };
+      }
       this.initialConfigError = `App Server 配置已损坏并被忽略，可从界面重新绑定：${this.actionError(error)}`;
-      return { bound: false };
+      return { bound: false, terminalAgentEnabled: false };
     }
   }
 
@@ -1038,6 +1260,10 @@ export class CodexAppServerService {
       modelId: config.modelId,
       reasoningEffort: config.reasoningEffort,
       bound: config.bound,
+      // Requiring a fresh UI acknowledgement on each app launch is the
+      // durable fail-closed fallback if a violation cannot be persisted.
+      terminalAgentEnabled: false,
+      lastAgentViolation: config.lastAgentViolation,
     };
     writeFileSync(temporaryPath, `${JSON.stringify(persisted, null, 2)}\n`, {
       encoding: 'utf8',

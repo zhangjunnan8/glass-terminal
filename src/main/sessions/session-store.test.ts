@@ -105,4 +105,26 @@ describe('SessionStore', () => {
     expect(store.readAudit(session.id).filter((event) => event.type === 'session_renamed'))
       .toHaveLength(1);
   });
+
+  it('persists the local and upstream thread mapping for the isolated App Server backend', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    const localThreadId = '22222222-2222-2222-2222-222222222222';
+
+    store.bindAgentBackendThread(session.id, {
+      kind: 'codex-app-server-isolated',
+      policyVersion: 1,
+    }, localThreadId);
+    store.bindProviderThread(session.id, localThreadId, 'upstream-thread-opaque');
+
+    const restored = new SessionStore(root).get(session.id);
+    expect(restored.aiThreadId).toBe(localThreadId);
+    expect(restored.agentBackend).toEqual({
+      kind: 'codex-app-server-isolated',
+      policyVersion: 1,
+    });
+    expect(restored.providerId).toBeUndefined();
+    expect(restored.providerThreadId).toBe('upstream-thread-opaque');
+  });
 });

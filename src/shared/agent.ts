@@ -13,6 +13,19 @@ export type AgentRuntimeState =
 
 export type TerminalInputMode = 'human' | 'locked' | 'secure-human';
 
+export const CODEX_APP_SERVER_AGENT_BACKEND = 'codex-app-server-isolated' as const;
+export const CODEX_APP_SERVER_AGENT_POLICY_VERSION = 1 as const;
+
+export type AgentBackendRef =
+  | {
+    kind: 'generic-provider';
+    providerId: string;
+  }
+  | {
+    kind: typeof CODEX_APP_SERVER_AGENT_BACKEND;
+    policyVersion: typeof CODEX_APP_SERVER_AGENT_POLICY_VERSION;
+  };
+
 export type CommandActor = 'ai' | 'user_modified_ai_command';
 export type CommandExecutionStatus =
   | 'running'
@@ -61,6 +74,8 @@ export interface AgentSessionView {
   terminalId: string;
   sessionId: string;
   threadId: string;
+  backend: AgentBackendRef;
+  /** @deprecated Kept for persisted Alpha clients; use backend instead. */
   providerId: string;
   state: AgentRuntimeState;
   terminalInputMode: TerminalInputMode;
@@ -88,6 +103,8 @@ export interface PendingTakeover {
 export interface SendAgentPromptRequest {
   terminalId: string;
   prompt: string;
+  backend?: AgentBackendRef;
+  /** @deprecated Use backend. */
   providerId?: string;
 }
 
@@ -101,6 +118,8 @@ export interface ResolveApprovalRequest {
 export interface SetFullTakeoverRequest {
   terminalId: string;
   enabled: boolean;
+  backend?: AgentBackendRef;
+  /** @deprecated Use backend. */
   providerId?: string;
   approvalId?: string;
   editedCommand?: string;

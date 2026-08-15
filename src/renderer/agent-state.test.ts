@@ -8,6 +8,7 @@ function view(revision: number, state: AgentSessionView['state']): AgentSessionV
     terminalId: 'terminal',
     sessionId: 'session',
     threadId: 'thread',
+    backend: { kind: 'generic-provider', providerId: 'provider' },
     providerId: 'provider',
     state,
     terminalInputMode: state === 'PAUSED' ? 'human' : 'locked',

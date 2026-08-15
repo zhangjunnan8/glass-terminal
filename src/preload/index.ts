@@ -107,6 +107,10 @@ const codexAppServerBridge: DesktopBridge['codexAppServer'] = {
     CODEX_APP_SERVER_CHANNELS.saveSelection,
     request,
   ),
+  setTerminalAgentEnabled: (request) => ipcRenderer.invoke(
+    CODEX_APP_SERVER_CHANNELS.setTerminalAgentEnabled,
+    request,
+  ),
   onStateChanged: (listener) => {
     const handler = (
       _event: Electron.IpcRendererEvent,
