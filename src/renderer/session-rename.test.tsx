@@ -221,4 +221,106 @@ describe('renderer host and session dialogs', () => {
       .toContain('无法保存会话名称');
   });
 
+  it('requires an unsaved password and leaves credential saving unchecked by default', async () => {
+    const bridge = bridgeWith(vi.fn());
+    await renderSelectedHost(bridge);
+
+    const connectButton = [...container.querySelectorAll<HTMLButtonElement>(
+      '.selected-host-card button',
+    )].find((button) => button.textContent === '连接');
+    expect(connectButton).toBeDefined();
+    await act(async () => connectButton!.click());
+
+    const dialog = container.querySelector<HTMLFormElement>('[data-testid="ssh-connect-dialog"]');
+    const password = dialog?.elements.namedItem('password') as HTMLInputElement | null;
+    const saveCredential = dialog?.elements.namedItem('saveCredential') as HTMLInputElement | null;
+    expect(password?.required).toBe(true);
+    expect(password?.placeholder).toBe('请输入 SSH 密码');
+    expect(saveCredential?.checked).toBe(false);
+  });
+
+  it('passes an entered password and saveCredential=true only after the user opts in', async () => {
+    const bridge = bridgeWith(vi.fn());
+    const connectedTerminal = {
+      id: 'ssh-terminal-2',
+      title: host.name,
+      profileId: 'ssh-host-1',
+      shellKind: 'posix' as const,
+      transport: 'ssh' as const,
+      hostId: host.id,
+    };
+    vi.mocked(bridge.terminal.connectSsh).mockResolvedValue({
+      status: 'connected',
+      terminal: connectedTerminal,
+    });
+    await renderSelectedHost(bridge);
+
+    const connectButton = [...container.querySelectorAll<HTMLButtonElement>(
+      '.selected-host-card button',
+    )].find((button) => button.textContent === '连接')!;
+    await act(async () => connectButton.click());
+    const dialog = container.querySelector<HTMLFormElement>('[data-testid="ssh-connect-dialog"]')!;
+    const password = dialog.elements.namedItem('password') as HTMLInputElement;
+    const saveCredential = dialog.elements.namedItem('saveCredential') as HTMLInputElement;
+
+    await act(async () => setInputValue(password, 'memory-only-password'));
+    await act(async () => saveCredential.click());
+    await act(async () => dialog.requestSubmit());
+    await settle();
+
+    expect(bridge.terminal.connectSsh).toHaveBeenCalledWith({
+      hostId: host.id,
+      sessionId: undefined,
+      password: 'memory-only-password',
+      passphrase: undefined,
+      saveCredential: true,
+      trustHostKey: undefined,
+    });
+  });
+
+  it('allows an empty password and checks credential saving for a saved host', async () => {
+    const savedHost = { ...host, credentialConfigured: true };
+    const bridge = bridgeWith(vi.fn());
+    vi.mocked(bridge.hosts.list).mockResolvedValue([savedHost]);
+    await renderSelectedHost(bridge);
+
+    const connectButton = [...container.querySelectorAll<HTMLButtonElement>(
+      '.selected-host-card button',
+    )].find((button) => button.textContent === '连接')!;
+    await act(async () => connectButton.click());
+
+    const dialog = container.querySelector<HTMLFormElement>('[data-testid="ssh-connect-dialog"]')!;
+    const password = dialog.elements.namedItem('password') as HTMLInputElement;
+    const saveCredential = dialog.elements.namedItem('saveCredential') as HTMLInputElement;
+    expect(password.required).toBe(false);
+    expect(password.placeholder).toBe('留空使用已保存密码');
+    expect(password.value).toBe('');
+    expect(saveCredential.checked).toBe(true);
+  });
+
+  it('forgets a saved credential through the bridge and refreshes the host state', async () => {
+    const savedHost = { ...host, credentialConfigured: true };
+    const bridge = bridgeWith(vi.fn());
+    vi.mocked(bridge.hosts.list)
+      .mockReset()
+      .mockResolvedValueOnce([savedHost])
+      .mockResolvedValue([{ ...savedHost, credentialConfigured: false }]);
+    vi.mocked(bridge.hosts.forgetCredential).mockResolvedValue(undefined);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    await renderSelectedHost(bridge);
+
+    const forget = container.querySelector<HTMLButtonElement>(
+      '.selected-host-card [data-action="forget-host-credential"]',
+    );
+    expect(forget).not.toBeNull();
+    await act(async () => forget!.click());
+    await settle();
+
+    expect(bridge.hosts.forgetCredential).toHaveBeenCalledWith(host.id);
+    expect(bridge.hosts.list).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('.host-credential-row')?.textContent).toContain('未保存');
+    expect(container.querySelector('.host-credential-message[role="status"]')?.textContent)
+      .toContain('已从 Windows 凭据管理器删除');
+  });
+
 });

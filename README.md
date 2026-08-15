@@ -22,6 +22,9 @@ visible PTY or SSH shell.
 - Agent commands never execute in a hidden convenience shell.
 - Human approval is the default; full takeover is explicit and reversible.
 - Credentials are excluded from model context and plaintext logs.
+- SSH passwords/private-key passphrases are session-only by default; an
+  explicit UI option stores them in the current user's Windows Credential
+  Manager for password-free reconnects.
 - No telemetry.
 
 ## Development

@@ -165,6 +165,11 @@ button { border: 0; }
 .selected-host-card > div { display: flex; gap: 5px; margin-top: 10px; }
 .selected-host-card button { min-height: 32px; padding: 6px 8px; color: #b4c0cf; border: 1px solid #2a384b; border-radius: 3px; background: #151f2c; cursor: pointer; font-size: 13px; }
 .selected-host-card .danger-text { margin-left: auto; color: #e7838b; }
+.selected-host-card > .host-credential-row { align-items: center; justify-content: space-between; }
+.host-credential-row small { color: #8fa0b5; font-size: 13px; }
+.selected-host-card .host-credential-row button { color: #e1b77e; border-color: #59462c; }
+.selected-host-card > .host-credential-message { display: block; margin-top: 9px; padding: 8px; color: #aadccf; border: 1px solid #285344; border-radius: 4px; background: #0c211a; font-size: 13px; line-height: 1.45; }
+.host-credential-message.error { color: #f1a0a6; border-color: #5b3038; background: #2a151a; }
 .selected-host-card > .host-session-history { display: block; padding-top: 8px; border-top: 1px solid #202c3c; }
 .host-session-history > small { color: #7b8a9e; font-size: 12px; letter-spacing: .03em; }
 .session-history-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 0; border-bottom: 1px solid #182331; }
@@ -561,6 +566,10 @@ button { border: 0; }
 .codex-agent-confirm-check input { width: 20px !important; height: 20px !important; margin: 1px 0 0; flex: 0 0 20px; accent-color: #67d2b0; }
 .codex-agent-confirm-check span { min-width: 0; }
 .connection-summary { margin-bottom: 14px; padding: 10px; color: #a0b2c7; border: 1px solid #253346; border-radius: 4px; background: #0b121b; font: 13px "Cascadia Code", Consolas, monospace; }
+.modal .credential-save-check { display: flex; height: auto; margin-top: 13px; flex-direction: row; align-items: center; gap: 9px; color: #c4d0df; font-size: 14px; cursor: pointer; }
+.modal .credential-save-check input { width: 18px; height: 18px; flex: 0 0 18px; accent-color: #67d2b0; }
+.credential-forget-button { min-height: 34px; padding: 7px 10px; color: #e1b77e; border: 1px solid #59462c; border-radius: 4px; background: #251d11; cursor: pointer; font-size: 13px; }
+.credential-forget-button:disabled { cursor: not-allowed; opacity: .55; }
 .secure-note { padding-left: 16px; position: relative; }
 .secure-note::before { content: "◆"; position: absolute; left: 0; color: #5ed0ae; }
 .form-error { margin-top: 11px; padding: 9px; color: #f1a0a6; border: 1px solid #5b3038; border-radius: 4px; background: #2a151a; font-size: 13px; word-break: break-word; }

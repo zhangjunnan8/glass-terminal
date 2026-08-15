@@ -15,12 +15,21 @@
   and reject mismatches.
 - Initial-output buffering so the remote banner/prompt cannot race ahead of the
   xterm attachment.
-- Passwords and passphrases are connection-only values and never enter Host
-  JSON. The smoke-data secret scan passed.
+- Passwords and passphrases never enter Host JSON, Session data, terminal logs,
+  or Audit. The connection dialog can explicitly save/update them in the
+  current user's Windows Credential Manager; only an opaque reference and
+  `credentialConfigured` flag are retained in Host metadata.
+- Saved credentials can be used by leaving the reconnect field empty and can
+  be removed entirely through the UI. Changing hostname, port, username,
+  authentication method, or private-key identity retires the old credential
+  before the new Host identity can use it.
 
 ## Tests run
 
-- HostStore unit tests, including non-secret persistence and fingerprint pinning.
+- HostStore and HostService unit tests, including non-secret persistence,
+  fingerprint pinning, opt-in credential save/reuse/removal, stale-reference
+  retirement, identity changes, and partial-failure rollback. Automated tests
+  use only the in-memory secret adapter and never touch real Windows credentials.
 - Existing shell discovery and product tests.
 - Real SSH integration against the designated Ubuntu VM:
   unknown-key rejection, explicit trust, password login, PTY allocation,
@@ -41,6 +50,4 @@ created or changed.
 
 - ProxyJump and SSH config import remain for the later management milestone.
 - Host search UI is present but filtering is not wired yet.
-- Persistent credentials wait for the Windows Credential Manager adapter; the
-  current safe default is session-memory-only.
 - Milestone 3 adds temporary-to-formal Session upgrade and durable history.

@@ -50,11 +50,16 @@ interface TerminalTab extends TerminalDescriptor {
 interface ConnectionSecret {
   password?: string;
   passphrase?: string;
+  saveCredential?: boolean;
 }
 
 interface CodexUiMessage {
   tone: 'success' | 'error';
   text: string;
+}
+
+interface HostCredentialMessage extends CodexUiMessage {
+  hostId: string;
 }
 
 interface TrustChallenge {
@@ -146,6 +151,7 @@ export function App() {
   const codexAgentConfirmationRef = useRef<HTMLDivElement>(null);
   const agentBodyRef = useRef<HTMLDivElement>(null);
   const agentStickToBottomRef = useRef(true);
+  const sshConnectionLock = useRef(false);
   const [agentStates, setAgentStates] = useState<Record<string, AgentSessionView>>({});
   const [agentBackendChoices, setAgentBackendChoices] = useState<Record<string, AgentBackendKind>>({});
   const [agentUpdatesBelow, setAgentUpdatesBelow] = useState(false);
@@ -162,6 +168,9 @@ export function App() {
   const [fullTakeoverChallenge, setFullTakeoverChallenge] = useState<FullTakeoverChallenge | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [sshConnectionPending, setSshConnectionPending] = useState(false);
+  const [hostCredentialMessage, setHostCredentialMessage] = useState<HostCredentialMessage | null>(null);
+  const [credentialActionPending, setCredentialActionPending] = useState(false);
 
   useEffect(() => {
     void window.aiTerminal.runtime.getInfo().then(setRuntime);
@@ -428,7 +437,9 @@ export function App() {
   }
 
   async function refreshHosts() {
-    setHosts(await window.aiTerminal.hosts.list());
+    const next = await window.aiTerminal.hosts.list();
+    setHosts(next);
+    return next;
   }
 
   async function refreshSessions() {
@@ -737,6 +748,13 @@ export function App() {
     };
     try {
       const saved = await window.aiTerminal.hosts.save(input);
+      if (editingHost?.credentialConfigured && !saved.credentialConfigured) {
+        setHostCredentialMessage({
+          hostId: saved.id,
+          tone: 'success',
+          text: 'SSH 连接身份已变更，旧的已保存凭据已停用。',
+        });
+      }
       await refreshHosts();
       setSelectedHostId(saved.id);
       setEditingHost(undefined);
@@ -747,9 +765,50 @@ export function App() {
 
   async function removeHost(host: HostProfile) {
     if (!window.confirm(`确定删除主机“${host.name}”吗？`)) return;
-    await window.aiTerminal.hosts.remove(host.id);
-    if (selectedHostId === host.id) setSelectedHostId(null);
-    await refreshHosts();
+    try {
+      await window.aiTerminal.hosts.remove(host.id);
+      if (selectedHostId === host.id) setSelectedHostId(null);
+      setHostCredentialMessage(null);
+      await refreshHosts();
+    } catch (error) {
+      setHostCredentialMessage({
+        hostId: host.id,
+        tone: 'error',
+        text: errorMessage(error),
+      });
+    }
+  }
+
+  function openSshConnection(host: HostProfile, sessionId?: string) {
+    setConnectionError(null);
+    setReconnectingSessionId(sessionId ?? null);
+    setConnectingHost(host);
+  }
+
+  async function forgetHostCredential(host: HostProfile) {
+    if (credentialActionPending) return;
+    if (!window.confirm(`确定删除“${host.name}”已保存的 SSH 凭据吗？`)) return;
+    setCredentialActionPending(true);
+    setConnectionError(null);
+    try {
+      await window.aiTerminal.hosts.forgetCredential(host.id);
+      const nextHosts = await refreshHosts();
+      const updated = nextHosts.find((candidate) => candidate.id === host.id);
+      setConnectingHost((current) => (
+        current?.id === host.id && updated ? updated : current
+      ));
+      setHostCredentialMessage({
+        hostId: host.id,
+        tone: 'success',
+        text: '已从 Windows 凭据管理器删除 SSH 凭据。',
+      });
+    } catch (error) {
+      const message = errorMessage(error);
+      setConnectionError(message);
+      setHostCredentialMessage({ hostId: host.id, tone: 'error', text: message });
+    } finally {
+      setCredentialActionPending(false);
+    }
   }
 
   async function establishSsh(
@@ -758,6 +817,9 @@ export function App() {
     trustHostKey?: string,
     sessionId = reconnectingSessionId ?? undefined,
   ) {
+    if (sshConnectionLock.current) return;
+    sshConnectionLock.current = true;
+    setSshConnectionPending(true);
     setConnectionError(null);
     try {
       const result = await window.aiTerminal.terminal.connectSsh({
@@ -775,10 +837,33 @@ export function App() {
       setConnectingHost(null);
       setReconnectingSessionId(null);
       setTrustChallenge(null);
-      await refreshHosts();
+      const nextHosts = await refreshHosts();
       await refreshSessions();
+      const updatedHost = nextHosts.find((candidate) => candidate.id === host.id);
+      if (result.credentialWarning) {
+        setHostCredentialMessage({
+          hostId: host.id,
+          tone: 'error',
+          text: result.credentialWarning,
+        });
+      } else if (secret.saveCredential && updatedHost?.credentialConfigured) {
+        setHostCredentialMessage({
+          hostId: host.id,
+          tone: 'success',
+          text: 'SSH 凭据已安全保存到当前用户的 Windows 凭据管理器。',
+        });
+      } else if (secret.saveCredential && !updatedHost?.credentialConfigured) {
+        setHostCredentialMessage({
+          hostId: host.id,
+          tone: 'error',
+          text: '本次连接没有可保存的密码或私钥口令。',
+        });
+      }
     } catch (error) {
       setConnectionError(errorMessage(error));
+    } finally {
+      sshConnectionLock.current = false;
+      setSshConnectionPending(false);
     }
   }
 
@@ -789,6 +874,7 @@ export function App() {
     void establishSsh(connectingHost, {
       password: String(data.get('password') ?? '') || undefined,
       passphrase: String(data.get('passphrase') ?? '') || undefined,
+      saveCredential: data.get('saveCredential') === 'on',
     });
   }
 
@@ -877,12 +963,30 @@ export function App() {
             <span>{authMethodLabel(selectedHost.authMethod)} · {selectedHost.hostKeyFingerprint ? '已信任' : '未验证'}</span>
             <div>
               <button onClick={() => {
-                setReconnectingSessionId(null);
-                setConnectingHost(selectedHost);
+                openSshConnection(selectedHost);
               }}>连接</button>
               <button onClick={() => setEditingHost(selectedHost)}>编辑</button>
               <button className="danger-text" onClick={() => void removeHost(selectedHost)}>删除</button>
             </div>
+            {selectedHost.authMethod !== 'agent' && (
+              <div className="host-credential-row">
+                <small>Windows 凭据：{selectedHost.credentialConfigured ? '已保存' : '未保存'}</small>
+                {selectedHost.credentialConfigured && (
+                  <button
+                    type="button"
+                    data-action="forget-host-credential"
+                    disabled={credentialActionPending}
+                    onClick={() => void forgetHostCredential(selectedHost)}
+                  >{credentialActionPending ? '正在删除…' : '删除凭据'}</button>
+                )}
+              </div>
+            )}
+            {hostCredentialMessage?.hostId === selectedHost.id && (
+              <div
+                className={`host-credential-message ${hostCredentialMessage.tone}`}
+                role={hostCredentialMessage.tone === 'error' ? 'alert' : 'status'}
+              >{hostCredentialMessage.text}</div>
+            )}
             <div className="host-session-history">
               <small>会话历史</small>
               {selectedHostSessions.map((session) => (
@@ -900,8 +1004,7 @@ export function App() {
                       onClick={() => openSessionRename(session)}
                     >重命名</button>
                     <button onClick={() => {
-                      setReconnectingSessionId(session.id);
-                      setConnectingHost(selectedHost);
+                      openSshConnection(selectedHost, session.id);
                     }}>重连</button>
                   </span>
                 </div>
@@ -910,7 +1013,7 @@ export function App() {
             </div>
           </div>
         )}
-        <div className="sidebar-footer">无遥测 · 密码仅保留在内存中</div>
+        <div className="sidebar-footer">无遥测 · SSH 凭据可选保存到 Windows 凭据管理器</div>
       </aside>
 
       <main className="workspace">
@@ -1324,29 +1427,74 @@ export function App() {
 
       {connectingHost && (
         <div className="modal-backdrop">
-          <form className="modal compact-modal" onSubmit={submitConnection}>
+          <form
+            key={`${connectingHost.id}:${connectingHost.credentialConfigured}`}
+            className="modal compact-modal"
+            data-testid="ssh-connect-dialog"
+            onSubmit={submitConnection}
+          >
             <div className="modal-header">
               <strong>连接到 {connectingHost.name}</strong>
               <button type="button" onClick={() => {
                 setConnectingHost(null);
                 setReconnectingSessionId(null);
-              }}>×</button>
+              }} disabled={sshConnectionPending}>×</button>
             </div>
             <div className="connection-summary">{connectingHost.username}@{connectingHost.hostname}:{connectingHost.port}</div>
             {(connectingHost.authMethod === 'password' || connectingHost.authMethod === 'keyboard-interactive') && (
-              <label>密码<input name="password" type="password" autoFocus autoComplete="off" /></label>
+              <label>密码<input
+                name="password"
+                type="password"
+                required={!connectingHost.credentialConfigured}
+                placeholder={connectingHost.credentialConfigured ? '留空使用已保存密码' : '请输入 SSH 密码'}
+                autoFocus
+                autoComplete="off"
+              /></label>
             )}
             {connectingHost.authMethod === 'private-key' && (
-              <label>私钥口令<input name="passphrase" type="password" autoFocus autoComplete="off" /></label>
+              <label>私钥口令<input
+                name="passphrase"
+                type="password"
+                placeholder={connectingHost.credentialConfigured ? '留空使用已保存口令' : '私钥没有口令时可留空'}
+                autoFocus
+                autoComplete="off"
+              /></label>
             )}
-            <p className="secure-note">凭据仅用于本次连接，不会持久化保存。</p>
+            {connectingHost.authMethod !== 'agent' && (
+              <>
+                <label className="credential-save-check">
+                  <input
+                    name="saveCredential"
+                    type="checkbox"
+                    defaultChecked={connectingHost.credentialConfigured}
+                  />
+                  <span>连接成功后保存或更新此凭据</span>
+                </label>
+                <p className="secure-note">
+                  {connectingHost.credentialConfigured
+                    ? '已保存的凭据只由主进程从当前用户的 Windows 凭据管理器读取；密码框可留空。'
+                    : '勾选后仅保存到当前用户的 Windows 凭据管理器，不写入主机、会话、终端或审计日志。'}
+                </p>
+                {connectingHost.credentialConfigured && (
+                  <button
+                    className="credential-forget-button"
+                    type="button"
+                    data-action="forget-host-credential"
+                    disabled={credentialActionPending || sshConnectionPending}
+                    onClick={() => void forgetHostCredential(connectingHost)}
+                  >{credentialActionPending ? '正在删除…' : '删除已保存凭据'}</button>
+                )}
+              </>
+            )}
             {connectionError && <div className="form-error">{connectionError}</div>}
             <div className="modal-actions">
               <button type="button" onClick={() => {
                 setConnectingHost(null);
                 setReconnectingSessionId(null);
-              }}>取消</button>
-              <button className="primary" type="submit">连接</button>
+              }} disabled={sshConnectionPending}>取消</button>
+              <button className="primary" type="submit" disabled={sshConnectionPending}>
+                {sshConnectionPending ? '正在连接…' : '连接'}
+              </button>
             </div>
           </form>
         </div>
@@ -1978,14 +2126,15 @@ export function App() {
               <button onClick={() => {
                 setTrustChallenge(null);
                 setReconnectingSessionId(null);
-              }}>取消</button>
-              <button className="primary" onClick={() => void establishSsh(
+              }} disabled={sshConnectionPending}>取消</button>
+              <button className="primary" disabled={sshConnectionPending} onClick={() => void establishSsh(
                 trustChallenge.host,
                 trustChallenge.secret,
                 trustChallenge.fingerprint,
                 trustChallenge.sessionId,
-              )}>信任并连接</button>
+              )}>{sshConnectionPending ? '正在连接…' : '信任并连接'}</button>
             </div>
+            {connectionError && <div className="form-error" role="alert">{connectionError}</div>}
           </div>
         </div>
       )}
