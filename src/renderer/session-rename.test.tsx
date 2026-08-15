@@ -254,6 +254,28 @@ describe('renderer host and session dialogs', () => {
     expect(container.querySelector('.history-sidebar-row strong')?.textContent).toBe(session.name);
   });
 
+  it('hides and restores the AI panel without destroying the terminal workspace', async () => {
+    const bridge = bridgeWith(vi.fn());
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    const shell = container.querySelector<HTMLElement>('.app-shell')!;
+    expect(shell.dataset.agentPanelVisible).toBe('true');
+    await act(async () => container.querySelector<HTMLButtonElement>(
+      '[data-action="hide-agent-panel"]',
+    )!.click());
+    expect(shell.dataset.agentPanelVisible).toBe('false');
+    expect(container.querySelector('.agent-panel')).toBeNull();
+    expect(container.querySelector('[data-testid="terminal-pane"]')).not.toBeNull();
+
+    await act(async () => container.querySelector<HTMLButtonElement>(
+      '[data-action="show-agent-panel"]',
+    )!.click());
+    expect(shell.dataset.agentPanelVisible).toBe('true');
+    expect(container.querySelector('.agent-panel')).not.toBeNull();
+  });
+
   it('requires an unsaved password and leaves credential saving unchecked by default', async () => {
     const bridge = bridgeWith(vi.fn());
     await renderSelectedHost(bridge);

@@ -1,5 +1,10 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { FormEvent } from 'react';
+import type {
+  CSSProperties,
+  FormEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+} from 'react';
 import type { HostInput, HostProfile } from '../shared/host';
 import type { RuntimeInfo } from '../shared/ipc';
 import { PRODUCT_NAME } from '../shared/product';
@@ -27,6 +32,7 @@ import {
   isAgentOutputNearBottom,
   scrollAgentOutputToBottom,
 } from './agent-scroll';
+import { clampAgentPanelWidth, shouldSubmitAgentComposer } from './agent-ui';
 import {
   agentStateLabel,
   authMethodLabel,
@@ -158,6 +164,8 @@ export function App() {
   const [agentStates, setAgentStates] = useState<Record<string, AgentSessionView>>({});
   const [agentBackendChoices, setAgentBackendChoices] = useState<Record<string, AgentBackendKind>>({});
   const [agentUpdatesBelow, setAgentUpdatesBelow] = useState(false);
+  const [agentPanelVisible, setAgentPanelVisible] = useState(true);
+  const [agentPanelWidth, setAgentPanelWidth] = useState(390);
   const [agentPrompt, setAgentPrompt] = useState('');
   const [editedApprovalCommand, setEditedApprovalCommand] = useState('');
   const [editingHost, setEditingHost] = useState<HostProfile | null | undefined>(undefined);
@@ -315,7 +323,7 @@ export function App() {
   const filteredSessions = normalizedSidebarSearch
     ? sessions.filter((session) => {
       const host = session.hostId ? hosts.find((candidate) => candidate.id === session.hostId) : null;
-      return `${session.name} ${host?.name ?? ''} ${session.effectiveUser ?? ''} ${session.lastKnownCwd ?? ''}`
+      return `${session.name} ${host?.name ?? ''} ${session.effectiveUser ?? ''} ${session.cwd ?? ''}`
         .toLocaleLowerCase('zh-CN').includes(normalizedSidebarSearch);
     })
     : sessions;
@@ -392,7 +400,16 @@ export function App() {
     } else {
       setAgentUpdatesBelow(true);
     }
-  }, [activeId, activeAgent?.revision]);
+  }, [activeId, activeAgent?.revision, agentPanelVisible]);
+
+  useEffect(() => {
+    const clampForViewport = () => {
+      setAgentPanelWidth((current) => clampAgentPanelWidth(current, window.innerWidth));
+    };
+    clampForViewport();
+    window.addEventListener('resize', clampForViewport);
+    return () => window.removeEventListener('resize', clampForViewport);
+  }, []);
 
   function handleAgentBodyScroll() {
     const element = agentBodyRef.current;
@@ -408,6 +425,37 @@ export function App() {
     agentStickToBottomRef.current = true;
     scrollAgentOutputToBottom(element);
     setAgentUpdatesBelow(false);
+  }
+
+  function beginAgentPanelResize(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = agentPanelWidth;
+    const resize = (moveEvent: PointerEvent) => {
+      const requested = startWidth + startX - moveEvent.clientX;
+      setAgentPanelWidth(clampAgentPanelWidth(requested, window.innerWidth));
+    };
+    const stop = () => {
+      document.body.classList.remove('agent-panel-resizing');
+      window.removeEventListener('pointermove', resize);
+      window.removeEventListener('pointerup', stop);
+      window.removeEventListener('pointercancel', stop);
+    };
+    document.body.classList.add('agent-panel-resizing');
+    window.addEventListener('pointermove', resize);
+    window.addEventListener('pointerup', stop, { once: true });
+    window.addEventListener('pointercancel', stop, { once: true });
+  }
+
+  function handleAgentComposerKeyDown(event: ReactKeyboardEvent<HTMLTextAreaElement>) {
+    if (!shouldSubmitAgentComposer({
+      key: event.key,
+      shiftKey: event.shiftKey,
+      isComposing: event.nativeEvent.isComposing,
+    })) return;
+    event.preventDefault();
+    event.currentTarget.form?.requestSubmit();
   }
   const activeInputMode = activeAgent?.terminalInputMode ?? 'human';
   const foregroundRunning = activeAgent?.state === 'PAUSED'
@@ -909,7 +957,12 @@ export function App() {
   }
 
   return (
-    <div className="app-shell" data-locale="zh-CN">
+    <div
+      className={`app-shell ${agentPanelVisible ? '' : 'agent-panel-hidden'}`}
+      data-locale="zh-CN"
+      data-agent-panel-visible={agentPanelVisible ? 'true' : 'false'}
+      style={{ '--agent-panel-width': `${agentPanelWidth}px` } as CSSProperties}
+    >
       <header className="titlebar">
         <div className="brand-mark" aria-hidden="true">&gt;_</div>
         <div className="brand-copy">
@@ -1244,12 +1297,49 @@ export function App() {
           </footer>
         </section>
         {sftpOpen && <SftpDrawer terminal={activeTab} onClose={() => setSftpOpen(false)} />}
+        {!agentPanelVisible && (
+          <button
+            className="show-agent-panel"
+            data-action="show-agent-panel"
+            onClick={() => setAgentPanelVisible(true)}
+          >显示 AI</button>
+        )}
       </main>
 
+      {agentPanelVisible && (
       <aside className="agent-panel">
+        <div
+          className="agent-panel-resizer"
+          role="separator"
+          aria-label="调整 AI 栏宽度"
+          aria-orientation="vertical"
+          aria-valuemin={300}
+          aria-valuemax={720}
+          aria-valuenow={agentPanelWidth}
+          tabIndex={0}
+          onPointerDown={beginAgentPanelResize}
+          onKeyDown={(event) => {
+            if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+            event.preventDefault();
+            const delta = event.key === 'ArrowLeft' ? 24 : -24;
+            setAgentPanelWidth((current) => clampAgentPanelWidth(
+              current + delta,
+              window.innerWidth,
+            ));
+          }}
+        />
         <div className="agent-header">
           <div className="agent-heading">
-            <strong>AI 智能体</strong>
+            <div className="agent-heading-title-row">
+              <strong>AI 智能体</strong>
+              <button
+                type="button"
+                title="隐藏 AI 栏"
+                aria-label="隐藏 AI 栏"
+                data-action="hide-agent-panel"
+                onClick={() => setAgentPanelVisible(false)}
+              >×</button>
+            </div>
             <label className="agent-backend-picker">
               <span>当前智能体后端</span>
               <select
@@ -1442,10 +1532,11 @@ export function App() {
             placeholder="让智能体检查或操作当前终端…"
             value={agentPrompt}
             onChange={(event) => setAgentPrompt(event.target.value)}
+            onKeyDown={handleAgentComposerKeyDown}
             disabled={!selectedAgentBackendReady || !activeTab || activeTab.status !== 'connected' || composerBlocked}
           />
           <div>
-            <span>{activeAgent?.backendTurnDraining
+            <span title="Enter 发送，Shift+Enter 换行">{activeAgent?.backendTurnDraining
               ? '正在等待 App Server 安全停止旧轮次…'
               : selectedAgentBackendReady
               ? activeAgent
@@ -1462,6 +1553,7 @@ export function App() {
           </div>
         </form>
       </aside>
+      )}
 
       {renamingSession && (
         <div className="modal-backdrop" data-testid="rename-session-backdrop">
