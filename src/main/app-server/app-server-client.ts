@@ -10,6 +10,14 @@ export interface AppServerNotification {
   params?: unknown;
 }
 
+export interface AppServerRequest {
+  id: number | string;
+  method: string;
+  params?: unknown;
+}
+
+export type AppServerRequestHandler = (request: AppServerRequest) => unknown | Promise<unknown>;
+
 interface PendingRequest {
   resolve(value: unknown): void;
   reject(error: Error): void;
@@ -20,6 +28,7 @@ export interface AppServerConnection {
   request<T>(method: string, params?: unknown, timeoutMs?: number): Promise<T>;
   notify(method: string, params?: unknown): void;
   onNotification(listener: (notification: AppServerNotification) => void): () => void;
+  onRequest(handler: AppServerRequestHandler): () => void;
   onExit(listener: (error: Error) => void): () => void;
   close(): void;
 }
@@ -50,6 +59,7 @@ export class CodexAppServerClient implements AppServerConnection {
     notification: AppServerNotification,
   ) => void>();
   private readonly exitListeners = new Set<(error: Error) => void>();
+  private requestHandler?: AppServerRequestHandler;
 
   constructor(private readonly child: ChildProcessWithoutNullStreams) {
     child.stdout.setEncoding('utf8');
@@ -114,6 +124,16 @@ export class CodexAppServerClient implements AppServerConnection {
   onNotification(listener: (notification: AppServerNotification) => void): () => void {
     this.notificationListeners.add(listener);
     return () => this.notificationListeners.delete(listener);
+  }
+
+  onRequest(handler: AppServerRequestHandler): () => void {
+    if (this.requestHandler && this.requestHandler !== handler) {
+      throw new Error('Codex App Server 已注册工具请求处理器。');
+    }
+    this.requestHandler = handler;
+    return () => {
+      if (this.requestHandler === handler) this.requestHandler = undefined;
+    };
   }
 
   onExit(listener: (error: Error) => void): () => void {
@@ -194,17 +214,12 @@ export class CodexAppServerClient implements AppServerConnection {
 
     if (typeof message.method !== 'string') return;
     if (typeof message.id === 'number' || typeof message.id === 'string') {
-      try {
-        this.write({
-          id: message.id,
-          error: {
-            code: -32601,
-            message: 'AI Terminal 当前未启用 App Server 工具请求。',
-          },
-        });
-      } catch (error) {
-        this.failTransport(error instanceof Error ? error : new Error(String(error)));
-      }
+      const request: AppServerRequest = {
+        id: message.id,
+        method: message.method,
+        params: message.params,
+      };
+      void this.handleServerRequest(request);
       return;
     }
     const notification = { method: message.method, params: message.params };
@@ -214,6 +229,42 @@ export class CodexAppServerClient implements AppServerConnection {
       } catch {
         // One host listener must not corrupt the stdio protocol loop or starve peers.
       }
+    }
+  }
+
+  private async handleServerRequest(request: AppServerRequest): Promise<void> {
+    const handler = this.requestHandler;
+    if (!handler) {
+      this.writeServerResponse({
+        id: request.id,
+        error: {
+          code: -32601,
+          message: 'AI Terminal 当前未启用 App Server 工具请求。',
+        },
+      });
+      return;
+    }
+    try {
+      const result = await handler(request);
+      if (this.closed) return;
+      this.writeServerResponse({ id: request.id, result: result ?? {} });
+    } catch (error) {
+      if (this.closed) return;
+      this.writeServerResponse({
+        id: request.id,
+        error: {
+          code: -32000,
+          message: safeErrorMessage(error).slice(0, 1_000),
+        },
+      });
+    }
+  }
+
+  private writeServerResponse(response: unknown): void {
+    try {
+      this.write(response);
+    } catch (error) {
+      this.failTransport(error instanceof Error ? error : new Error(String(error)));
     }
   }
 
@@ -268,6 +319,9 @@ export async function launchCodexAppServer(
         name: 'ai_terminal',
         title: 'AI Terminal',
         version: clientVersion,
+      },
+      capabilities: {
+        experimentalApi: true,
       },
     });
     client.notify('initialized', {});

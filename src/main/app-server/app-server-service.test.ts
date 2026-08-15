@@ -12,6 +12,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
   AppServerConnection,
   AppServerNotification,
+  AppServerRequestHandler,
 } from './app-server-client';
 import {
   bundledCodexCandidates,
@@ -68,6 +69,11 @@ class FakeConnection extends EventEmitter implements AppServerConnection {
   onNotification(listener: (notification: AppServerNotification) => void): () => void {
     this.on('notification', listener);
     return () => this.off('notification', listener);
+  }
+
+  onRequest(handler: AppServerRequestHandler): () => void {
+    this.on('request', handler);
+    return () => this.off('request', handler);
   }
 
   onExit(listener: (error: Error) => void): () => void {

@@ -62,7 +62,10 @@ describe('CodexAppServerClient', () => {
     );
     expect(messages.map((message) => message.method)).toEqual(['initialize', 'initialized']);
     expect(messages[0]).toMatchObject({
-      params: { clientInfo: { name: 'ai_terminal', title: 'AI Terminal', version: '0.1.0' } },
+      params: {
+        clientInfo: { name: 'ai_terminal', title: 'AI Terminal', version: '0.1.0' },
+        capabilities: { experimentalApi: true },
+      },
     });
     connection.close();
   });
@@ -126,6 +129,65 @@ describe('CodexAppServerClient', () => {
     expect(outgoing[0]).toMatchObject({
       id: 'server-request-44',
       error: { code: -32601 },
+    });
+    client.close();
+  });
+
+  it('routes asynchronous server requests and replies with the exact request id', async () => {
+    const child = new FakeChild();
+    const client = new CodexAppServerClient(child.asChild());
+    const outgoing: Record<string, unknown>[] = [];
+    readJsonLines(child.stdin, (message) => outgoing.push(message));
+    const handler = vi.fn(async (request) => ({
+      contentItems: [{ type: 'inputText', text: JSON.stringify(request.params) }],
+      success: true,
+    }));
+    client.onRequest(handler);
+
+    child.stdout.write(`${JSON.stringify({
+      id: 'tool-request-7',
+      method: 'item/tool/call',
+      params: { threadId: 'thread-1', turnId: 'turn-1', tool: 'terminal_state' },
+    })}\n`);
+
+    await vi.waitFor(() => expect(outgoing).toHaveLength(1));
+    expect(handler).toHaveBeenCalledWith({
+      id: 'tool-request-7',
+      method: 'item/tool/call',
+      params: { threadId: 'thread-1', turnId: 'turn-1', tool: 'terminal_state' },
+    });
+    expect(outgoing[0]).toEqual({
+      id: 'tool-request-7',
+      result: {
+        contentItems: [{
+          type: 'inputText',
+          text: JSON.stringify({
+            threadId: 'thread-1', turnId: 'turn-1', tool: 'terminal_state',
+          }),
+        }],
+        success: true,
+      },
+    });
+    client.close();
+  });
+
+  it('turns a server request handler failure into a bounded protocol error', async () => {
+    const child = new FakeChild();
+    const client = new CodexAppServerClient(child.asChild());
+    const outgoing: Record<string, unknown>[] = [];
+    readJsonLines(child.stdin, (message) => outgoing.push(message));
+    client.onRequest(async () => {
+      throw new Error('tool rejected safely');
+    });
+
+    child.stdout.write(`${JSON.stringify({
+      id: 91, method: 'item/tool/call', params: {},
+    })}\n`);
+
+    await vi.waitFor(() => expect(outgoing).toHaveLength(1));
+    expect(outgoing[0]).toMatchObject({
+      id: 91,
+      error: { code: -32000, message: 'tool rejected safely' },
     });
     client.close();
   });
