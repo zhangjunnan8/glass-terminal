@@ -47,6 +47,7 @@ export function SftpDrawer({ terminal, onClose }: SftpDrawerProps) {
   const [pathInput, setPathInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [transfersCollapsed, setTransfersCollapsed] = useState(false);
   const available = terminal?.transport === 'ssh' && terminal.status === 'connected';
 
   const visibleTransfers = useMemo(
@@ -178,33 +179,48 @@ export function SftpDrawer({ terminal, onClose }: SftpDrawerProps) {
             )}
           </div>
 
-          <section className="transfer-queue">
-            <div className="transfer-heading">传输任务 <span>{visibleTransfers.length}</span></div>
-            {visibleTransfers.map((job) => {
-              const percentage = job.totalBytes > 0
-                ? Math.min(100, (job.bytesTransferred / job.totalBytes) * 100)
-                : 0;
-              return (
-                <div className="transfer-job" key={job.id}>
-                  <div>
-                    <strong>{job.direction === 'upload' ? '↑' : '↓'} {job.displayName}</strong>
-                    <span className={`transfer-status ${job.status}`}>{transferStatusLabel(job.status)}</span>
-                  </div>
-                  <div className="transfer-track"><span style={{ width: `${percentage}%` }} /></div>
-                  <small>
-                    {humanBytes(job.bytesTransferred)} / {humanBytes(job.totalBytes)}
-                    {job.error ? ` · ${job.error}` : ''}
-                  </small>
-                  {(job.status === 'queued' || job.status === 'running') && (
-                    <button onClick={() => void window.aiTerminal.sftp.cancelTransfer(job.id)}>取消</button>
-                  )}
-                  {(job.status === 'failed' || job.status === 'cancelled') && (
-                    <button onClick={() => void window.aiTerminal.sftp.retryTransfer(job.id)}>重试</button>
-                  )}
-                </div>
-              );
-            })}
-            {visibleTransfers.length === 0 && <div className="transfer-empty">暂无传输任务。</div>}
+          <section
+            className={`transfer-queue ${transfersCollapsed ? 'collapsed' : ''}`}
+            data-collapsed={transfersCollapsed ? 'true' : 'false'}
+          >
+            <div className="transfer-heading">
+              <span>传输任务 <b>{visibleTransfers.length}</b></span>
+              <button
+                type="button"
+                data-action="toggle-transfer-queue"
+                aria-expanded={!transfersCollapsed}
+                onClick={() => setTransfersCollapsed((collapsed) => !collapsed)}
+              >{transfersCollapsed ? '展开' : '收起'} <span aria-hidden="true">{transfersCollapsed ? '⌃' : '⌄'}</span></button>
+            </div>
+            {!transfersCollapsed && (
+              <div className="transfer-jobs">
+                {visibleTransfers.map((job) => {
+                  const percentage = job.totalBytes > 0
+                    ? Math.min(100, (job.bytesTransferred / job.totalBytes) * 100)
+                    : 0;
+                  return (
+                    <div className="transfer-job" key={job.id}>
+                      <div>
+                        <strong>{job.direction === 'upload' ? '↑' : '↓'} {job.displayName}</strong>
+                        <span className={`transfer-status ${job.status}`}>{transferStatusLabel(job.status)}</span>
+                      </div>
+                      <div className="transfer-track"><span style={{ width: `${percentage}%` }} /></div>
+                      <small>
+                        {humanBytes(job.bytesTransferred)} / {humanBytes(job.totalBytes)}
+                        {job.error ? ` · ${job.error}` : ''}
+                      </small>
+                      {(job.status === 'queued' || job.status === 'running') && (
+                        <button onClick={() => void window.aiTerminal.sftp.cancelTransfer(job.id)}>取消</button>
+                      )}
+                      {(job.status === 'failed' || job.status === 'cancelled') && (
+                        <button onClick={() => void window.aiTerminal.sftp.retryTransfer(job.id)}>重试</button>
+                      )}
+                    </div>
+                  );
+                })}
+                {visibleTransfers.length === 0 && <div className="transfer-empty">暂无传输任务。</div>}
+              </div>
+            )}
           </section>
         </>
       )}

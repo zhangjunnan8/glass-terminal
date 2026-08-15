@@ -1,11 +1,18 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
   CSSProperties,
+  DragEvent as ReactDragEvent,
   FormEvent,
   KeyboardEvent as ReactKeyboardEvent,
   PointerEvent as ReactPointerEvent,
 } from 'react';
-import type { HostInput, HostProfile } from '../shared/host';
+import {
+  HOST_PROTOCOL_OPTIONS,
+  type HostFolder,
+  type HostInput,
+  type HostProfile,
+  type HostProtocol,
+} from '../shared/host';
 import type { RuntimeInfo } from '../shared/ipc';
 import { PRODUCT_NAME } from '../shared/product';
 import type { SessionRecord } from '../shared/session';
@@ -38,7 +45,13 @@ import {
   scrollAgentOutputToBottom,
 } from './agent-scroll';
 import { clampAgentPanelWidth, shouldSubmitAgentComposer } from './agent-ui';
-import { mergeProviderModelOptions } from './provider-ui';
+import {
+  mergeProviderModelOptions,
+  providerModelOptionPrompt,
+  type ProviderModelOptionSource,
+} from './provider-ui';
+import { readUiTheme, storeUiTheme } from './theme';
+import type { UiTheme } from './theme';
 import {
   agentStateLabel,
   authMethodLabel,
@@ -72,6 +85,14 @@ interface CodexUiMessage {
 interface HostCredentialMessage extends CodexUiMessage {
   hostId: string;
 }
+
+type HostFolderDialog =
+  | { mode: 'create'; folder: null }
+  | { mode: 'rename' | 'delete'; folder: HostFolder };
+
+type HostTreeDrag =
+  | { kind: 'folder'; id: string }
+  | { kind: 'host'; id: string };
 
 interface ProviderDiscoveryMessage {
   tone: 'loading' | 'success' | 'error';
@@ -142,13 +163,23 @@ function preferredCodexReasoningEffort(
 }
 
 export function App() {
+  const [uiTheme, setUiTheme] = useState<UiTheme>(() => readUiTheme());
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
   const [shells, setShells] = useState<ShellProfile[]>([]);
   const [hosts, setHosts] = useState<HostProfile[]>([]);
+  const [hostFolders, setHostFolders] = useState<HostFolder[]>([]);
+  const [collapsedHostFolders, setCollapsedHostFolders] = useState<Set<string>>(() => new Set());
+  const [ungroupedHostsCollapsed, setUngroupedHostsCollapsed] = useState(false);
+  const [hostFolderDialog, setHostFolderDialog] = useState<HostFolderDialog | null>(null);
+  const [hostFolderNameDraft, setHostFolderNameDraft] = useState('');
+  const [hostFolderError, setHostFolderError] = useState<string | null>(null);
+  const [hostFolderActionPending, setHostFolderActionPending] = useState(false);
+  const [hostTreeDrag, setHostTreeDrag] = useState<HostTreeDrag | null>(null);
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [providers, setProviders] = useState<ProviderProfile[]>([]);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const activeIdRef = useRef<string | null>(null);
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
   const [sidebarView, setSidebarView] = useState<SidebarView>('terminals');
   const [sidebarSearch, setSidebarSearch] = useState('');
@@ -163,6 +194,7 @@ export function App() {
   const [providerModelOptions, setProviderModelOptions] = useState<string[]>(
     () => [...(PROVIDER_TEMPLATES[0]?.suggestedModels ?? [])],
   );
+  const [providerModelOptionSource, setProviderModelOptionSource] = useState<ProviderModelOptionSource>('suggested');
   const [providerDiscoveryMessage, setProviderDiscoveryMessage] = useState<ProviderDiscoveryMessage | null>(null);
   const [codexAppServer, setCodexAppServer] = useState<CodexAppServerSnapshot | null>(null);
   const [codexMessage, setCodexMessage] = useState<CodexUiMessage | null>(null);
@@ -178,6 +210,7 @@ export function App() {
   const providerDiscoveryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const providerDiscoveryGenerationRef = useRef(0);
   const agentBodyRef = useRef<HTMLDivElement>(null);
+  const agentComposerRef = useRef<HTMLTextAreaElement>(null);
   const agentStickToBottomRef = useRef(true);
   const agentResizeCleanupRef = useRef<(() => void) | null>(null);
   const sshConnectionLock = useRef(false);
@@ -187,8 +220,12 @@ export function App() {
   const [agentPanelVisible, setAgentPanelVisible] = useState(true);
   const [agentPanelWidth, setAgentPanelWidth] = useState(390);
   const [agentPrompt, setAgentPrompt] = useState('');
+  const [editingAgentMessageId, setEditingAgentMessageId] = useState<string | null>(null);
+  const [editingAgentTerminalId, setEditingAgentTerminalId] = useState<string | null>(null);
+  const [agentMessageActionPending, setAgentMessageActionPending] = useState<string | null>(null);
   const [editedApprovalCommand, setEditedApprovalCommand] = useState('');
   const [editingHost, setEditingHost] = useState<HostProfile | null | undefined>(undefined);
+  const [editingHostProtocol, setEditingHostProtocol] = useState<HostProtocol>('ssh');
   const [connectingHost, setConnectingHost] = useState<HostProfile | null>(null);
   const [reconnectingSessionId, setReconnectingSessionId] = useState<string | null>(null);
   const [renamingSession, setRenamingSession] = useState<SessionRecord | null>(null);
@@ -204,8 +241,15 @@ export function App() {
   const [credentialActionPending, setCredentialActionPending] = useState(false);
 
   useEffect(() => {
+    storeUiTheme(uiTheme);
+  }, [uiTheme]);
+
+  useEffect(() => {
     void window.aiTerminal.runtime.getInfo().then(setRuntime);
     void window.aiTerminal.hosts.list().then(setHosts).catch((error) => {
+      setStartupError(errorMessage(error));
+    });
+    void window.aiTerminal.hosts.listFolders().then(setHostFolders).catch((error) => {
       setStartupError(errorMessage(error));
     });
     void window.aiTerminal.sessions.list().then(setSessions).catch((error) => {
@@ -313,6 +357,7 @@ export function App() {
       template.suggestedModels,
       editingProvider ? [editingProvider.modelId] : undefined,
     ));
+    setProviderModelOptionSource('suggested');
     setProviderDiscoveryMessage(null);
     if (editingProvider?.apiKeyConfigured) scheduleProviderModelDiscovery(250);
     return cancelPendingProviderDiscovery;
@@ -341,10 +386,6 @@ export function App() {
     () => tabs.find((tab) => tab.id === activeId) ?? null,
     [activeId, tabs],
   );
-  const selectedHost = hosts.find((host) => host.id === selectedHostId) ?? null;
-  const selectedHostSessions = selectedHost
-    ? sessions.filter((session) => session.hostId === selectedHost.id)
-    : [];
   const normalizedSidebarSearch = sidebarSearch.trim().toLocaleLowerCase('zh-CN');
   const filteredShells = normalizedSidebarSearch
     ? shells.filter((shell) => `${shell.label} ${shell.detail}`.toLocaleLowerCase('zh-CN')
@@ -353,10 +394,17 @@ export function App() {
   const filteredTabs = normalizedSidebarSearch
     ? tabs.filter((tab) => tab.title.toLocaleLowerCase('zh-CN').includes(normalizedSidebarSearch))
     : tabs;
-  const filteredHosts = normalizedSidebarSearch
-    ? hosts.filter((host) => `${host.name} ${host.username} ${host.hostname} ${host.group ?? ''}`
+  const hostFolderNames = new Map(hostFolders.map((folder) => [folder.id, folder.name]));
+  const filteredHosts = [...(normalizedSidebarSearch
+    ? hosts.filter((host) => `${host.name} ${host.username} ${host.hostname} ${host.group ?? ''} ${hostFolderNames.get(host.folderId ?? '') ?? ''}`
       .toLocaleLowerCase('zh-CN').includes(normalizedSidebarSearch))
-    : hosts;
+    : hosts)].sort((left, right) => left.sortOrder - right.sortOrder || left.name.localeCompare(right.name, 'zh-CN'));
+  const orderedHostFolders = [...hostFolders]
+    .sort((left, right) => left.sortOrder - right.sortOrder || left.name.localeCompare(right.name, 'zh-CN'));
+  const filteredUngroupedHosts = filteredHosts.filter((host) => !host.folderId);
+  const hasMatchingHostFolder = Boolean(normalizedSidebarSearch && orderedHostFolders.some((folder) => (
+    folder.name.toLocaleLowerCase('zh-CN').includes(normalizedSidebarSearch)
+  )));
   const filteredSessions = normalizedSidebarSearch
     ? sessions.filter((session) => {
       const host = session.hostId ? hosts.find((candidate) => candidate.id === session.hostId) : null;
@@ -392,6 +440,9 @@ export function App() {
       ? '正在处理界面操作'
       : null;
   const activeAgent = activeTab ? agentStates[activeTab.id] : undefined;
+  const latestUserMessage = activeAgent
+    ? [...activeAgent.messages].reverse().find((message) => message.role === 'user')
+    : undefined;
   const explicitAgentBackendKind = activeTab
     ? agentBackendChoices[activeTab.id]
     : undefined;
@@ -425,6 +476,13 @@ export function App() {
     agentStickToBottomRef.current = true;
     setAgentUpdatesBelow(false);
     if (agentBodyRef.current) scrollAgentOutputToBottom(agentBodyRef.current);
+  }, [activeId]);
+
+  useLayoutEffect(() => {
+    activeIdRef.current = activeId;
+    setEditingAgentMessageId(null);
+    setEditingAgentTerminalId(null);
+    setAgentPrompt('');
   }, [activeId]);
 
   useLayoutEffect(() => {
@@ -569,6 +627,12 @@ export function App() {
   async function refreshHosts() {
     const next = await window.aiTerminal.hosts.list();
     setHosts(next);
+    return next;
+  }
+
+  async function refreshHostFolders() {
+    const next = await window.aiTerminal.hosts.listFolders();
+    setHostFolders(next);
     return next;
   }
 
@@ -727,14 +791,12 @@ export function App() {
     try {
       const result = await window.aiTerminal.providers.discoverModels(request);
       if (providerDiscoveryGenerationRef.current !== generation) return;
-      const template = providerTemplateForBaseUrl(baseUrl);
-      const currentModel = providerModelInputRef.current?.value ?? '';
-      const models = mergeProviderModelOptions(
-        result.models,
-        template.suggestedModels,
-        currentModel ? [currentModel] : undefined,
-      );
+      // Keep the picker identical to the provider's response. Template
+      // suggestions and a manually entered current value must not inflate the
+      // displayed discovery count.
+      const models = mergeProviderModelOptions(result.models);
       setProviderModelOptions(models);
+      setProviderModelOptionSource('discovered');
       if (providerModelInputRef.current && !providerModelInputRef.current.value.trim()) {
         providerModelInputRef.current.value = models[0] ?? '';
       }
@@ -757,6 +819,7 @@ export function App() {
     setProviderTemplateId(template.id);
     setProviderDiscoveryMessage(null);
     setProviderModelOptions([...template.suggestedModels]);
+    setProviderModelOptionSource('suggested');
     if (providerNameInputRef.current) providerNameInputRef.current.value = template.name;
     if (providerBaseUrlInputRef.current) providerBaseUrlInputRef.current.value = template.baseUrl;
     if (providerModelInputRef.current) {
@@ -773,6 +836,7 @@ export function App() {
       template.suggestedModels,
       [provider.modelId],
     ));
+    setProviderModelOptionSource('suggested');
     setProviderDiscoveryMessage(null);
     setEditingProvider(provider);
     setProviderDraftRevision((current) => current + 1);
@@ -784,6 +848,7 @@ export function App() {
     const template = PROVIDER_TEMPLATES[0]!;
     setProviderTemplateId(template.id);
     setProviderModelOptions([...template.suggestedModels]);
+    setProviderModelOptionSource('suggested');
     setProviderDiscoveryMessage(null);
     setEditingProvider(null);
     setProviderDraftRevision((current) => current + 1);
@@ -810,25 +875,117 @@ export function App() {
 
   async function sendAgentPrompt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!activeTab || !agentPrompt.trim() || !selectedAgentBackend || !selectedAgentBackendReady) {
+    if (
+      !activeTab
+      || !agentPrompt.trim()
+      || !selectedAgentBackend
+      || !selectedAgentBackendReady
+      || agentMessageActionPending
+    ) {
       return;
     }
+    const requestTerminalId = activeTab.id;
+    const replacementMessageId = editingAgentTerminalId === requestTerminalId
+      ? editingAgentMessageId
+      : null;
     const prompt = agentPrompt.trim();
     setAgentPrompt('');
+    setAgentMessageActionPending(replacementMessageId ?? 'send');
     try {
-      const state = await window.aiTerminal.agent.sendPrompt({
-        terminalId: activeTab.id,
-        prompt,
-        backend: selectedAgentBackend,
-      });
+      const state = replacementMessageId
+        ? await window.aiTerminal.agent.revisePrompt({
+          terminalId: requestTerminalId,
+          messageId: replacementMessageId,
+          action: 'replace',
+          prompt,
+        })
+        : await window.aiTerminal.agent.sendPrompt({
+          terminalId: requestTerminalId,
+          prompt,
+          backend: selectedAgentBackend,
+        });
+      setEditingAgentMessageId(null);
+      setEditingAgentTerminalId(null);
       setAgentStates((current) => mergeAgentState(current, state));
       setTabs((current) => current.map((tab) => (
         tab.id === state.terminalId ? { ...tab, sessionId: state.sessionId } : tab
       )));
       await refreshSessions();
     } catch (error) {
+      if (activeIdRef.current === requestTerminalId) setAgentPrompt(prompt);
       setConnectionError(errorMessage(error));
+      if (replacementMessageId) {
+        // The append-only retract may have succeeded before starting the
+        // replacement turn failed. Refresh once so a retry becomes a normal
+        // send instead of targeting a message that no longer exists.
+        try {
+          const current = await window.aiTerminal.agent.getState(requestTerminalId);
+          if (current) {
+            setAgentStates((states) => mergeAgentState(states, current));
+            if (!current.messages.some((message) => message.id === replacementMessageId)) {
+              setEditingAgentMessageId(null);
+              setEditingAgentTerminalId(null);
+            }
+          }
+        } catch {
+          // Keep the editable text available even if the refresh also fails.
+        }
+      }
+    } finally {
+      setAgentMessageActionPending(null);
     }
+  }
+
+  async function interruptLatestAgentMessage(messageId: string) {
+    if (!activeTab || agentMessageActionPending) return;
+    setAgentMessageActionPending(messageId);
+    try {
+      const state = await window.aiTerminal.agent.interruptTurn({
+        terminalId: activeTab.id,
+        messageId,
+      });
+      setAgentStates((current) => mergeAgentState(current, state));
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    } finally {
+      setAgentMessageActionPending(null);
+    }
+  }
+
+  async function retractLatestAgentMessage(messageId: string, content: string) {
+    if (!activeTab || agentMessageActionPending) return;
+    const requestTerminalId = activeTab.id;
+    setAgentMessageActionPending(messageId);
+    try {
+      const state = await window.aiTerminal.agent.revisePrompt({
+        terminalId: requestTerminalId,
+        messageId,
+        action: 'retract',
+      });
+      setAgentStates((current) => mergeAgentState(current, state));
+      if (activeIdRef.current === requestTerminalId) {
+        setEditingAgentMessageId(null);
+        setEditingAgentTerminalId(null);
+        setAgentPrompt(content);
+        requestAnimationFrame(() => agentComposerRef.current?.focus());
+      }
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    } finally {
+      setAgentMessageActionPending(null);
+    }
+  }
+
+  function editLatestAgentMessage(messageId: string, content: string) {
+    if (!activeTab || agentMessageActionPending) return;
+    setEditingAgentMessageId(messageId);
+    setEditingAgentTerminalId(activeTab.id);
+    setAgentPrompt(content);
+    requestAnimationFrame(() => {
+      const composer = agentComposerRef.current;
+      composer?.focus();
+      composer?.setSelectionRange(composer.value.length, composer.value.length);
+    });
   }
 
   async function resolveAgentApproval(decision: 'execute' | 'edit' | 'reject') {
@@ -973,18 +1130,162 @@ export function App() {
     }
   }
 
+  function openHostEditor(host: HostProfile | null) {
+    setConnectionError(null);
+    setEditingHostProtocol('ssh');
+    setEditingHost(host);
+  }
+
+  function openHostFolderDialog(mode: HostFolderDialog['mode'], folder?: HostFolder) {
+    if (mode !== 'create' && !folder) return;
+    const dialog: HostFolderDialog = mode === 'create'
+      ? { mode, folder: null }
+      : { mode, folder: folder! };
+    setHostFolderDialog(dialog);
+    setHostFolderNameDraft(dialog.folder?.name ?? '');
+    setHostFolderError(null);
+  }
+
+  function closeHostFolderDialog() {
+    if (hostFolderActionPending) return;
+    setHostFolderDialog(null);
+    setHostFolderNameDraft('');
+    setHostFolderError(null);
+  }
+
+  async function submitHostFolderDialog(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!hostFolderDialog || hostFolderActionPending) return;
+    const name = hostFolderNameDraft.trim();
+    if (hostFolderDialog.mode !== 'delete' && !name) {
+      setHostFolderError('请输入文件夹名称。');
+      return;
+    }
+    setHostFolderActionPending(true);
+    setHostFolderError(null);
+    try {
+      if (hostFolderDialog.mode === 'create') {
+        const created = await window.aiTerminal.hosts.createFolder({ name });
+        setCollapsedHostFolders((current) => {
+          const next = new Set(current);
+          next.delete(created.id);
+          return next;
+        });
+      } else if (hostFolderDialog.mode === 'rename') {
+        await window.aiTerminal.hosts.renameFolder({
+          folderId: hostFolderDialog.folder.id,
+          name,
+        });
+      } else {
+        await window.aiTerminal.hosts.removeFolder(hostFolderDialog.folder.id);
+        setCollapsedHostFolders((current) => {
+          const next = new Set(current);
+          next.delete(hostFolderDialog.folder.id);
+          return next;
+        });
+      }
+      await refreshHostFolders();
+      setHostFolderDialog(null);
+      setHostFolderNameDraft('');
+    } catch (error) {
+      setHostFolderError(errorMessage(error));
+    } finally {
+      setHostFolderActionPending(false);
+    }
+  }
+
+  function toggleHostFolder(folderId: string) {
+    setCollapsedHostFolders((current) => {
+      const next = new Set(current);
+      if (next.has(folderId)) next.delete(folderId);
+      else next.add(folderId);
+      return next;
+    });
+  }
+
+  function startHostTreeDrag(
+    event: ReactDragEvent<HTMLElement>,
+    item: HostTreeDrag,
+  ) {
+    setHostTreeDrag(item);
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData('text/plain', `${item.kind}:${item.id}`);
+  }
+
+  function allowHostTreeDrop(event: ReactDragEvent<HTMLElement>) {
+    if (!hostTreeDrag) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+  }
+
+  async function moveDraggedHost(folderId: string | null, beforeHostId: string | null) {
+    if (hostTreeDrag?.kind !== 'host') return;
+    const hostId = hostTreeDrag.id;
+    setHostTreeDrag(null);
+    try {
+      await window.aiTerminal.hosts.moveHost({ hostId, folderId, beforeHostId });
+      await refreshHosts();
+      if (folderId) {
+        setCollapsedHostFolders((current) => {
+          const next = new Set(current);
+          next.delete(folderId);
+          return next;
+        });
+      } else {
+        setUngroupedHostsCollapsed(false);
+      }
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    }
+  }
+
+  async function dropOnHostFolder(folder: HostFolder, beforeFolder = false) {
+    if (!hostTreeDrag) return;
+    if (hostTreeDrag.kind === 'host') {
+      await moveDraggedHost(folder.id, null);
+      return;
+    }
+    const folderId = hostTreeDrag.id;
+    setHostTreeDrag(null);
+    try {
+      const next = await window.aiTerminal.hosts.moveFolder({
+        folderId,
+        beforeFolderId: beforeFolder ? folder.id : null,
+      });
+      setHostFolders(next);
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    }
+  }
+
+  async function moveDraggedFolderToEnd() {
+    if (hostTreeDrag?.kind !== 'folder') return;
+    const folderId = hostTreeDrag.id;
+    setHostTreeDrag(null);
+    try {
+      setHostFolders(await window.aiTerminal.hosts.moveFolder({
+        folderId,
+        beforeFolderId: null,
+      }));
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    }
+  }
+
   async function saveHost(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (editingHostProtocol !== 'ssh') return;
     const data = new FormData(event.currentTarget);
     const input: HostInput = {
       id: editingHost?.id,
+      protocol: 'ssh',
       name: String(data.get('name') ?? ''),
       hostname: String(data.get('hostname') ?? ''),
       port: Number(data.get('port') ?? 22),
       username: String(data.get('username') ?? ''),
       authMethod: String(data.get('authMethod') ?? 'password') as HostInput['authMethod'],
       privateKeyPath: String(data.get('privateKeyPath') ?? ''),
-      group: String(data.get('group') ?? ''),
+      folderId: String(data.get('folderId') ?? '') || null,
       favorite: data.get('favorite') === 'on',
     };
     try {
@@ -1127,10 +1428,146 @@ export function App() {
     });
   }
 
+  function toggleSelectedHost(host: HostProfile) {
+    setSelectedHostId((current) => current === host.id ? null : host.id);
+    if (host.folderId) {
+      setCollapsedHostFolders((current) => {
+        const next = new Set(current);
+        next.delete(host.folderId!);
+        return next;
+      });
+    } else {
+      setUngroupedHostsCollapsed(false);
+    }
+  }
+
+  function renderHostTreeEntry(host: HostProfile, folderId: string | null) {
+    const expanded = selectedHostId === host.id;
+    const hostSessions = sessions.filter((session) => session.hostId === host.id);
+    return (
+      <div
+        className={`host-tree-item ${hostTreeDrag?.kind === 'host' && hostTreeDrag.id === host.id ? 'dragging' : ''}`}
+        data-host-id={host.id}
+        key={host.id}
+        onDragOver={(event) => {
+          if (hostTreeDrag?.kind === 'host') allowHostTreeDrop(event);
+        }}
+        onDrop={(event) => {
+          if (hostTreeDrag?.kind !== 'host') return;
+          event.preventDefault();
+          event.stopPropagation();
+          void moveDraggedHost(folderId, host.id);
+        }}
+      >
+        <div className="host-row-shell">
+          <button
+            className={`host-row ${expanded ? 'active' : ''}`}
+            aria-expanded={expanded}
+            onClick={() => toggleSelectedHost(host)}
+          >
+            <span className="host-icon">{host.favorite ? '★' : '◇'}</span>
+            <span>
+              <strong>{host.name}</strong>
+              <small>{host.username}@{host.hostname}:{host.port}</small>
+            </span>
+          </button>
+          <button
+            type="button"
+            className="host-drag-handle"
+            draggable
+            aria-label={`拖拽排序 ${host.name}`}
+            title="按住拖拽排序或移入文件夹"
+            data-action="drag-host"
+            onClick={(event) => event.stopPropagation()}
+            onDragStart={(event) => startHostTreeDrag(event, { kind: 'host', id: host.id })}
+            onDragEnd={() => setHostTreeDrag(null)}
+          ><span aria-hidden="true" /></button>
+        </div>
+        <div
+          className={`host-details-collapse ${expanded ? 'open' : ''}`}
+          aria-hidden={!expanded}
+          data-testid={`host-details-${host.id}`}
+        >
+          <div className="host-details-collapse-inner">
+            <div className="selected-host-card">
+              <strong>{host.name}</strong>
+              <span>{authMethodLabel(host.authMethod)} · {host.hostKeyFingerprint ? '已信任' : '未验证'}</span>
+              <div>
+                <button
+                  data-action="connect-host"
+                  disabled={sshConnectionPending}
+                  onClick={() => openSshConnection(host)}
+                >{sshConnectionPending ? '正在连接…' : '连接'}</button>
+                <button onClick={() => openHostEditor(host)}>编辑</button>
+                <button className="danger-text" onClick={() => void removeHost(host)}>删除</button>
+              </div>
+              {host.authMethod !== 'agent' && (
+                <div className="host-credential-row">
+                  <small>Windows 凭据：{host.credentialConfigured ? '已保存' : '未保存'}</small>
+                  {host.credentialConfigured && (
+                    <button
+                      type="button"
+                      data-action="forget-host-credential"
+                      disabled={credentialActionPending}
+                      onClick={() => void forgetHostCredential(host)}
+                    >{credentialActionPending ? '正在删除…' : '删除凭据'}</button>
+                  )}
+                </div>
+              )}
+              {hostCredentialMessage?.hostId === host.id && (
+                <div
+                  className={`host-credential-message ${hostCredentialMessage.tone}`}
+                  role={hostCredentialMessage.tone === 'error' ? 'alert' : 'status'}
+                >{hostCredentialMessage.text}</div>
+              )}
+              <div className="host-session-history">
+                <small>会话历史</small>
+                {hostSessions.map((session) => {
+                  const liveTab = tabs.find((tab) => (
+                    tab.status === 'connected'
+                    && (tab.sessionId === session.id || tab.id === session.runtimeTerminalId)
+                  ));
+                  return (
+                    <div className="session-history-row" key={session.id}>
+                      <span>
+                        <strong>{session.name}</strong>
+                        <small>{sessionStatusLabel(session.status)} · {new Date(session.updatedAt).toLocaleString('zh-CN')}</small>
+                      </span>
+                      <span className="session-history-actions">
+                        <button
+                          type="button"
+                          title="重命名会话"
+                          data-action="rename-session"
+                          data-session-id={session.id}
+                          onClick={() => openSessionRename(session)}
+                        >重命名</button>
+                        <button
+                          data-action="reconnect-session"
+                          data-session-id={session.id}
+                          disabled={sshConnectionPending}
+                          onClick={() => {
+                            if (liveTab) setActiveId(liveTab.id);
+                            else openSshConnection(host, session.id);
+                          }}
+                        >{liveTab ? '打开' : '重连'}</button>
+                      </span>
+                    </div>
+                  );
+                })}
+                {hostSessions.length === 0 && <small>尚无正式会话。</small>}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div
       className={`app-shell ${agentPanelVisible ? '' : 'agent-panel-hidden'}`}
       data-locale="zh-CN"
+      data-theme={uiTheme}
       data-agent-panel-visible={agentPanelVisible ? 'true' : 'false'}
       style={{ '--agent-panel-width': `${agentPanelWidth}px` } as CSSProperties}
     >
@@ -1141,6 +1578,15 @@ export function App() {
           <span>共享终端智能体</span>
         </div>
         <div className="workspace-title">本地工作区</div>
+        <button
+          type="button"
+          className="theme-toggle"
+          data-action="toggle-theme"
+          aria-label={uiTheme === 'dark' ? '切换到白色主题' : '切换到深色主题'}
+          aria-pressed={uiTheme === 'light'}
+          title={uiTheme === 'dark' ? '切换到白色主题' : '切换到深色主题'}
+          onClick={() => setUiTheme((current) => current === 'dark' ? 'light' : 'dark')}
+        >{uiTheme === 'dark' ? '☀ 白色' : '☾ 深色'}</button>
         <div className="runtime-pill">
           <span className="status-dot" />
           {runtime ? `${runtime.platform} · ${runtime.arch}` : '正在启动…'}
@@ -1160,7 +1606,7 @@ export function App() {
         >⌁</button>
         <button
           className={`activity ${sidebarView === 'hosts' ? 'active' : ''}`}
-          title="SSH 主机"
+          title="主机"
           data-action="show-hosts"
           aria-pressed={sidebarView === 'hosts'}
           onClick={() => {
@@ -1198,9 +1644,9 @@ export function App() {
         <div className="panel-heading">
           <span>{sidebarView === 'terminals'
             ? '终端'
-            : sidebarView === 'hosts' ? 'SSH 主机' : '会话历史'}</span>
+            : sidebarView === 'hosts' ? '主机' : '会话历史'}</span>
           {sidebarView === 'hosts' && (
-            <button title="添加 SSH 主机" onClick={() => setEditingHost(null)}>＋</button>
+            <button title="添加主机" onClick={() => openHostEditor(null)}>＋</button>
           )}
         </div>
         <label className="search-box">
@@ -1209,7 +1655,7 @@ export function App() {
             aria-label="筛选当前列表"
             placeholder={sidebarView === 'terminals'
               ? '搜索 Shell 或终端'
-              : sidebarView === 'hosts' ? '搜索 SSH 主机' : '搜索会话历史'}
+              : sidebarView === 'hosts' ? '搜索主机或文件夹' : '搜索会话历史'}
             value={sidebarSearch}
             onChange={(event) => setSidebarSearch(event.target.value)}
           />
@@ -1254,97 +1700,140 @@ export function App() {
           {sidebarView === 'hosts' && (
             <>
               <div className="section-label section-with-action">
-                <span>SSH 主机</span>
-                <button onClick={() => setEditingHost(null)}>添加</button>
+                <span>主机</span>
+                <span className="host-section-actions">
+                  <button data-action="create-host-folder" onClick={() => openHostFolderDialog('create')}>新建文件夹</button>
+                  <button onClick={() => openHostEditor(null)}>添加</button>
+                </span>
               </div>
-              <div className="host-list">
-                {filteredHosts.map((host) => (
-                  <button
-                    className={`host-row ${selectedHostId === host.id ? 'active' : ''}`}
-                    key={host.id}
-                    aria-expanded={selectedHostId === host.id}
-                    onClick={() => setSelectedHostId((current) => current === host.id ? null : host.id)}
-                  >
-                    <span className="host-icon">{host.favorite ? '★' : '◇'}</span>
-                    <span>
-                      <strong>{host.name}</strong>
-                      <small>{host.username}@{host.hostname}:{host.port}</small>
-                    </span>
-                  </button>
-                ))}
-                {filteredHosts.length === 0 && <div className="empty-list">没有匹配的 SSH 主机</div>}
-              </div>
-
-              {selectedHost && (
-                <div className="selected-host-card">
-            <strong>{selectedHost.name}</strong>
-            <span>{authMethodLabel(selectedHost.authMethod)} · {selectedHost.hostKeyFingerprint ? '已信任' : '未验证'}</span>
-            <div>
-              <button
-                data-action="connect-host"
-                disabled={sshConnectionPending}
-                onClick={() => openSshConnection(selectedHost)}
-              >{sshConnectionPending ? '正在连接…' : '连接'}</button>
-              <button onClick={() => setEditingHost(selectedHost)}>编辑</button>
-              <button className="danger-text" onClick={() => void removeHost(selectedHost)}>删除</button>
-            </div>
-            {selectedHost.authMethod !== 'agent' && (
-              <div className="host-credential-row">
-                <small>Windows 凭据：{selectedHost.credentialConfigured ? '已保存' : '未保存'}</small>
-                {selectedHost.credentialConfigured && (
-                  <button
-                    type="button"
-                    data-action="forget-host-credential"
-                    disabled={credentialActionPending}
-                    onClick={() => void forgetHostCredential(selectedHost)}
-                  >{credentialActionPending ? '正在删除…' : '删除凭据'}</button>
-                )}
-              </div>
-            )}
-            {hostCredentialMessage?.hostId === selectedHost.id && (
               <div
-                className={`host-credential-message ${hostCredentialMessage.tone}`}
-                role={hostCredentialMessage.tone === 'error' ? 'alert' : 'status'}
-              >{hostCredentialMessage.text}</div>
-            )}
-            <div className="host-session-history">
-              <small>会话历史</small>
-              {selectedHostSessions.map((session) => {
-                const liveTab = tabs.find((tab) => (
-                  tab.status === 'connected'
-                  && (tab.sessionId === session.id || tab.id === session.runtimeTerminalId)
-                ));
-                return (
-                <div className="session-history-row" key={session.id}>
-                  <span>
-                    <strong>{session.name}</strong>
-                    <small>{sessionStatusLabel(session.status)} · {new Date(session.updatedAt).toLocaleString('zh-CN')}</small>
-                  </span>
-                  <span className="session-history-actions">
+                className={`host-tree host-list ${hostTreeDrag ? `drag-${hostTreeDrag.kind}` : ''}`}
+                data-testid="host-tree"
+              >
+                {orderedHostFolders.map((folder) => {
+                  const allFolderHosts = hosts.filter((host) => host.folderId === folder.id)
+                    .sort((left, right) => left.sortOrder - right.sortOrder);
+                  const folderMatchesSearch = normalizedSidebarSearch
+                    && folder.name.toLocaleLowerCase('zh-CN').includes(normalizedSidebarSearch);
+                  const folderHosts = folderMatchesSearch
+                    ? allFolderHosts
+                    : filteredHosts.filter((host) => host.folderId === folder.id);
+                  if (normalizedSidebarSearch && folderHosts.length === 0 && !folderMatchesSearch) {
+                    return null;
+                  }
+                  const collapsed = normalizedSidebarSearch
+                    ? false
+                    : collapsedHostFolders.has(folder.id);
+                  const isDragged = hostTreeDrag?.kind === 'folder' && hostTreeDrag.id === folder.id;
+                  return (
+                    <section
+                      className={`host-folder ${isDragged ? 'dragging' : ''}`}
+                      data-folder-id={folder.id}
+                      key={folder.id}
+                      onDragOver={allowHostTreeDrop}
+                      onDrop={(event) => {
+                        event.preventDefault();
+                        void dropOnHostFolder(folder, hostTreeDrag?.kind === 'folder');
+                      }}
+                    >
+                      <div className="host-folder-heading">
+                        <button
+                          type="button"
+                          className="host-folder-toggle"
+                          aria-expanded={!collapsed}
+                          onClick={() => toggleHostFolder(folder.id)}
+                        >
+                          <span className="host-folder-chevron" aria-hidden="true">›</span>
+                          <span aria-hidden="true">▣</span>
+                          <strong>{folder.name}</strong>
+                          <small>{allFolderHosts.length}</small>
+                        </button>
+                        <span className="host-folder-actions">
+                          <button
+                            type="button"
+                            title="重命名文件夹"
+                            aria-label={`重命名文件夹 ${folder.name}`}
+                            onClick={() => openHostFolderDialog('rename', folder)}
+                          >✎</button>
+                          <button
+                            type="button"
+                            className="danger-text"
+                            title={allFolderHosts.length > 0 ? '请先移出文件夹中的主机' : '删除空文件夹'}
+                            aria-label={`删除文件夹 ${folder.name}`}
+                            disabled={allFolderHosts.length > 0}
+                            onClick={() => openHostFolderDialog('delete', folder)}
+                          >×</button>
+                        </span>
+                        <button
+                          type="button"
+                          className="host-drag-handle folder-drag-handle"
+                          draggable
+                          aria-label={`拖拽排序文件夹 ${folder.name}`}
+                          title="按住拖拽文件夹排序"
+                          data-action="drag-host-folder"
+                          onDragStart={(event) => startHostTreeDrag(event, { kind: 'folder', id: folder.id })}
+                          onDragEnd={() => setHostTreeDrag(null)}
+                        ><span aria-hidden="true" /></button>
+                      </div>
+                      <div className={`host-folder-contents ${collapsed ? '' : 'open'}`} aria-hidden={collapsed}>
+                        <div>
+                          {folderHosts.map((host) => renderHostTreeEntry(host, folder.id))}
+                          {folderHosts.length === 0 && <div className="host-folder-empty">拖拽主机到此文件夹</div>}
+                        </div>
+                      </div>
+                    </section>
+                  );
+                })}
+
+                {(!normalizedSidebarSearch || filteredUngroupedHosts.length > 0) && <section
+                  className="host-folder ungrouped-hosts"
+                  data-folder-id="ungrouped"
+                  onDragOver={(event) => {
+                    if (hostTreeDrag?.kind === 'host') allowHostTreeDrop(event);
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    void moveDraggedHost(null, null);
+                  }}
+                >
+                  <div className="host-folder-heading">
                     <button
                       type="button"
-                      title="重命名会话"
-                      data-action="rename-session"
-                      data-session-id={session.id}
-                      onClick={() => openSessionRename(session)}
-                    >重命名</button>
-                    <button
-                      data-action="reconnect-session"
-                      data-session-id={session.id}
-                      disabled={sshConnectionPending}
-                      onClick={() => {
-                        if (liveTab) setActiveId(liveTab.id);
-                        else openSshConnection(selectedHost, session.id);
-                      }}
-                    >{liveTab ? '打开' : '重连'}</button>
-                  </span>
-                </div>
-                );
-              })}
-              {selectedHostSessions.length === 0 && <small>尚无正式会话。</small>}
-            </div>
-                </div>
-              )}
+                      className="host-folder-toggle"
+                      aria-expanded={!ungroupedHostsCollapsed}
+                      onClick={() => setUngroupedHostsCollapsed((current) => !current)}
+                    >
+                      <span className="host-folder-chevron" aria-hidden="true">›</span>
+                      <span aria-hidden="true">□</span>
+                      <strong>未分组</strong>
+                      <small>{hosts.filter((host) => !host.folderId).length}</small>
+                    </button>
+                  </div>
+                  <div className={`host-folder-contents ${normalizedSidebarSearch || !ungroupedHostsCollapsed ? 'open' : ''}`} aria-hidden={!normalizedSidebarSearch && ungroupedHostsCollapsed}>
+                    <div>
+                      {filteredUngroupedHosts.map((host) => renderHostTreeEntry(host, null))}
+                      {filteredUngroupedHosts.length === 0 && (
+                        <div className="host-folder-empty">拖拽主机到此处</div>
+                      )}
+                    </div>
+                  </div>
+                </section>}
+
+                <div
+                  className="host-folder-end-drop"
+                  data-drop-zone="folder-end"
+                  onDragOver={(event) => {
+                    if (hostTreeDrag?.kind === 'folder') allowHostTreeDrop(event);
+                  }}
+                  onDrop={(event) => {
+                    event.preventDefault();
+                    void moveDraggedFolderToEnd();
+                  }}
+                >拖到此处将文件夹移到末尾</div>
+                {filteredHosts.length === 0 && normalizedSidebarSearch && !hasMatchingHostFolder && (
+                  <div className="empty-list">没有匹配的主机或文件夹</div>
+                )}
+              </div>
             </>
           )}
 
@@ -1369,7 +1858,7 @@ export function App() {
                       }}
                     >
                       <strong>{session.name}</strong>
-                      <small>{host?.name ?? (session.transport === 'ssh' ? 'SSH 主机' : '本地 Shell')}</small>
+                      <small>{host?.name ?? (session.transport === 'ssh' ? '主机' : '本地 Shell')}</small>
                       <small>{sessionStatusLabel(session.status)} · {new Date(session.updatedAt).toLocaleString('zh-CN')}</small>
                     </button>
                     <div className="history-session-actions">
@@ -1467,10 +1956,11 @@ export function App() {
                 terminalId={tab.id}
                 active={tab.id === activeId}
                 inputMode={agentStates[tab.id]?.terminalInputMode ?? 'human'}
+                uiTheme={uiTheme}
               />
             ))}
             {tabs.length === 0 && !startupError && (
-              <div className="terminal-placeholder">请选择本地 Shell 或 SSH 主机以打开终端。</div>
+              <div className="terminal-placeholder">请选择本地 Shell 或主机以打开终端。</div>
             )}
             {startupError && <div className="terminal-error">{startupError}</div>}
           </div>
@@ -1644,7 +2134,16 @@ export function App() {
               )}
             </div>
           )}
-          {activeAgent?.messages.map((message) => (
+          {activeAgent?.messages.map((message) => {
+            const latestUser = message.role === 'user' && message.id === latestUserMessage?.id;
+            const latestUserRunning = latestUser && (
+              agentTurnBusy(activeAgent.state)
+              || Boolean(activeAgent.backendTurnDraining)
+              || foregroundRunning
+            );
+            const interruptAlreadyRequested = foregroundRunning
+              && Boolean(activeAgent.activeExecution?.interruptRequestedAt);
+            return (
             <article className={`agent-message ${message.role}`} key={message.id}>
               <span>{roleLabel(message.role)}</span>
               <AgentMessageContent
@@ -1652,8 +2151,46 @@ export function App() {
                 content={message.content}
                 streaming={activeAgent.streamingMessageId === message.id}
               />
+              {latestUser && (
+                <div className="agent-message-actions" data-testid="latest-user-message-actions">
+                  <small title="终端输出、命令执行和审计记录都会保留">
+                    仅调整对话，不回滚终端
+                  </small>
+                  {latestUserRunning ? (
+                    <button
+                      type="button"
+                      className="interrupt"
+                      data-action="interrupt-agent-message"
+                      disabled={Boolean(agentMessageActionPending)
+                        || activeAgent.backendTurnDraining
+                        || interruptAlreadyRequested}
+                      onClick={() => void interruptLatestAgentMessage(message.id)}
+                    >{activeAgent.backendTurnDraining
+                      ? '正在停止…'
+                      : interruptAlreadyRequested
+                        ? '已发送 Ctrl+C'
+                        : foregroundRunning ? '打断前台进程' : '打断'}</button>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        data-action="retract-agent-message"
+                        disabled={Boolean(agentMessageActionPending)}
+                        onClick={() => void retractLatestAgentMessage(message.id, message.content)}
+                      >撤回</button>
+                      <button
+                        type="button"
+                        data-action="edit-agent-message"
+                        disabled={Boolean(agentMessageActionPending)}
+                        onClick={() => editLatestAgentMessage(message.id, message.content)}
+                      >修改</button>
+                    </>
+                  )}
+                </div>
+              )}
             </article>
-          ))}
+            );
+          })}
           {activeAgent?.pendingApproval?.status === 'waiting'
             && activeAgent.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND && (
             <section className="approval-card">
@@ -1719,7 +2256,22 @@ export function App() {
           )}
         </div>
         <form className="composer" onSubmit={(event) => void sendAgentPrompt(event)}>
+          {editingAgentMessageId && (
+            <div className="composer-editing" role="status">
+              <span>正在修改上一条消息；发送后会重新执行，已发生的终端操作不会撤销</span>
+              <button
+                type="button"
+                data-action="cancel-edit-agent-message"
+                onClick={() => {
+                  setEditingAgentMessageId(null);
+                  setEditingAgentTerminalId(null);
+                  setAgentPrompt('');
+                }}
+              >取消</button>
+            </div>
+          )}
           <textarea
+            ref={agentComposerRef}
             aria-label="向 AI 发送消息"
             data-testid="agent-composer"
             placeholder="让智能体检查或操作当前终端…"
@@ -1740,8 +2292,8 @@ export function App() {
               : selectedAgentBackendStatus}</span>
             <button
               type="submit"
-              aria-label="发送消息"
-              disabled={!agentPrompt.trim() || !selectedAgentBackendReady || !activeTab || composerBlocked}
+              aria-label={editingAgentMessageId ? '修改并重新发送' : '发送消息'}
+              disabled={!agentPrompt.trim() || !selectedAgentBackendReady || !activeTab || composerBlocked || Boolean(agentMessageActionPending)}
             >↑</button>
           </div>
         </form>
@@ -1815,34 +2367,160 @@ export function App() {
         </div>
       )}
 
+      {hostFolderDialog && (
+        <div className="modal-backdrop">
+          <form
+            className="modal compact-modal host-folder-modal"
+            data-testid="host-folder-dialog"
+            onSubmit={(event) => void submitHostFolderDialog(event)}
+            onKeyDown={(event) => {
+              if (event.key !== 'Escape') return;
+              event.preventDefault();
+              closeHostFolderDialog();
+            }}
+          >
+            <div className="modal-header">
+              <strong>{hostFolderDialog.mode === 'create'
+                ? '新建主机文件夹'
+                : hostFolderDialog.mode === 'rename'
+                  ? '重命名主机文件夹'
+                  : '删除主机文件夹'}</strong>
+              <button type="button" disabled={hostFolderActionPending} onClick={closeHostFolderDialog}>×</button>
+            </div>
+            {hostFolderDialog.mode === 'delete' ? (
+              <p>确定删除空文件夹“{hostFolderDialog.folder.name}”吗？主机数据不会被删除。</p>
+            ) : (
+              <label>文件夹名称
+                <input
+                  autoFocus
+                  autoComplete="off"
+                  value={hostFolderNameDraft}
+                  aria-invalid={Boolean(hostFolderError)}
+                  onChange={(event) => {
+                    setHostFolderNameDraft(event.target.value);
+                    setHostFolderError(null);
+                  }}
+                />
+              </label>
+            )}
+            {hostFolderError && <div className="form-error" role="alert">{hostFolderError}</div>}
+            <div className="modal-actions">
+              <button type="button" disabled={hostFolderActionPending} onClick={closeHostFolderDialog}>取消</button>
+              <button
+                className={hostFolderDialog.mode === 'delete' ? 'danger-action' : 'primary'}
+                type="submit"
+                disabled={hostFolderActionPending}
+              >{hostFolderActionPending
+                  ? '正在处理…'
+                  : hostFolderDialog.mode === 'delete' ? '删除文件夹' : '保存'}</button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {editingHost !== undefined && (
         <div className="modal-backdrop">
-          <form className="modal" onSubmit={(event) => void saveHost(event)}>
+          <form className="modal host-editor-modal" onSubmit={(event) => void saveHost(event)}>
             <div className="modal-header">
-              <strong>{editingHost ? '编辑 SSH 主机' : '添加 SSH 主机'}</strong>
+              <strong>{editingHost ? '编辑主机' : '添加主机'}</strong>
               <button type="button" onClick={() => setEditingHost(undefined)}>×</button>
             </div>
-            <div className="form-grid">
-              <label className="span-2">显示名称<input name="name" required defaultValue={editingHost?.name ?? 'Ubuntu 测试机'} /></label>
-              <label className="span-2">主机名或 IP 地址<input name="hostname" required defaultValue={editingHost?.hostname ?? ''} /></label>
-              <label>端口<input name="port" type="number" min="1" max="65535" required defaultValue={editingHost?.port ?? 22} /></label>
-              <label>用户名<input name="username" required defaultValue={editingHost?.username ?? ''} /></label>
-              <label className="span-2">认证方式
-                <select name="authMethod" defaultValue={editingHost?.authMethod ?? 'password'}>
-                  <option value="password">用户名和密码</option>
-                  <option value="keyboard-interactive">键盘交互认证</option>
-                  <option value="private-key">私钥</option>
-                  <option value="agent">Windows OpenSSH / Pageant 代理</option>
-                </select>
-              </label>
-              <label className="span-2">私钥路径（使用私钥时）<input name="privateKeyPath" defaultValue={editingHost?.privateKeyPath ?? ''} /></label>
-              <label>分组<input name="group" defaultValue={editingHost?.group ?? ''} /></label>
-              <label className="check-label"><input name="favorite" type="checkbox" defaultChecked={editingHost?.favorite} /> 收藏</label>
+            <div className="host-protocol-tabs" role="tablist" aria-label="主机协议">
+              {HOST_PROTOCOL_OPTIONS.map((option) => (
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected={editingHostProtocol === option.protocol}
+                  className={editingHostProtocol === option.protocol ? 'active' : ''}
+                  data-protocol={option.protocol}
+                  key={option.protocol}
+                  onClick={() => {
+                    setEditingHostProtocol(option.protocol);
+                    setConnectionError(null);
+                  }}
+                >
+                  <strong>{option.label}</strong>
+                  <small>{option.implemented ? '可用' : '尚未接入'}</small>
+                </button>
+              ))}
             </div>
+
+            {editingHostProtocol === 'ssh' && (
+              <div className="form-grid" role="tabpanel">
+                <label className="span-2">显示名称<input name="name" required defaultValue={editingHost?.name ?? 'Ubuntu 测试机'} /></label>
+                <label className="span-2">主机名或 IP 地址<input name="hostname" required defaultValue={editingHost?.hostname ?? ''} /></label>
+                <label>端口<input name="port" type="number" min="1" max="65535" required defaultValue={editingHost?.port ?? 22} /></label>
+                <label>用户名<input name="username" required defaultValue={editingHost?.username ?? ''} /></label>
+                <label className="span-2">认证方式
+                  <select name="authMethod" defaultValue={editingHost?.authMethod ?? 'password'}>
+                    <option value="password">用户名和密码</option>
+                    <option value="keyboard-interactive">键盘交互认证</option>
+                    <option value="private-key">私钥</option>
+                    <option value="agent">Windows OpenSSH / Pageant 代理</option>
+                  </select>
+                </label>
+                <label className="span-2">私钥路径（使用私钥时）<input name="privateKeyPath" defaultValue={editingHost?.privateKeyPath ?? ''} /></label>
+                <label>文件夹
+                  <select name="folderId" defaultValue={editingHost?.folderId ?? ''}>
+                    <option value="">未分组</option>
+                    {orderedHostFolders.map((folder) => (
+                      <option value={folder.id} key={folder.id}>{folder.name}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="check-label"><input name="favorite" type="checkbox" defaultChecked={editingHost?.favorite} /> 收藏</label>
+              </div>
+            )}
+
+            {editingHostProtocol === 'vnc' && (
+              <div className="form-grid host-protocol-form" role="tabpanel">
+                <label className="span-2">显示名称<input defaultValue="VNC 主机" /></label>
+                <label className="span-2">主机名或 IP 地址<input placeholder="192.168.1.10" /></label>
+                <label>端口<input type="number" min="1" max="65535" defaultValue={5900} /></label>
+                <label>用户名（可选）<input /></label>
+              </div>
+            )}
+
+            {editingHostProtocol === 'rdp' && (
+              <div className="form-grid host-protocol-form" role="tabpanel">
+                <label className="span-2">显示名称<input defaultValue="RDP 主机" /></label>
+                <label className="span-2">主机名或 IP 地址<input placeholder="192.168.1.20" /></label>
+                <label>端口<input type="number" min="1" max="65535" defaultValue={3389} /></label>
+                <label>用户名<input /></label>
+                <label className="span-2">域（可选）<input /></label>
+              </div>
+            )}
+
+            {editingHostProtocol === 'serial' && (
+              <div className="form-grid host-protocol-form" role="tabpanel">
+                <label className="span-2">显示名称<input defaultValue="串口终端" /></label>
+                <label className="span-2">设备路径<input placeholder="COM3" /></label>
+                <label>波特率
+                  <select defaultValue="115200">
+                    <option value="9600">9600</option>
+                    <option value="57600">57600</option>
+                    <option value="115200">115200</option>
+                  </select>
+                </label>
+                <label>数据位<select defaultValue="8"><option>8</option><option>7</option><option>6</option><option>5</option></select></label>
+                <label>停止位<select defaultValue="1"><option>1</option><option>1.5</option><option>2</option></select></label>
+                <label>校验<select defaultValue="none"><option value="none">无</option><option value="even">偶校验</option><option value="odd">奇校验</option></select></label>
+                <label className="span-2">流控制<select defaultValue="none"><option value="none">无</option><option value="hardware">硬件</option><option value="software">软件</option></select></label>
+              </div>
+            )}
+
+            {editingHostProtocol !== 'ssh' && (
+              <div className="host-protocol-unavailable" role="status">
+                <strong>{HOST_PROTOCOL_OPTIONS.find((option) => option.protocol === editingHostProtocol)?.label} 尚未接入</strong>
+                <span>{HOST_PROTOCOL_OPTIONS.find((option) => option.protocol === editingHostProtocol)?.description}。当前仅展示配置字段，不会保存或发起虚假连接。</span>
+              </div>
+            )}
             {connectionError && <div className="form-error">{connectionError}</div>}
             <div className="modal-actions">
               <button type="button" onClick={() => setEditingHost(undefined)}>取消</button>
-              <button className="primary" type="submit">保存主机</button>
+              <button className="primary" type="submit" disabled={editingHostProtocol !== 'ssh'}>
+                {editingHostProtocol === 'ssh' ? '保存主机' : '尚未接入'}
+              </button>
             </div>
           </form>
         </div>
@@ -2385,12 +3063,33 @@ export function App() {
                         : '内置模板已锁定官方 Base URL，只需输入 API Key。'}
                     </small>
                     <label>
-                      模型 ID
+                      可用模型
+                      <select
+                        key={`models-${providerModelOptions.join('\u0000')}`}
+                        data-testid="provider-model-select"
+                        defaultValue=""
+                        onChange={(event) => {
+                          const modelId = event.currentTarget.value;
+                          if (modelId && providerModelInputRef.current) {
+                            providerModelInputRef.current.value = modelId;
+                          }
+                        }}
+                      >
+                        <option value="">{providerModelOptionPrompt(
+                          providerModelOptionSource,
+                          providerModelOptions.length,
+                        )}</option>
+                        {providerModelOptions.map((model) => (
+                          <option data-provider-model value={model} key={model}>{model}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label>
+                      模型 ID（可手动输入）
                       <div className="provider-model-field">
                         <input
                           ref={providerModelInputRef}
                           name="modelId"
-                          list="provider-model-options"
                           required
                           placeholder="从检索结果选择或手动输入"
                           defaultValue={editingProvider?.modelId
@@ -2399,15 +3098,10 @@ export function App() {
                         />
                         <button
                           type="button"
-                          disabled={providerDiscoveryMessage?.tone === 'loading'}
+                          disabled={providerDiscoveryMessage?.text === '正在检索可用模型…'}
                           onClick={() => scheduleProviderModelDiscovery(0)}
                         >检索模型</button>
                       </div>
-                      <datalist id="provider-model-options">
-                        {providerModelOptions.map((model) => (
-                          <option value={model} key={model} />
-                        ))}
-                      </datalist>
                     </label>
                     <label>
                       API Key
@@ -2520,7 +3214,7 @@ export function App() {
       {trustChallenge && (
         <div className="modal-backdrop">
           <div className="modal compact-modal">
-            <div className="modal-header"><strong>信任此 SSH 主机？</strong></div>
+            <div className="modal-header"><strong>信任此主机的 SSH 密钥？</strong></div>
             <p>这是首次连接到 {trustChallenge.host.hostname}。继续前请核对服务器指纹。</p>
             <code className="fingerprint">{trustChallenge.fingerprint}</code>
             <div className="modal-actions">

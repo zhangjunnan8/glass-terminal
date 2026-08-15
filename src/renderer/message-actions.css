@@ -1,0 +1,86 @@
+.agent-message-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid #243348;
+}
+
+.agent-message-actions > small {
+  margin-right: auto;
+  color: #78879b;
+  font-size: 11px;
+}
+
+.agent-message-actions button {
+  min-height: 30px;
+  padding: 5px 9px;
+  color: #aab8ca;
+  border: 1px solid #34445a;
+  border-radius: 4px;
+  background: #17212e;
+  cursor: pointer;
+  font-size: 12px;
+  transition: border-color 130ms ease, background-color 130ms ease, transform 90ms ease;
+}
+
+.agent-message-actions button:hover:not(:disabled) {
+  color: #dce6f3;
+  border-color: #52705f;
+  background: #203027;
+}
+
+.agent-message-actions button:active:not(:disabled) { transform: scale(.96); }
+.agent-message-actions button:disabled { cursor: wait; opacity: .55; }
+.agent-message-actions .interrupt { color: #ffdfe2; border-color: #8e3f4b; background: #622530; }
+.agent-message-actions .interrupt:hover:not(:disabled) { border-color: #c05e6b; background: #7a2d3a; }
+
+.composer-editing {
+  margin: -2px -2px 8px;
+  padding: 7px 8px;
+  color: #d7b970 !important;
+  border: 1px solid #705831;
+  border-radius: 4px;
+  background: #211a0e;
+}
+
+.composer-editing button {
+  width: auto;
+  height: 28px;
+  padding: 4px 8px;
+  color: #d8c28e;
+  border: 1px solid #745b33;
+  background: #30250f;
+  box-shadow: none;
+  font-size: 12px;
+}
+
+.app-shell[data-theme="light"] .agent-message-actions { border-color: #ced8d4; }
+.app-shell[data-theme="light"] .agent-message-actions > small { color: #68768a; }
+.app-shell[data-theme="light"] .agent-message-actions button {
+  color: #405065;
+  border-color: #c3ccd8;
+  background: #f0f3f7;
+}
+.app-shell[data-theme="light"] .agent-message-actions button:hover:not(:disabled) {
+  color: #214f43;
+  border-color: #8bbcaf;
+  background: #e6f3ef;
+}
+.app-shell[data-theme="light"] .agent-message-actions .interrupt {
+  color: #ffffff;
+  border-color: #a93243;
+  background: #bd3e50;
+}
+.app-shell[data-theme="light"] .composer-editing {
+  color: #73500a !important;
+  border-color: #d7bc7e;
+  background: #fff8e8;
+}
+.app-shell[data-theme="light"] .composer-editing button {
+  color: #684704;
+  border-color: #d2b36e;
+  background: #fff3d5;
+}

@@ -2,6 +2,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CODEX_APP_SERVER_AGENT_BACKEND } from '../shared/agent';
+import type { AgentSessionView } from '../shared/agent';
 import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import type { DesktopBridge } from '../shared/ipc';
 import type { ProviderProfile } from '../shared/provider';
@@ -29,6 +30,28 @@ const provider: ProviderProfile = {
   createdAt: now,
   updatedAt: now,
 };
+
+function agentView(state: AgentSessionView['state'] = 'COMPLETED'): AgentSessionView {
+  return {
+    revision: 1,
+    terminalId: 'terminal-1',
+    sessionId: 'session-1',
+    threadId: 'thread-1',
+    backend: { kind: 'generic-provider', providerId: provider.id },
+    providerId: provider.id,
+    state,
+    terminalInputMode: state === 'THINKING' ? 'locked' : 'human',
+    fullTakeover: false,
+    messages: [
+      { id: 'user-1', role: 'user', content: '第一条', createdAt: now },
+      { id: 'assistant-1', role: 'assistant', content: '第一条回复', createdAt: now },
+      { id: 'user-2', role: 'user', content: '最后一条命令', createdAt: now },
+      ...(state === 'COMPLETED'
+        ? [{ id: 'assistant-2', role: 'assistant' as const, content: '已完成', createdAt: now }]
+        : []),
+    ],
+  };
+}
 
 function codexSnapshot(contextEnabled = false, revision = 1): CodexAppServerSnapshot {
   return {
@@ -153,6 +176,8 @@ function bridgeForCodex(snapshot: CodexAppServerSnapshot): DesktopBridge {
     },
     agent: {
       sendPrompt: vi.fn(),
+      interruptTurn: vi.fn(),
+      revisePrompt: vi.fn(),
       getState: vi.fn().mockResolvedValue(undefined),
       resolveApproval: vi.fn(),
       setFullTakeover: vi.fn(),
@@ -183,6 +208,7 @@ describe('native Codex App Server renderer mode', () => {
 
   beforeEach(() => {
     Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    window.localStorage.clear();
     container = document.createElement('div');
     document.body.append(container);
     root = createRoot(container);
@@ -245,5 +271,76 @@ describe('native Codex App Server renderer mode', () => {
     expect(container.querySelector<HTMLInputElement>('[data-testid="codex-terminal-context-toggle"]')?.checked)
       .toBe(true);
     expect(container.textContent).not.toContain('启用实验模式');
+  });
+
+  it('persists a white application theme without changing system settings', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    const shell = container.querySelector<HTMLElement>('.app-shell')!;
+    const toggle = container.querySelector<HTMLButtonElement>('[data-action="toggle-theme"]')!;
+    expect(shell.dataset.theme).toBe('dark');
+    await act(async () => toggle.click());
+    expect(shell.dataset.theme).toBe('light');
+    expect(window.localStorage.getItem('ai-terminal:ui-theme')).toBe('light');
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('offers retract and edit only on the latest completed user message', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    const completed = agentView();
+    const revised = { ...completed, revision: 2, state: 'THINKING' as const };
+    bridge.agent.getState = vi.fn().mockResolvedValue(completed);
+    bridge.agent.revisePrompt = vi.fn().mockResolvedValue(revised);
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    expect(container.querySelectorAll('[data-testid="latest-user-message-actions"]')).toHaveLength(1);
+    expect(container.querySelector('[data-action="interrupt-agent-message"]')).toBeNull();
+    const edit = container.querySelector<HTMLButtonElement>('[data-action="edit-agent-message"]')!;
+    await act(async () => edit.click());
+    const composer = container.querySelector<HTMLTextAreaElement>('[data-testid="agent-composer"]')!;
+    expect(composer.value).toBe('最后一条命令');
+    expect(container.querySelector('.composer-editing')?.textContent).toContain('正在修改');
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="修改并重新发送"]')!.click();
+    });
+    await settle();
+    expect(bridge.agent.revisePrompt).toHaveBeenCalledWith({
+      terminalId: 'terminal-1',
+      messageId: 'user-2',
+      action: 'replace',
+      prompt: '最后一条命令',
+    });
+  });
+
+  it('shows a one-click interrupt instead of edit controls while the latest prompt runs', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    const running = agentView('THINKING');
+    bridge.agent.getState = vi.fn().mockResolvedValue(running);
+    bridge.agent.interruptTurn = vi.fn().mockResolvedValue({
+      ...running,
+      revision: 2,
+      state: 'PAUSED',
+      terminalInputMode: 'human',
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    expect(container.querySelector('[data-action="retract-agent-message"]')).toBeNull();
+    expect(container.querySelector('[data-action="edit-agent-message"]')).toBeNull();
+    const interrupt = container.querySelector<HTMLButtonElement>('[data-action="interrupt-agent-message"]')!;
+    await act(async () => interrupt.click());
+    expect(bridge.agent.interruptTurn).toHaveBeenCalledWith({
+      terminalId: 'terminal-1',
+      messageId: 'user-2',
+    });
   });
 });

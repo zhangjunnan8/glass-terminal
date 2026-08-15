@@ -13,3 +13,14 @@ export function mergeProviderModelOptions(
   }
   return models;
 }
+
+export type ProviderModelOptionSource = 'suggested' | 'discovered';
+
+export function providerModelOptionPrompt(
+  source: ProviderModelOptionSource,
+  count: number,
+): string {
+  return source === 'discovered'
+    ? `已检索到 ${count} 个可用模型`
+    : `模板建议（${count} 个）`;
+}

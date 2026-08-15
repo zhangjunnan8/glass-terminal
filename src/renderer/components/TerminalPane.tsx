@@ -3,6 +3,8 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Terminal } from '@xterm/xterm';
 import '@xterm/xterm/css/xterm.css';
 import type { TerminalInputMode } from '../../shared/agent';
+import { terminalTheme } from '../terminal-theme';
+import type { UiTheme } from '../theme';
 import {
   positionTerminalContextMenu,
   terminalPasteAllowed,
@@ -13,12 +15,14 @@ interface TerminalPaneProps {
   terminalId: string;
   active: boolean;
   inputMode: TerminalInputMode;
+  uiTheme: UiTheme;
 }
 
 export function TerminalPane({
   terminalId,
   active,
   inputMode,
+  uiTheme,
 }: TerminalPaneProps) {
   const paneRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -65,22 +69,7 @@ export function TerminalPane({
       fontSize: 15,
       lineHeight: 1.28,
       scrollback: 10_000,
-      theme: {
-        background: '#080c12',
-        foreground: '#d7e0ed',
-        cursor: '#6de6c3',
-        cursorAccent: '#0b1018',
-        selectionBackground: '#315f6d88',
-        black: '#0a0f16',
-        red: '#f07178',
-        green: '#9ece6a',
-        yellow: '#e0af68',
-        blue: '#7aa2f7',
-        magenta: '#bb9af7',
-        cyan: '#7dcfff',
-        white: '#c0caf5',
-        brightBlack: '#565f89',
-      },
+      theme: terminalTheme(uiTheme),
     });
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
@@ -149,6 +138,10 @@ export function TerminalPane({
       fitRef.current = null;
     };
   }, [terminalId]);
+
+  useEffect(() => {
+    if (terminalRef.current) terminalRef.current.options.theme = terminalTheme(uiTheme);
+  }, [uiTheme]);
 
   useEffect(() => {
     if (!contextMenu) return;

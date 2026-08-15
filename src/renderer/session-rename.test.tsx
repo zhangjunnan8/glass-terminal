@@ -132,6 +132,8 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
     },
     agent: {
       sendPrompt: vi.fn(),
+      interruptTurn: vi.fn(),
+      revisePrompt: vi.fn(),
       getState: vi.fn().mockResolvedValue(undefined),
       resolveApproval: vi.fn(),
       setFullTakeover: vi.fn(),
@@ -256,7 +258,8 @@ describe('renderer host and session dialogs', () => {
     expect(container.querySelector('.selected-host-card')).not.toBeNull();
     await act(async () => hostButton.click());
     expect(hostButton.getAttribute('aria-expanded')).toBe('false');
-    expect(container.querySelector('.selected-host-card')).toBeNull();
+    expect(container.querySelector('.host-details-collapse.open')).toBeNull();
+    expect(container.querySelector('.host-details-collapse')?.getAttribute('aria-hidden')).toBe('true');
 
     const historyActivity = container.querySelector<HTMLButtonElement>('[data-action="show-history"]')!;
     await act(async () => historyActivity.click());
