@@ -106,6 +106,22 @@ describe('SessionStore', () => {
       .toHaveLength(1);
   });
 
+  it('durably updates cwd and effective user without replacing the AI thread binding', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    const threadId = '22222222-2222-2222-2222-222222222222';
+    store.bindAgentThread(session.id, 'provider', threadId);
+
+    store.updateShellContext(session.id, { cwd: '/srv/project', effectiveUser: 'root' });
+
+    const restored = new SessionStore(root).get(session.id);
+    expect(restored.cwd).toBe('/srv/project');
+    expect(restored.effectiveUser).toBe('root');
+    expect(restored.aiThreadId).toBe(threadId);
+    expect(restored.agentBackend).toEqual({ kind: 'generic-provider', providerId: 'provider' });
+  });
+
   it('persists the local and upstream thread mapping for the isolated App Server backend', () => {
     const root = temporaryRoot();
     const store = new SessionStore(root);

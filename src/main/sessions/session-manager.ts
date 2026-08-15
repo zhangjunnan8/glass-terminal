@@ -6,10 +6,16 @@ import type { SessionAuditEvent } from '../../shared/session';
 import type { AgentBackendRef } from '../../shared/agent';
 import type { TerminalDescriptor } from '../../shared/terminal';
 import type { TerminalService } from '../terminal/terminal-service';
+import {
+  buildSshRestoreInput,
+  inferShellContext,
+  ShellContextTracker,
+} from './session-context';
 import { SessionStore } from './session-store';
 
 export class SessionManager {
   private readonly removeJournalListener: () => void;
+  private readonly contextTrackers = new Map<string, ShellContextTracker>();
 
   constructor(
     private readonly store: SessionStore,
@@ -18,8 +24,24 @@ export class SessionManager {
   ) {
     this.removeJournalListener = terminals.onJournal((_terminalId, sessionId, event) => {
       this.store.appendTerminalEvents(sessionId, [event]);
+      if (event.kind === 'output') {
+        try {
+          const session = this.store.get(sessionId);
+          let tracker = this.contextTrackers.get(sessionId);
+          if (!tracker) {
+            tracker = new ShellContextTracker(session.shellKind);
+            this.contextTrackers.set(sessionId, tracker);
+          }
+          const context = tracker.push(event.data);
+          if (context) this.store.updateShellContext(sessionId, context);
+        } catch (error) {
+          // Terminal I/O must remain usable if a context metadata update cannot be persisted.
+          console.error('Unable to persist Session shell context:', error);
+        }
+      }
       if (event.kind === 'exit') {
         this.store.markDisconnected(sessionId, event.exitCode, event.signal);
+        this.contextTrackers.delete(sessionId);
       }
     });
   }
@@ -33,14 +55,19 @@ export class SessionManager {
     if (existingSessionId) return this.store.get(existingSessionId);
 
     const snapshot = this.terminals.snapshot(owner, terminalId);
-    let effectiveUser = process.env.USERNAME;
+    const terminalOutput = snapshot.history
+      .filter((event) => event.kind === 'output')
+      .map((event) => event.data)
+      .join('');
+    const inferredContext = inferShellContext(terminalOutput, snapshot.descriptor.shellKind);
+    let effectiveUser = inferredContext?.effectiveUser ?? process.env.USERNAME;
     let targetSnapshot: SessionRecord['targetSnapshot'] = {
       label: snapshot.descriptor.title,
     };
     if (snapshot.descriptor.hostId) {
       try {
         const host = this.hosts.get(snapshot.descriptor.hostId);
-        effectiveUser = host.username;
+        effectiveUser = inferredContext?.effectiveUser ?? host.username;
         targetSnapshot = {
           label: host.name,
           hostname: host.hostname,
@@ -55,10 +82,14 @@ export class SessionManager {
     const session = this.store.create({
       ...snapshot,
       effectiveUser,
-      cwd: snapshot.descriptor.transport === 'local' ? homedir() : undefined,
+      cwd: inferredContext?.cwd
+        ?? (snapshot.descriptor.transport === 'local' ? homedir() : undefined),
       targetSnapshot,
     });
     this.terminals.bindSession(owner, terminalId, session.id);
+    const tracker = new ShellContextTracker(snapshot.descriptor.shellKind);
+    tracker.push(terminalOutput);
+    this.contextTrackers.set(session.id, tracker);
 
     const exit = [...snapshot.history].reverse().find((event) => event.kind === 'exit');
     if (exit?.kind === 'exit') {
@@ -79,7 +110,16 @@ export class SessionManager {
     const snapshot = this.terminals.snapshot(owner, terminal.id);
     this.store.appendTerminalEvents(sessionId, snapshot.history);
     this.terminals.bindSession(owner, terminal.id, sessionId);
-    return this.store.markConnected(sessionId, terminal.id);
+    const connected = this.store.markConnected(sessionId, terminal.id);
+    this.contextTrackers.set(sessionId, new ShellContextTracker(session.shellKind));
+    const restoreInput = buildSshRestoreInput(session);
+    if (restoreInput) this.terminals.write(owner, terminal.id, restoreInput);
+    return connected;
+  }
+
+  sessionForTerminal(owner: WebContents, terminalId: string): SessionRecord | undefined {
+    const sessionId = this.terminals.sessionId(owner, terminalId);
+    return sessionId ? this.store.get(sessionId) : undefined;
   }
 
   rename(request: RenameSessionRequest): SessionRecord {
@@ -133,6 +173,7 @@ export class SessionManager {
 
   close(): void {
     this.removeJournalListener();
+    this.contextTrackers.clear();
     this.store.flushAll();
   }
 }

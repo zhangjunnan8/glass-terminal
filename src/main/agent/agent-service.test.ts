@@ -69,6 +69,7 @@ class DeferredStreamingProvider implements AgentProviderRuntime {
 class FakeSessions {
   readonly audits: Array<{ type: string; details?: Record<string, unknown> }> = [];
   readonly threadEvents: Array<Record<string, unknown>> = [];
+  persistedThreadEvents: Array<Record<string, unknown>> = [];
   readonly failAuditTypes = new Set<string>();
   failThreadEvents = false;
   session: SessionRecord = {
@@ -96,6 +97,7 @@ class FakeSessions {
   };
 
   upgrade() { return this.session; }
+  sessionForTerminal() { return this.session; }
   bindAgentThread(_sessionId: string, providerId: string, threadId: string) {
     this.session = {
       ...this.session,
@@ -121,7 +123,7 @@ class FakeSessions {
     this.session = { ...this.session, providerThreadId };
     return this.session;
   }
-  readThreadEvents() { return []; }
+  readThreadEvents() { return this.persistedThreadEvents; }
   appendThreadEvent(_sessionId: string, _threadId: string, event: Record<string, unknown>) {
     if (this.failThreadEvents) throw new Error('thread persistence failed');
     this.threadEvents.push(event);
@@ -425,6 +427,40 @@ function toolCall(id: string, command: string): AgentCompletion {
 }
 
 describe('AgentService shared-terminal controls', () => {
+  it('hydrates the persisted AI conversation when a Session reconnects to a new terminal', () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      runtimeTerminalId: 'reconnected-terminal',
+      aiThreadId: '22222222-2222-2222-2222-222222222222',
+      agentBackend: { kind: 'generic-provider', providerId: 'provider' },
+      providerId: 'provider',
+    };
+    sessions.persistedThreadEvents = [{
+      type: 'chat',
+      timestamp: new Date(1).toISOString(),
+      item: {
+        id: 'message-1',
+        role: 'assistant',
+        content: 'Persisted answer',
+        createdAt: new Date(1).toISOString(),
+      },
+    }];
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+    );
+
+    const restored = service.getState(browserOwner(), 'reconnected-terminal');
+
+    expect(restored?.threadId).toBe('22222222-2222-2222-2222-222222222222');
+    expect(restored?.messages).toEqual([expect.objectContaining({
+      id: 'message-1',
+      content: 'Persisted answer',
+    })]);
+  });
+
   it('publishes App Server deltas before turn completion using one stable message', async () => {
     const codex = new DeferredStreamingCodexAppServer();
     const sessions = new FakeSessions();

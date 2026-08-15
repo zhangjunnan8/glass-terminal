@@ -218,6 +218,24 @@ export class SessionStore {
     return updated;
   }
 
+  updateShellContext(
+    sessionId: string,
+    context: { cwd?: string; effectiveUser?: string },
+  ): SessionRecord {
+    const current = this.get(sessionId);
+    const cwd = context.cwd ?? current.cwd;
+    const effectiveUser = context.effectiveUser ?? current.effectiveUser;
+    if (cwd === current.cwd && effectiveUser === current.effectiveUser) return current;
+    const updated: SessionRecord = {
+      ...current,
+      cwd,
+      effectiveUser,
+      updatedAt: new Date().toISOString(),
+    };
+    this.save(updated);
+    return updated;
+  }
+
   markDisconnected(
     sessionId: string,
     exitCode: number,

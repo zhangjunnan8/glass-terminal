@@ -169,8 +169,16 @@ export class AgentService {
   }
 
   getState(owner: WebContents, terminalId: string): AgentSessionView | null {
-    const runtime = this.runtimes.get(terminalId);
-    if (!runtime) return null;
+    let runtime = this.runtimes.get(terminalId);
+    if (!runtime) {
+      const session = this.sessions.sessionForTerminal(owner, terminalId);
+      const persistedBackend = session?.agentBackend
+        ?? (session?.providerId
+          ? { kind: 'generic-provider' as const, providerId: session.providerId }
+          : undefined);
+      if (!session?.aiThreadId || !persistedBackend) return null;
+      runtime = this.ensureRuntime(owner, terminalId, persistedBackend);
+    }
     if (runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
     return cloneView(runtime);
   }
