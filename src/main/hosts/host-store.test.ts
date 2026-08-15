@@ -2,6 +2,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import type { HostInput } from '../../shared/host';
 import { HostStore } from './host-store';
 
 const temporaryDirectories: string[] = [];
@@ -13,6 +14,24 @@ function createStore() {
   return { store: new HostStore(filePath), filePath };
 }
 
+function storedDocument(filePath: string) {
+  return JSON.parse(readFileSync(filePath, 'utf8')) as {
+    version: number;
+    folders: Array<Record<string, unknown>>;
+    hosts: Array<Record<string, unknown>>;
+  };
+}
+
+function sshHost(name: string, suffix = name): HostInput {
+  return {
+    name,
+    hostname: `192.0.2.${suffix.length}`,
+    port: 22,
+    username: 'zjn',
+    authMethod: 'password',
+  };
+}
+
 afterEach(() => {
   for (const directory of temporaryDirectories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
@@ -20,7 +39,7 @@ afterEach(() => {
 });
 
 describe('HostStore', () => {
-  it('persists only non-secret host fields', () => {
+  it('persists only allowlisted, non-secret Host fields in a versioned document', () => {
     const { store, filePath } = createStore();
     const host = store.save({
       name: 'Ubuntu Lab',
@@ -29,22 +48,21 @@ describe('HostStore', () => {
       username: 'zjn',
       authMethod: 'password',
     });
-    expect(store.get(host.id).hostname).toBe('192.168.31.93');
-    expect(store.get(host.id).credentialConfigured).toBe(false);
+    expect(store.get(host.id)).toMatchObject({
+      protocol: 'ssh',
+      hostname: '192.168.31.93',
+      sortOrder: 0,
+      credentialConfigured: false,
+    });
     const persisted = readFileSync(filePath, 'utf8');
+    expect(storedDocument(filePath).version).toBe(2);
     expect(persisted).not.toContain('password": "');
     expect(persisted).not.toContain('passphrase');
   });
 
   it('keeps a trusted fingerprint across profile edits', () => {
     const { store } = createStore();
-    const host = store.save({
-      name: 'Ubuntu Lab',
-      hostname: '192.168.31.93',
-      port: 22,
-      username: 'zjn',
-      authMethod: 'password',
-    });
+    const host = store.save(sshHost('Ubuntu Lab'));
     store.trustFingerprint(host.id, 'SHA256:example');
     const updated = store.save({ ...host, name: 'Ubuntu Debug' });
     expect(updated.hostKeyFingerprint).toBe('SHA256:example');
@@ -52,13 +70,7 @@ describe('HostStore', () => {
 
   it('keeps credential references internal and retires them before identity changes', () => {
     const { store, filePath } = createStore();
-    const host = store.save({
-      name: 'Ubuntu Lab',
-      hostname: '192.168.31.93',
-      port: 22,
-      username: 'zjn',
-      authMethod: 'password',
-    });
+    const host = store.save(sshHost('Ubuntu Lab'));
     const reference = `AI Terminal/ssh/${host.id}`;
     const configured = store.configureCredential(host.id, reference);
     expect(configured.credentialConfigured).toBe(true);
@@ -81,23 +93,131 @@ describe('HostStore', () => {
     expect(readFileSync(filePath, 'utf8')).not.toContain(reference);
   });
 
-  it('rebuilds old Host JSON through an allowlist before exposing it', () => {
-    const { store: initial, filePath } = createStore();
-    const host = initial.save({
+  it('migrates legacy group strings to stable folders without exposing injected fields', () => {
+    const { filePath } = createStore();
+    const timestamp = '2026-01-02T03:04:05.000Z';
+    const legacy = [{
+      id: 'legacy-host',
       name: 'Ubuntu Lab',
       hostname: '192.168.31.93',
       port: 22,
       username: 'zjn',
       authMethod: 'password',
-    });
-    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as Array<Record<string, unknown>>;
-    parsed[0].password = 'must-not-cross-ipc';
-    parsed[0].credentialReference = 'AI Terminal/ssh/not-the-host-id';
-    writeFileSync(filePath, JSON.stringify(parsed), 'utf8');
+      group: 'Production',
+      favorite: false,
+      credentialConfigured: true,
+      credentialReference: 'AI Terminal/ssh/not-the-host-id',
+      password: 'must-not-cross-ipc',
+      revision: 7,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    }];
+    writeFileSync(filePath, JSON.stringify(legacy), 'utf8');
 
-    const reloaded = new HostStore(filePath);
-    expect(reloaded.get(host.id)).not.toHaveProperty('password');
-    expect(reloaded.get(host.id)).not.toHaveProperty('credentialReference');
-    expect(reloaded.get(host.id).credentialConfigured).toBe(false);
+    const firstLoad = new HostStore(filePath);
+    const firstFolder = firstLoad.listFolders()[0];
+    const migrated = firstLoad.get('legacy-host');
+    expect(firstFolder).toMatchObject({ name: 'Production', sortOrder: 0 });
+    expect(migrated).toMatchObject({
+      protocol: 'ssh',
+      folderId: firstFolder.id,
+      group: 'Production',
+      credentialConfigured: false,
+    });
+    expect(migrated).not.toHaveProperty('password');
+    expect(migrated).not.toHaveProperty('credentialReference');
+
+    const secondLoad = new HostStore(filePath);
+    expect(secondLoad.listFolders()[0].id).toBe(firstFolder.id);
+
+    firstLoad.moveHost({
+      hostId: migrated.id,
+      folderId: null,
+      beforeHostId: null,
+    });
+    const persisted = storedDocument(filePath);
+    expect(persisted.version).toBe(2);
+    expect(persisted.hosts[0].revision).toBe(7);
+  });
+
+  it('creates, renames, orders, and only removes empty Host folders', () => {
+    const { store } = createStore();
+    const production = store.createFolder({ name: 'Production' });
+    const staging = store.createFolder({ name: 'Staging' });
+    expect(() => store.createFolder({ name: 'production' })).toThrow(/same|exist|\u5b58在/i);
+
+    const renamed = store.renameFolder({ folderId: staging.id, name: 'Testing' });
+    expect(renamed.name).toBe('Testing');
+    const ordered = store.moveFolder({
+      folderId: renamed.id,
+      beforeFolderId: production.id,
+    });
+    expect(ordered.map((folder) => folder.id)).toEqual([renamed.id, production.id]);
+
+    const host = store.save({ ...sshHost('Grouped'), folderId: production.id });
+    expect(() => store.removeFolder(production.id)).toThrow(/empty|\u7a7a/);
+    store.moveHost({ hostId: host.id, folderId: null, beforeHostId: null });
+    store.removeFolder(production.id);
+    expect(store.listFolders().map((folder) => folder.id)).toEqual([renamed.id]);
+  });
+
+  it('moves and reorders Hosts without changing identity, credentials, or revision', () => {
+    const { store, filePath } = createStore();
+    const source = store.createFolder({ name: 'Source' });
+    const target = store.createFolder({ name: 'Target' });
+    const first = store.save({ ...sshHost('First'), folderId: source.id });
+    const second = store.save({ ...sshHost('Second'), folderId: source.id });
+    const targetHost = store.save({ ...sshHost('Target host'), folderId: target.id });
+    store.trustFingerprint(first.id, 'SHA256:move-safe');
+    store.configureCredential(first.id, `AI Terminal/ssh/${first.id}`);
+    const before = storedDocument(filePath).hosts.find((host) => host.id === first.id)!;
+
+    const moved = store.moveHost({
+      hostId: first.id,
+      folderId: target.id,
+      beforeHostId: targetHost.id,
+    });
+    expect(moved.folderId).toBe(target.id);
+    expect(store.list().filter((host) => host.folderId === target.id).map((host) => host.id))
+      .toEqual([first.id, targetHost.id]);
+    expect(store.list().filter((host) => host.folderId === source.id).map((host) => host.id))
+      .toEqual([second.id]);
+    store.moveFolder({ folderId: target.id, beforeFolderId: source.id });
+
+    const after = storedDocument(filePath).hosts.find((host) => host.id === first.id)!;
+    for (const field of [
+      'protocol',
+      'hostname',
+      'port',
+      'username',
+      'authMethod',
+      'hostKeyFingerprint',
+      'credentialConfigured',
+      'credentialReference',
+      'revision',
+      'createdAt',
+      'updatedAt',
+    ]) {
+      expect(after[field], field).toEqual(before[field]);
+    }
+    expect(store.credentialReference(first.id)).toBe(`AI Terminal/ssh/${first.id}`);
+  });
+
+  it('rejects cross-folder reorder targets and unimplemented protocol persistence', () => {
+    const { store } = createStore();
+    const left = store.createFolder({ name: 'Left' });
+    const right = store.createFolder({ name: 'Right' });
+    const leftHost = store.save({ ...sshHost('Left host'), folderId: left.id });
+    const rightHost = store.save({ ...sshHost('Right host'), folderId: right.id });
+
+    expect(() => store.moveHost({
+      hostId: leftHost.id,
+      folderId: left.id,
+      beforeHostId: rightHost.id,
+    })).toThrow(/destination folder/);
+    expect(() => store.save({
+      ...sshHost('Future VNC'),
+      protocol: 'vnc',
+    } as unknown as HostInput)).toThrow(/not implemented/);
   });
 });

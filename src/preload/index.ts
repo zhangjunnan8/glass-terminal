@@ -55,6 +55,12 @@ const hostBridge: DesktopBridge['hosts'] = {
   save: (input) => ipcRenderer.invoke(HOST_CHANNELS.save, input),
   remove: (hostId) => ipcRenderer.invoke(HOST_CHANNELS.remove, hostId),
   forgetCredential: (hostId) => ipcRenderer.invoke(HOST_CHANNELS.forgetCredential, hostId),
+  listFolders: () => ipcRenderer.invoke(HOST_CHANNELS.listFolders),
+  createFolder: (request) => ipcRenderer.invoke(HOST_CHANNELS.createFolder, request),
+  renameFolder: (request) => ipcRenderer.invoke(HOST_CHANNELS.renameFolder, request),
+  removeFolder: (folderId) => ipcRenderer.invoke(HOST_CHANNELS.removeFolder, folderId),
+  moveFolder: (request) => ipcRenderer.invoke(HOST_CHANNELS.moveFolder, request),
+  moveHost: (request) => ipcRenderer.invoke(HOST_CHANNELS.moveHost, request),
 };
 
 const sessionBridge: DesktopBridge['sessions'] = {

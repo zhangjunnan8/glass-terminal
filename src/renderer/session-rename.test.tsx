@@ -19,6 +19,7 @@ const now = '2026-08-15T00:00:00.000Z';
 
 const host: HostProfile = {
   id: 'host-1',
+  protocol: 'ssh',
   name: 'Ubuntu',
   hostname: '192.0.2.10',
   port: 22,
@@ -26,6 +27,7 @@ const host: HostProfile = {
   authMethod: 'password',
   credentialConfigured: false,
   favorite: false,
+  sortOrder: 0,
   createdAt: now,
   updatedAt: now,
 };
@@ -91,6 +93,12 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       save: vi.fn(),
       remove: vi.fn(),
       forgetCredential: vi.fn(),
+      listFolders: vi.fn().mockResolvedValue([]),
+      createFolder: vi.fn(),
+      renameFolder: vi.fn(),
+      removeFolder: vi.fn(),
+      moveFolder: vi.fn(),
+      moveHost: vi.fn(),
     },
     sessions: {
       list: vi.fn().mockResolvedValue([session]),

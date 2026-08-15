@@ -4,7 +4,14 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { PRODUCT_NAME } from '../shared/product';
 import { HOST_CHANNELS } from '../shared/host';
-import type { HostInput, SshConnectRequest } from '../shared/host';
+import type {
+  CreateHostFolderRequest,
+  HostInput,
+  MoveHostFolderRequest,
+  MoveHostRequest,
+  RenameHostFolderRequest,
+  SshConnectRequest,
+} from '../shared/host';
 import { TERMINAL_CHANNELS } from '../shared/terminal';
 import type { CreateTerminalRequest } from '../shared/terminal';
 import { SESSION_CHANNELS } from '../shared/session';
@@ -226,6 +233,27 @@ handleTrusted(HOST_CHANNELS.remove, (_event, hostId: string) => (
 handleTrusted(HOST_CHANNELS.forgetCredential, (_event, hostId: string) => (
   requireHostService().forgetCredential(hostId)
 ));
+handleTrusted(HOST_CHANNELS.listFolders, () => requireHostService().listFolders());
+handleTrusted(
+  HOST_CHANNELS.createFolder,
+  (_event, request: CreateHostFolderRequest) => requireHostService().createFolder(request),
+);
+handleTrusted(
+  HOST_CHANNELS.renameFolder,
+  (_event, request: RenameHostFolderRequest) => requireHostService().renameFolder(request),
+);
+handleTrusted(
+  HOST_CHANNELS.removeFolder,
+  (_event, folderId: string) => requireHostService().removeFolder(folderId),
+);
+handleTrusted(
+  HOST_CHANNELS.moveFolder,
+  (_event, request: MoveHostFolderRequest) => requireHostService().moveFolder(request),
+);
+handleTrusted(
+  HOST_CHANNELS.moveHost,
+  (_event, request: MoveHostRequest) => requireHostService().moveHost(request),
+);
 handleTrusted(HOST_CHANNELS.connect, (event, request: SshConnectRequest) => (
   requireHostService().connect(event.sender, request)
 ));

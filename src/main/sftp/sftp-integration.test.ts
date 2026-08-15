@@ -56,11 +56,13 @@ describe.runIf(enabled)('real SFTP over the visible SSH connection', () => {
     } as unknown as WebContents;
     const host: HostProfile = {
       id: 'sftp-integration-host',
+      protocol: 'ssh',
       name: 'Ubuntu SFTP integration target',
       hostname: process.env.AI_TERMINAL_SSH_TEST_HOST!,
       port: Number(process.env.AI_TERMINAL_SSH_TEST_PORT ?? 22),
       username: process.env.AI_TERMINAL_SSH_TEST_USER!,
       authMethod: 'password',
+      sortOrder: 0,
       favorite: false,
       credentialConfigured: false,
       createdAt: new Date(0).toISOString(),

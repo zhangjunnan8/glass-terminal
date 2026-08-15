@@ -114,6 +114,12 @@ function bridgeForCodex(snapshot: CodexAppServerSnapshot): DesktopBridge {
       save: vi.fn(),
       remove: vi.fn(),
       forgetCredential: vi.fn(),
+      listFolders: vi.fn().mockResolvedValue([]),
+      createFolder: vi.fn(),
+      renameFolder: vi.fn(),
+      removeFolder: vi.fn(),
+      moveFolder: vi.fn(),
+      moveHost: vi.fn(),
     },
     sessions: {
       list: vi.fn().mockResolvedValue([]),

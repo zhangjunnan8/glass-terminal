@@ -1,8 +1,13 @@
 import type { WebContents } from 'electron';
 import {
   SSH_ERROR_CODES,
+  type CreateHostFolderRequest,
+  type HostFolder,
   type HostInput,
   type HostProfile,
+  type MoveHostFolderRequest,
+  type MoveHostRequest,
+  type RenameHostFolderRequest,
   type SshConnectRequest,
   type SshConnectResult,
 } from '../../shared/host';
@@ -34,6 +39,30 @@ export class HostService {
 
   list(): HostProfile[] {
     return this.hosts.list();
+  }
+
+  listFolders(): HostFolder[] {
+    return this.hosts.listFolders();
+  }
+
+  createFolder(request: CreateHostFolderRequest): HostFolder {
+    return this.hosts.createFolder(request);
+  }
+
+  renameFolder(request: RenameHostFolderRequest): HostFolder {
+    return this.hosts.renameFolder(request);
+  }
+
+  removeFolder(folderId: string): void {
+    this.hosts.removeFolder(folderId);
+  }
+
+  moveFolder(request: MoveHostFolderRequest): HostFolder[] {
+    return this.hosts.moveFolder(request);
+  }
+
+  moveHost(request: MoveHostRequest): HostProfile {
+    return this.hosts.moveHost(request);
   }
 
   async save(input: HostInput): Promise<HostProfile> {

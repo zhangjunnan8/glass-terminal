@@ -1,6 +1,11 @@
 import type {
+  CreateHostFolderRequest,
+  HostFolder,
   HostInput,
   HostProfile,
+  MoveHostFolderRequest,
+  MoveHostRequest,
+  RenameHostFolderRequest,
   SshConnectRequest,
   SshConnectResult,
 } from './host';
@@ -73,6 +78,12 @@ export interface DesktopBridge {
     save(input: HostInput): Promise<HostProfile>;
     remove(hostId: string): Promise<void>;
     forgetCredential(hostId: string): Promise<void>;
+    listFolders(): Promise<HostFolder[]>;
+    createFolder(request: CreateHostFolderRequest): Promise<HostFolder>;
+    renameFolder(request: RenameHostFolderRequest): Promise<HostFolder>;
+    removeFolder(folderId: string): Promise<void>;
+    moveFolder(request: MoveHostFolderRequest): Promise<HostFolder[]>;
+    moveHost(request: MoveHostRequest): Promise<HostProfile>;
   };
   sessions: {
     list(hostId?: string): Promise<SessionRecord[]>;

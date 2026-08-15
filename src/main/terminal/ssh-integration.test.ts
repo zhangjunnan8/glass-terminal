@@ -46,11 +46,13 @@ describe.runIf(enabled)('real SSH shared terminal', () => {
     } as unknown as WebContents;
     const host: HostProfile = {
       id: 'integration-host',
+      protocol: 'ssh',
       name: 'Ubuntu integration target',
       hostname: process.env.AI_TERMINAL_SSH_TEST_HOST!,
       port: Number(process.env.AI_TERMINAL_SSH_TEST_PORT ?? 22),
       username: process.env.AI_TERMINAL_SSH_TEST_USER!,
       authMethod: 'password',
+      sortOrder: 0,
       favorite: false,
       credentialConfigured: false,
       createdAt: new Date(0).toISOString(),
