@@ -39,6 +39,45 @@ export type SpawnCodexProcess = (
   options: SpawnOptionsWithoutStdio,
 ) => ChildProcessWithoutNullStreams;
 
+export interface CodexAppServerLaunchOptions {
+  codexHome: string;
+  workingDirectory: string;
+}
+
+const INHERITED_ENVIRONMENT_KEYS = [
+  'ALL_PROXY',
+  'APPDATA',
+  'ComSpec',
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'LANG',
+  'LC_ALL',
+  'LOCALAPPDATA',
+  'NO_PROXY',
+  'PATH',
+  'PATHEXT',
+  'ProgramData',
+  'ProgramFiles',
+  'ProgramFiles(x86)',
+  'SystemRoot',
+  'TEMP',
+  'TMP',
+  'USERPROFILE',
+  'WINDIR',
+] as const;
+
+export function isolatedCodexEnvironment(
+  source: NodeJS.ProcessEnv,
+  codexHome: string,
+): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = { CODEX_HOME: codexHome };
+  for (const key of INHERITED_ENVIRONMENT_KEYS) {
+    const value = source[key];
+    if (value !== undefined) environment[key] = value;
+  }
+  return environment;
+}
+
 function safeErrorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
@@ -305,12 +344,15 @@ export class CodexAppServerClient implements AppServerConnection {
 export async function launchCodexAppServer(
   executable: string,
   clientVersion: string,
+  options: CodexAppServerLaunchOptions,
   spawnProcess: SpawnCodexProcess = spawn as SpawnCodexProcess,
 ): Promise<AppServerConnection> {
   const child = spawnProcess(executable, ['app-server'], {
     windowsHide: true,
     shell: false,
     stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: options.workingDirectory,
+    env: isolatedCodexEnvironment(process.env, options.codexHome),
   });
   const client = new CodexAppServerClient(child);
   try {

@@ -4,6 +4,7 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { describe, expect, it, vi } from 'vitest';
 import {
   CodexAppServerClient,
+  isolatedCodexEnvironment,
   launchCodexAppServer,
 } from './app-server-client';
 
@@ -53,12 +54,20 @@ describe('CodexAppServerClient', () => {
     });
     const spawnFactory = vi.fn(() => child.asChild());
 
-    const connection = await launchCodexAppServer('codex.exe', '0.1.0', spawnFactory);
+    const connection = await launchCodexAppServer('codex.exe', '0.1.0', {
+      codexHome: 'C:\\app-data\\codex-home',
+      workingDirectory: 'C:\\app-data\\server-cwd',
+    }, spawnFactory);
 
     expect(spawnFactory).toHaveBeenCalledWith(
       'codex.exe',
       ['app-server'],
-      expect.objectContaining({ shell: false, windowsHide: true }),
+      expect.objectContaining({
+        shell: false,
+        windowsHide: true,
+        cwd: 'C:\\app-data\\server-cwd',
+        env: expect.objectContaining({ CODEX_HOME: 'C:\\app-data\\codex-home' }),
+      }),
     );
     expect(messages.map((message) => message.method)).toEqual(['initialize', 'initialized']);
     expect(messages[0]).toMatchObject({
@@ -83,9 +92,29 @@ describe('CodexAppServerClient', () => {
     await expect(launchCodexAppServer(
       'codex.exe',
       '0.1.0',
+      { codexHome: 'C:\\private-home', workingDirectory: 'C:\\private-cwd' },
       () => child.asChild(),
     )).rejects.toThrow('handshake rejected');
     expect(child.killed).toBe(true);
+  });
+
+  it('builds a narrow child environment without credentials or SSH agent access', () => {
+    const environment = isolatedCodexEnvironment({
+      PATH: 'C:\\Windows\\System32',
+      SystemRoot: 'C:\\Windows',
+      HTTPS_PROXY: 'http://127.0.0.1:8080',
+      OPENAI_API_KEY: 'must-not-leak',
+      SSH_AUTH_SOCK: '\\\\.\\pipe\\openssh-ssh-agent',
+      GITHUB_TOKEN: 'must-not-leak-either',
+      CUSTOM_PASSWORD: 'also-secret',
+    }, 'C:\\app-data\\codex-home');
+
+    expect(environment).toEqual({
+      CODEX_HOME: 'C:\\app-data\\codex-home',
+      HTTPS_PROXY: 'http://127.0.0.1:8080',
+      PATH: 'C:\\Windows\\System32',
+      SystemRoot: 'C:\\Windows',
+    });
   });
 
   it('routes partial, batched, and out-of-order responses by exact id', async () => {

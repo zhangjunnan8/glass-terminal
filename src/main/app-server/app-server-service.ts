@@ -24,6 +24,7 @@ import {
 import type {
   AppServerConnection,
   AppServerNotification,
+  CodexAppServerLaunchOptions,
 } from './app-server-client';
 
 const TERMINAL_AGENT_BLOCK_REASON = 'App Server 暂时无法硬性关闭内建 Shell/File 工具；为保证所有命令只进入同一可见终端，终端 Agent 链路保持禁用。';
@@ -65,7 +66,11 @@ export interface CodexAppServerDependencies {
   arch: string;
   clientVersion: string;
   openExternal(url: string): Promise<void>;
-  launch(executable: string, clientVersion: string): Promise<AppServerConnection>;
+  launch(
+    executable: string,
+    clientVersion: string,
+    options: CodexAppServerLaunchOptions,
+  ): Promise<AppServerConnection>;
   probe(executable: string): Promise<string>;
 }
 
@@ -282,6 +287,7 @@ export class CodexAppServerService {
   private readonly completedLogins = new Map<string, { success: boolean; error?: string }>();
   private readonly listeners = new Set<(snapshot: CodexAppServerSnapshot) => void>();
   private readonly dependencies: CodexAppServerDependencies;
+  private readonly runtimeRoot: string;
 
   constructor(
     private readonly configPath: string,
@@ -292,6 +298,7 @@ export class CodexAppServerService {
     dependencies?: Partial<CodexAppServerDependencies>,
   ) {
     this.config = this.readConfig();
+    this.runtimeRoot = join(dirname(configPath), 'codex-app-server-runtime');
     this.dependencies = {
       ...defaultDependencies(applicationRoot, resourcesPath, clientVersion, openExternal),
       ...dependencies,
@@ -670,9 +677,14 @@ export class CodexAppServerService {
     this.update({ phase: 'starting', executable: selected });
     let launchedConnection: AppServerConnection | undefined;
     try {
+      const codexHome = join(this.runtimeRoot, 'codex-home');
+      const workingDirectory = join(this.runtimeRoot, 'server-cwd');
+      mkdirSync(codexHome, { recursive: true, mode: 0o700 });
+      mkdirSync(workingDirectory, { recursive: true, mode: 0o700 });
       const connection = await this.dependencies.launch(
         selected.path,
         this.dependencies.clientVersion,
+        { codexHome, workingDirectory },
       );
       launchedConnection = connection;
       if (!this.isGenerationCurrent(generation)) {

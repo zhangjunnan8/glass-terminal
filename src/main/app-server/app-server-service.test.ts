@@ -135,7 +135,7 @@ afterEach(() => {
 
 describe('CodexAppServerService', () => {
   it('starts, logs in through the browser, loads models, and persists no auth data', async () => {
-    const { root, connection, openExternal, service } = fixture();
+    const { root, connection, launch, openExternal, service } = fixture();
     const started = await service.start();
     expect(started).toMatchObject({
       phase: 'ready',
@@ -165,6 +165,14 @@ describe('CodexAppServerService', () => {
     expect(persisted).not.toContain('user@example.com');
     expect(persisted).not.toContain('browser-login');
     expect(persisted).toContain('gpt-test');
+    expect(launch).toHaveBeenCalledWith(
+      expect.any(String),
+      '0.1.0',
+      {
+        codexHome: join(root, 'codex-app-server-runtime', 'codex-home'),
+        workingDirectory: join(root, 'codex-app-server-runtime', 'server-cwd'),
+      },
+    );
   });
 
   it('owns the device-code UI lifecycle and cancels by exact login id', async () => {
