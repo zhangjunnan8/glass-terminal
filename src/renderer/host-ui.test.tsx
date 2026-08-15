@@ -228,6 +228,24 @@ describe('主机分组与协议界面', () => {
     });
   });
 
+  it('在主机拖拽失败时显示当前工作区错误', async () => {
+    bridge.hosts.moveHost = vi.fn().mockRejectedValue(new Error('无法保存主机排序'));
+    await openHosts();
+    const item = container.querySelector<HTMLElement>('[data-host-id="host-1"]')!;
+    await act(async () => {
+      item.querySelector<HTMLElement>('[data-action="drag-host"]')!
+        .dispatchEvent(dragEvent('dragstart'));
+    });
+    await act(async () => {
+      container.querySelector<HTMLElement>('[data-folder-id="ungrouped"]')!
+        .dispatchEvent(dragEvent('drop'));
+    });
+    await settle();
+
+    expect(container.querySelector('[data-testid="workspace-action-error"]')?.textContent)
+      .toContain('无法保存主机排序');
+  });
+
   it('在新建主机对话框显示协议标签，未接入协议禁止保存', async () => {
     await openHosts();
     await act(async () => {

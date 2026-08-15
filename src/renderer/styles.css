@@ -1060,3 +1060,48 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
   border-color: #db9ca6;
   background: #fff0f2;
 }
+
+.workspace-action-error {
+  position: fixed;
+  z-index: 140;
+  top: 48px;
+  right: 18px;
+  display: flex;
+  max-width: min(520px, calc(100vw - 36px));
+  min-height: 42px;
+  padding: 9px 10px 9px 13px;
+  align-items: center;
+  gap: 12px;
+  color: #ffd9dd;
+  border: 1px solid #99414f;
+  border-radius: 6px;
+  background: #421b23;
+  box-shadow: 0 12px 34px #0009;
+  font-size: 14px;
+}
+.workspace-action-error span { flex: 1; overflow-wrap: anywhere; }
+.workspace-action-error button {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  color: inherit;
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 18px;
+}
+.workspace-action-error button:hover { background: #ffffff18; }
+.app-shell[data-theme="light"] .workspace-action-error {
+  color: #831e30;
+  border-color: #d38b98;
+  background: #fff0f2;
+  box-shadow: 0 12px 34px #3f20302e;
+}
+
+/* Light-theme status text must remain legible at the compact sidebar sizes. */
+.app-shell[data-theme="light"] .selected-host-card > span { color: #176e5c; }
+.app-shell[data-theme="light"] .host-credential-row small { color: #44546a; }
+.app-shell[data-theme="light"] .provider-status.ready { color: #176e5c; }
+.app-shell[data-theme="light"] .provider-status.error { color: #9f2639; }
+.app-shell[data-theme="light"] .provider-status.not-tested { color: #5c6879; }
+.app-shell[data-theme="light"] .provider-field-note { color: #536176; }

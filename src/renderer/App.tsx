@@ -236,6 +236,7 @@ export function App() {
   const [fullTakeoverChallenge, setFullTakeoverChallenge] = useState<FullTakeoverChallenge | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [workspaceActionError, setWorkspaceActionError] = useState<string | null>(null);
   const [sshConnectionPending, setSshConnectionPending] = useState(false);
   const [hostCredentialMessage, setHostCredentialMessage] = useState<HostCredentialMessage | null>(null);
   const [credentialActionPending, setCredentialActionPending] = useState(false);
@@ -889,6 +890,7 @@ export function App() {
       ? editingAgentMessageId
       : null;
     const prompt = agentPrompt.trim();
+    setWorkspaceActionError(null);
     setAgentPrompt('');
     setAgentMessageActionPending(replacementMessageId ?? 'send');
     try {
@@ -913,7 +915,7 @@ export function App() {
       await refreshSessions();
     } catch (error) {
       if (activeIdRef.current === requestTerminalId) setAgentPrompt(prompt);
-      setConnectionError(errorMessage(error));
+      setWorkspaceActionError(errorMessage(error));
       if (replacementMessageId) {
         // The append-only retract may have succeeded before starting the
         // replacement turn failed. Refresh once so a retry becomes a normal
@@ -938,6 +940,7 @@ export function App() {
 
   async function interruptLatestAgentMessage(messageId: string) {
     if (!activeTab || agentMessageActionPending) return;
+    setWorkspaceActionError(null);
     setAgentMessageActionPending(messageId);
     try {
       const state = await window.aiTerminal.agent.interruptTurn({
@@ -946,7 +949,7 @@ export function App() {
       });
       setAgentStates((current) => mergeAgentState(current, state));
     } catch (error) {
-      setConnectionError(errorMessage(error));
+      setWorkspaceActionError(errorMessage(error));
     } finally {
       setAgentMessageActionPending(null);
     }
@@ -955,6 +958,7 @@ export function App() {
   async function retractLatestAgentMessage(messageId: string, content: string) {
     if (!activeTab || agentMessageActionPending) return;
     const requestTerminalId = activeTab.id;
+    setWorkspaceActionError(null);
     setAgentMessageActionPending(messageId);
     try {
       const state = await window.aiTerminal.agent.revisePrompt({
@@ -970,7 +974,7 @@ export function App() {
         requestAnimationFrame(() => agentComposerRef.current?.focus());
       }
     } catch (error) {
-      setConnectionError(errorMessage(error));
+      setWorkspaceActionError(errorMessage(error));
     } finally {
       setAgentMessageActionPending(null);
     }
@@ -990,6 +994,7 @@ export function App() {
 
   async function resolveAgentApproval(decision: 'execute' | 'edit' | 'reject') {
     if (!activeTab || !activeAgent?.pendingApproval) return;
+    setWorkspaceActionError(null);
     try {
       const state = await window.aiTerminal.agent.resolveApproval({
         terminalId: activeTab.id,
@@ -999,7 +1004,7 @@ export function App() {
       });
       setAgentStates((current) => mergeAgentState(current, state));
     } catch (error) {
-      setConnectionError(errorMessage(error));
+      setWorkspaceActionError(errorMessage(error));
     }
   }
 
@@ -1011,6 +1016,7 @@ export function App() {
     backend: AgentBackendRef | undefined = activeAgent?.backend ?? selectedAgentBackend,
   ) {
     if (!terminalId || !backend) return;
+    setWorkspaceActionError(null);
     try {
       const state = await window.aiTerminal.agent.setFullTakeover({
         terminalId,
@@ -1026,22 +1032,24 @@ export function App() {
       setFullTakeoverChallenge(null);
       await refreshSessions();
     } catch (error) {
-      setConnectionError(errorMessage(error));
+      setWorkspaceActionError(errorMessage(error));
     }
   }
 
   async function requestAgentTakeover() {
     if (!activeTab) return;
+    setWorkspaceActionError(null);
     try {
       const state = await window.aiTerminal.agent.takeover({ terminalId: activeTab.id });
       setAgentStates((current) => mergeAgentState(current, state));
     } catch (error) {
-      setConnectionError(errorMessage(error));
+      setWorkspaceActionError(errorMessage(error));
     }
   }
 
   async function resolveAgentTakeover(action: 'keep' | 'interrupt') {
     if (!activeTab || !activeAgent?.pendingTakeover) return;
+    setWorkspaceActionError(null);
     try {
       const state = await window.aiTerminal.agent.resolveTakeover({
         terminalId: activeTab.id,
@@ -1051,11 +1059,12 @@ export function App() {
       });
       setAgentStates((current) => mergeAgentState(current, state));
     } catch (error) {
-      setConnectionError(errorMessage(error));
+      setWorkspaceActionError(errorMessage(error));
     }
   }
 
   async function confirmShellReady(terminalId: string, executionId: string) {
+    setWorkspaceActionError(null);
     try {
       const state = await window.aiTerminal.agent.confirmShellReady({
         terminalId,
@@ -1063,12 +1072,13 @@ export function App() {
       });
       setAgentStates((current) => mergeAgentState(current, state));
     } catch (error) {
-      setConnectionError(errorMessage(error));
+      setWorkspaceActionError(errorMessage(error));
     }
   }
 
   async function activateAiSession() {
     if (!activeTab) return;
+    setWorkspaceActionError(null);
     try {
       const session = await window.aiTerminal.sessions.upgrade({ terminalId: activeTab.id });
       setTabs((current) => current.map((tab) => (
@@ -1076,7 +1086,7 @@ export function App() {
       )));
       await refreshSessions();
     } catch (error) {
-      setConnectionError(errorMessage(error));
+      setWorkspaceActionError(errorMessage(error));
     }
   }
 
@@ -1222,6 +1232,7 @@ export function App() {
     if (hostTreeDrag?.kind !== 'host') return;
     const hostId = hostTreeDrag.id;
     setHostTreeDrag(null);
+    setWorkspaceActionError(null);
     try {
       await window.aiTerminal.hosts.moveHost({ hostId, folderId, beforeHostId });
       await refreshHosts();
@@ -1235,7 +1246,7 @@ export function App() {
         setUngroupedHostsCollapsed(false);
       }
     } catch (error) {
-      setConnectionError(errorMessage(error));
+      setWorkspaceActionError(errorMessage(error));
     }
   }
 
@@ -1247,6 +1258,7 @@ export function App() {
     }
     const folderId = hostTreeDrag.id;
     setHostTreeDrag(null);
+    setWorkspaceActionError(null);
     try {
       const next = await window.aiTerminal.hosts.moveFolder({
         folderId,
@@ -1254,7 +1266,7 @@ export function App() {
       });
       setHostFolders(next);
     } catch (error) {
-      setConnectionError(errorMessage(error));
+      setWorkspaceActionError(errorMessage(error));
     }
   }
 
@@ -1262,13 +1274,14 @@ export function App() {
     if (hostTreeDrag?.kind !== 'folder') return;
     const folderId = hostTreeDrag.id;
     setHostTreeDrag(null);
+    setWorkspaceActionError(null);
     try {
       setHostFolders(await window.aiTerminal.hosts.moveFolder({
         folderId,
         beforeFolderId: null,
       }));
     } catch (error) {
-      setConnectionError(errorMessage(error));
+      setWorkspaceActionError(errorMessage(error));
     }
   }
 
@@ -1592,6 +1605,17 @@ export function App() {
           {runtime ? `${runtime.platform} · ${runtime.arch}` : '正在启动…'}
         </div>
       </header>
+
+      {workspaceActionError && (
+        <div className="workspace-action-error" role="alert" data-testid="workspace-action-error">
+          <span>{workspaceActionError}</span>
+          <button
+            type="button"
+            aria-label="关闭操作错误"
+            onClick={() => setWorkspaceActionError(null)}
+          >×</button>
+        </div>
+      )}
 
       <aside className="activitybar" aria-label="主导航">
         <button

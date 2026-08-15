@@ -343,4 +343,26 @@ describe('native Codex App Server renderer mode', () => {
       messageId: 'user-2',
     });
   });
+
+  it('shows an Agent action failure outside unrelated connection dialogs', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    const completed = agentView();
+    bridge.agent.getState = vi.fn().mockResolvedValue(completed);
+    bridge.agent.revisePrompt = vi.fn().mockRejectedValue(new Error('修改请求已过期'));
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-action="edit-agent-message"]')!.click();
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="修改并重新发送"]')!.click();
+    });
+    await settle();
+
+    expect(container.querySelector('[data-testid="workspace-action-error"]')?.textContent)
+      .toContain('修改请求已过期');
+  });
 });
