@@ -30,6 +30,7 @@ class TrackingSecretStore implements SecretStore {
   readonly order: string[];
   failSet = false;
   failRemove = false;
+  removeGate?: Promise<void>;
 
   constructor(order: string[]) {
     this.order = order;
@@ -47,6 +48,7 @@ class TrackingSecretStore implements SecretStore {
 
   async remove(reference: string): Promise<void> {
     this.order.push('credential-remove');
+    await this.removeGate;
     if (this.failRemove) throw new Error('credential remove failed');
     this.values.delete(reference);
   }
@@ -370,7 +372,7 @@ describe('HostService SSH credentials', () => {
     expect(current.hosts.get(current.host.id).credentialConfigured).toBe(false);
   });
 
-  it('fails closed when forgetting or deleting a credential cannot remove the secret', async () => {
+  it('fails closed when forgetting a credential cannot remove the secret', async () => {
     const current = fixture();
     const reference = await current.credentials.set(current.host.id, 'old-password');
     current.hosts.configureCredential(current.host.id, reference);
@@ -381,11 +383,44 @@ describe('HostService SSH credentials', () => {
     );
     expect(current.hosts.get(current.host.id).credentialConfigured).toBe(false);
     expect(current.hosts.credentialReference(current.host.id)).toBeUndefined();
+  });
 
-    await expect(current.service.remove(current.host.id)).rejects.toThrow(
-      'credential remove failed',
-    );
-    expect(current.hosts.get(current.host.id).credentialConfigured).toBe(false);
+  it('removes Host metadata without waiting for slow background Credential Manager cleanup', async () => {
+    const current = fixture();
+    const cleanupGate = deferred<void>();
+    current.secrets.removeGate = cleanupGate.promise;
+    const remove = vi.spyOn(current.hosts, 'remove');
+
+    await current.service.remove(current.host.id);
+
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(() => current.hosts.get(current.host.id)).toThrow(/not found/i);
+    expect(current.order).toEqual(['credential-remove']);
+
+    let cleanupFinished = false;
+    const cleanup = current.service.flushCredentialCleanup().then(() => {
+      cleanupFinished = true;
+    });
+    await Promise.resolve();
+    expect(cleanupFinished).toBe(false);
+    cleanupGate.resolve();
+    await cleanup;
+    expect(cleanupFinished).toBe(true);
+  });
+
+  it('keeps a failed background cleanup contained after the Host becomes inaccessible', async () => {
+    const current = fixture();
+    const reference = await current.credentials.set(current.host.id, 'old-password');
+    current.hosts.configureCredential(current.host.id, reference);
+    current.order.length = 0;
+    current.secrets.failRemove = true;
+
+    await expect(current.service.remove(current.host.id)).resolves.toBeUndefined();
+    await expect(current.service.flushCredentialCleanup()).resolves.toBeUndefined();
+
+    expect(current.order).toEqual(['credential-remove']);
+    expect(() => current.hosts.get(current.host.id)).toThrow(/not found/i);
+    expect(current.secrets.values.get(reference)).toBe('old-password');
   });
 
   it('best-effort deletes the OS secret when metadata retirement fails', async () => {

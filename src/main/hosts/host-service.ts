@@ -29,6 +29,7 @@ const CREDENTIAL_SAVE_WARNING = 'SSH 已连接，但无法将凭据保存到 Win
 
 export class HostService {
   private readonly hostOperationTails = new Map<string, Promise<void>>();
+  private credentialCleanupTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly hosts: HostStore,
@@ -73,9 +74,17 @@ export class HostService {
   async remove(hostId: string): Promise<void> {
     await this.withHostLock(hostId, async () => {
       this.hosts.get(hostId);
-      await this.retireAndRemoveCredential(hostId);
+      // The Host metadata is the authority that can activate a secret. Remove it
+      // atomically first, then retire the stable UUID-scoped credential in the
+      // background so a slow Credential Manager process cannot block the UI.
       this.hosts.remove(hostId);
+      this.queueCredentialCleanup(hostId);
     });
+  }
+
+  /** Waits for already queued best-effort cleanup; intended for shutdown and tests. */
+  async flushCredentialCleanup(): Promise<void> {
+    await this.credentialCleanupTail;
   }
 
   async forgetCredential(hostId: string): Promise<void> {
@@ -309,6 +318,15 @@ export class HostService {
       throw error;
     }
     await this.credentials.remove(hostId, retiredReference ?? activeReference);
+  }
+
+  private queueCredentialCleanup(hostId: string): void {
+    this.credentialCleanupTail = this.credentialCleanupTail
+      .then(() => this.credentials.remove(hostId))
+      .catch(() => {
+        // Host UUIDs are never reused and their metadata is already gone, so a
+        // failed OS cleanup cannot reactivate or expose the orphaned credential.
+      });
   }
 
   private async withHostLock<T>(hostId: string, operation: () => Promise<T>): Promise<T> {
