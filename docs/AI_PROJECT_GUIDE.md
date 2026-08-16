@@ -80,7 +80,7 @@ React renderer + xterm.js
        TerminalService -> node-pty / ssh2 shell / same-client SFTP
        SessionManager  -> SessionStore
        HostService     -> HostStore + Windows Credential Manager
-       AgentService    -> Generic AgentLoop | Codex App Server TurnRunner
+       AgentService    -> GenericHarnessBackend(AgentLoop) | Codex App Server TurnRunner
        SftpService / TransferQueue
 ```
 
@@ -201,10 +201,13 @@ command/file 审批自动返回 `acceptForSession`，额外权限请求始终拒
    `TerminalService.createSsh()` -> host-key 处理 -> shell descriptor/tab -> 可选 `SessionManager.reconnect()`。
 3. **首次 AI**：`agent.sendPrompt` -> `AgentService.ensureRuntime()` -> `SessionManager.upgrade()` ->
    回填 main-side 临时 journal -> 建立/恢复一个本地 AI thread。
-4. **Generic 命令**：Provider -> `AgentLoop` -> `terminal_execute` -> `AgentService.requestCommand()` ->
-   UI 审批/Full Takeover -> `TerminalService.executeStructured()` -> 同一 backend -> sentinel result -> 继续 loop。
-5. **Generic 文件**：UI 临时授权 -> 冻结 Session cwd -> `file_*` -> `AgentFileService` ->
-   Node FS/已有 SSH Client 的 SFTP -> SHA/原子写；权限变更和成功 write/patch -> Audit。
+4. **Generic 命令**：`AgentService` -> `AgentBackend.sendMessage()` -> `GenericHarnessBackend` ->
+   本轮显式 `ToolGateway` -> `terminal_execute` -> `AgentService.requestCommand()` -> UI 审批/Full Takeover ->
+   `TerminalService.executeStructured()` -> 同一可见 backend -> 结构化 result -> 继续 loop。
+5. **Generic Workspace**：用户显式设置 Workspace Root 并临时授权 ->
+   `workspace_list/search/glob/read_file/apply_patch/...` -> `SessionToolGateway` ->
+   `AgentFileWorkspaceAdapter` -> LocalFilesystem/已有 SSH Client 的 SFTP。文件正文和 diff 不进 Terminal journal，
+   Agent 状态只发送有界、脱敏的 Tool Activity 摘要。
 6. **Codex**：UI 启动/登录/选模型 -> `CodexAppServerService` -> `AppServerClient` ->
    `AgentService.runCodexTurn()` -> `TurnRunner` thread/turn -> 本机 Codex workspace；可见终端只提供身份/可选只读内容。
 7. **持久化**：Terminal output -> journal listener -> gzip chunk；Agent chat/turn ->

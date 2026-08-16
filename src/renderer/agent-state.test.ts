@@ -15,6 +15,7 @@ function view(revision: number, state: AgentSessionView['state']): AgentSessionV
     fullTakeover: false,
     fileAccessMode: 'off',
     messages: [],
+    activities: [],
   };
 }
 

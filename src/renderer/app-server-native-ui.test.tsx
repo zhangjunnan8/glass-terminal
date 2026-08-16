@@ -2,7 +2,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CODEX_APP_SERVER_AGENT_BACKEND } from '../shared/agent';
-import type { AgentSessionView } from '../shared/agent';
+import type { AgentSessionView, AgentToolActivity } from '../shared/agent';
 import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import type { DesktopBridge } from '../shared/ipc';
 import type { ProviderProfile } from '../shared/provider';
@@ -70,6 +70,7 @@ function agentView(state: AgentSessionView['state'] = 'COMPLETED'): AgentSession
     terminalInputMode: state === 'THINKING' ? 'locked' : 'human',
     fullTakeover: false,
     fileAccessMode: 'off',
+    activities: [],
     messages: [
       { id: 'user-1', role: 'user', content: '第一条', createdAt: now },
       { id: 'assistant-1', role: 'assistant', content: '第一条回复', createdAt: now },
@@ -484,6 +485,67 @@ describe('native Codex App Server renderer mode', () => {
       terminalId: 'terminal-1',
       messageId: 'user-2',
     });
+  });
+
+  it('shows bounded tool activity metadata outside chat and hides an empty list', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    const unsafeMetadata = {
+      rawArgs: 'RAW_ARGUMENTS_MUST_NOT_RENDER',
+      result: 'RAW_RESULT_MUST_NOT_RENDER',
+      error: 'RAW_ERROR_MUST_NOT_RENDER',
+    };
+    const activities: Array<AgentToolActivity & typeof unsafeMetadata> = [
+      {
+        id: 'read-1', toolName: 'workspace_read_file', kind: 'workspace',
+        label: '读取文件', status: 'succeeded', startedAt: now, finishedAt: now,
+        summary: '已读取文本文件', ...unsafeMetadata,
+      },
+      {
+        id: 'search-1', toolName: 'workspace_search', kind: 'workspace',
+        label: '搜索工作区', status: 'running', startedAt: now,
+        summary: '正在搜索匹配项', ...unsafeMetadata,
+      },
+      {
+        id: 'patch-1', toolName: 'workspace_apply_patch', kind: 'workspace',
+        label: '应用补丁', status: 'failed', startedAt: now, finishedAt: now,
+        summary: '未能应用更改', ...unsafeMetadata,
+      },
+      {
+        id: 'terminal-1', toolName: 'terminal_execute', kind: 'terminal',
+        label: '执行终端命令', status: 'cancelled', startedAt: now, finishedAt: now,
+        summary: '命令已取消', ...unsafeMetadata,
+      },
+    ];
+    const view: AgentSessionView = {
+      ...agentView(),
+      messages: [],
+      activities,
+    };
+    let emitAgentState: ((state: AgentSessionView) => void) | undefined;
+    bridge.agent.getState = vi.fn().mockResolvedValue(view);
+    bridge.agent.onStateChanged = vi.fn((listener) => {
+      emitAgentState = listener;
+      return () => undefined;
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    const activityList = container.querySelector('[data-testid="tool-activity-list"]');
+    expect(activityList?.querySelectorAll('li')).toHaveLength(4);
+    for (const label of ['读取文件', '搜索工作区', '应用补丁', '执行终端命令']) {
+      expect(activityList?.textContent).toContain(label);
+    }
+    expect(container.querySelectorAll('.agent-message')).toHaveLength(0);
+    expect(activityList?.textContent).not.toContain('RAW_ARGUMENTS_MUST_NOT_RENDER');
+    expect(activityList?.textContent).not.toContain('RAW_RESULT_MUST_NOT_RENDER');
+    expect(activityList?.textContent).not.toContain('RAW_ERROR_MUST_NOT_RENDER');
+
+    await act(async () => emitAgentState?.({ ...view, revision: 2, activities: [] }));
+    expect(container.querySelector('[data-testid="tool-activity-list"]')).toBeNull();
+    expect(container.querySelectorAll('.agent-message')).toHaveLength(0);
   });
 
   it('shows an Agent action failure outside unrelated connection dialogs', async () => {

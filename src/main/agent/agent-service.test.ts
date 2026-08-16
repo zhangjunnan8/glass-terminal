@@ -6,6 +6,7 @@ import {
 } from '../../shared/agent';
 import type {
   AgentBackendRef,
+  AgentSessionView,
   CommandActor,
   CommandExecution,
   TerminalInputMode,
@@ -20,7 +21,21 @@ import type {
   StructuredExecutionHooks,
   TerminalService,
 } from '../terminal/terminal-service';
-import type { AgentCompletion, AgentCompletionRequest, AgentProviderRuntime } from './agent-loop';
+import type {
+  AgentBackend,
+  AgentBackendThread,
+  InterruptAgentBackendInput,
+  SendAgentBackendMessageInput,
+} from './agent-backend';
+import type {
+  AgentCompletion,
+  AgentCompletionRequest,
+  AgentLoopEvent,
+  AgentLoopResult,
+  AgentMessage,
+  AgentProviderRuntime,
+  AgentToolCall,
+} from './agent-loop';
 import type { AgentFileService } from './agent-file-service';
 import { AgentService } from './agent-service';
 
@@ -64,6 +79,152 @@ class DeferredStreamingProvider implements AgentProviderRuntime {
   finish(content: string): void {
     if (!this.resolveCompletion) throw new Error('Streaming request has not started.');
     this.resolveCompletion({ message: { role: 'assistant', content } });
+  }
+}
+
+class RecordingBackend implements AgentBackend {
+  readonly createInputs: Array<{ id: string }> = [];
+  readonly resumeInputs: Array<{ id: string; priorMessages: readonly AgentMessage[] }> = [];
+  readonly sendInputs: SendAgentBackendMessageInput[] = [];
+  readonly priorMessagesAtSend: AgentMessage[][] = [];
+  readonly interrupts: InterruptAgentBackendInput[] = [];
+  private readonly histories = new Map<string, AgentMessage[]>();
+
+  async createThread(input: { id: string }): Promise<AgentBackendThread> {
+    this.createInputs.push({ id: input.id });
+    this.histories.set(input.id, []);
+    return { id: input.id };
+  }
+
+  async resume(input: {
+    id: string;
+    priorMessages: readonly AgentMessage[];
+  }): Promise<AgentBackendThread> {
+    const priorMessages = input.priorMessages.map((message) => ({ ...message }));
+    this.resumeInputs.push({ id: input.id, priorMessages });
+    this.histories.set(input.id, priorMessages);
+    return { id: input.id };
+  }
+
+  async sendMessage(input: SendAgentBackendMessageInput): Promise<AgentLoopResult> {
+    this.sendInputs.push(input);
+    const priorMessages = this.histories.get(input.thread.id) ?? [];
+    this.priorMessagesAtSend.push(priorMessages.map((message) => ({ ...message })));
+    return this.complete(input);
+  }
+
+  async interrupt(input: InterruptAgentBackendInput): Promise<void> {
+    this.interrupts.push(input);
+  }
+
+  protected complete(input: SendAgentBackendMessageInput): AgentLoopResult {
+    const finalText = `reply:${input.prompt}`;
+    const messages: AgentMessage[] = [
+      ...(this.histories.get(input.thread.id) ?? []),
+      { role: 'user', content: input.prompt },
+      { role: 'assistant', content: finalText },
+    ];
+    this.histories.set(input.thread.id, messages);
+    input.onEvent?.({ type: 'assistant_text', text: finalText });
+    return {
+      id: `turn-${this.sendInputs.length}`,
+      messages,
+      finalText,
+      rounds: 1,
+    };
+  }
+}
+
+class DeferredRecordingBackend extends RecordingBackend {
+  private pending?: {
+    input: SendAgentBackendMessageInput;
+    resolve(result: AgentLoopResult): void;
+  };
+
+  override sendMessage(input: SendAgentBackendMessageInput): Promise<AgentLoopResult> {
+    this.sendInputs.push(input);
+    this.priorMessagesAtSend.push([]);
+    return new Promise((resolve) => {
+      this.pending = { input, resolve };
+    });
+  }
+
+  finish(): void {
+    if (!this.pending) throw new Error('Backend message has not started.');
+    const pending = this.pending;
+    this.pending = undefined;
+    pending.resolve(this.complete(pending.input));
+  }
+}
+
+class DeferredActivityBackend extends RecordingBackend {
+  private pending?: {
+    input: SendAgentBackendMessageInput;
+    resolve(result: AgentLoopResult): void;
+    reject(error: unknown): void;
+  };
+
+  override sendMessage(input: SendAgentBackendMessageInput): Promise<AgentLoopResult> {
+    this.sendInputs.push(input);
+    this.priorMessagesAtSend.push([]);
+    return new Promise((resolve, reject) => {
+      this.pending = { input, resolve, reject };
+    });
+  }
+
+  emit(event: AgentLoopEvent): void {
+    if (!this.pending) throw new Error('Backend message has not started.');
+    this.pending.input.onEvent?.(event);
+  }
+
+  finish(): void {
+    if (!this.pending) throw new Error('Backend message has not started.');
+    const pending = this.pending;
+    this.pending = undefined;
+    pending.resolve(this.complete(pending.input));
+  }
+
+  fail(error: unknown): void {
+    if (!this.pending) throw new Error('Backend message has not started.');
+    const pending = this.pending;
+    this.pending = undefined;
+    pending.reject(error);
+  }
+}
+
+class DeferredCreateBackend extends RecordingBackend {
+  private pendingCreate?: {
+    input: { id: string };
+    resolve(thread: AgentBackendThread): void;
+    reject(error: unknown): void;
+  };
+
+  override createThread(input: { id: string }): Promise<AgentBackendThread> {
+    this.createInputs.push(input);
+    return new Promise((resolve, reject) => {
+      this.pendingCreate = { input, resolve, reject };
+    });
+  }
+
+  resolveCreate(): void {
+    if (!this.pendingCreate) throw new Error('Backend thread creation has not started.');
+    const pending = this.pendingCreate;
+    this.pendingCreate = undefined;
+    pending.resolve({ id: pending.input.id });
+  }
+
+  rejectCreate(error: unknown): void {
+    if (!this.pendingCreate) throw new Error('Backend thread creation has not started.');
+    const pending = this.pendingCreate;
+    this.pendingCreate = undefined;
+    pending.reject(error);
+  }
+}
+
+class ThrowingInterruptActivityBackend extends DeferredActivityBackend {
+  override interrupt(input: InterruptAgentBackendInput): Promise<void> {
+    this.interrupts.push(input);
+    throw new Error('synchronous backend interrupt failure');
   }
 }
 
@@ -290,6 +451,9 @@ class FakeTerminals {
     this.exitListener = listener;
     return () => { this.exitListener = undefined; };
   }
+  exit(terminalId = 'terminal', ownerId = 99): void {
+    this.exitListener?.(terminalId, ownerId);
+  }
   onSensitiveSubmission(listener: (
     terminalId: string,
     ownerId: number,
@@ -334,6 +498,7 @@ class FakeTerminals {
     this.controlModes.push('human');
     return true;
   }
+  hasControlLease(): boolean { return Boolean(this.controlLease); }
   beginSensitiveMode() {
     this.sensitiveBeginCount += 1;
     this.sensitiveLease = 'sensitive-lease';
@@ -459,7 +624,703 @@ function toolCall(id: string, command: string): AgentCompletion {
   };
 }
 
+function activityCall(
+  id: string,
+  name: string,
+  argumentsValue: Record<string, unknown> | string = {},
+): AgentToolCall {
+  return {
+    id,
+    name,
+    arguments: typeof argumentsValue === 'string'
+      ? argumentsValue
+      : JSON.stringify(argumentsValue),
+  };
+}
+
+async function startActivityHarness(prompt = 'Inspect the workspace.') {
+  const backend = new DeferredActivityBackend();
+  const terminals = new FakeTerminals();
+  const sessions = new FakeSessions();
+  const owner = browserOwner();
+  const service = new AgentService(
+    terminals as unknown as TerminalService,
+    sessions as unknown as SessionManager,
+    providerStore(),
+    undefined,
+    undefined,
+    undefined,
+    () => backend,
+  );
+  const initial = service.sendPrompt(owner, { terminalId: 'terminal', prompt });
+  await waitFor(() => backend.sendInputs.length === 1);
+  return { backend, initial, owner, service, sessions, terminals };
+}
+
 describe('AgentService shared-terminal controls', () => {
+  it('does not let a stale create resolution replace the backend selected after takeover', async () => {
+    const backendA = new DeferredCreateBackend();
+    const backendB = new DeferredCreateBackend();
+    const remainingBackends: AgentBackend[] = [backendA, backendB];
+    const backendFactory = vi.fn(() => {
+      const backend = remainingBackends.shift();
+      if (!backend) throw new Error('No replacement backend remains.');
+      return backend;
+    });
+    const terminals = new FakeTerminals();
+    const owner = browserOwner();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      undefined,
+      backendFactory,
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'First turn.' });
+    await waitFor(() => backendA.createInputs.length === 1);
+    service.takeover(owner, { terminalId: 'terminal' });
+    expect(terminals.hasControlLease()).toBe(false);
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Replacement turn.' });
+    await waitFor(() => backendB.createInputs.length === 1);
+    backendA.resolveCreate();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(backendA.sendInputs).toEqual([]);
+    expect(backendB.sendInputs).toEqual([]);
+    expect(service.getState(owner, 'terminal')?.state).toBe('THINKING');
+
+    backendB.resolveCreate();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    expect(backendFactory).toHaveBeenCalledTimes(2);
+    expect(backendB.sendInputs).toHaveLength(1);
+    expect(backendB.sendInputs[0].prompt).toBe('Replacement turn.');
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      state: 'COMPLETED',
+      terminalInputMode: 'human',
+      error: undefined,
+    });
+    expect(terminals.hasControlLease()).toBe(false);
+    service.close();
+  });
+
+  it('does not let a stale create rejection clear the replacement backend or lease', async () => {
+    const backendA = new DeferredCreateBackend();
+    const backendB = new DeferredCreateBackend();
+    const remainingBackends: AgentBackend[] = [backendA, backendB];
+    const backendFactory = vi.fn(() => {
+      const backend = remainingBackends.shift();
+      if (!backend) throw new Error('No replacement backend remains.');
+      return backend;
+    });
+    const terminals = new FakeTerminals();
+    const owner = browserOwner();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      undefined,
+      backendFactory,
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'First turn.' });
+    await waitFor(() => backendA.createInputs.length === 1);
+    service.takeover(owner, { terminalId: 'terminal' });
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Replacement turn.' });
+    await waitFor(() => backendB.createInputs.length === 1);
+
+    backendA.rejectCreate(new Error('stale create rejected'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      state: 'THINKING',
+      error: undefined,
+    });
+
+    backendB.resolveCreate();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    expect(backendB.sendInputs).toHaveLength(1);
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      state: 'COMPLETED',
+      terminalInputMode: 'human',
+      error: undefined,
+    });
+    expect(terminals.hasControlLease()).toBe(false);
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Reuse replacement backend.' });
+    await waitFor(() => backendB.sendInputs.length === 2);
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    expect(backendFactory).toHaveBeenCalledTimes(2);
+    expect(backendB.createInputs).toHaveLength(1);
+    expect(terminals.hasControlLease()).toBe(false);
+    service.close();
+  });
+
+  it.each(['takeover', 'close'] as const)(
+    'finishes cleanup when backend interrupt throws synchronously during %s',
+    async (action) => {
+      const backend = new ThrowingInterruptActivityBackend();
+      const terminals = new FakeTerminals();
+      const owner = browserOwner();
+      const service = new AgentService(
+        terminals as unknown as TerminalService,
+        new FakeSessions() as unknown as SessionManager,
+        providerStore(),
+        undefined,
+        undefined,
+        undefined,
+        () => backend,
+      );
+      service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Long tool turn.' });
+      await waitFor(() => backend.sendInputs.length === 1);
+      backend.emit({
+        type: 'tool_started',
+        toolCall: activityCall('interrupt-activity', 'workspace_stat', { path: 'src/index.ts' }),
+      });
+      const runtime = (service as unknown as {
+        runtimes: Map<string, { activities: AgentSessionView['activities'] }>;
+      }).runtimes.get('terminal')!;
+      const errorLog = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+      if (action === 'takeover') {
+        expect(() => service.takeover(owner, { terminalId: 'terminal' })).not.toThrow();
+      } else {
+        expect(() => service.close()).not.toThrow();
+      }
+
+      expect(runtime.activities).toEqual([
+        expect.objectContaining({
+          id: 'interrupt-activity',
+          status: 'cancelled',
+          finishedAt: expect.any(String),
+        }),
+      ]);
+      expect(terminals.hasControlLease()).toBe(false);
+      expect(terminals.controlModes.at(-1)).toBe('human');
+      expect(backend.interrupts).toContainEqual({
+        threadId: expect.any(String),
+        reason: action === 'takeover' ? 'takeover' : 'shutdown',
+      });
+      expect(errorLog).toHaveBeenCalledWith(
+        'Unable to interrupt Generic Harness backend:',
+        expect.objectContaining({ message: 'synchronous backend interrupt failure' }),
+      );
+
+      backend.finish();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      if (action === 'takeover') {
+        expect(service.getState(owner, 'terminal')).toMatchObject({
+          state: 'PAUSED',
+          terminalInputMode: 'human',
+        });
+        service.close();
+      }
+      errorLog.mockRestore();
+    },
+  );
+
+  it.each(['resolved', 'rejected'] as const)(
+    'ignores backend events emitted after sendMessage has %s',
+    async (outcome) => {
+      const { backend, owner, service, sessions } = await startActivityHarness();
+      if (outcome === 'resolved') backend.finish();
+      else backend.fail(new Error('expected backend rejection'));
+      await waitFor(() => service.getState(owner, 'terminal')?.state === (
+        outcome === 'resolved' ? 'COMPLETED' : 'FAILED'
+      ));
+
+      const staleOnEvent = backend.sendInputs[0].onEvent;
+      expect(staleOnEvent).toBeTypeOf('function');
+      const before = service.getState(owner, 'terminal')!;
+      const threadEventCount = sessions.threadEvents.length;
+      const auditCount = sessions.audits.length;
+      const sendCount = vi.mocked(owner.send).mock.calls.length;
+      const staleSecret = `STALE_EVENT_SECRET_${outcome}`;
+      const staleCall = activityCall('stale-tool', 'workspace_write_file', {
+        path: 'src/stale.ts',
+        content: staleSecret,
+        expectedSha256: null,
+      });
+
+      staleOnEvent?.({ type: 'tool_started', toolCall: staleCall });
+      staleOnEvent?.({
+        type: 'tool_completed',
+        toolCall: staleCall,
+        result: JSON.stringify({
+          ok: true,
+          path: `src/${staleSecret}.ts`,
+          sha256: 'a'.repeat(64),
+          bytes: 12,
+        }),
+      });
+      staleOnEvent?.({ type: 'assistant_delta', text: staleSecret });
+      staleOnEvent?.({ type: 'assistant_text', text: staleSecret });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+
+      const after = service.getState(owner, 'terminal')!;
+      expect(after.revision).toBe(before.revision);
+      expect(after.activities).toEqual(before.activities);
+      expect(after.messages).toEqual(before.messages);
+      expect(after.streamingMessageId).toBe(before.streamingMessageId);
+      expect(sessions.threadEvents).toHaveLength(threadEventCount);
+      expect(sessions.audits).toHaveLength(auditCount);
+      expect(vi.mocked(owner.send).mock.calls).toHaveLength(sendCount);
+      expect(JSON.stringify({ after, events: sessions.threadEvents, audits: sessions.audits }))
+        .not.toContain(staleSecret);
+      service.close();
+    },
+  );
+
+  it('projects tool start and completion into a succeeded activity summary', async () => {
+    const { backend, owner, service } = await startActivityHarness();
+    const call = activityCall('search-1', 'workspace_search', {
+      path: 'src',
+      query: 'private query',
+    });
+
+    backend.emit({ type: 'tool_started', toolCall: call });
+    expect(service.getState(owner, 'terminal')?.activities).toEqual([
+      expect.objectContaining({
+        id: 'search-1',
+        toolName: 'workspace_search',
+        kind: 'workspace',
+        label: 'Search workspace src',
+        status: 'running',
+      }),
+    ]);
+
+    backend.emit({
+      type: 'tool_completed',
+      toolCall: call,
+      result: JSON.stringify({
+        ok: true,
+        matches: [{ path: 'src/a.ts' }, { path: 'src/b.ts' }],
+        filesScanned: 7,
+      }),
+    });
+    expect(service.getState(owner, 'terminal')?.activities).toEqual([
+      expect.objectContaining({
+        id: 'search-1',
+        status: 'succeeded',
+        summary: '2 matches · 7 files',
+        finishedAt: expect.any(String),
+      }),
+    ]);
+
+    backend.finish();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    service.close();
+  });
+
+  it('settles a running activity as failed when the backend rejects', async () => {
+    const { backend, owner, service } = await startActivityHarness();
+    backend.emit({
+      type: 'tool_started',
+      toolCall: activityCall('stat-1', 'workspace_stat', { path: 'src/index.ts' }),
+    });
+
+    backend.fail(new Error('backend failed after tool start'));
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'FAILED');
+
+    expect(service.getState(owner, 'terminal')?.activities).toEqual([
+      expect.objectContaining({
+        id: 'stat-1',
+        status: 'failed',
+        finishedAt: expect.any(String),
+      }),
+    ]);
+    service.close();
+  });
+
+  it.each(['user stop', 'takeover', 'terminal exit'] as const)(
+    'settles a running activity as cancelled on %s',
+    async (action) => {
+      const { backend, initial, owner, service, terminals } = await startActivityHarness();
+      backend.emit({
+        type: 'tool_started',
+        toolCall: activityCall('read-1', 'workspace_read_file', { path: 'src/index.ts' }),
+      });
+
+      if (action === 'user stop') {
+        service.interruptTurn(owner, {
+          terminalId: 'terminal',
+          messageId: initial.messages.at(-1)!.id,
+        });
+      } else if (action === 'takeover') {
+        service.takeover(owner, { terminalId: 'terminal' });
+      } else {
+        terminals.exit();
+      }
+
+      expect(service.getState(owner, 'terminal')?.activities).toEqual([
+        expect.objectContaining({
+          id: 'read-1',
+          status: 'cancelled',
+          finishedAt: expect.any(String),
+        }),
+      ]);
+      backend.finish();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(service.getState(owner, 'terminal')?.activities[0]?.status).toBe('cancelled');
+      service.close();
+    },
+  );
+
+  it('keeps only the 24 most recently started tool activities', async () => {
+    const { backend, owner, service } = await startActivityHarness();
+    for (let index = 0; index < 30; index += 1) {
+      backend.emit({
+        type: 'tool_started',
+        toolCall: activityCall(`activity-${index}`, 'workspace_stat', {
+          path: `src/file-${index}.ts`,
+        }),
+      });
+    }
+
+    const activities = service.getState(owner, 'terminal')!.activities;
+    expect(activities).toHaveLength(24);
+    expect(activities[0]?.id).toBe('activity-6');
+    expect(activities.at(-1)?.id).toBe('activity-29');
+
+    backend.finish();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    service.close();
+  });
+
+  it('does not share activity arrays or objects across returned and emitted views', async () => {
+    const { backend, owner, service } = await startActivityHarness();
+    backend.emit({
+      type: 'tool_started',
+      toolCall: activityCall('clone-1', 'workspace_stat', { path: 'src/index.ts' }),
+    });
+
+    const returned = service.getState(owner, 'terminal')!;
+    returned.activities[0]!.label = 'tampered returned label';
+    returned.activities.length = 0;
+    expect(service.getState(owner, 'terminal')?.activities).toEqual([
+      expect.objectContaining({ id: 'clone-1', label: 'Stat src/index.ts', status: 'running' }),
+    ]);
+
+    const send = vi.mocked(owner.send);
+    const emitted = send.mock.calls.at(-1)?.[1] as AgentSessionView;
+    emitted.activities[0]!.label = 'tampered emitted label';
+    emitted.activities.length = 0;
+    expect(service.getState(owner, 'terminal')?.activities).toEqual([
+      expect.objectContaining({ id: 'clone-1', label: 'Stat src/index.ts', status: 'running' }),
+    ]);
+
+    backend.finish();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    service.close();
+  });
+
+  it('clears the previous activity list when a second turn starts', async () => {
+    const { backend, owner, service } = await startActivityHarness('First turn.');
+    const call = activityCall('first-turn', 'workspace_glob', {
+      path: 'src',
+      pattern: '**/*.ts',
+    });
+    backend.emit({ type: 'tool_started', toolCall: call });
+    backend.emit({
+      type: 'tool_completed',
+      toolCall: call,
+      result: JSON.stringify({ ok: true, paths: ['src/index.ts'] }),
+    });
+    backend.finish();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    expect(service.getState(owner, 'terminal')?.activities).toHaveLength(1);
+
+    const second = service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Second turn.' });
+    expect(second.activities).toEqual([]);
+    expect(service.getState(owner, 'terminal')?.activities).toEqual([]);
+    await waitFor(() => backend.sendInputs.length === 2);
+    backend.finish();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    service.close();
+  });
+
+  it('keeps 3 MiB tool secrets out of activities and activity persistence', async () => {
+    const { backend, owner, service, sessions } = await startActivityHarness();
+    const argumentSecret = 'ARGUMENT_SECRET_17f2b9';
+    const resultSecret = 'RESULT_SECRET_42ac71';
+    const errorSecret = 'ERROR_SECRET_b7e631';
+    const hugeArguments = JSON.stringify({
+      query: `${argumentSecret}\u0000\u001b${'A'.repeat(3 * 1024 * 1024)}`,
+      path: 'src',
+    });
+    const hugeResult = JSON.stringify({
+      ok: false,
+      error: `${resultSecret}\u0000\u001b${errorSecret}${'R'.repeat(3 * 1024 * 1024)}`,
+    });
+    const call = activityCall('hostile-1', 'workspace_search', hugeArguments);
+    const threadEventCount = sessions.threadEvents.length;
+    const auditCount = sessions.audits.length;
+
+    backend.emit({ type: 'tool_started', toolCall: call });
+    backend.emit({ type: 'tool_completed', toolCall: call, result: hugeResult });
+
+    const activities = service.getState(owner, 'terminal')!.activities;
+    const serialized = JSON.stringify(activities);
+    expect(activities).toEqual([
+      expect.objectContaining({ id: 'hostile-1', status: 'failed' }),
+    ]);
+    expect(serialized.length).toBeLessThan(1_000);
+    for (const secret of [argumentSecret, resultSecret, errorSecret]) {
+      expect(serialized).not.toContain(secret);
+    }
+    expect(serialized).not.toContain('\\u0000');
+    expect(serialized).not.toContain('\\u001b');
+    expect(sessions.threadEvents).toHaveLength(threadEventCount);
+    expect(sessions.audits).toHaveLength(auditCount);
+
+    backend.finish();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    expect(JSON.stringify(sessions.threadEvents)).not.toContain('"activities"');
+    expect(JSON.stringify(sessions.audits)).not.toContain('"activities"');
+    expect(sessions.threadEvents.some(({ type }) => String(type).includes('activity'))).toBe(false);
+    expect(sessions.audits.some(({ type }) => type.includes('activity'))).toBe(false);
+    service.close();
+  });
+
+  it('does not audit an oversized malicious workspace mutation completion result', async () => {
+    const { backend, owner, service, sessions } = await startActivityHarness();
+    const auditSecret = 'OVERSIZED_AUDIT_SECRET_f80d61';
+    const call = activityCall('oversized-patch', 'workspace_apply_patch', {
+      path: 'src/index.ts',
+      expectedSha256: 'a'.repeat(64),
+      patches: [],
+    });
+    const oversizedResult = JSON.stringify({
+      ok: true,
+      path: `${auditSecret}${'P'.repeat(2 * 1024 * 1024 + 1)}`,
+      sha256: 'b'.repeat(64),
+      bytes: 12,
+    });
+
+    backend.emit({ type: 'tool_started', toolCall: call });
+    backend.emit({ type: 'tool_completed', toolCall: call, result: oversizedResult });
+    backend.finish();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(sessions.audits.filter(({ type }) => type === 'file_modified')).toEqual([]);
+    expect(JSON.stringify(service.getState(owner, 'terminal')?.activities)).not.toContain(auditSecret);
+    expect(JSON.stringify(sessions.threadEvents)).not.toContain('"activities"');
+    expect(JSON.stringify(sessions.audits)).not.toContain(auditSecret);
+    service.close();
+  });
+
+  it('creates one Generic backend thread, reuses its history, and injects a fresh gateway per turn', async () => {
+    const backend = new RecordingBackend();
+    const backendFactory = vi.fn(() => backend);
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      () => { throw new Error('Legacy Provider factory must stay behind the backend adapter.'); },
+      undefined,
+      undefined,
+      backendFactory,
+    );
+    const owner = browserOwner();
+
+    const first = service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'First.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Second.' });
+    await waitFor(() => backend.sendInputs.length === 2);
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(backendFactory).toHaveBeenCalledTimes(1);
+    expect(backend.createInputs).toEqual([{ id: first.threadId }]);
+    expect(backend.resumeInputs).toEqual([]);
+    expect(backend.sendInputs).toHaveLength(2);
+    expect(backend.sendInputs[0].thread).toBe(backend.sendInputs[1].thread);
+    expect(backend.sendInputs[0].gateway).not.toBe(backend.sendInputs[1].gateway);
+    expect(backend.sendInputs.map(({ gateway }) => gateway.context)).toEqual([
+      expect.objectContaining({
+        sessionId: '11111111-1111-1111-1111-111111111111',
+        terminal: expect.objectContaining({ terminalId: 'terminal', type: 'ssh' }),
+      }),
+      expect.objectContaining({
+        sessionId: '11111111-1111-1111-1111-111111111111',
+        terminal: expect.objectContaining({ terminalId: 'terminal', type: 'ssh' }),
+      }),
+    ]);
+    expect(backend.priorMessagesAtSend[0]).toEqual([]);
+    expect(backend.priorMessagesAtSend[1]).toEqual([
+      { role: 'user', content: 'First.' },
+      { role: 'assistant', content: 'reply:First.' },
+    ]);
+  });
+
+  it('resumes a Generic backend thread from the latest persisted turn', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      providerId: 'provider',
+      agentBackend: { kind: 'generic-provider', providerId: 'provider' },
+      aiThreadId: 'persisted-thread',
+    };
+    const persistedMessages: AgentMessage[] = [
+      { role: 'user', content: 'Persisted prompt.' },
+      { role: 'assistant', content: 'Persisted answer.' },
+    ];
+    sessions.persistedThreadEvents = [{
+      type: 'turn',
+      id: 'persisted-turn',
+      messages: persistedMessages,
+    }];
+    const backend = new RecordingBackend();
+    const backendFactory = vi.fn(() => backend);
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      undefined,
+      backendFactory,
+    );
+
+    service.sendPrompt(browserOwner(), { terminalId: 'terminal', prompt: 'Continue.' });
+    await waitFor(() => backend.sendInputs.length === 1);
+
+    expect(backendFactory).toHaveBeenCalledTimes(1);
+    expect(backend.createInputs).toEqual([]);
+    expect(backend.resumeInputs).toEqual([{
+      id: 'persisted-thread',
+      priorMessages: persistedMessages,
+    }]);
+    expect(backend.priorMessagesAtSend[0]).toEqual(persistedMessages);
+  });
+
+  it('discards a Generic backend thread after replacing persisted conversation history', async () => {
+    const backends: RecordingBackend[] = [];
+    const backendFactory = vi.fn(() => {
+      const backend = new RecordingBackend();
+      backends.push(backend);
+      return backend;
+    });
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      undefined,
+      backendFactory,
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Keep.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Replace me.' });
+    await waitFor(() => backends[0]?.sendInputs.length === 2);
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    const targetMessageId = [...service.getState(owner, 'terminal')!.messages]
+      .reverse().find((message) => message.role === 'user')!.id;
+
+    service.revisePrompt(owner, {
+      terminalId: 'terminal',
+      messageId: targetMessageId,
+      action: 'replace',
+      prompt: 'Replacement.',
+    });
+    await waitFor(() => backends.length === 2 && backends[1].sendInputs.length === 1);
+
+    expect(backendFactory).toHaveBeenCalledTimes(2);
+    expect(backends[0].sendInputs).toHaveLength(2);
+    expect(backends[1].createInputs).toEqual([]);
+    expect(backends[1].resumeInputs).toHaveLength(1);
+    expect(backends[1].resumeInputs[0].priorMessages).toEqual([
+      { role: 'user', content: 'Keep.' },
+      { role: 'assistant', content: 'reply:Keep.' },
+    ]);
+  });
+
+  it('forwards user stop, takeover, and shutdown interrupts to the active Generic thread', async () => {
+    const start = async () => {
+      const backend = new DeferredRecordingBackend();
+      const owner = browserOwner();
+      const service = new AgentService(
+        new FakeTerminals() as unknown as TerminalService,
+        new FakeSessions() as unknown as SessionManager,
+        providerStore(),
+        undefined,
+        undefined,
+        undefined,
+        () => backend,
+      );
+      const running = service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Wait.' });
+      await waitFor(() => backend.sendInputs.length === 1);
+      return { backend, owner, running, service };
+    };
+
+    const stopped = await start();
+    const messageId = stopped.running.messages.find((message) => message.role === 'user')!.id;
+    stopped.service.interruptTurn(stopped.owner, { terminalId: 'terminal', messageId });
+    expect(stopped.backend.interrupts).toEqual([{
+      threadId: stopped.running.threadId,
+      reason: 'user',
+    }]);
+    expect(stopped.backend.sendInputs[0].signal.aborted).toBe(true);
+    stopped.backend.finish();
+
+    const takenOver = await start();
+    takenOver.service.takeover(takenOver.owner, { terminalId: 'terminal' });
+    expect(takenOver.backend.interrupts).toEqual([{
+      threadId: takenOver.running.threadId,
+      reason: 'takeover',
+    }]);
+    expect(takenOver.backend.sendInputs[0].signal.aborted).toBe(true);
+    takenOver.backend.finish();
+
+    const closed = await start();
+    closed.service.close();
+    expect(closed.backend.interrupts).toEqual([{
+      threadId: closed.running.threadId,
+      reason: 'shutdown',
+    }]);
+    expect(closed.backend.sendInputs[0].signal.aborted).toBe(true);
+    closed.backend.finish();
+  });
+
+  it('never constructs a Generic backend for a native Codex turn', async () => {
+    const genericBackendFactory = vi.fn((_providerId: string): AgentBackend => {
+      throw new Error('Generic backend must not be constructed.');
+    });
+    const providerFactory = vi.fn((_providerId: string): AgentProviderRuntime => {
+      throw new Error('Generic Provider must not be constructed.');
+    });
+    const codex = new FakeCodexAppServer();
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      providerFactory,
+      codex as unknown as CodexAppServerService,
+      undefined,
+      genericBackendFactory,
+    );
+
+    service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Use native Codex.',
+      backend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      },
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(genericBackendFactory).not.toHaveBeenCalled();
+    expect(providerFactory).not.toHaveBeenCalled();
+  });
+
   it('allows Workspace changes without a runtime and enforces runtime ownership', async () => {
     const terminals = new FakeTerminals();
     const service = new AgentService(
@@ -524,6 +1385,7 @@ describe('AgentService shared-terminal controls', () => {
 
     expect(() => service.assertWorkspaceChangeAllowed(owner, 'terminal'))
       .toThrow('Agent 运行或正在停止时');
+    await waitFor(() => Boolean(provider.request));
     provider.finish('Done.');
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
   });

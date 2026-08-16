@@ -111,6 +111,94 @@ function fakeToolGateway(overrides: {
 }
 
 describe('AgentLoop', () => {
+  it('never invokes terminal or Workspace tools from a completion returned after cancellation', async () => {
+    let resolveCompletion!: (completion: AgentCompletion) => void;
+    const provider: AgentProviderRuntime = {
+      complete: vi.fn(() => new Promise<AgentCompletion>((resolve) => {
+        resolveCompletion = resolve;
+      })),
+    };
+    const execute = vi.fn();
+    const writeFile = vi.fn();
+    const controller = new AbortController();
+    const events: string[] = [];
+    const loop = new AgentLoop(
+      provider,
+      fakeToolGateway({ terminal: { execute }, workspace: { writeFile } }),
+      (event) => events.push(event.type),
+    );
+
+    const turn = loop.run({
+      systemPrompt: 'Use injected tools.',
+      userPrompt: 'Make a change.',
+      terminalContext: '',
+      fileAccessMode: 'read-write',
+      signal: controller.signal,
+    });
+    const rejection = expect(turn).rejects.toThrow('cancelled by takeover');
+    controller.abort(new Error('cancelled by takeover'));
+    resolveCompletion({
+      message: {
+        role: 'assistant',
+        content: null,
+        toolCalls: [
+          {
+            id: 'late-write',
+            name: 'workspace_write_file',
+            arguments: JSON.stringify({
+              path: 'late.txt',
+              content: 'must not be written',
+              expectedSha256: null,
+            }),
+          },
+          {
+            id: 'late-command',
+            name: 'terminal_execute',
+            arguments: JSON.stringify({ command: 'echo must-not-run' }),
+          },
+        ],
+      },
+    });
+
+    await rejection;
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
+  });
+
+  it('rechecks cancellation after tool_started before invoking the gateway', async () => {
+    const controller = new AbortController();
+    const execute = vi.fn();
+    const provider = new SequencedProvider([{
+      message: {
+        role: 'assistant',
+        content: null,
+        toolCalls: [{
+          id: 'command-1',
+          name: 'terminal_execute',
+          arguments: JSON.stringify({ command: 'echo must-not-run' }),
+        }],
+      },
+    }]);
+    const loop = new AgentLoop(
+      provider,
+      fakeToolGateway({ terminal: { execute } }),
+      (event) => {
+        if (event.type === 'tool_started') {
+          controller.abort(new Error('cancelled at tool boundary'));
+        }
+      },
+    );
+
+    await expect(loop.run({
+      systemPrompt: 'Use injected tools.',
+      userPrompt: 'Run a command.',
+      terminalContext: '',
+      signal: controller.signal,
+    })).rejects.toThrow('cancelled at tool boundary');
+    expect(execute).not.toHaveBeenCalled();
+  });
+
   it('forwards provider text deltas before publishing the completed assistant message', async () => {
     const events: Array<{ type: string; text?: string }> = [];
     const provider: AgentProviderRuntime = {

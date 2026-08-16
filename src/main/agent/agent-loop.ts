@@ -1,21 +1,18 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentFileAccessMode } from '../../shared/agent';
 import type { ToolGateway, WorkspaceTool } from '../../shared/tools';
+import type {
+  AgentBackendEvent,
+  AgentBackendResult,
+  AgentMessage,
+  AgentToolCall,
+} from './agent-backend';
 
-export type AgentMessage =
-  | { role: 'system' | 'user'; content: string }
-  | {
-    role: 'assistant';
-    content: string | null;
-    toolCalls?: AgentToolCall[];
-  }
-  | { role: 'tool'; content: string; toolCallId: string };
-
-export interface AgentToolCall {
-  id: string;
-  name: string;
-  arguments: string;
-}
+// Compatibility aliases keep Provider/loop consumers independent while the
+// replaceable AgentBackend contract owns the neutral transcript/event DTOs.
+export type { AgentMessage, AgentToolCall } from './agent-backend';
+export type AgentLoopEvent = AgentBackendEvent;
+export type AgentLoopResult = AgentBackendResult;
 
 export interface AgentToolDefinition {
   name: string;
@@ -38,13 +35,6 @@ export interface AgentProviderRuntime {
   complete(request: AgentCompletionRequest): Promise<AgentCompletion>;
 }
 
-export interface AgentLoopEvent {
-  type: 'assistant_delta' | 'assistant_text' | 'tool_started' | 'tool_completed';
-  text?: string;
-  toolCall?: AgentToolCall;
-  result?: string;
-}
-
 export interface AgentLoopInput {
   systemPrompt: string;
   userPrompt: string;
@@ -52,13 +42,6 @@ export interface AgentLoopInput {
   priorMessages?: AgentMessage[];
   fileAccessMode?: AgentFileAccessMode;
   signal: AbortSignal;
-}
-
-export interface AgentLoopResult {
-  id: string;
-  messages: AgentMessage[];
-  finalText: string;
-  rounds: number;
 }
 
 export const TERMINAL_TOOLS: AgentToolDefinition[] = [
@@ -465,6 +448,14 @@ function writableWorkspace(
   return gateway.workspace;
 }
 
+function throwIfTurnCancelled(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const error = new Error('Agent turn cancelled.');
+  error.name = 'AbortError';
+  throw error;
+}
+
 export class AgentLoop {
   constructor(
     private readonly provider: AgentProviderRuntime,
@@ -487,15 +478,20 @@ export class AgentLoop {
     let finalText = '';
 
     for (let round = 1; round <= this.maxRounds; round += 1) {
-      if (input.signal.aborted) throw new Error('Agent turn cancelled.');
+      throwIfTurnCancelled(input.signal);
       const completion = await this.provider.complete({
         messages,
         tools: toolsForMode(fileAccessMode),
         signal: input.signal,
         onTextDelta: (delta) => {
-          if (delta) this.onEvent({ type: 'assistant_delta', text: delta });
+          if (delta && !input.signal.aborted) {
+            this.onEvent({ type: 'assistant_delta', text: delta });
+          }
         },
       });
+      // Providers are not trusted to observe AbortSignal. Never accept a late
+      // completion after the user has stopped or taken over the turn.
+      throwIfTurnCancelled(input.signal);
       const assistant = completion.message;
       messages.push(assistant);
       if (assistant.content) {
@@ -503,6 +499,7 @@ export class AgentLoop {
         this.onEvent({ type: 'assistant_text', text: assistant.content });
       }
       if (!assistant.toolCalls?.length) {
+        throwIfTurnCancelled(input.signal);
         compactCompletedWorkspaceHistory(messages);
         return { id: randomUUID(), messages, finalText, rounds: round };
       }
@@ -510,17 +507,26 @@ export class AgentLoop {
       compactCompletedWorkspaceHistory(messages, assistant);
 
       for (const call of assistant.toolCalls) {
+        throwIfTurnCancelled(input.signal);
         this.onEvent({ type: 'tool_started', toolCall: call });
+        // A tool-start observer may synchronously cancel the turn. Check again
+        // immediately before invoking the externally-effectful gateway.
+        throwIfTurnCancelled(input.signal);
         let result: string;
         try {
           result = await this.executeTool(call, fileAccessMode, workspaceResultBudget);
         } catch (error) {
+          throwIfTurnCancelled(input.signal);
           result = WORKSPACE_TOOL_NAMES.has(call.name)
             ? boundedWorkspaceErrorResult(error, workspaceResultBudget)
             : JSON.stringify({ ok: false, error: (error as Error).message });
         }
+        // An already-started tool cannot always be rolled back, but its late
+        // result must not advance this turn or permit another tool dispatch.
+        throwIfTurnCancelled(input.signal);
         messages.push({ role: 'tool', toolCallId: call.id, content: result });
         this.onEvent({ type: 'tool_completed', toolCall: call, result });
+        throwIfTurnCancelled(input.signal);
       }
       // Workspace contents and mutation payloads are useful for one reasoning step only.
       // Mutation arguments are compacted immediately; their structured result is sufficient.

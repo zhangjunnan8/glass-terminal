@@ -41,6 +41,7 @@ import { mergeAgentState } from './agent-state';
 import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
 import { AgentActivityCard } from './components/AgentActivityCard';
+import { ToolActivityList } from './components/ToolActivityList';
 import {
   isAgentOutputNearBottom,
   scrollAgentOutputToBottom,
@@ -2376,7 +2377,7 @@ export function App() {
               </button>
             </section>
           )}
-          {!activeAgent?.messages.length && (
+          {!activeAgent?.messages.length && !activeAgent?.activities?.length && (
             <div className="agent-empty">
               <div className="agent-glyph">✦</div>
               <strong>理解终端上下文的 AI 助手</strong>
@@ -2469,6 +2470,7 @@ export function App() {
             </article>
             );
           })}
+          <ToolActivityList activities={activeAgent?.activities ?? []} />
           {activeAgent?.pendingApproval?.status === 'waiting'
             && activeAgent.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND && (
             <section className="approval-card">

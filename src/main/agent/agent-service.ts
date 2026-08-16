@@ -32,9 +32,19 @@ import type { TerminalCommandResult, WorkspaceBinding } from '../../shared/tools
 import type { ProviderStore } from '../providers/provider-store';
 import type { SessionManager } from '../sessions/session-manager';
 import type { TerminalService } from '../terminal/terminal-service';
-import { AgentLoop } from './agent-loop';
-import type { AgentMessage, AgentProviderRuntime } from './agent-loop';
+import type {
+  AgentBackend,
+  AgentBackendEvent,
+  AgentBackendThread,
+  AgentMessage,
+} from './agent-backend';
+import type { AgentProviderRuntime } from './agent-loop';
 import { AgentFileService } from './agent-file-service';
+import {
+  reduceAgentToolActivities,
+  settleRunningToolActivities,
+} from './agent-tool-activity';
+import { GenericHarnessBackend } from './generic-harness-backend';
 import { GenericOpenAiProvider } from './generic-provider';
 import type { CodexAppServerService } from '../app-server/app-server-service';
 import { SharedTerminalTool } from '../tools/shared-terminal-tool';
@@ -54,6 +64,8 @@ interface AgentRuntimeRecord extends AgentSessionView {
   owner: WebContents;
   ownerId: number;
   priorMessages: AgentMessage[];
+  harnessBackend?: AgentBackend;
+  harnessThread?: AgentBackendThread;
   providerThreadId?: string;
   abortController?: AbortController;
   turnToken: number;
@@ -64,6 +76,8 @@ interface AgentRuntimeRecord extends AgentSessionView {
   resolveApproval?: (resolution: ApprovalResolution) => void;
   streamEmitTimer?: ReturnType<typeof setTimeout>;
 }
+
+type GenericBackendFactory = (providerId: string) => AgentBackend;
 
 const BUSY_STATES = new Set<AgentRuntimeState>([
   'THINKING',
@@ -78,7 +92,7 @@ const BUSY_STATES = new Set<AgentRuntimeState>([
 const SYSTEM_PROMPT = `You are the AI agent inside AI Terminal.
 You and the human operate the exact same visible terminal session. Use only the provided tools.
 Never invent command output. Read terminal state/history when needed, request one clear command at a time, inspect its structured result, and continue until the user's goal is handled.
-  Every command must use terminal_execute so it appears in the visible terminal. Workspace tools, when explicitly enabled, operate directly inside the explicit Workspace Root and must never be emulated with a hidden shell. Use workspace_list, workspace_search, workspace_glob, and workspace_read_file for discovery, then prefer small workspace_apply_patch calls for edits; never use terminal cat/grep/sed/echo to emulate file tools or dump an entire repository.
+Every command must use terminal_execute so it appears in the visible terminal. Workspace tools, when explicitly enabled, operate directly inside the explicit Workspace Root and must never be emulated with a hidden shell. Use workspace_list, workspace_search, workspace_glob, and workspace_read_file for discovery, then prefer small workspace_apply_patch calls for edits; never use terminal cat/grep/sed/echo to emulate file tools or dump an entire repository.
 Do not ask the user to send passwords, API keys, passphrases, OTPs, or other credentials through chat. Authentication is entered by the user directly in the visible terminal.
 Commands require explicit user approval unless the UI reports that Full Takeover is active.`;
 
@@ -96,6 +110,7 @@ function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
     fileAccessMode: runtime.fileAccessMode,
     fileAccessRoot: runtime.fileAccessRoot,
     messages: runtime.messages.map((message) => ({ ...message })),
+    activities: runtime.activities.map((activity) => ({ ...activity })),
     streamingMessageId: runtime.streamingMessageId,
     backendTurnDraining: runtime.backendTurnDraining,
     pendingApproval: runtime.pendingApproval ? { ...runtime.pendingApproval } : undefined,
@@ -131,6 +146,37 @@ interface ReplayedConversation {
 }
 
 const MAX_CODEX_RESEEDED_HISTORY_CHARS = 24_000;
+const MAX_MUTATION_AUDIT_RESULT_CHARS = 256 * 1024;
+
+function mutationAuditDetails(result: string | undefined): {
+  path: string;
+  sha256: string;
+  bytes: number;
+} | undefined {
+  if (!result || result.length > MAX_MUTATION_AUDIT_RESULT_CHARS) return undefined;
+  try {
+    const completed = JSON.parse(result) as Record<string, unknown>;
+    if (
+      completed.ok !== true
+      || typeof completed.path !== 'string'
+      || !completed.path
+      || completed.path.length > 4_096
+      || /[\u0000-\u001F\u007F]/u.test(completed.path)
+      || typeof completed.sha256 !== 'string'
+      || !/^[a-f0-9]{64}$/iu.test(completed.sha256)
+      || typeof completed.bytes !== 'number'
+      || !Number.isSafeInteger(completed.bytes)
+      || completed.bytes < 0
+    ) return undefined;
+    return {
+      path: completed.path,
+      sha256: completed.sha256,
+      bytes: completed.bytes,
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 function codexPromptWithLocalHistory(
   messages: AgentChatItem[],
@@ -248,6 +294,7 @@ export class AgentService {
   private readonly removeExitListener: () => void;
   private readonly removeSensitiveSubmissionListener: () => void;
   private readonly fileService: AgentFileService;
+  private readonly genericBackendFactory: GenericBackendFactory;
 
   constructor(
     private readonly terminals: TerminalService,
@@ -258,8 +305,11 @@ export class AgentService {
     ) => new GenericOpenAiProvider(providerId, providers),
     private readonly codexAppServer?: CodexAppServerService,
     fileService?: AgentFileService,
+    genericBackendFactory?: GenericBackendFactory,
   ) {
     this.fileService = fileService ?? new AgentFileService(terminals, sessions);
+    this.genericBackendFactory = genericBackendFactory
+      ?? ((providerId) => new GenericHarnessBackend(this.providerFactory(providerId)));
     this.removeExitListener = terminals.onExit((terminalId, ownerId) => {
       this.handleTerminalExit(terminalId, ownerId);
     });
@@ -330,7 +380,7 @@ export class AgentService {
         this.emit(runtime);
         return cloneView(runtime);
       }
-      const paused = this.takeover(owner, { terminalId: request.terminalId });
+      const paused = this.takeover(owner, { terminalId: request.terminalId }, 'user');
       if (!paused.pendingTakeover) return paused;
       return this.resolveTakeover(owner, {
         terminalId: request.terminalId,
@@ -437,8 +487,14 @@ export class AgentService {
     );
     runtime.messages = replayed.messages;
     runtime.priorMessages = replayed.priorMessages;
+    runtime.activities = [];
     if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
       runtime.providerThreadId = replayed.providerThreadId;
+    } else {
+      // Generic Harness threads own their in-memory history. Replaying an
+      // append-only retract/replace must seed a fresh backend thread next turn.
+      runtime.harnessBackend = undefined;
+      runtime.harnessThread = undefined;
     }
     runtime.error = undefined;
     runtime.activeExecution = undefined;
@@ -689,7 +745,11 @@ export class AgentService {
     return cloneView(runtime);
   }
 
-  takeover(owner: WebContents, request: TakeoverRequest): AgentSessionView {
+  takeover(
+    owner: WebContents,
+    request: TakeoverRequest,
+    interruptReason: 'user' | 'takeover' = 'takeover',
+  ): AgentSessionView {
     const runtime = this.requireOwned(owner, request.terminalId);
     if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
       throw new Error('Codex App Server 不操作用户终端，无需人工接管。');
@@ -709,6 +769,16 @@ export class AgentService {
     this.cancelStreamEmit(runtime);
     runtime.turnToken += 1;
     runtime.abortController?.abort();
+    this.interruptHarness(runtime, interruptReason);
+    // A cancelled replaceable backend may retain partial provider-side state.
+    // Discard it and resume a fresh adapter from the last committed transcript.
+    runtime.harnessBackend = undefined;
+    runtime.harnessThread = undefined;
+    runtime.activities = settleRunningToolActivities(
+      runtime.activities,
+      'cancelled',
+      new Date().toISOString(),
+    );
     runtime.abortController = undefined;
     if (runtime.pendingApproval) {
       this.appendControlAudit(runtime, 'command_rejected', 'user', {
@@ -820,7 +890,7 @@ export class AgentService {
     if (!runtime) return;
     if (runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
     this.clearFullTakeover(runtime, 'terminal_closed');
-    this.invalidateRuntime(runtime);
+    this.invalidateRuntime(runtime, 'shutdown');
     this.runtimes.delete(terminalId);
   }
 
@@ -828,7 +898,7 @@ export class AgentService {
     for (const [terminalId, runtime] of this.runtimes) {
       if (runtime.ownerId !== ownerId) continue;
       this.clearFullTakeover(runtime, 'window_closed');
-      this.invalidateRuntime(runtime);
+      this.invalidateRuntime(runtime, 'shutdown');
       this.runtimes.delete(terminalId);
     }
   }
@@ -838,7 +908,7 @@ export class AgentService {
     this.removeSensitiveSubmissionListener();
     for (const runtime of this.runtimes.values()) {
       this.clearFullTakeover(runtime, 'application_shutdown');
-      this.invalidateRuntime(runtime);
+      this.invalidateRuntime(runtime, 'shutdown');
     }
     this.runtimes.clear();
   }
@@ -855,40 +925,18 @@ export class AgentService {
     }
     if (!controlLeaseId) throw new Error('Generic Agent control lease is missing.');
     const signal = runtime.abortController!.signal;
-    const provider = this.providerFactory(runtime.providerId);
-    const boundSession = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
-    if (!boundSession) throw new Error('当前终端没有可用的正式 Session。');
-    const workspace: WorkspaceBinding | undefined = runtime.fileAccessRoot
-      ? {
-        backend: boundSession.transport === 'ssh' ? 'sftp' : 'local',
-        root: runtime.fileAccessRoot,
-        ...(boundSession.hostId ? { hostId: boundSession.hostId } : {}),
-      }
-      : boundSession.workspace;
-    const context = buildSessionToolContext(
-      { ...boundSession, ...(workspace ? { workspace } : {}) },
-      this.terminals.descriptor(runtime.owner, runtime.terminalId),
-      { workspacePermissions: workspacePermissions(runtime.fileAccessMode, workspace) },
-    );
-    const terminalTool = new SharedTerminalTool({
-      context,
-      owner: runtime.owner,
-      terminals: this.terminals,
-      sessions: this.sessions,
-      execute: (command, reason) => this.requestCommand(runtime, token, { command, reason }),
-    });
-    const workspaceTool = workspace
-      ? new AgentFileWorkspaceAdapter(
-        this.fileService,
-        runtime.owner,
-        runtime.terminalId,
-        workspace,
-      )
-      : undefined;
-    const gateway = new SessionToolGateway(context, terminalTool, workspaceTool);
     let streamedMessage: AgentChatItem | undefined;
-    const loop = new AgentLoop(provider, gateway, (event) => {
-      if (!this.isCurrentTurn(runtime, token)) return;
+    let acceptBackendEvents = true;
+    const onEvent = (event: AgentBackendEvent): void => {
+      if (!acceptBackendEvents || !this.isCurrentTurn(runtime, token)) return;
+      if (event.type === 'tool_started' || event.type === 'tool_completed') {
+        runtime.activities = reduceAgentToolActivities(
+          runtime.activities,
+          event,
+          new Date().toISOString(),
+        );
+        this.emit(runtime);
+      }
       if (
         event.type === 'tool_completed'
         && (
@@ -898,19 +946,10 @@ export class AgentService {
           || event.toolCall?.name === 'file_patch'
         )
       ) {
-        let completed: Record<string, unknown> | undefined;
-        try {
-          completed = event.result
-            ? JSON.parse(event.result) as Record<string, unknown>
-            : undefined;
-        } catch {
-          // A malformed tool result is handled by the Agent loop; never log its content.
-        }
-        if (completed?.ok === true) {
+        const details = mutationAuditDetails(event.result);
+        if (details) {
           this.sessions.appendAudit(runtime.sessionId, 'file_modified', 'ai', {
-            path: completed.path,
-            sha256: completed.sha256,
-            bytes: completed.bytes,
+            ...details,
           });
         }
       }
@@ -939,18 +978,84 @@ export class AgentService {
         }
         this.emit(runtime);
       }
-    });
+    };
 
     try {
-      const context = this.sessions.readTerminalHistory(runtime.sessionId).slice(-12_000);
-      const result = await loop.run({
-        systemPrompt: SYSTEM_PROMPT,
-        userPrompt: prompt,
-        terminalContext: context,
-        priorMessages: runtime.priorMessages,
-        fileAccessMode: runtime.fileAccessMode,
-        signal,
+      const boundSession = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
+      if (!boundSession) throw new Error('当前终端没有可用的正式 Session。');
+      const workspace: WorkspaceBinding | undefined = runtime.fileAccessRoot
+        ? {
+          backend: boundSession.transport === 'ssh' ? 'sftp' : 'local',
+          root: runtime.fileAccessRoot,
+          ...(boundSession.hostId ? { hostId: boundSession.hostId } : {}),
+        }
+        : boundSession.workspace;
+      const toolContext = buildSessionToolContext(
+        { ...boundSession, ...(workspace ? { workspace } : {}) },
+        this.terminals.descriptor(runtime.owner, runtime.terminalId),
+        { workspacePermissions: workspacePermissions(runtime.fileAccessMode, workspace) },
+      );
+      const terminalTool = new SharedTerminalTool({
+        context: toolContext,
+        owner: runtime.owner,
+        terminals: this.terminals,
+        sessions: this.sessions,
+        execute: (command, reason) => this.requestCommand(runtime, token, { command, reason }),
       });
+      const workspaceTool = workspace
+        ? new AgentFileWorkspaceAdapter(
+          this.fileService,
+          runtime.owner,
+          runtime.terminalId,
+          workspace,
+        )
+        : undefined;
+      const gateway = new SessionToolGateway(toolContext, terminalTool, workspaceTool);
+
+      let backend = runtime.harnessBackend;
+      if (!backend) {
+        backend = this.genericBackendFactory(runtime.providerId);
+        runtime.harnessBackend = backend;
+      }
+      let thread = runtime.harnessThread;
+      if (!thread) {
+        try {
+          const createdThread = runtime.priorMessages.length > 0
+            ? await backend.resume({
+              id: runtime.threadId,
+              priorMessages: runtime.priorMessages,
+              signal,
+            })
+            : await backend.createThread({ id: runtime.threadId, signal });
+          if (
+            !this.isCurrentTurn(runtime, token)
+            || runtime.harnessBackend !== backend
+          ) return;
+          thread = createdThread;
+          runtime.harnessThread = createdThread;
+        } catch (error) {
+          if (
+            !this.isCurrentTurn(runtime, token)
+            || runtime.harnessBackend !== backend
+          ) return;
+          if (!runtime.harnessThread) runtime.harnessBackend = undefined;
+          throw error;
+        }
+      }
+      if (!this.isCurrentTurn(runtime, token)) return;
+
+      const terminalContext = this.sessions.readTerminalHistory(runtime.sessionId).slice(-12_000);
+      const result = await backend.sendMessage({
+        thread,
+        prompt,
+        systemPrompt: SYSTEM_PROMPT,
+        terminalContext,
+        fileAccessMode: runtime.fileAccessMode,
+        gateway,
+        signal,
+        onEvent,
+      });
+      acceptBackendEvents = false;
       if (!this.isCurrentTurn(runtime, token)) return;
       runtime.priorMessages = result.messages.filter((message) => message.role !== 'system');
       this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
@@ -962,10 +1067,16 @@ export class AgentService {
       runtime.pendingApproval = undefined;
       runtime.activeExecution = undefined;
       runtime.streamingMessageId = undefined;
+      runtime.activities = settleRunningToolActivities(
+        runtime.activities,
+        'failed',
+        new Date().toISOString(),
+      );
       this.cancelStreamEmit(runtime);
       this.setHumanState(runtime, 'COMPLETED', controlLeaseId);
       this.emit(runtime);
     } catch (error) {
+      acceptBackendEvents = false;
       if (!this.isCurrentTurn(runtime, token)) return;
       if (streamedMessage?.content) {
         try { this.persistChatItem(runtime, streamedMessage); } catch { /* preserve original error */ }
@@ -975,6 +1086,11 @@ export class AgentService {
       this.cancelStreamEmit(runtime);
       runtime.pendingApproval = undefined;
       runtime.activeExecution = undefined;
+      runtime.activities = settleRunningToolActivities(
+        runtime.activities,
+        signal.aborted ? 'cancelled' : 'failed',
+        new Date().toISOString(),
+      );
       runtime.error = error instanceof Error ? error.message : String(error);
       this.setHumanState(runtime, signal.aborted ? 'PAUSED' : 'FAILED', controlLeaseId);
       this.emit(runtime);
@@ -1430,7 +1546,7 @@ export class AgentService {
       ) {
         throw new Error('Cannot switch Provider while the Agent or a foreground process is active.');
       }
-      this.invalidateRuntime(existing);
+      this.invalidateRuntime(existing, 'user');
     }
 
     const persistedBackend = session.agentBackend
@@ -1465,6 +1581,7 @@ export class AgentService {
       fileAccessMode: 'off',
       fileAccessRoot: undefined,
       messages: replayed.messages,
+      activities: [],
       priorMessages: replayed.priorMessages,
       providerThreadId: canReuseThread && backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
         ? replayed.providerThreadId
@@ -1584,13 +1701,24 @@ export class AgentService {
     resolve?.();
   }
 
-  private invalidateRuntime(runtime: AgentRuntimeRecord): void {
+  private invalidateRuntime(
+    runtime: AgentRuntimeRecord,
+    reason: 'user' | 'takeover' | 'shutdown' = 'shutdown',
+  ): void {
     runtime.turnToken += 1;
     runtime.streamingMessageId = undefined;
     runtime.backendTurnDraining = false;
     this.cancelStreamEmit(runtime);
     runtime.abortController?.abort();
+    this.interruptHarness(runtime, reason);
+    runtime.activities = settleRunningToolActivities(
+      runtime.activities,
+      'cancelled',
+      new Date().toISOString(),
+    );
     runtime.abortController = undefined;
+    runtime.harnessBackend = undefined;
+    runtime.harnessThread = undefined;
     runtime.resolveApproval?.({ decision: 'reject', command: '' });
     runtime.resolveApproval = undefined;
     runtime.pendingApproval = undefined;
@@ -1613,6 +1741,25 @@ export class AgentService {
         runtime.controlLeaseId,
       );
       runtime.controlLeaseId = undefined;
+    }
+  }
+
+  private interruptHarness(
+    runtime: AgentRuntimeRecord,
+    reason: 'user' | 'takeover' | 'shutdown',
+  ): void {
+    if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) return;
+    const backend = runtime.harnessBackend;
+    const thread = runtime.harnessThread;
+    if (!backend || !thread) return;
+    try {
+      void backend.interrupt({ threadId: thread.id, reason }).catch((error) => {
+        console.error('Unable to interrupt Generic Harness backend:', error);
+      });
+    } catch (error) {
+      // A replaceable backend may throw before returning its promised result;
+      // runtime cleanup and terminal lease release must still continue.
+      console.error('Unable to interrupt Generic Harness backend:', error);
     }
   }
 
@@ -1737,6 +1884,7 @@ export class AgentService {
     runtime.pendingTakeover = undefined;
     runtime.authRequest = undefined;
     runtime.streamingMessageId = undefined;
+    runtime.activities = [];
     if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
       runtime.controlLeaseId = undefined;
       this.setIndependentCodexState(runtime, 'THINKING');

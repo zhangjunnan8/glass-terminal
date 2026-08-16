@@ -70,6 +70,20 @@ export interface AgentChatItem {
   createdAt: string;
 }
 
+export type AgentToolActivityKind = 'terminal' | 'workspace' | 'other';
+export type AgentToolActivityStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
+
+export interface AgentToolActivity {
+  id: string;
+  toolName: string;
+  kind: AgentToolActivityKind;
+  label: string;
+  status: AgentToolActivityStatus;
+  startedAt: string;
+  finishedAt?: string;
+  summary?: string;
+}
+
 export interface AgentSessionView {
   revision: number;
   terminalId: string;
@@ -86,6 +100,8 @@ export interface AgentSessionView {
   /** Canonical explicit Session Workspace Root captured when file access was enabled. */
   fileAccessRoot?: string;
   messages: AgentChatItem[];
+  /** Bounded, metadata-only summaries of recent tool use. */
+  activities: AgentToolActivity[];
   streamingMessageId?: string;
   /** App Server interrupt is still draining; terminal input is human-owned but a new turn is unsafe. */
   backendTurnDraining?: boolean;
