@@ -1,5 +1,7 @@
 # AI Terminal
 
+> 新 AI 窗口/开发者请先读：[`docs/AI_PROJECT_GUIDE.md`](docs/AI_PROJECT_GUIDE.md)。
+
 Windows-first desktop terminal where a human and an AI agent share the same
 visible PTY or SSH shell.
 
@@ -61,9 +63,9 @@ src/
   main/       Electron main process and platform adapters
   preload/    narrow, typed IPC bridge
   renderer/   React UI
-  core/       platform-neutral domain logic
   shared/     IPC contracts and shared types
 docs/
+  AI_PROJECT_GUIDE.md
   architecture/
   progress/
 ```
