@@ -1,5 +1,6 @@
 import type { TerminalDescriptor } from './terminal';
 import type { AgentBackendRef, AgentChatItem } from './agent';
+import type { WorkspaceBinding } from './tools';
 
 export type SessionNameSource = 'automatic' | 'manual';
 export type SessionConnectionState = 'connected' | 'disconnected';
@@ -51,6 +52,8 @@ export interface SessionRecord {
   runtimeTerminalId: string;
   cwd?: string;
   effectiveUser?: string;
+  /** Explicit project root. It is not itself an authorization grant. */
+  workspace?: WorkspaceBinding;
   aiThreadId?: string;
   agentBackend?: AgentBackendRef;
   providerThreadId?: string;
