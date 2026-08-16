@@ -53,10 +53,12 @@ import { TransferQueue } from './sftp/transfer-queue';
 import { ProviderStore } from './providers/provider-store';
 import { MemorySecretStore, WindowsCredentialStore } from './providers/secret-store';
 import { AgentService } from './agent/agent-service';
+import { AgentFileService } from './agent/agent-file-service';
 import { startAgentSmokeProvider } from './smoke/agent-provider-server';
 import type { AgentSmokeProvider } from './smoke/agent-provider-server';
 import { registerSmokeRunner, smokeModeFromEnvironment } from './smoke/smoke-runner';
 import { TerminalService } from './terminal/terminal-service';
+import { RemoteFilesystemProvider } from './filesystem/remote-filesystem';
 import { CodexAppServerService } from './app-server/app-server-service';
 import {
   isTrustedRendererUrl,
@@ -75,7 +77,8 @@ const rendererEntryUrl = developmentRendererUrl?.href ?? pathToFileURL(
 const smokeMode = smokeModeFromEnvironment();
 const isSmokeTest = smokeMode !== null;
 const terminalService = new TerminalService();
-const sftpService = new SftpService(terminalService);
+const remoteFilesystemProvider = new RemoteFilesystemProvider(terminalService);
+const sftpService = new SftpService(remoteFilesystemProvider);
 const transferQueue = new TransferQueue(terminalService);
 let hostStore: HostStore | undefined;
 let hostService: HostService | undefined;
@@ -540,6 +543,7 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
     providerStore,
     undefined,
     codexAppServerService,
+    new AgentFileService(terminalService, sessionManager, remoteFilesystemProvider),
   );
   createMainWindow();
   void codexAppServerService.startIfBound();

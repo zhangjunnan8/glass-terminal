@@ -8,6 +8,7 @@ import type { HostProfile } from '../../shared/host';
 import { SSH_ERROR_CODES } from '../../shared/host';
 import type { TransferJobSnapshot } from '../../shared/sftp';
 import { TerminalService } from '../terminal/terminal-service';
+import { RemoteFilesystemProvider } from '../filesystem/remote-filesystem';
 import { SftpService } from './sftp-service';
 import { TransferQueue } from './transfer-queue';
 
@@ -47,7 +48,7 @@ async function waitForTransfer(
 describe.runIf(enabled)('real SFTP over the visible SSH connection', () => {
   it('browses, uploads, and downloads without a second SSH login', async () => {
     const service = new TerminalService();
-    const sftpService = new SftpService(service);
+    const sftpService = new SftpService(new RemoteFilesystemProvider(service));
     const queue = new TransferQueue(service);
     const owner = {
       id: 7_002,

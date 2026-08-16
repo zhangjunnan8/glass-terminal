@@ -12,7 +12,11 @@ import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { WebContents } from 'electron';
-import type { SFTPWrapper, Stats } from 'ssh2';
+import type {
+  RemoteFilesystem,
+  RemoteFilesystemProvider,
+  RemoteFileStat,
+} from '../filesystem/remote-filesystem';
 import type { SessionManager } from '../sessions/session-manager';
 import type { TerminalService } from '../terminal/terminal-service';
 import { AGENT_FILE_LIMITS, AgentFileService } from './agent-file-service';
@@ -30,23 +34,57 @@ function createService(root: string): AgentFileService {
   return new AgentFileService({} as TerminalService, sessions);
 }
 
-function sshAttributes(type: 'file' | 'directory' | 'symlink', size = 0): Stats {
+function remoteStat(type: RemoteFileStat['type'], size = 0): RemoteFileStat {
   return {
-    mode: type === 'file' ? 0o100644 : type === 'directory' ? 0o040755 : 0o120777,
+    mode: type === 'file' ? 0o644 : type === 'directory' ? 0o755 : 0o777,
     size,
-    isFile: () => type === 'file',
-    isDirectory: () => type === 'directory',
-    isSymbolicLink: () => type === 'symlink',
-  } as Stats;
+    type,
+    modifiedAt: '2026-08-16T00:00:00.000Z',
+  };
 }
 
-function createSshService(sftp: SFTPWrapper) {
-  const openSftp = vi.fn().mockResolvedValue(sftp);
+function fakeRemoteFilesystem(
+  overrides: Partial<RemoteFilesystem> = {},
+): RemoteFilesystem {
+  return {
+    realpath: vi.fn(async (path: string) => path),
+    stat: vi.fn(async () => undefined),
+    lstat: vi.fn(async () => undefined),
+    readFile: vi.fn(async () => Buffer.alloc(0)),
+    writeFile: vi.fn(async () => undefined),
+    listDirectory: vi.fn(async () => []),
+    rename: vi.fn(async () => undefined),
+    atomicReplace: vi.fn(async () => undefined),
+    unlink: vi.fn(async () => undefined),
+    mkdir: vi.fn(async () => undefined),
+    rmdir: vi.fn(async () => undefined),
+    ...overrides,
+  };
+}
+
+function createSshService(filesystem: RemoteFilesystem) {
+  const withFilesystem = vi.fn(async <T>(
+    _owner: WebContents,
+    _terminalId: string,
+    operation: (remote: RemoteFilesystem) => Promise<T>,
+    _expectedHostId?: string,
+  ) => operation(filesystem));
+  const provider = { withFilesystem } as unknown as RemoteFilesystemProvider;
+  const openSftp = vi.fn(() => {
+    throw new Error('AgentFileService must not open SFTP directly.');
+  });
   const sessions = {
-    sessionForTerminal: () => ({ id: 'session-id', transport: 'ssh', cwd: '/work' }),
+    sessionForTerminal: () => ({
+      id: 'session-id', transport: 'ssh', hostId: 'host-1', cwd: '/work',
+    }),
   } as unknown as SessionManager;
   return {
-    service: new AgentFileService({ openSftp } as unknown as TerminalService, sessions),
+    service: new AgentFileService(
+      { openSftp } as unknown as TerminalService,
+      sessions,
+      provider,
+    ),
+    withFilesystem,
     openSftp,
   };
 }
@@ -172,33 +210,30 @@ describe('AgentFileService local workspace boundary', () => {
     expect(result.truncated).toBe(false);
   });
 
-  it('uses the shared TerminalService SFTP channel, accepts numeric not-found, and uses atomic overwrite', async () => {
+  it('uses one RemoteFilesystem abstraction with the expected Host and atomic overwrite', async () => {
     const current = Buffer.from('old\n');
-    const standardRename = vi.fn((_source, _target, callback) => callback(null));
-    const atomicRename = vi.fn((_source, _target, callback) => callback(null));
-    const sftp = {
-      realpath: vi.fn((path: string, callback: (error: Error | null, path: string) => void) => callback(null, path)),
-      lstat: vi.fn((path: string, callback: (error: Error | null, stats?: Stats) => void) => {
-        if (path.endsWith('/new.ts')) {
-          const error = Object.assign(new Error('not found'), { code: 2 });
-          callback(error);
-        } else {
-          callback(null, sshAttributes('file', current.length));
-        }
-      }),
-      readFile: vi.fn((_path: string, callback: (error: Error | null, data: Buffer) => void) => callback(null, current)),
-      writeFile: vi.fn((_path: string, _data: Buffer, _options: unknown, callback: (error?: Error) => void) => callback()),
+    const standardRename = vi.fn(async () => undefined);
+    const atomicRename = vi.fn(async () => undefined);
+    const filesystem = fakeRemoteFilesystem({
+      lstat: vi.fn(async (path: string) => (
+        path.endsWith('/new.ts') ? undefined : remoteStat('file', current.length)
+      )),
+      readFile: vi.fn(async () => current),
       rename: standardRename,
-      ext_openssh_rename: atomicRename,
-      unlink: vi.fn((_path: string, callback: (error?: Error) => void) => callback()),
-      end: vi.fn(),
-    } as unknown as SFTPWrapper;
-    const { service, openSftp } = createSshService(sftp);
+      atomicReplace: atomicRename,
+    });
+    const { service, withFilesystem, openSftp } = createSshService(filesystem);
     const owner = { id: 1 } as WebContents;
 
     await expect(service.writeText(owner, 'terminal', 'new.ts', 'new\n', null, '/work'))
       .resolves.toMatchObject({ created: true, path: '/work/new.ts' });
-    expect(openSftp).toHaveBeenCalledTimes(1);
+    expect(withFilesystem).toHaveBeenNthCalledWith(
+      1,
+      owner,
+      'terminal',
+      expect.any(Function),
+      'host-1',
+    );
     expect(standardRename).toHaveBeenCalledTimes(1);
     expect(atomicRename).not.toHaveBeenCalled();
 
@@ -210,21 +245,24 @@ describe('AgentFileService local workspace boundary', () => {
       createHash('sha256').update(current).digest('hex'),
       '/work',
     )).resolves.toMatchObject({ created: false, path: '/work/existing.ts' });
-    expect(openSftp).toHaveBeenCalledTimes(2);
+    expect(withFilesystem).toHaveBeenNthCalledWith(
+      2,
+      owner,
+      'terminal',
+      expect.any(Function),
+      'host-1',
+    );
     expect(atomicRename).toHaveBeenCalledTimes(1);
+    expect(openSftp).not.toHaveBeenCalled();
   });
 
   it('rejects a remote final-component symlink before reading or replacing it', async () => {
     const readFile = vi.fn();
-    const sftp = {
-      realpath: vi.fn((path: string, callback: (error: Error | null, path: string) => void) => callback(null, path)),
-      lstat: vi.fn((_path: string, callback: (error: Error | null, stats: Stats) => void) => (
-        callback(null, sshAttributes('symlink'))
-      )),
+    const filesystem = fakeRemoteFilesystem({
+      lstat: vi.fn(async () => remoteStat('symlink')),
       readFile,
-      end: vi.fn(),
-    } as unknown as SFTPWrapper;
-    const { service } = createSshService(sftp);
+    });
+    const { service } = createSshService(filesystem);
 
     await expect(service.writeText(
       { id: 1 } as WebContents,

@@ -1,8 +1,7 @@
 import { posix } from 'node:path';
 import type { WebContents } from 'electron';
-import type { FileEntryWithStats, SFTPWrapper } from 'ssh2';
 import type { SftpDirectoryListing, SftpEntry } from '../../shared/sftp';
-import type { TerminalService } from '../terminal/terminal-service';
+import type { RemoteFilesystemProvider } from '../filesystem/remote-filesystem';
 
 export function remotePath(path: string): string {
   if (!path || path.includes('\0')) throw new Error('Invalid remote path.');
@@ -11,64 +10,32 @@ export function remotePath(path: string): string {
   return normalized;
 }
 
-export function sftpRealpath(sftp: SFTPWrapper, path: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    sftp.realpath(path, (error, absolutePath) => {
-      if (error) reject(error);
-      else resolve(absolutePath);
-    });
-  });
-}
-
-export function sftpReaddir(sftp: SFTPWrapper, path: string) {
-  return new Promise<FileEntryWithStats[]>((resolve, reject) => {
-    sftp.readdir(path, (error, entries) => {
-      if (error) reject(error);
-      else resolve(entries);
-    });
-  });
-}
-
 export class SftpService {
-  constructor(private readonly terminals: TerminalService) {}
+  constructor(private readonly filesystems: RemoteFilesystemProvider) {}
 
   async listDirectory(
     owner: WebContents,
     terminalId: string,
     requestedPath?: string,
   ): Promise<SftpDirectoryListing> {
-    const sftp = await this.terminals.openSftp(owner, terminalId);
-    try {
-      const target = requestedPath
-        ? remotePath(requestedPath)
-        : remotePath(await sftpRealpath(sftp, '.'));
-      const entries = await sftpReaddir(sftp, target);
-      const mapped: SftpEntry[] = entries.map((entry) => {
-        const attributes = entry.attrs;
-        const type: SftpEntry['type'] = attributes.isDirectory()
-          ? 'directory'
-          : attributes.isFile()
-            ? 'file'
-            : attributes.isSymbolicLink()
-              ? 'symlink'
-              : 'other';
-        return {
-          name: entry.filename,
-          path: posix.join(target, entry.filename),
-          type,
-          size: attributes.size,
-          modifiedAt: new Date(attributes.mtime * 1_000).toISOString(),
-          mode: attributes.mode,
-        };
-      });
+    const requestedTarget = requestedPath ? remotePath(requestedPath) : undefined;
+    return this.filesystems.withFilesystem(owner, terminalId, async (filesystem) => {
+      const target = requestedTarget ?? remotePath(await filesystem.realpath('.'));
+      const entries = await filesystem.listDirectory(target);
+      const mapped: SftpEntry[] = entries.map((entry) => ({
+        name: entry.name,
+        path: entry.path,
+        type: entry.stat.type,
+        size: entry.stat.size,
+        modifiedAt: entry.stat.modifiedAt,
+        mode: entry.stat.mode,
+      }));
       mapped.sort((left, right) => {
         if (left.type === 'directory' && right.type !== 'directory') return -1;
         if (left.type !== 'directory' && right.type === 'directory') return 1;
         return left.name.localeCompare(right.name);
       });
       return { terminalId, path: target, entries: mapped };
-    } finally {
-      sftp.end();
-    }
+    });
   }
 }

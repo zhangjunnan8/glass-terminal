@@ -12,7 +12,10 @@ import {
 import { basename, dirname, isAbsolute, normalize, relative, resolve } from 'node:path';
 import { posix } from 'node:path';
 import type { WebContents } from 'electron';
-import type { FileEntryWithStats, SFTPWrapper, Stats } from 'ssh2';
+import {
+  RemoteFilesystemProvider,
+  type RemoteFilesystem,
+} from '../filesystem/remote-filesystem';
 import type { SessionManager } from '../sessions/session-manager';
 import type { TerminalService } from '../terminal/terminal-service';
 
@@ -47,11 +50,18 @@ export interface AgentFilePatch {
   replace: string;
 }
 
-interface ResolvedTarget {
-  transport: 'local' | 'ssh';
-  root: string;
-  requestedPath: string;
-}
+type ResolvedTarget =
+  | {
+    transport: 'local';
+    root: string;
+    requestedPath: string;
+  }
+  | {
+    transport: 'ssh';
+    root: string;
+    requestedPath: string;
+    hostId: string;
+  };
 
 function sha256(content: Buffer | string): string {
   return createHash('sha256').update(content).digest('hex');
@@ -130,110 +140,11 @@ function assertBoundRootUnchanged(
   if (!same) throw new Error('绑定的文件访问根目录已被替换或重定向；请关闭后重新授权。');
 }
 
-function sftpRealpath(sftp: SFTPWrapper, path: string): Promise<string> {
-  return new Promise((resolvePath, reject) => {
-    sftp.realpath(path, (error, resolvedPath) => {
-      if (error) reject(error);
-      else resolvePath(resolvedPath);
-    });
-  });
-}
-
-function sftpStat(sftp: SFTPWrapper, path: string): Promise<Stats | undefined> {
-  return new Promise((resolveStats, reject) => {
-    sftp.stat(path, (error, attributes) => {
-      if (error && isNotFound(error)) resolveStats(undefined);
-      else if (error) reject(error);
-      else resolveStats(attributes);
-    });
-  });
-}
-
-function sftpLstat(sftp: SFTPWrapper, path: string): Promise<Stats | undefined> {
-  return new Promise((resolveStats, reject) => {
-    sftp.lstat(path, (error, attributes) => {
-      if (error && isNotFound(error)) resolveStats(undefined);
-      else if (error) reject(error);
-      else resolveStats(attributes);
-    });
-  });
-}
-
-function isNotFound(error: unknown): boolean {
-  const code = (error as { code?: string | number } | undefined)?.code;
-  return code === 'ENOENT' || code === 2;
-}
-
-function sftpReadFile(sftp: SFTPWrapper, path: string): Promise<Buffer> {
-  return new Promise((resolveBuffer, reject) => {
-    sftp.readFile(path, (error, data) => {
-      if (error) reject(error);
-      else resolveBuffer(Buffer.isBuffer(data) ? data : Buffer.from(data));
-    });
-  });
-}
-
-function sftpWriteFile(
-  sftp: SFTPWrapper,
-  path: string,
-  content: Buffer,
-  mode = 0o600,
-): Promise<void> {
-  return new Promise((resolveWrite, reject) => {
-    sftp.writeFile(path, content, { mode: mode & 0o777 }, (error) => {
-      if (error) reject(error);
-      else resolveWrite();
-    });
-  });
-}
-
-function sftpRename(sftp: SFTPWrapper, source: string, destination: string): Promise<void> {
-  return new Promise((resolveRename, reject) => {
-    sftp.rename(source, destination, (error) => {
-      if (error) reject(error);
-      else resolveRename();
-    });
-  });
-}
-
-function sftpAtomicReplace(sftp: SFTPWrapper, source: string, destination: string): Promise<void> {
-  return new Promise((resolveRename, reject) => {
-    sftp.ext_openssh_rename(source, destination, (error) => {
-      if (error) reject(new Error(`远程服务器不支持安全原子覆盖：${error.message}`));
-      else resolveRename();
-    });
-  });
-}
-
-function sftpUnlink(sftp: SFTPWrapper, path: string): Promise<void> {
-  return new Promise((resolveUnlink, reject) => {
-    sftp.unlink(path, (error) => {
-      if (error) reject(error);
-      else resolveUnlink();
-    });
-  });
-}
-
-function sftpReaddir(sftp: SFTPWrapper, path: string): Promise<FileEntryWithStats[]> {
-  return new Promise((resolveEntries, reject) => {
-    sftp.readdir(path, (error, entries) => {
-      if (error) reject(error);
-      else resolveEntries(entries);
-    });
-  });
-}
-
-function entryType(attributes: FileEntryWithStats['attrs']): AgentFileListEntry['type'] {
-  if (attributes.isDirectory()) return 'directory';
-  if (attributes.isFile()) return 'file';
-  if (attributes.isSymbolicLink()) return 'symlink';
-  return 'other';
-}
-
 export class AgentFileService {
   constructor(
     private readonly terminals: TerminalService,
     private readonly sessions: SessionManager,
+    private readonly remoteFilesystems = new RemoteFilesystemProvider(terminals),
   ) {}
 
   async bindWorkspaceRoot(owner: WebContents, terminalId: string): Promise<string> {
@@ -242,12 +153,15 @@ export class AgentFileService {
     if (!session.cwd) throw new Error('当前会话工作目录未知；请先在终端显示一个 Shell 提示符。');
     if (session.transport === 'ssh') {
       if (!posix.isAbsolute(session.cwd)) throw new Error('远程会话工作目录必须是绝对路径。');
-      return this.withSftp(owner, terminalId, async (sftp) => {
-        const root = await sftpRealpath(sftp, session.cwd!);
-        const attributes = await sftpStat(sftp, root);
-        if (!attributes?.isDirectory()) throw new Error('当前会话工作目录不是可访问的目录。');
+      if (!session.hostId) throw new Error('远程会话缺少 Host 绑定。');
+      return this.remoteFilesystems.withFilesystem(owner, terminalId, async (filesystem) => {
+        const root = await filesystem.realpath(session.cwd!);
+        const attributes = await filesystem.stat(root);
+        if (attributes?.type !== 'directory') {
+          throw new Error('当前会话工作目录不是可访问的目录。');
+        }
         return root;
-      });
+      }, session.hostId);
     }
     const root = await realpath(resolve(session.cwd));
     if (!(await stat(root)).isDirectory()) throw new Error('当前会话工作目录不是可访问的目录。');
@@ -277,17 +191,17 @@ export class AgentFileService {
       }
       return { path, content: assertUtf8Text(buffer, path), bytes: buffer.length, sha256: sha256(buffer) };
     }
-    return this.withSftp(owner, terminalId, async (sftp) => {
-      const root = await sftpRealpath(sftp, target.root);
+    return this.withRemoteFilesystem(owner, terminalId, target, async (filesystem) => {
+      const root = await filesystem.realpath(target.root);
       assertBoundRootUnchanged(target.root, root, 'ssh');
-      const path = await sftpRealpath(sftp, target.requestedPath);
+      const path = await filesystem.realpath(target.requestedPath);
       assertWithinRoot(root, path, 'ssh');
-      const attributes = await sftpStat(sftp, path);
-      if (!attributes?.isFile()) throw new Error('目标不是普通文件。');
+      const attributes = await filesystem.stat(path);
+      if (attributes?.type !== 'file') throw new Error('目标不是普通文件。');
       if (attributes.size > MAX_AGENT_FILE_BYTES) {
         throw new Error(`文件为 ${attributes.size} 字节，超过 ${MAX_AGENT_FILE_BYTES} 字节读取限制。`);
       }
-      const buffer = await sftpReadFile(sftp, path);
+      const buffer = await filesystem.readFile(path);
       if (buffer.length > MAX_AGENT_FILE_BYTES) {
         throw new Error(`文件读取结果为 ${buffer.length} 字节，超过 ${MAX_AGENT_FILE_BYTES} 字节限制。`);
       }
@@ -323,18 +237,18 @@ export class AgentFileService {
       }));
       return { path, entries: mapped, truncated: entries.length > limited.length };
     }
-    return this.withSftp(owner, terminalId, async (sftp) => {
-      const root = await sftpRealpath(sftp, target.root);
+    return this.withRemoteFilesystem(owner, terminalId, target, async (filesystem) => {
+      const root = await filesystem.realpath(target.root);
       assertBoundRootUnchanged(target.root, root, 'ssh');
-      const path = await sftpRealpath(sftp, target.requestedPath);
+      const path = await filesystem.realpath(target.requestedPath);
       assertWithinRoot(root, path, 'ssh');
-      const entries = await sftpReaddir(sftp, path);
+      const entries = await filesystem.listDirectory(path);
       return {
         path,
         entries: entries.slice(0, MAX_AGENT_DIRECTORY_ENTRIES).map((entry) => ({
-          name: entry.filename,
-          type: entryType(entry.attrs),
-          size: entry.attrs.size,
+          name: entry.name,
+          type: entry.stat.type,
+          size: entry.stat.size,
         })),
         truncated: entries.length > MAX_AGENT_DIRECTORY_ENTRIES,
       };
@@ -376,36 +290,36 @@ export class AgentFileService {
       }
       return { path, bytes: bytes.length, sha256: sha256(bytes), created: current === undefined };
     }
-    return this.withSftp(owner, terminalId, async (sftp) => {
-      const root = await sftpRealpath(sftp, target.root);
+    return this.withRemoteFilesystem(owner, terminalId, target, async (filesystem) => {
+      const root = await filesystem.realpath(target.root);
       assertBoundRootUnchanged(target.root, root, 'ssh');
-      const parent = await sftpRealpath(sftp, posix.dirname(target.requestedPath));
+      const parent = await filesystem.realpath(posix.dirname(target.requestedPath));
       assertWithinRoot(root, parent, 'ssh');
       const path = posix.join(parent, posix.basename(target.requestedPath));
-      const attributes = await sftpLstat(sftp, path);
-      if (attributes?.isSymbolicLink()) throw new Error('不允许通过符号链接覆盖文件。');
-      if (attributes && !attributes.isFile()) throw new Error('目标不是普通文件。');
+      const attributes = await filesystem.lstat(path);
+      if (attributes?.type === 'symlink') throw new Error('不允许通过符号链接覆盖文件。');
+      if (attributes && attributes.type !== 'file') throw new Error('目标不是普通文件。');
       if (attributes && attributes.size > MAX_AGENT_FILE_BYTES) {
         throw new Error(`文件为 ${attributes.size} 字节，超过 ${MAX_AGENT_FILE_BYTES} 字节写入限制。`);
       }
-      const current = attributes ? await sftpReadFile(sftp, path) : undefined;
+      const current = attributes ? await filesystem.readFile(path) : undefined;
       if (current && current.length > MAX_AGENT_FILE_BYTES) {
         throw new Error(`文件读取结果为 ${current.length} 字节，超过 ${MAX_AGENT_FILE_BYTES} 字节限制。`);
       }
       this.assertExpectedHash(path, current, expectedSha256);
       const temporary = posix.join(parent, `.ai-terminal-${randomUUID()}.tmp`);
       try {
-        await sftpWriteFile(sftp, temporary, bytes, attributes?.mode);
+        await filesystem.writeFile(temporary, bytes, attributes?.mode);
         if (attributes) {
-          await sftpAtomicReplace(sftp, temporary, path);
+          await filesystem.atomicReplace(temporary, path);
         } else {
           // Recheck absence immediately before the standard rename. Existing
           // targets require the OpenSSH atomic-overwrite extension above.
-          if (await sftpLstat(sftp, path)) throw new Error('文件已在写入期间创建；请重新读取。');
-          await sftpRename(sftp, temporary, path);
+          if (await filesystem.lstat(path)) throw new Error('文件已在写入期间创建；请重新读取。');
+          await filesystem.rename(temporary, path);
         }
       } catch (error) {
-        await sftpUnlink(sftp, temporary).catch(() => undefined);
+        await filesystem.unlink(temporary).catch(() => undefined);
         throw error;
       }
       return { path, bytes: bytes.length, sha256: sha256(bytes), created: current === undefined };
@@ -458,9 +372,10 @@ export class AgentFileService {
     if (session.transport === 'ssh') {
       const root = posix.normalize(boundRoot);
       if (!root.startsWith('/')) throw new Error('远程会话工作目录必须是绝对路径。');
+      if (!session.hostId) throw new Error('远程会话缺少 Host 绑定。');
       const path = posix.resolve(root, requestedPath);
       assertWithinRoot(root, path, 'ssh');
-      return { transport: 'ssh', root, requestedPath: path };
+      return { transport: 'ssh', root, requestedPath: path, hostId: session.hostId };
     }
     const root = resolve(boundRoot);
     const path = resolve(root, requestedPath);
@@ -506,17 +421,18 @@ export class AgentFileService {
     if (sha256(current) !== expectedSha256) throw new Error('文件已变化；请重新读取后再写入。');
   }
 
-  private async withSftp<T>(
+  private withRemoteFilesystem<T>(
     owner: WebContents,
     terminalId: string,
-    operation: (sftp: SFTPWrapper) => Promise<T>,
+    target: Extract<ResolvedTarget, { transport: 'ssh' }>,
+    operation: (filesystem: RemoteFilesystem) => Promise<T>,
   ): Promise<T> {
-    const sftp = await this.terminals.openSftp(owner, terminalId);
-    try {
-      return await operation(sftp);
-    } finally {
-      sftp.end();
-    }
+    return this.remoteFilesystems.withFilesystem(
+      owner,
+      terminalId,
+      operation,
+      target.hostId,
+    );
   }
 }
 
