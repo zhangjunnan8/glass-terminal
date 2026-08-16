@@ -40,6 +40,7 @@ import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
 import { mergeAgentState } from './agent-state';
 import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
+import { AgentActivityCard } from './components/AgentActivityCard';
 import {
   isAgentOutputNearBottom,
   scrollAgentOutputToBottom,
@@ -154,6 +155,15 @@ function agentTurnBusy(state?: AgentRuntimeState): boolean {
     'WAITING_AUTH',
     'TAKEOVER_PENDING',
   ].includes(state));
+}
+
+function agentBackendActivityLabel(
+  backend: AgentBackendRef,
+  providers: ProviderProfile[],
+): string {
+  if (backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) return 'Codex App Server';
+  return providers.find((provider) => provider.id === backend.providerId)?.name
+    ?? '默认 Provider';
 }
 
 function mergeCodexAppServerState(
@@ -2273,25 +2283,34 @@ export function App() {
                 />
               </Suspense>
               {latestUser && (
-                <div className="agent-message-actions" data-testid="latest-user-message-actions">
-                  <small title="终端输出、命令执行和审计记录都会保留">
-                    仅调整对话，不回滚终端
-                  </small>
-                  {latestUserRunning ? (
-                    <button
-                      type="button"
-                      className="interrupt"
-                      data-action="interrupt-agent-message"
-                      disabled={Boolean(agentMessageActionPending)
-                        || activeAgent.backendTurnDraining
-                        || interruptAlreadyRequested}
-                      onClick={() => void interruptLatestAgentMessage(message.id)}
-                    >{activeAgent.backendTurnDraining
+                latestUserRunning ? (
+                  <AgentActivityCard
+                    phase={activeAgent.backendTurnDraining
+                      ? '正在安全停止当前轮次'
+                      : interruptAlreadyRequested
+                        ? '已发送 Ctrl+C，等待前台进程退出'
+                        : foregroundRunning
+                          ? '前台命令正在运行'
+                          : agentStateLabel(activeAgent.state)}
+                    backend={agentBackendActivityLabel(activeAgent.backend, providers)}
+                    context={activeTab
+                      ? `当前终端：${activeTab.transport === 'ssh' ? 'SSH' : '本地'} · ${activeTab.title}`
+                      : '当前无终端'}
+                    interruptLabel={activeAgent.backendTurnDraining
                       ? '正在停止…'
                       : interruptAlreadyRequested
                         ? '已发送 Ctrl+C'
-                        : foregroundRunning ? '打断前台进程' : '打断'}</button>
-                  ) : (
+                        : foregroundRunning ? '打断前台进程' : '打断'}
+                    interruptDisabled={Boolean(agentMessageActionPending)
+                      || Boolean(activeAgent.backendTurnDraining)
+                      || interruptAlreadyRequested}
+                    onInterrupt={() => void interruptLatestAgentMessage(message.id)}
+                  />
+                ) : (
+                  <div className="agent-message-actions" data-testid="latest-user-message-actions">
+                    <small title="终端输出、命令执行和审计记录都会保留">
+                      仅调整对话，不回滚终端
+                    </small>
                     <>
                       <button
                         type="button"
@@ -2306,8 +2325,8 @@ export function App() {
                         onClick={() => editLatestAgentMessage(message.id, message.content)}
                       >修改</button>
                     </>
-                  )}
-                </div>
+                  </div>
+                )
               )}
             </article>
             );

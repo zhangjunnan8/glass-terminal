@@ -366,6 +366,11 @@ describe('native Codex App Server renderer mode', () => {
 
     expect(container.querySelector('[data-action="retract-agent-message"]')).toBeNull();
     expect(container.querySelector('[data-action="edit-agent-message"]')).toBeNull();
+    const activity = container.querySelector<HTMLElement>('[data-testid="agent-activity-card"]')!;
+    expect(activity.textContent).toContain('AI 正在思考');
+    expect(activity.textContent).toContain('Shared terminal provider');
+    expect(activity.textContent).toContain('当前终端：本地 · PowerShell');
+    expect(container.querySelector('[data-testid="agent-activity-dots"]')?.children).toHaveLength(3);
     const interrupt = container.querySelector<HTMLButtonElement>('[data-action="interrupt-agent-message"]')!;
     await act(async () => interrupt.click());
     expect(bridge.agent.interruptTurn).toHaveBeenCalledWith({

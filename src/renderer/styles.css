@@ -394,6 +394,24 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .agent-message { margin: 10px; padding: 9px 10px; border: 1px solid #233043; border-radius: 5px; background: #111a26; }
 .agent-message.user { border-color: #29463f; background: #101d1a; }
 .agent-message > span { color: #61c9a8; font-size: 12px; font-weight: 800; letter-spacing: .03em; }
+.agent-activity-card { display: flex; min-width: 0; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; padding: 9px 10px; overflow: hidden; border: 1px solid #31584f; border-radius: 5px; background: #0c201b; box-shadow: inset 3px 0 #55c8a6; }
+.agent-activity-main { display: flex; min-width: 0; align-items: center; gap: 10px; }
+.agent-activity-dots { display: inline-flex; width: 30px; flex: 0 0 30px; align-items: center; justify-content: center; gap: 3px; }
+.agent-activity-dots > span { width: 6px; height: 6px; border-radius: 50%; background: #69d6b5; animation: agent-activity-dot 1.05s ease-in-out infinite; }
+.agent-activity-dots > span:nth-child(2) { animation-delay: 140ms; }
+.agent-activity-dots > span:nth-child(3) { animation-delay: 280ms; }
+.agent-activity-copy { min-width: 0; }
+.agent-activity-copy strong, .agent-activity-copy small { display: block; }
+.agent-activity-copy strong { color: #cce9e0; font-size: 13px; line-height: 1.4; }
+.agent-activity-copy small { margin-top: 2px; overflow: hidden; color: #7fa99d; font-size: 11px; line-height: 1.4; text-overflow: ellipsis; white-space: nowrap; }
+.agent-activity-card .interrupt { min-height: 32px; flex: 0 0 auto; padding: 6px 9px; color: #ffd3d7; border: 1px solid #81404a; border-radius: 4px; background: #35181e; cursor: pointer; font-size: 12px; font-weight: 700; transition: border-color 130ms ease, background-color 130ms ease, transform 80ms ease; }
+.agent-activity-card .interrupt:hover:not(:disabled) { border-color: #b35a67; background: #4a2028; }
+.agent-activity-card .interrupt:active:not(:disabled) { transform: scale(.96); }
+.agent-activity-card .interrupt:disabled { cursor: default; opacity: .55; }
+@keyframes agent-activity-dot {
+  0%, 60%, 100% { opacity: .28; transform: translateY(0) scale(.78); }
+  30% { opacity: 1; transform: translateY(-2px) scale(1); }
+}
 .agent-plain-message, .agent-markdown { margin: 6px 0 0; color: #c3cddd; font-size: 14px; line-height: 1.6; overflow-wrap: anywhere; }
 .agent-plain-message { white-space: pre-wrap; word-break: break-word; }
 .agent-markdown.streaming .agent-plain-message { display: inline; }
@@ -885,6 +903,12 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 }
 .app-shell[data-theme="light"] .agent-message.user { border-color: #a9d2c7; background: #edf8f4; }
 .app-shell[data-theme="light"] .agent-message > span { color: #087f68; }
+.app-shell[data-theme="light"] .agent-activity-card { border-color: #9bcbbd; background: #edf8f4; box-shadow: inset 3px 0 #239579; }
+.app-shell[data-theme="light"] .agent-activity-dots > span { background: #14836b; }
+.app-shell[data-theme="light"] .agent-activity-copy strong { color: #205f50; }
+.app-shell[data-theme="light"] .agent-activity-copy small { color: #52776d; }
+.app-shell[data-theme="light"] .agent-activity-card .interrupt { color: #932c3a; border-color: #dda9b0; background: #fff0f2; }
+.app-shell[data-theme="light"] .agent-activity-card .interrupt:hover:not(:disabled) { border-color: #c77e89; background: #ffe4e8; }
 .app-shell[data-theme="light"] :is(.agent-plain-message, .agent-markdown) { color: #263247; }
 .app-shell[data-theme="light"] .agent-markdown :is(h1, h2, h3, h4, h5, h6) { color: #172033; }
 .app-shell[data-theme="light"] .agent-markdown blockquote { color: #536176; border-color: #91a2b8; }
@@ -1228,4 +1252,9 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
   .session-history-metadata { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .session-history-content { overflow: auto; grid-template-columns: 1fr; }
   .session-history-content > section { min-height: 300px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .agent-activity-dots > span { animation: none; opacity: .72; transform: none; }
+  .agent-activity-card .interrupt { transition: none; }
 }
