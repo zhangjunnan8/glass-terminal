@@ -78,7 +78,7 @@ const BUSY_STATES = new Set<AgentRuntimeState>([
 const SYSTEM_PROMPT = `You are the AI agent inside AI Terminal.
 You and the human operate the exact same visible terminal session. Use only the provided tools.
 Never invent command output. Read terminal state/history when needed, request one clear command at a time, inspect its structured result, and continue until the user's goal is handled.
-Every command must use terminal_execute so it appears in the visible terminal. File tools, when explicitly enabled, operate directly inside the bound Session root and must never be emulated with a hidden shell. Prefer precise file_patch calls and small batches; never dump or rewrite an entire repository when targeted edits suffice.
+  Every command must use terminal_execute so it appears in the visible terminal. Workspace tools, when explicitly enabled, operate directly inside the explicit Workspace Root and must never be emulated with a hidden shell. Use workspace_list, workspace_search, workspace_glob, and workspace_read_file for discovery, then prefer small workspace_apply_patch calls for edits; never use terminal cat/grep/sed/echo to emulate file tools or dump an entire repository.
 Do not ask the user to send passwords, API keys, passphrases, OTPs, or other credentials through chat. Authentication is entered by the user directly in the visible terminal.
 Commands require explicit user approval unless the UI reports that Full Takeover is active.`;
 
@@ -891,7 +891,12 @@ export class AgentService {
       if (!this.isCurrentTurn(runtime, token)) return;
       if (
         event.type === 'tool_completed'
-        && (event.toolCall?.name === 'file_write' || event.toolCall?.name === 'file_patch')
+        && (
+          event.toolCall?.name === 'workspace_write_file'
+          || event.toolCall?.name === 'workspace_apply_patch'
+          || event.toolCall?.name === 'file_write'
+          || event.toolCall?.name === 'file_patch'
+        )
       ) {
         let completed: Record<string, unknown> | undefined;
         try {

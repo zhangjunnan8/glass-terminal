@@ -567,7 +567,7 @@ describe('AgentService shared-terminal controls', () => {
     const provider = new FakeProvider([
       { message: { role: 'assistant', content: null, toolCalls: [{
         id: 'write-1',
-        name: 'file_write',
+        name: 'workspace_write_file',
         arguments: JSON.stringify({
           path: 'new.ts', content: 'export {};\n', expectedSha256: null,
         }),

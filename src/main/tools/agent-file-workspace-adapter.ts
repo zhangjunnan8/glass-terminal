@@ -65,27 +65,51 @@ export class AgentFileWorkspaceAdapter implements WorkspaceTool {
     );
   }
 
-  async search(): Promise<never> {
-    throw new Error('workspace_search is not implemented by the compatibility backend.');
+  search(query: string, options?: { path?: string; maxResults?: number }) {
+    return this.files.search(
+      this.owner,
+      this.terminalId,
+      query,
+      options,
+      this.binding.root,
+    );
   }
 
-  async glob(): Promise<never> {
-    throw new Error('workspace_glob is not implemented by the compatibility backend.');
+  glob(pattern: string, options?: { path?: string; maxResults?: number }) {
+    return this.files.glob(
+      this.owner,
+      this.terminalId,
+      pattern,
+      options,
+      this.binding.root,
+    );
   }
 
   stat(path: string) {
     return this.files.statPath(this.owner, this.terminalId, path, this.binding.root);
   }
 
-  async mkdir(): Promise<never> {
-    throw new Error('workspace_mkdir is not implemented by the compatibility backend.');
+  mkdir(path: string) {
+    return this.files.mkdirPath(this.owner, this.terminalId, path, this.binding.root);
   }
 
-  async rename(): Promise<never> {
-    throw new Error('workspace_rename is not implemented by the compatibility backend.');
+  rename(source: string, destination: string) {
+    return this.files.renamePath(
+      this.owner,
+      this.terminalId,
+      source,
+      destination,
+      this.binding.root,
+    );
   }
 
-  async delete(): Promise<never> {
-    throw new Error('workspace_delete is not implemented by the compatibility backend.');
+  delete(path: string, options?: { recursive?: boolean }) {
+    return this.files.deletePath(
+      this.owner,
+      this.terminalId,
+      path,
+      options,
+      this.binding.root,
+    );
   }
 }

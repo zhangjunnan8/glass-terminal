@@ -105,6 +105,8 @@ export interface WorkspaceFileWriteResult {
   diff?: string;
   additions?: number;
   deletions?: number;
+  /** True when the diff body or complexity-bounded summary is incomplete. */
+  diffTruncated?: boolean;
 }
 
 export interface WorkspacePatchOperation {

@@ -1,8 +1,13 @@
 import type { WebContents } from 'electron';
+import { Readable } from 'node:stream';
 import type { SFTPWrapper, Stats } from 'ssh2';
 import { describe, expect, it, vi } from 'vitest';
 import type { TerminalService } from '../terminal/terminal-service';
-import { RemoteFilesystemProvider, SftpRemoteFilesystem } from './remote-filesystem';
+import {
+  FilesystemReadLimitError,
+  RemoteFilesystemProvider,
+  SftpRemoteFilesystem,
+} from './remote-filesystem';
 
 function attributes(
   type: 'file' | 'directory' | 'symlink' | 'other',
@@ -135,6 +140,7 @@ describe('SftpRemoteFilesystem', () => {
 
     await filesystem.writeFile('/plain', content);
     await filesystem.writeFile('/mode', content, 0o640);
+    await filesystem.writeFile('/exclusive', content, 0o600, true);
     await filesystem.rename('/from', '/to');
     await filesystem.atomicReplace('/temporary', '/target');
     await filesystem.unlink('/old');
@@ -156,6 +162,13 @@ describe('SftpRemoteFilesystem', () => {
       { mode: 0o640 },
       expect.any(Function),
     );
+    expect(sftp.writeFile).toHaveBeenNthCalledWith(
+      3,
+      '/exclusive',
+      content,
+      { mode: 0o600, flag: 'wx' },
+      expect.any(Function),
+    );
     expect(sftp.rename).toHaveBeenCalledWith('/from', '/to', expect.any(Function));
     expect(sftp.ext_openssh_rename).toHaveBeenCalledWith(
       '/temporary',
@@ -171,6 +184,33 @@ describe('SftpRemoteFilesystem', () => {
       expect.any(Function),
     );
     expect(sftp.rmdir).toHaveBeenCalledWith('/empty-directory', expect.any(Function));
+  });
+
+  it('bounds streamed SFTP reads before retaining an oversized payload', async () => {
+    const createReadStream = vi.fn(() => Readable.from([Buffer.from('1234')]));
+    const filesystem = new SftpRemoteFilesystem({
+      ...basicSftp(),
+      createReadStream,
+    } as unknown as SFTPWrapper);
+
+    await expect(filesystem.readFile('/bounded', 4)).resolves.toEqual(Buffer.from('1234'));
+    await expect(filesystem.readFile('/bounded', 3))
+      .rejects.toBeInstanceOf(FilesystemReadLimitError);
+    expect(createReadStream).toHaveBeenNthCalledWith(1, '/bounded', { start: 0, end: 4 });
+    expect(createReadStream).toHaveBeenNthCalledWith(2, '/bounded', { start: 0, end: 3 });
+  });
+
+  it('rejects a bounded SFTP read if the stream closes without ending', async () => {
+    const stream = new Readable({ read: () => undefined });
+    const filesystem = new SftpRemoteFilesystem({
+      ...basicSftp(),
+      createReadStream: vi.fn(() => stream),
+    } as unknown as SFTPWrapper);
+
+    const read = filesystem.readFile('/interrupted', 4);
+    stream.destroy();
+
+    await expect(read).rejects.toThrow('SFTP read stream closed before end');
   });
 
   it('reports an explicit atomic-replace error', async () => {

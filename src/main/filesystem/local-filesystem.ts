@@ -1,6 +1,7 @@
 import {
   lstat as fsLstat,
   mkdir as fsMkdir,
+  open as fsOpen,
   readFile as fsReadFile,
   readdir as fsReaddir,
   realpath as fsRealpath,
@@ -12,11 +13,12 @@ import {
 } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { Stats } from 'node:fs';
+import { FilesystemReadLimitError } from './remote-filesystem';
 import type {
+  FilesystemBackend,
   RemoteDirectoryEntry,
   RemoteEntryType,
   RemoteFileStat,
-  RemoteFilesystem,
 } from './remote-filesystem';
 
 function entryType(attributes: Stats): RemoteEntryType {
@@ -39,7 +41,7 @@ function isNotFound(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT';
 }
 
-export class LocalFilesystemBackend implements RemoteFilesystem {
+export class LocalFilesystemBackend implements FilesystemBackend {
   realpath(path: string): Promise<string> {
     return fsRealpath(path);
   }
@@ -62,25 +64,52 @@ export class LocalFilesystemBackend implements RemoteFilesystem {
     }
   }
 
-  readFile(path: string): Promise<Buffer> {
-    return fsReadFile(path);
+  async readFile(path: string, maxBytes?: number): Promise<Buffer> {
+    if (maxBytes === undefined) return fsReadFile(path);
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+      throw new Error('maxBytes must be a non-negative safe integer.');
+    }
+    const handle = await fsOpen(path, 'r');
+    try {
+      const content = Buffer.allocUnsafe(maxBytes + 1);
+      let bytes = 0;
+      while (bytes < content.length) {
+        const result = await handle.read(content, bytes, content.length - bytes, bytes);
+        if (result.bytesRead === 0) break;
+        bytes += result.bytesRead;
+      }
+      if (bytes > maxBytes) throw new FilesystemReadLimitError(maxBytes);
+      return content.subarray(0, bytes);
+    } finally {
+      await handle.close();
+    }
   }
 
-  async writeFile(path: string, content: Buffer, mode = 0o600): Promise<void> {
-    await fsWriteFile(path, content, { mode: mode & 0o777 });
+  async writeFile(
+    path: string,
+    content: Buffer,
+    mode = 0o600,
+    exclusive = false,
+  ): Promise<void> {
+    await fsWriteFile(path, content, { mode: mode & 0o777, flag: exclusive ? 'wx' : 'w' });
   }
 
   async listDirectory(path: string): Promise<RemoteDirectoryEntry[]> {
     const entries = await fsReaddir(path, { withFileTypes: true });
-    return Promise.all(entries.map(async (entry) => {
+    entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+    const result: RemoteDirectoryEntry[] = [];
+    // Keep metadata reads bounded in-flight. A huge directory may still be
+    // materialized by readdir, but it no longer creates one Promise per entry.
+    for (const entry of entries) {
       const entryPath = join(path, entry.name);
-      return {
+      result.push({
         name: entry.name,
         path: entryPath,
         // lstat is deliberate: listing a link must never inspect its target.
         stat: fileStat(await fsLstat(entryPath)),
-      };
-    }));
+      });
+    }
+    return result;
   }
 
   async rename(source: string, destination: string): Promise<void> {

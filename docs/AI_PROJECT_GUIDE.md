@@ -286,14 +286,14 @@ Provider 的限制。不要第一反应就继续放大上限。
 大型代码任务的正确路线：
 
 1. 开启 Generic Agent 的 read-only 或 read-write 文件权限。
-2. `file_list` -> 只读必需文件 -> 优先小型 `file_patch`；`file_write` 只用于一次能完整提交的
+2. `workspace_list/search/glob` -> `workspace_read_file` 只读必需文件 -> 优先小型 `workspace_apply_patch`；`workspace_write_file` 只用于一次能完整提交的
    文件，它是整文件原子覆盖，不支持 append/offset/分片拼接。
 3. 不要让模型在最终回答/单个 tool arguments 里回显整个仓库或数十个大文件。
-4. 用可见 `terminal_execute` 运行构建、测试、部署和删除/移动/chmod 命令。
+4. 用可见 `terminal_execute` 运行构建、测试、部署、chmod、sudo 和有副作用的 Git 命令；普通 Workspace 内 mkdir/rename/delete 使用结构化 Workspace 工具。
 5. 超大仓库按模块/目标拆成多个 turn；较大文本文件按重新 read/hash 后的精确 patch 分轮处理，
    无法落在文件工具边界内时改走可见终端；二进制或超大文件走 SFTP queue。
 
-Generic 文件工具限制：单 UTF-8 文件 read/service write 512 KiB，`file_write` 单次
+Generic 文件工具限制：单 UTF-8 文件 read/service write 512 KiB，`workspace_write_file` 单次
 131,072 字符，每 turn 读/列表结果合计 2 MiB，目录 500 项，exact patch 64 条；一个
 Agent turn 最多 12 rounds。当前没有通用 conversation token-budget/自动总结器，超大仓库或长会话仍应拆分。
 

@@ -11,6 +11,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { LocalFilesystemBackend } from './local-filesystem';
+import { FilesystemReadLimitError } from './remote-filesystem';
 
 const roots: string[] = [];
 
@@ -81,6 +82,19 @@ describe('LocalFilesystemBackend', () => {
     await filesystem.rmdir(directory);
     await filesystem.unlink(renamed);
     await expect(filesystem.stat(renamed)).resolves.toBeUndefined();
+  });
+
+  it('bounds reads and supports exclusive file creation', async () => {
+    const root = temporaryRoot();
+    const filesystem = new LocalFilesystemBackend();
+    const path = join(root, 'bounded.txt');
+
+    await filesystem.writeFile(path, Buffer.from('1234'), undefined, true);
+    await expect(filesystem.readFile(path, 4)).resolves.toEqual(Buffer.from('1234'));
+    await expect(filesystem.readFile(path, 3)).rejects.toBeInstanceOf(FilesystemReadLimitError);
+    await expect(filesystem.writeFile(path, Buffer.from('overwrite'), undefined, true))
+      .rejects.toMatchObject({ code: 'EEXIST' });
+    expect(readFileSync(path, 'utf8')).toBe('1234');
   });
 
   it.runIf(process.platform !== 'win32')(

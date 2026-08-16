@@ -18,18 +18,38 @@ export interface RemoteDirectoryEntry {
   stat: RemoteFileStat;
 }
 
-export interface RemoteFilesystem {
+/**
+ * Transport-neutral filesystem primitives used by Workspace operations.
+ *
+ * Implementations deliberately expose lstat separately from stat so callers
+ * can refuse symlink traversal before reading or mutating a path.
+ */
+export interface FilesystemBackend {
   realpath(path: string): Promise<string>;
   stat(path: string): Promise<RemoteFileStat | undefined>;
   lstat(path: string): Promise<RemoteFileStat | undefined>;
-  readFile(path: string): Promise<Buffer>;
-  writeFile(path: string, content: Buffer, mode?: number): Promise<void>;
+  /** Reads at most maxBytes, throwing before retaining an oversized payload. */
+  readFile(path: string, maxBytes?: number): Promise<Buffer>;
+  writeFile(path: string, content: Buffer, mode?: number, exclusive?: boolean): Promise<void>;
   listDirectory(path: string): Promise<RemoteDirectoryEntry[]>;
   rename(source: string, destination: string): Promise<void>;
   atomicReplace(source: string, destination: string): Promise<void>;
   unlink(path: string): Promise<void>;
   mkdir(path: string, mode?: number): Promise<void>;
   rmdir(path: string): Promise<void>;
+}
+
+/**
+ * Compatibility name retained for SFTP consumers introduced before the local
+ * Workspace backend. Remote and local backends share the same primitive API.
+ */
+export interface RemoteFilesystem extends FilesystemBackend {}
+
+export class FilesystemReadLimitError extends Error {
+  constructor(readonly maxBytes: number) {
+    super(`File exceeds the ${maxBytes} byte read limit.`);
+    this.name = 'FilesystemReadLimitError';
+  }
 }
 
 function entryType(attributes: Stats): RemoteEntryType {
@@ -84,7 +104,8 @@ export class SftpRemoteFilesystem implements RemoteFilesystem {
     return this.readStat('lstat', path);
   }
 
-  readFile(path: string): Promise<Buffer> {
+  readFile(path: string, maxBytes?: number): Promise<Buffer> {
+    if (maxBytes !== undefined) return this.readFileBounded(path, maxBytes);
     return new Promise((resolve, reject) => {
       this.sftp.readFile(path, (error, content) => {
         if (error) reject(error);
@@ -93,11 +114,14 @@ export class SftpRemoteFilesystem implements RemoteFilesystem {
     });
   }
 
-  writeFile(path: string, content: Buffer, mode?: number): Promise<void> {
+  writeFile(path: string, content: Buffer, mode?: number, exclusive = false): Promise<void> {
     return callbackOperation((callback) => {
       // New Agent-created files remain private by default; existing modes are
       // preserved but never forward file-type or special permission bits.
-      this.sftp.writeFile(path, content, { mode: (mode ?? 0o600) & 0o777 }, callback);
+      this.sftp.writeFile(path, content, {
+        mode: (mode ?? 0o600) & 0o777,
+        ...(exclusive ? { flag: 'wx' } : {}),
+      }, callback);
     });
   }
 
@@ -159,6 +183,44 @@ export class SftpRemoteFilesystem implements RemoteFilesystem {
         if (error && isNotFound(error)) resolve(undefined);
         else if (error) reject(error);
         else resolve(fileStat(attributes));
+      });
+    });
+  }
+
+  private readFileBounded(path: string, maxBytes: number): Promise<Buffer> {
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) {
+      return Promise.reject(new Error('maxBytes must be a non-negative safe integer.'));
+    }
+    return new Promise((resolve, reject) => {
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      let settled = false;
+      const stream = this.sftp.createReadStream(path, {
+        // Read one sentinel byte so an exact-size file is distinguishable
+        // from a larger file without buffering the larger payload.
+        start: 0,
+        end: maxBytes,
+      });
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (error) reject(error);
+        else resolve(Buffer.concat(chunks, bytes));
+      };
+      stream.on('data', (chunk: Buffer | string) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        bytes += buffer.length;
+        if (bytes > maxBytes) {
+          stream.destroy();
+          finish(new FilesystemReadLimitError(maxBytes));
+          return;
+        }
+        chunks.push(buffer);
+      });
+      stream.once('error', (error: Error) => finish(error));
+      stream.once('end', () => finish());
+      stream.once('close', () => {
+        if (!settled) finish(new Error(`SFTP read stream closed before end: ${path}`));
       });
     });
   }

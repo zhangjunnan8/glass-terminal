@@ -17,6 +17,7 @@ import type { TerminalDescriptor } from '../../shared/terminal';
 import type { TerminalService } from '../terminal/terminal-service';
 import { LocalFilesystemBackend } from '../filesystem/local-filesystem';
 import { RemoteFilesystemProvider } from '../filesystem/remote-filesystem';
+import { assertSafeWindowsRequestedPath } from '../filesystem/workspace-path-security';
 import {
   buildSshRestoreInput,
   inferShellContext,
@@ -166,8 +167,10 @@ export class SessionManager {
     ) throw new Error('Workspace target does not match the Session terminal.');
 
     if (session.transport === 'local') {
+      if (process.platform === 'win32') assertSafeWindowsRequestedPath(request.root);
       if (!isAbsolute(request.root)) throw new Error('Local workspace root must be absolute.');
       const root = await this.localFilesystem.realpath(request.root);
+      if (process.platform === 'win32') assertSafeWindowsRequestedPath(root);
       if (!isAbsolute(root)) throw new Error('Local workspace root must resolve absolutely.');
       const attributes = await this.localFilesystem.stat(root);
       if (attributes?.type !== 'directory') {

@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentFileAccessMode } from '../../shared/agent';
-import type { ToolGateway } from '../../shared/tools';
+import type { ToolGateway, WorkspaceTool } from '../../shared/tools';
 
 export type AgentMessage =
   | { role: 'system' | 'user'; content: string }
@@ -93,10 +93,10 @@ export const TERMINAL_TOOLS: AgentToolDefinition[] = [
   },
 ];
 
-const FILE_READ_TOOLS: AgentToolDefinition[] = [
+const WORKSPACE_READ_TOOLS: AgentToolDefinition[] = [
   {
-    name: 'file_list',
-    description: 'List a bounded directory inside the explicitly bound Session root. This never runs a shell command.',
+    name: 'workspace_list',
+    description: 'List one bounded directory inside the explicit Workspace Root without running a shell command.',
     parameters: {
       type: 'object',
       properties: { path: { type: 'string', maxLength: 4_096, default: '.' } },
@@ -104,8 +104,8 @@ const FILE_READ_TOOLS: AgentToolDefinition[] = [
     },
   },
   {
-    name: 'file_read',
-    description: 'Read only one needed, bounded UTF-8 text file inside the bound Session root and return its SHA-256. Prefer small, targeted reads; never request an entire repository.',
+    name: 'workspace_read_file',
+    description: 'Read one needed, bounded UTF-8 text file inside the Workspace Root and return its SHA-256. Prefer small, targeted reads.',
     parameters: {
       type: 'object',
       required: ['path'],
@@ -114,21 +114,49 @@ const FILE_READ_TOOLS: AgentToolDefinition[] = [
     },
   },
   {
-    name: 'file_stat',
-    description: 'Inspect one file, directory, or symbolic link inside the bound Session root without reading its contents or running a shell command.',
+    name: 'workspace_stat',
+    description: 'Inspect one file, directory, or symbolic link inside the Workspace Root without reading its contents or running a shell command.',
     parameters: {
       type: 'object',
       required: ['path'],
       properties: { path: { type: 'string', minLength: 1, maxLength: 4_096 } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'workspace_search',
+    description: 'Search bounded UTF-8 workspace files for literal text and return structured line/column previews. Use this instead of grep in the terminal.',
+    parameters: {
+      type: 'object',
+      required: ['query'],
+      properties: {
+        query: { type: 'string', minLength: 1, maxLength: 4_096 },
+        path: { type: 'string', minLength: 1, maxLength: 4_096, default: '.' },
+        maxResults: { type: 'integer', minimum: 1, maximum: 200, default: 100 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'workspace_glob',
+    description: 'Find bounded workspace paths matching a glob pattern without running find, dir, or another shell command.',
+    parameters: {
+      type: 'object',
+      required: ['pattern'],
+      properties: {
+        pattern: { type: 'string', minLength: 1, maxLength: 4_096 },
+        path: { type: 'string', minLength: 1, maxLength: 4_096, default: '.' },
+        maxResults: { type: 'integer', minimum: 1, maximum: 500, default: 200 },
+      },
       additionalProperties: false,
     },
   },
 ];
 
-const FILE_WRITE_TOOLS: AgentToolDefinition[] = [
+const WORKSPACE_WRITE_TOOLS: AgentToolDefinition[] = [
   {
-    name: 'file_patch',
-    description: 'Atomically apply exact, unique text replacements. expectedSha256 must be from the latest file_read.',
+    name: 'workspace_apply_patch',
+    description: 'Preferred way to modify an existing file. Atomically apply exact, unique text replacements and return a diff. expectedSha256 must be from the latest workspace_read_file; re-read after a conflict.',
     parameters: {
       type: 'object',
       required: ['path', 'expectedSha256', 'patches'],
@@ -150,8 +178,8 @@ const FILE_WRITE_TOOLS: AgentToolDefinition[] = [
     },
   },
   {
-    name: 'file_write',
-    description: 'Atomically write one bounded UTF-8 text file. Pass the latest SHA-256 when replacing, or null only when the path must not exist.',
+    name: 'workspace_write_file',
+    description: 'Atomically create one bounded UTF-8 text file. For an existing file prefer workspace_apply_patch; if replacement is necessary, pass the latest SHA-256. Pass null only when the path must not exist.',
     parameters: {
       type: 'object',
       required: ['path', 'content', 'expectedSha256'],
@@ -168,34 +196,124 @@ const FILE_WRITE_TOOLS: AgentToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'workspace_mkdir',
+    description: 'Create one directory inside the Workspace Root without running a shell command.',
+    parameters: {
+      type: 'object',
+      required: ['path'],
+      properties: { path: { type: 'string', minLength: 1, maxLength: 4_096 } },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'workspace_rename',
+    description: 'Rename or move one workspace path to another path inside the same Workspace Root.',
+    parameters: {
+      type: 'object',
+      required: ['source', 'destination'],
+      properties: {
+        source: { type: 'string', minLength: 1, maxLength: 4_096 },
+        destination: { type: 'string', minLength: 1, maxLength: 4_096 },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'workspace_delete',
+    description: 'Delete one workspace path. Recursive directory deletion must be explicitly requested.',
+    parameters: {
+      type: 'object',
+      required: ['path'],
+      properties: {
+        path: { type: 'string', minLength: 1, maxLength: 4_096 },
+        recursive: { type: 'boolean', default: false },
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
-const FILE_TOOL_NAMES = new Set([
+const WORKSPACE_TOOL_NAMES = new Set([
+  'workspace_list',
+  'workspace_read_file',
+  'workspace_stat',
+  'workspace_search',
+  'workspace_glob',
+  'workspace_apply_patch',
+  'workspace_write_file',
+  'workspace_mkdir',
+  'workspace_rename',
+  'workspace_delete',
+  // Execution-only compatibility for prior persisted Provider turns.
   'file_list',
   'file_read',
   'file_stat',
   'file_patch',
   'file_write',
 ]);
-const FILE_WRITE_TOOL_NAMES = new Set(['file_patch', 'file_write']);
-const MAX_FILE_READ_BYTES_PER_TURN = 2 * 1024 * 1024;
+const WORKSPACE_MUTATION_TOOL_NAMES = new Set([
+  'workspace_apply_patch',
+  'workspace_write_file',
+  'workspace_mkdir',
+  'workspace_rename',
+  'workspace_delete',
+  'file_patch',
+  'file_write',
+]);
+const MAX_WORKSPACE_RESULT_BYTES_PER_TURN = 2 * 1024 * 1024;
+const MAX_WORKSPACE_ERROR_CHARS = 4_096;
 
 function toolsForMode(mode: AgentFileAccessMode): AgentToolDefinition[] {
   if (mode === 'off') return TERMINAL_TOOLS;
   return mode === 'read-only'
-    ? [...TERMINAL_TOOLS, ...FILE_READ_TOOLS]
-    : [...TERMINAL_TOOLS, ...FILE_READ_TOOLS, ...FILE_WRITE_TOOLS];
+    ? [...TERMINAL_TOOLS, ...WORKSPACE_READ_TOOLS]
+    : [...TERMINAL_TOOLS, ...WORKSPACE_READ_TOOLS, ...WORKSPACE_WRITE_TOOLS];
 }
 
-function compactToolResult(content: string): string {
+function compactToolResult(content: string, toolName: string): string {
   try {
     const value = JSON.parse(content) as Record<string, unknown>;
+    const matches = Array.isArray(value.matches)
+      ? value.matches.length
+      : typeof value.matches === 'number' ? value.matches : undefined;
+    const paths = Array.isArray(value.paths)
+      ? value.paths.length
+      : typeof value.paths === 'number' ? value.paths : undefined;
+    const entries = Array.isArray(value.entries)
+      ? value.entries.length
+      : typeof value.entries === 'number' ? value.entries : undefined;
+    if (toolName === 'workspace_search') {
+      return JSON.stringify({
+        ok: value.ok,
+        compacted: true,
+        matches,
+        filesScanned: typeof value.filesScanned === 'number' ? value.filesScanned : undefined,
+        truncated: typeof value.truncated === 'boolean' ? value.truncated : undefined,
+      });
+    }
+    if (toolName === 'workspace_glob') {
+      return JSON.stringify({
+        ok: value.ok,
+        compacted: true,
+        paths,
+        truncated: typeof value.truncated === 'boolean' ? value.truncated : undefined,
+      });
+    }
     return JSON.stringify({
       ok: value.ok,
       compacted: true,
       path: typeof value.path === 'string' ? value.path : undefined,
       bytes: typeof value.bytes === 'number' ? value.bytes : undefined,
       sha256: typeof value.sha256 === 'string' ? value.sha256 : undefined,
+      created: typeof value.created === 'boolean' ? value.created : undefined,
+      additions: typeof value.additions === 'number' ? value.additions : undefined,
+      deletions: typeof value.deletions === 'number' ? value.deletions : undefined,
+      matches,
+      paths,
+      entries,
+      filesScanned: typeof value.filesScanned === 'number' ? value.filesScanned : undefined,
+      truncated: typeof value.truncated === 'boolean' ? value.truncated : undefined,
       error: typeof value.error === 'string' ? value.error.slice(0, 1_000) : undefined,
     });
   } catch {
@@ -203,37 +321,71 @@ function compactToolResult(content: string): string {
   }
 }
 
-function compactCompletedFileHistory(
+function compactCompletedWorkspaceHistory(
   messages: AgentMessage[],
   keepAssistant?: Extract<AgentMessage, { role: 'assistant' }>,
 ): void {
-  const compactIds = new Set<string>();
+  const compactCalls = new Map<string, string>();
   for (const message of messages) {
     if (message.role !== 'assistant' || !message.toolCalls) continue;
     if (message === keepAssistant) continue;
     message.toolCalls = message.toolCalls.map((call) => {
-      if (!FILE_TOOL_NAMES.has(call.name)) return call;
-      compactIds.add(call.id);
+      if (!WORKSPACE_TOOL_NAMES.has(call.name)) return call;
+      compactCalls.set(call.id, call.name);
       return { ...call, arguments: '{"historyCompacted":true}' };
     });
   }
   for (const message of messages) {
-    if (message.role === 'tool' && compactIds.has(message.toolCallId)) {
-      message.content = compactToolResult(message.content);
+    if (message.role === 'tool' && compactCalls.has(message.toolCallId)) {
+      message.content = compactToolResult(
+        message.content,
+        compactCalls.get(message.toolCallId)!,
+      );
     }
   }
 }
 
-function consumeFileResultBudget(serialized: string, budget: { remaining: number }): string {
+function consumeWorkspaceResultBudget(serialized: string, budget: { remaining: number }): string {
   const bytes = Buffer.byteLength(serialized, 'utf8');
   if (bytes > budget.remaining) {
     throw new Error(
-      `本轮文件读取/列表结果超过 ${MAX_FILE_READ_BYTES_PER_TURN} 字节总限制；`
+      `本轮 Workspace 工具结果超过 ${MAX_WORKSPACE_RESULT_BYTES_PER_TURN} 字节总限制；`
       + '请先处理已读取内容，再分批读取。',
     );
   }
   budget.remaining -= bytes;
   return serialized;
+}
+
+function boundedWorkspaceErrorResult(
+  error: unknown,
+  budget: { remaining: number },
+): string {
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  const truncated = rawMessage.length > MAX_WORKSPACE_ERROR_CHARS;
+  const bounded = JSON.stringify({
+    ok: false,
+    error: rawMessage.slice(0, MAX_WORKSPACE_ERROR_CHARS),
+    ...(truncated ? { errorTruncated: true } : {}),
+  });
+  if (Buffer.byteLength(bounded, 'utf8') <= budget.remaining) {
+    return consumeWorkspaceResultBudget(bounded, budget);
+  }
+
+  const exhausted = JSON.stringify({
+    ok: false,
+    error: 'Workspace tool result omitted because the per-turn result budget is exhausted.',
+    resultOmitted: true,
+  });
+  if (Buffer.byteLength(exhausted, 'utf8') <= budget.remaining) {
+    return consumeWorkspaceResultBudget(exhausted, budget);
+  }
+  if (budget.remaining >= 2) {
+    return consumeWorkspaceResultBudget('{}', budget);
+  }
+  // An empty tool result is preferable to exceeding the hard turn budget or
+  // forwarding any portion of an untrusted oversized backend error.
+  return '';
 }
 
 function parseArguments(call: AgentToolCall): Record<string, unknown> {
@@ -248,6 +400,71 @@ function parseArguments(call: AgentToolCall): Record<string, unknown> {
   }
 }
 
+function requiredPath(
+  args: Record<string, unknown>,
+  toolName: string,
+  field = 'path',
+): string {
+  const value = args[field];
+  if (typeof value !== 'string' || !value || value.length > 4_096) {
+    throw new Error(`${toolName} requires a valid ${field}.`);
+  }
+  return value;
+}
+
+function optionalPath(args: Record<string, unknown>, toolName: string): string | undefined {
+  if (args.path === undefined) return undefined;
+  return requiredPath(args, toolName);
+}
+
+function optionalMaxResults(
+  args: Record<string, unknown>,
+  toolName: string,
+  maximum: number,
+): number | undefined {
+  if (args.maxResults === undefined) return undefined;
+  if (
+    typeof args.maxResults !== 'number'
+    || !Number.isInteger(args.maxResults)
+    || args.maxResults < 1
+    || args.maxResults > maximum
+  ) throw new Error(`${toolName} maxResults must be an integer from 1 to ${maximum}.`);
+  return args.maxResults;
+}
+
+function readableWorkspace(
+  gateway: ToolGateway,
+  fileAccessMode: AgentFileAccessMode,
+  toolName: string,
+): WorkspaceTool {
+  const permissions = gateway.context.permissions.workspace;
+  if (
+    fileAccessMode === 'off'
+    || !permissions.enabled
+    || !permissions.read
+    || !gateway.workspace
+  ) throw new Error(`${toolName} is disabled.`);
+  return gateway.workspace;
+}
+
+function writableWorkspace(
+  gateway: ToolGateway,
+  fileAccessMode: AgentFileAccessMode,
+  toolName: string,
+  requiredPermissions: ReadonlyArray<'read' | 'write' | 'create' | 'delete'> = ['write'],
+): WorkspaceTool {
+  const permissions = gateway.context.permissions.workspace;
+  if (
+    fileAccessMode !== 'read-write'
+    || !permissions.enabled
+    || requiredPermissions.some((permission) => !permissions[permission])
+  ) {
+    throw new Error(`${toolName} requires read-write access.`);
+  }
+  if (!gateway.workspace) throw new Error(`${toolName} is disabled.`);
+  return gateway.workspace;
+}
+
 export class AgentLoop {
   constructor(
     private readonly provider: AgentProviderRuntime,
@@ -258,7 +475,7 @@ export class AgentLoop {
 
   async run(input: AgentLoopInput): Promise<AgentLoopResult> {
     const fileAccessMode = input.fileAccessMode ?? 'off';
-    const fileReadBudget = { remaining: MAX_FILE_READ_BYTES_PER_TURN };
+    const workspaceResultBudget = { remaining: MAX_WORKSPACE_RESULT_BYTES_PER_TURN };
     const messages: AgentMessage[] = [
       { role: 'system', content: input.systemPrompt },
       ...(input.priorMessages ?? []),
@@ -286,39 +503,41 @@ export class AgentLoop {
         this.onEvent({ type: 'assistant_text', text: assistant.content });
       }
       if (!assistant.toolCalls?.length) {
-        compactCompletedFileHistory(messages);
+        compactCompletedWorkspaceHistory(messages);
         return { id: randomUUID(), messages, finalText, rounds: round };
       }
 
-      compactCompletedFileHistory(messages, assistant);
+      compactCompletedWorkspaceHistory(messages, assistant);
 
       for (const call of assistant.toolCalls) {
         this.onEvent({ type: 'tool_started', toolCall: call });
         let result: string;
         try {
-          result = await this.executeTool(call, fileAccessMode, fileReadBudget);
+          result = await this.executeTool(call, fileAccessMode, workspaceResultBudget);
         } catch (error) {
-          result = JSON.stringify({ ok: false, error: (error as Error).message });
+          result = WORKSPACE_TOOL_NAMES.has(call.name)
+            ? boundedWorkspaceErrorResult(error, workspaceResultBudget)
+            : JSON.stringify({ ok: false, error: (error as Error).message });
         }
         messages.push({ role: 'tool', toolCallId: call.id, content: result });
         this.onEvent({ type: 'tool_completed', toolCall: call, result });
       }
-      // File contents and write payloads are useful for one reasoning step only.
-      // Write/patch arguments are compacted immediately; their small result is sufficient.
+      // Workspace contents and mutation payloads are useful for one reasoning step only.
+      // Mutation arguments are compacted immediately; their structured result is sufficient.
       for (const call of assistant.toolCalls) {
-        if (FILE_WRITE_TOOL_NAMES.has(call.name)) {
+        if (WORKSPACE_MUTATION_TOOL_NAMES.has(call.name)) {
           call.arguments = '{"historyCompacted":true}';
         }
       }
     }
-    compactCompletedFileHistory(messages);
+    compactCompletedWorkspaceHistory(messages);
     throw new Error(`Agent exceeded the ${this.maxRounds}-round safety limit.`);
   }
 
   private async executeTool(
     call: AgentToolCall,
     fileAccessMode: AgentFileAccessMode,
-    fileReadBudget: { remaining: number },
+    workspaceResultBudget: { remaining: number },
   ): Promise<string> {
     const args = parseArguments(call);
     switch (call.name) {
@@ -342,94 +561,200 @@ export class AgentLoop {
         );
         return JSON.stringify({ ok: result.status === 'completed', ...result });
       }
+      case 'workspace_list':
       case 'file_list': {
-        if (fileAccessMode === 'off') throw new Error('file_list is disabled.');
-        if (!this.gateway.workspace) throw new Error('file_list is disabled.');
+        const workspace = readableWorkspace(this.gateway, fileAccessMode, call.name);
         const path = typeof args.path === 'string' ? args.path : '.';
-        if (!path || path.length > 4_096) throw new Error('file_list path is invalid.');
-        return consumeFileResultBudget(
-          JSON.stringify({ ok: true, ...await this.gateway.workspace.listDirectory(path) }),
-          fileReadBudget,
+        if (!path || path.length > 4_096) throw new Error(`${call.name} path is invalid.`);
+        return consumeWorkspaceResultBudget(
+          JSON.stringify({ ok: true, ...await workspace.listDirectory(path) }),
+          workspaceResultBudget,
         );
       }
+      case 'workspace_read_file':
       case 'file_read': {
-        if (fileAccessMode === 'off') throw new Error('file_read is disabled.');
-        if (!this.gateway.workspace) throw new Error('file_read is disabled.');
-        if (typeof args.path !== 'string' || !args.path || args.path.length > 4_096) {
-          throw new Error('file_read requires a valid path.');
-        }
-        const result = await this.gateway.workspace.readFile(args.path);
-        return consumeFileResultBudget(JSON.stringify({ ok: true, ...result }), fileReadBudget);
-      }
-      case 'file_stat': {
-        if (fileAccessMode === 'off') throw new Error('file_stat is disabled.');
-        if (!this.gateway.workspace) throw new Error('file_stat is disabled.');
-        if (typeof args.path !== 'string' || !args.path || args.path.length > 4_096) {
-          throw new Error('file_stat requires a valid path.');
-        }
-        return consumeFileResultBudget(
-          JSON.stringify({ ok: true, ...await this.gateway.workspace.stat(args.path) }),
-          fileReadBudget,
+        const workspace = readableWorkspace(this.gateway, fileAccessMode, call.name);
+        const path = requiredPath(args, call.name);
+        const result = await workspace.readFile(path);
+        return consumeWorkspaceResultBudget(
+          JSON.stringify({ ok: true, ...result }),
+          workspaceResultBudget,
         );
       }
-      case 'file_write': {
-        if (fileAccessMode !== 'read-write') throw new Error('file_write requires read-write access.');
-        if (!this.gateway.workspace) throw new Error('file_write is disabled.');
-        if (typeof args.path !== 'string' || !args.path || args.path.length > 4_096) {
-          throw new Error('file_write requires a valid path.');
-        }
-        if (typeof args.content !== 'string') throw new Error('file_write requires text content.');
-        if (args.content.length > 131_072) {
-          throw new Error('file_write content exceeds the 131,072-character tool limit; use file_patch or split the work.');
-        }
-        if (args.expectedSha256 !== null && typeof args.expectedSha256 !== 'string') {
-          throw new Error('file_write requires expectedSha256 (or null for a new file).');
-        }
-        return JSON.stringify({
-          ok: true,
-          ...await this.gateway.workspace.writeFile(
-            args.path,
-            args.content,
-            args.expectedSha256,
-          ),
-        });
+      case 'workspace_stat':
+      case 'file_stat': {
+        const workspace = readableWorkspace(this.gateway, fileAccessMode, call.name);
+        const path = requiredPath(args, call.name);
+        return consumeWorkspaceResultBudget(
+          JSON.stringify({ ok: true, ...await workspace.stat(path) }),
+          workspaceResultBudget,
+        );
       }
-      case 'file_patch': {
-        if (fileAccessMode !== 'read-write') throw new Error('file_patch requires read-write access.');
-        if (!this.gateway.workspace) throw new Error('file_patch is disabled.');
-        if (typeof args.path !== 'string' || !args.path || args.path.length > 4_096) {
-          throw new Error('file_patch requires a valid path.');
+      case 'workspace_search': {
+        const workspace = readableWorkspace(this.gateway, fileAccessMode, call.name);
+        if (
+          typeof args.query !== 'string'
+          || !args.query
+          || args.query.length > 4_096
+        ) throw new Error('workspace_search requires a valid query.');
+        const path = optionalPath(args, call.name);
+        const maxResults = optionalMaxResults(args, call.name, 200);
+        const result = await workspace.search(args.query, {
+          ...(path ? { path } : {}),
+          ...(maxResults !== undefined ? { maxResults } : {}),
+        });
+        return consumeWorkspaceResultBudget(
+          JSON.stringify({ ok: true, ...result }),
+          workspaceResultBudget,
+        );
+      }
+      case 'workspace_glob': {
+        const workspace = readableWorkspace(this.gateway, fileAccessMode, call.name);
+        if (
+          typeof args.pattern !== 'string'
+          || !args.pattern
+          || args.pattern.length > 4_096
+        ) throw new Error('workspace_glob requires a valid pattern.');
+        const path = optionalPath(args, call.name);
+        const maxResults = optionalMaxResults(args, call.name, 500);
+        const result = await workspace.glob(args.pattern, {
+          ...(path ? { path } : {}),
+          ...(maxResults !== undefined ? { maxResults } : {}),
+        });
+        return consumeWorkspaceResultBudget(
+          JSON.stringify({ ok: true, ...result }),
+          workspaceResultBudget,
+        );
+      }
+      case 'workspace_write_file':
+      case 'file_write': {
+        const path = requiredPath(args, call.name);
+        if (typeof args.content !== 'string') throw new Error(`${call.name} requires text content.`);
+        if (args.content.length > 131_072) {
+          throw new Error(`${call.name} content exceeds the 131,072-character tool limit; use workspace_apply_patch or split the work.`);
         }
+        if (
+          args.expectedSha256 !== null
+          && (
+            typeof args.expectedSha256 !== 'string'
+            || !/^[a-f0-9]{64}$/i.test(args.expectedSha256)
+          )
+        ) {
+          throw new Error(`${call.name} requires a valid expectedSha256 (or null for a new file).`);
+        }
+        const workspace = writableWorkspace(
+          this.gateway,
+          fileAccessMode,
+          call.name,
+          args.expectedSha256 === null ? ['create'] : ['read', 'write'],
+        );
+        return consumeWorkspaceResultBudget(
+          JSON.stringify({
+            ok: true,
+            ...await workspace.writeFile(
+              path,
+              args.content,
+              args.expectedSha256,
+            ),
+          }),
+          workspaceResultBudget,
+        );
+      }
+      case 'workspace_apply_patch':
+      case 'file_patch': {
+        const workspace = writableWorkspace(
+          this.gateway,
+          fileAccessMode,
+          call.name,
+          ['read', 'write'],
+        );
+        const path = requiredPath(args, call.name);
         if (typeof args.expectedSha256 !== 'string' || !/^[a-f0-9]{64}$/i.test(args.expectedSha256)) {
-          throw new Error('file_patch requires a valid expectedSha256.');
+          throw new Error(`${call.name} requires a valid expectedSha256.`);
         }
         if (!Array.isArray(args.patches) || !args.patches.length || args.patches.length > 64) {
-          throw new Error('file_patch requires 1-64 patches.');
+          throw new Error(`${call.name} requires 1-64 patches.`);
         }
         const patches = args.patches.map((patch) => {
           if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
-            throw new Error('file_patch entries must be objects.');
+            throw new Error(`${call.name} entries must be objects.`);
           }
           const record = patch as Record<string, unknown>;
-          if (typeof record.search !== 'string' || !record.search || typeof record.replace !== 'string') {
-            throw new Error('file_patch entries require search and replace text.');
+          if (
+            typeof record.search !== 'string'
+            || !record.search
+            || record.search.length > 131_072
+            || typeof record.replace !== 'string'
+            || record.replace.length > 131_072
+          ) {
+            throw new Error(`${call.name} entries require bounded search and replace text.`);
           }
           return { search: record.search, replace: record.replace };
         });
         if (JSON.stringify(patches).length > 262_144) {
-          throw new Error('file_patch payload is too large; use smaller, precise patch batches.');
+          throw new Error(`${call.name} payload is too large; use smaller, precise patch batches.`);
         }
-        return JSON.stringify({
-          ok: true,
-          ...await this.gateway.workspace.applyPatch(
-            args.path,
-            args.expectedSha256,
-            patches,
-          ),
-        });
+        return consumeWorkspaceResultBudget(
+          JSON.stringify({
+            ok: true,
+            ...await workspace.applyPatch(
+              path,
+              args.expectedSha256,
+              patches,
+            ),
+          }),
+          workspaceResultBudget,
+        );
+      }
+      case 'workspace_mkdir': {
+        const workspace = writableWorkspace(
+          this.gateway,
+          fileAccessMode,
+          call.name,
+          ['create'],
+        );
+        const path = requiredPath(args, call.name);
+        await workspace.mkdir(path);
+        return consumeWorkspaceResultBudget(
+          JSON.stringify({ ok: true, path }),
+          workspaceResultBudget,
+        );
+      }
+      case 'workspace_rename': {
+        const workspace = writableWorkspace(
+          this.gateway,
+          fileAccessMode,
+          call.name,
+          ['write', 'create', 'delete'],
+        );
+        const source = requiredPath(args, call.name, 'source');
+        const destination = requiredPath(args, call.name, 'destination');
+        await workspace.rename(source, destination);
+        return consumeWorkspaceResultBudget(
+          JSON.stringify({ ok: true, source, destination }),
+          workspaceResultBudget,
+        );
+      }
+      case 'workspace_delete': {
+        const workspace = writableWorkspace(
+          this.gateway,
+          fileAccessMode,
+          call.name,
+          ['delete'],
+        );
+        const path = requiredPath(args, call.name);
+        if (args.recursive !== undefined && typeof args.recursive !== 'boolean') {
+          throw new Error('workspace_delete recursive must be a boolean.');
+        }
+        const recursive = args.recursive === true;
+        await workspace.delete(path, { recursive });
+        return consumeWorkspaceResultBudget(
+          JSON.stringify({ ok: true, path, recursive }),
+          workspaceResultBudget,
+        );
       }
       default:
-        throw new Error(`Unsupported terminal tool: ${call.name}`);
+        throw new Error(`Unsupported tool: ${call.name}`);
     }
   }
 }

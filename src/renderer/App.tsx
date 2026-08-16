@@ -3464,7 +3464,7 @@ export function App() {
             <p>终端：<b>{fileAccessChallenge.target}</b></p>
             <p>绑定根目录：<code>{fileAccessChallenge.root}</code></p>
             <p className="risk-note">
-              允许后，Generic Provider 可直接修改绑定根目录内的文件；这些修改不会经过终端，
+              允许后，Generic Provider 可在绑定根目录内创建、修改、重命名或删除文件与目录；这些修改不会经过终端，
               也不能通过终端撤销。读取到的文件内容会作为 AI 请求上下文发送给当前 Provider。
               权限只在本次应用运行期间有效。所有命令仍必须进入可见终端。
             </p>
@@ -3478,7 +3478,7 @@ export function App() {
                   setFileAccessChallenge(null);
                   void setAgentFileAccess('read-write', challenge.terminalId, challenge.backend);
                 }}
-              >允许本次读写</button>
+              >允许本次读写与删除</button>
             </div>
           </div>
         </div>

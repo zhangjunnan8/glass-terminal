@@ -294,6 +294,47 @@ describe('SessionManager reconnect restoration', () => {
 });
 
 describe('SessionManager workspace binding', () => {
+  it.runIf(process.platform === 'win32')(
+    'rejects unsafe Windows root spellings before workspace persistence',
+    async () => {
+      const dataRoot = mkdtempSync(join(tmpdir(), 'ai-terminal-manager-windows-root-test-'));
+      roots.push(dataRoot);
+      const terminals = new FakeTerminals();
+      terminals.snapshots.set('local-terminal', localSnapshot('local-terminal'));
+      const store = new SessionStore(join(dataRoot, 'sessions'));
+      const local = new FakeLocalFilesystem();
+      const manager = new SessionManager(
+        store,
+        terminals as unknown as TerminalService,
+        { get: vi.fn() } as unknown as HostStore,
+        {} as RemoteFilesystemProvider,
+        local as unknown as LocalFilesystemBackend,
+      );
+      const browser = owner();
+
+      for (const unsafeRoot of [
+        'C:relative-project',
+        '\\\\?\\C:\\project',
+        'C:\\project\\visible:ads',
+        'C:\\project\\CON',
+      ]) {
+        await expect(manager.setWorkspace(browser, {
+          terminalId: 'local-terminal',
+          root: unsafeRoot,
+        })).rejects.toThrow();
+      }
+      expect(local.realpath).not.toHaveBeenCalled();
+
+      local.canonicalRoot = 'C:\\canonical\\CONOUT$';
+      await expect(manager.setWorkspace(browser, {
+        terminalId: 'local-terminal',
+        root: 'C:\\safe-project',
+      })).rejects.toThrow('Windows 保留名称');
+      expect(manager.sessionForTerminal(browser, 'local-terminal')?.workspace).toBeUndefined();
+      manager.close();
+    },
+  );
+
   it('canonicalizes, persists, and clears a local directory selected explicitly', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ai-terminal-manager-local-workspace-test-'));
     roots.push(root);
