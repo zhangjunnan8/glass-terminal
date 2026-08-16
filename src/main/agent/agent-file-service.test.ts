@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { WebContents } from 'electron';
@@ -29,6 +29,7 @@ function createService(root: string): AgentFileService {
       id: 'session-id',
       transport: 'local',
       cwd: root,
+      workspace: { backend: 'local', root },
     }),
   } as unknown as SessionManager;
   return new AgentFileService({} as TerminalService, sessions);
@@ -75,7 +76,11 @@ function createSshService(filesystem: RemoteFilesystem) {
   });
   const sessions = {
     sessionForTerminal: () => ({
-      id: 'session-id', transport: 'ssh', hostId: 'host-1', cwd: '/work',
+      id: 'session-id',
+      transport: 'ssh',
+      hostId: 'host-1',
+      cwd: '/work',
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host-1' },
     }),
   } as unknown as SessionManager;
   return {
@@ -121,6 +126,68 @@ describe('AgentFileService local workspace boundary', () => {
     const created = await service.writeText(owner, 'terminal', 'new.ts', 'export {};\n', null);
     expect(created.created).toBe(true);
     expect(readFileSync(join(root, 'new.ts'), 'utf8')).toBe('export {};\n');
+  });
+
+  it('requires an explicit compatible Workspace Root instead of falling back to cwd', async () => {
+    const owner = { id: 1 } as WebContents;
+    const noWorkspace = new AgentFileService({} as TerminalService, {
+      sessionForTerminal: () => ({
+        id: 'session-id', transport: 'local', cwd: process.cwd(),
+      }),
+    } as unknown as SessionManager);
+    await expect(noWorkspace.bindWorkspaceRoot(owner, 'terminal'))
+      .rejects.toThrow('请先设置 Workspace Root');
+
+    const wrongBackend = new AgentFileService({} as TerminalService, {
+      sessionForTerminal: () => ({
+        id: 'session-id',
+        transport: 'local',
+        workspace: { backend: 'sftp', root: '/work', hostId: 'host-1' },
+      }),
+    } as unknown as SessionManager);
+    await expect(wrongBackend.bindWorkspaceRoot(owner, 'terminal')).rejects.toThrow(/backend/i);
+
+    const withFilesystem = vi.fn();
+    const wrongHost = new AgentFileService(
+      {} as TerminalService,
+      {
+        sessionForTerminal: () => ({
+          id: 'session-id',
+          transport: 'ssh',
+          hostId: 'host-1',
+          workspace: { backend: 'sftp', root: '/work', hostId: 'host-2' },
+        }),
+      } as unknown as SessionManager,
+      { withFilesystem } as unknown as RemoteFilesystemProvider,
+    );
+    await expect(wrongHost.bindWorkspaceRoot(owner, 'terminal')).rejects.toThrow(/Host/);
+    expect(withFilesystem).not.toHaveBeenCalled();
+  });
+
+  it('keeps file access bound to session.workspace when cwd changes and rejects root overrides', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-workspace-root-'));
+    const other = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-cwd-'));
+    roots.push(root, other);
+    writeFileSync(join(root, 'bound.txt'), 'workspace', 'utf8');
+    writeFileSync(join(other, 'bound.txt'), 'cwd', 'utf8');
+    const session = {
+      id: 'session-id',
+      transport: 'local' as const,
+      cwd: root,
+      workspace: { backend: 'local' as const, root },
+    };
+    const service = new AgentFileService({} as TerminalService, {
+      sessionForTerminal: () => session,
+    } as unknown as SessionManager);
+    const owner = { id: 1 } as WebContents;
+
+    expect(await service.bindWorkspaceRoot(owner, 'terminal')).toBe(root);
+    session.cwd = other;
+    await expect(service.readText(owner, 'terminal', 'bound.txt')).resolves.toMatchObject({
+      content: 'workspace',
+    });
+    await expect(service.readText(owner, 'terminal', 'bound.txt', other))
+      .rejects.toThrow(/Workspace Root.*不一致/);
   });
 
   it('rejects traversal, ambiguous patches, and oversized content', async () => {
@@ -173,6 +240,10 @@ describe('AgentFileService local workspace boundary', () => {
     const service = createService(root);
     const owner = { id: 1 } as WebContents;
 
+    await expect(service.statPath(owner, 'terminal', 'linked')).resolves.toMatchObject({
+      type: 'symlink',
+      path: join(root, 'linked'),
+    });
     await expect(service.readText(owner, 'terminal', 'linked/secret.txt'))
       .rejects.toThrow('超出当前会话工作目录');
     await expect(service.writeText(owner, 'terminal', 'linked/new.txt', 'unsafe', null))
@@ -208,6 +279,52 @@ describe('AgentFileService local workspace boundary', () => {
     expect(result.path).toBe(root);
     expect(result.entries.map((entry) => entry.name).sort()).toEqual(['one.txt', 'two.txt']);
     expect(result.truncated).toBe(false);
+  });
+
+  it('routes local bind, read, list, and stat through the injected backend', async () => {
+    const root = resolve('virtual-local-workspace');
+    const file = resolve(root, 'demo.ts');
+    const localFilesystem = fakeRemoteFilesystem({
+      realpath: vi.fn(async (path: string) => path),
+      stat: vi.fn(async (path: string) => (
+        path === root ? remoteStat('directory') : remoteStat('file', 5)
+      )),
+      lstat: vi.fn(async () => remoteStat('file', 5)),
+      readFile: vi.fn(async () => Buffer.from('hello')),
+      listDirectory: vi.fn(async () => [{
+        name: 'demo.ts', path: file, stat: remoteStat('file', 5),
+      }]),
+    });
+    const sessions = {
+      sessionForTerminal: () => ({
+        id: 'session-id',
+        transport: 'local',
+        workspace: { backend: 'local', root },
+      }),
+    } as unknown as SessionManager;
+    const service = new AgentFileService(
+      {} as TerminalService,
+      sessions,
+      {} as RemoteFilesystemProvider,
+      localFilesystem,
+    );
+    const owner = { id: 1 } as WebContents;
+
+    await expect(service.bindWorkspaceRoot(owner, 'terminal')).resolves.toBe(root);
+    await expect(service.readText(owner, 'terminal', 'demo.ts')).resolves.toMatchObject({
+      path: file, content: 'hello', bytes: 5,
+    });
+    await expect(service.list(owner, 'terminal')).resolves.toMatchObject({
+      path: root,
+      entries: [{ name: 'demo.ts', type: 'file', size: 5 }],
+    });
+    await expect(service.statPath(owner, 'terminal', 'demo.ts')).resolves.toEqual({
+      path: file,
+      ...remoteStat('file', 5),
+    });
+    expect(localFilesystem.readFile).toHaveBeenCalledWith(file);
+    expect(localFilesystem.listDirectory).toHaveBeenCalledWith(root);
+    expect(localFilesystem.lstat).toHaveBeenCalledWith(file);
   });
 
   it('uses one RemoteFilesystem abstraction with the expected Host and atomic overwrite', async () => {
@@ -273,5 +390,24 @@ describe('AgentFileService local workspace boundary', () => {
       '/work',
     )).rejects.toThrow('符号链接');
     expect(readFile).not.toHaveBeenCalled();
+  });
+
+  it('returns remote stat metadata through the Host-bound filesystem', async () => {
+    const filesystem = fakeRemoteFilesystem({
+      lstat: vi.fn(async () => remoteStat('file', 42)),
+    });
+    const { service, withFilesystem } = createSshService(filesystem);
+    const owner = { id: 1 } as WebContents;
+
+    await expect(service.statPath(owner, 'terminal', 'demo.ts')).resolves.toEqual({
+      path: '/work/demo.ts',
+      ...remoteStat('file', 42),
+    });
+    expect(withFilesystem).toHaveBeenCalledWith(
+      owner,
+      'terminal',
+      expect.any(Function),
+      'host-1',
+    );
   });
 });

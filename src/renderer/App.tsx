@@ -415,6 +415,15 @@ export function App() {
     () => tabs.find((tab) => tab.id === activeId) ?? null,
     [activeId, tabs],
   );
+  const activeSession = useMemo(() => {
+    if (!activeTab) return null;
+    return sessions.find((session) => session.id === activeTab.sessionId)
+      ?? sessions.find((session) => (
+        session.runtimeTerminalId === activeTab.id
+        && session.connectionState === 'connected'
+      ))
+      ?? null;
+  }, [activeTab, sessions]);
   const normalizedSidebarSearch = sidebarSearch.trim().toLocaleLowerCase('zh-CN');
   const filteredShells = normalizedSidebarSearch
     ? shells.filter((shell) => `${shell.label} ${shell.detail}`.toLocaleLowerCase('zh-CN')
@@ -488,10 +497,12 @@ export function App() {
   const codexAgentAvailable = codexAppServer?.agentAvailable === true;
   const codexTerminalContextAccess = codexAppServer?.terminalContextAccess;
   const codexBackendSelected = selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND;
+  const activeRuntimeFileAccessMode: AgentFileAccessMode = activeAgent?.fileAccessMode ?? 'off';
   const selectedFileAccessMode: AgentFileAccessMode = !codexBackendSelected
     && activeAgent?.backend.kind === 'generic-provider'
     ? activeAgent.fileAccessMode
     : 'off';
+  const activeWorkspaceRoot = activeSession?.workspace?.root;
   const selectedAgentBackendReady = selectedAgentBackendKind
     === CODEX_APP_SERVER_AGENT_BACKEND
     ? codexAgentAvailable
@@ -614,6 +625,15 @@ export function App() {
   const composerBlocked = agentTurnBusy(activeAgent?.state)
     || foregroundRunning
     || Boolean(activeAgent?.backendTurnDraining);
+  const workspaceChangeDisabledReason = !activeTab
+    ? '请先选择终端'
+    : activeTab.status !== 'connected'
+      ? '终端已断开，不能修改工作区'
+      : activeRuntimeFileAccessMode !== 'off'
+        ? '请先关闭 AI 文件访问，再修改工作区'
+        : composerBlocked
+          ? 'AI 正在运行，暂时不能修改工作区'
+          : null;
 
   useEffect(() => {
     if (!activeId) return;
@@ -671,6 +691,16 @@ export function App() {
 
   async function refreshSessions() {
     setSessions(await window.aiTerminal.sessions.list());
+  }
+
+  function upsertSessionBinding(session: SessionRecord) {
+    setSessions((current) => [
+      session,
+      ...current.filter((candidate) => candidate.id !== session.id),
+    ]);
+    setTabs((current) => current.map((tab) => (
+      tab.id === session.runtimeTerminalId ? { ...tab, sessionId: session.id } : tab
+    )));
   }
 
   async function refreshProviders() {
@@ -1075,6 +1105,16 @@ export function App() {
   ) {
     if (!terminalId || !backend || backend.kind !== 'generic-provider') return;
     setWorkspaceActionError(null);
+    if (mode !== 'off') {
+      const session = sessions.find((candidate) => (
+        candidate.runtimeTerminalId === terminalId
+        || candidate.id === tabs.find((tab) => tab.id === terminalId)?.sessionId
+      ));
+      if (!session?.workspace?.root) {
+        setWorkspaceActionError('请先为当前终端设置 Workspace Root，再开启 AI 文件访问。');
+        return;
+      }
+    }
     try {
       const state = await window.aiTerminal.agent.setFileAccess({
         terminalId,
@@ -1140,6 +1180,44 @@ export function App() {
         tab.id === activeTab.id ? { ...tab, sessionId: session.id } : tab
       )));
       await refreshSessions();
+    } catch (error) {
+      setWorkspaceActionError(errorMessage(error));
+    }
+  }
+
+  async function chooseLocalWorkspace() {
+    if (!activeTab || activeTab.transport !== 'local' || workspaceChangeDisabledReason) return;
+    setWorkspaceActionError(null);
+    try {
+      const session = await window.aiTerminal.sessions.chooseLocalWorkspace({
+        terminalId: activeTab.id,
+      });
+      if (session) upsertSessionBinding(session);
+    } catch (error) {
+      setWorkspaceActionError(errorMessage(error));
+    }
+  }
+
+  async function setRemoteWorkspace(terminalId: string, path: string) {
+    if (!activeTab || activeTab.id !== terminalId || activeTab.transport !== 'ssh') {
+      throw new Error('工作区请求已过期，请在当前 SSH 终端重试。');
+    }
+    if (workspaceChangeDisabledReason) throw new Error(workspaceChangeDisabledReason);
+    const session = await window.aiTerminal.sessions.setWorkspace({
+      terminalId,
+      root: path,
+    });
+    upsertSessionBinding(session);
+  }
+
+  async function clearWorkspace() {
+    if (!activeTab || !activeSession || workspaceChangeDisabledReason) return;
+    setWorkspaceActionError(null);
+    try {
+      const session = await window.aiTerminal.sessions.clearWorkspace({
+        terminalId: activeTab.id,
+      });
+      upsertSessionBinding(session);
     } catch (error) {
       setWorkspaceActionError(errorMessage(error));
     }
@@ -2052,12 +2130,55 @@ export function App() {
             {startupError && <div className="terminal-error">{startupError}</div>}
           </div>
           <footer className="terminal-statusbar">
-            <span>UTF-8</span>
-            <span>{activeTab?.transport === 'ssh' ? 'SSH PTY' : 'ConPTY'}</span>
-            <span>{activeTab?.sessionId ? '正式会话' : '临时终端'}</span>
+            <div className="terminal-workspace-binding" data-testid="terminal-workspace-binding">
+              <span>Workspace:</span>
+              <code title={activeSession?.workspace?.root ?? '当前会话未设置工作区'}>
+                {activeSession?.workspace?.root ?? '未设置'}
+              </code>
+              {activeTab && (
+                <button
+                  type="button"
+                  data-action="choose-workspace"
+                  aria-label={activeTab.transport === 'ssh' ? '选择远程工作区' : '选择本地工作区'}
+                  disabled={Boolean(workspaceChangeDisabledReason)}
+                  title={workspaceChangeDisabledReason
+                    ?? (activeTab.transport === 'ssh'
+                      ? '在 SFTP 面板中选择远程工作区'
+                      : '选择本地工作区')}
+                  onClick={() => {
+                    if (activeTab.transport === 'ssh') setSftpOpen(true);
+                    else void chooseLocalWorkspace();
+                  }}
+                >选择…</button>
+              )}
+              {activeSession?.workspace && (
+                <button
+                  type="button"
+                  data-action="clear-workspace"
+                  aria-label="清除工作区"
+                  disabled={Boolean(workspaceChangeDisabledReason)}
+                  title={workspaceChangeDisabledReason ?? '清除当前工作区'}
+                  onClick={() => void clearWorkspace()}
+                >清除</button>
+              )}
+            </div>
+            <div className="terminal-status-meta">
+              <span>UTF-8</span>
+              <span>{activeTab?.transport === 'ssh' ? 'SSH PTY' : 'ConPTY'}</span>
+              <span>{activeSession ? '正式会话' : '临时终端'}</span>
+            </div>
           </footer>
         </section>
-        {sftpOpen && <SftpDrawer terminal={activeTab} onClose={() => setSftpOpen(false)} />}
+        {sftpOpen && (
+          <SftpDrawer
+            terminal={activeTab}
+            workspaceRoot={activeSession?.workspace?.root}
+            onSetWorkspace={activeTab?.transport === 'ssh' && !workspaceChangeDisabledReason
+              ? setRemoteWorkspace
+              : undefined}
+            onClose={() => setSftpOpen(false)}
+          />
+        )}
         {!agentPanelVisible && (
           <button
             className="show-agent-panel"
@@ -2137,29 +2258,41 @@ export function App() {
             <div className="agent-controls">
               <label
                 className="agent-file-access-picker"
-                title="开启后，读取到的文件内容会发送给当前 Generic Provider；权限仅在本次应用运行中有效。"
+                title={activeWorkspaceRoot
+                  ? '开启后，读取到的文件内容会发送给当前 Generic Provider；权限仅在本次应用运行中有效。'
+                  : '请先为当前终端设置 Workspace Root，再开启 AI 文件访问。'}
               >
                 <span>文件访问</span>
                 <select
                   aria-label="Generic Provider 文件访问权限"
                   data-testid="agent-file-access-mode"
                   value={selectedFileAccessMode}
-                  disabled={!activeTab || composerBlocked || !selectedAgentBackendReady}
+                  disabled={
+                    !activeTab
+                    || composerBlocked
+                    || !selectedAgentBackendReady
+                    || (!activeWorkspaceRoot && activeRuntimeFileAccessMode === 'off')
+                  }
                   onChange={(event) => {
                     const mode = event.target.value as AgentFileAccessMode;
+                    const workspaceRoot = activeWorkspaceRoot;
+                    if (mode !== 'off' && !workspaceRoot) {
+                      setWorkspaceActionError(
+                        '请先为当前终端设置 Workspace Root，再开启 AI 文件访问。',
+                      );
+                      return;
+                    }
                     if (
                       mode === 'read-write'
                       && selectedFileAccessMode !== 'read-write'
                       && activeTab
+                      && workspaceRoot
                       && selectedAgentBackend?.kind === 'generic-provider'
                     ) {
-                      const session = sessions.find((item) => (
-                        item.runtimeTerminalId === activeTab.id || item.id === activeTab.sessionId
-                      ));
                       setFileAccessChallenge({
                         terminalId: activeTab.id,
                         target: activeTab.title,
-                        root: activeAgent?.fileAccessRoot ?? session?.cwd ?? '当前正式 Session cwd（确认时绑定）',
+                        root: workspaceRoot,
                         backend: selectedAgentBackend,
                       });
                       return;
@@ -2172,9 +2305,14 @@ export function App() {
                   <option value="read-write">读写绑定根</option>
                 </select>
               </label>
-              {selectedFileAccessMode !== 'off' && activeAgent?.fileAccessRoot && (
-                <span className="agent-file-access-root" title={activeAgent.fileAccessRoot}>
-                  绑定根：{activeAgent.fileAccessRoot}
+              {!activeWorkspaceRoot && activeRuntimeFileAccessMode === 'off' && (
+                <span className="agent-file-access-root" data-testid="agent-workspace-required">
+                  请先设置 Workspace Root
+                </span>
+              )}
+              {selectedFileAccessMode !== 'off' && activeWorkspaceRoot && (
+                <span className="agent-file-access-root" title={activeWorkspaceRoot}>
+                  绑定根：{activeWorkspaceRoot}
                 </span>
               )}
               {activeAgent?.fullTakeover && <span className="takeover-badge">AI 全接管</span>}

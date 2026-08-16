@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { rm } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, posix, resolve } from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import type {
   SessionAuditEvent,
@@ -25,6 +25,7 @@ import type {
 } from '../../shared/session';
 import type { AgentBackendRef } from '../../shared/agent';
 import type { TerminalDescriptor } from '../../shared/terminal';
+import type { WorkspaceBinding } from '../../shared/tools';
 
 const LOG_SCHEMA_VERSION = 1;
 const TARGET_CHUNK_BYTES = 64 * 1024;
@@ -123,9 +124,51 @@ function parseSession(value: unknown, source: string): SessionRecord {
   ) {
     throw new Error(`Unsupported Session metadata in ${source}.`);
   }
-  return {
+  const record: SessionRecord = {
     ...(candidate as SessionRecord),
     targetSnapshot: candidate.targetSnapshot ?? { label: candidate.name },
+  };
+  record.workspace = validateWorkspaceBinding(record, candidate.workspace, source);
+  return record;
+}
+
+function validateWorkspaceBinding(
+  session: Pick<SessionRecord, 'transport' | 'hostId'>,
+  value: unknown,
+  source = 'Session',
+): WorkspaceBinding | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object') {
+    throw new Error(`Invalid workspace binding in ${source}.`);
+  }
+  const workspace = value as Partial<WorkspaceBinding>;
+  if (
+    (workspace.backend !== 'local' && workspace.backend !== 'sftp')
+    || typeof workspace.root !== 'string'
+    || !workspace.root
+    || (workspace.hostId !== undefined && typeof workspace.hostId !== 'string')
+  ) throw new Error(`Invalid workspace binding in ${source}.`);
+
+  if (session.transport === 'local') {
+    if (
+      workspace.backend !== 'local'
+      || workspace.hostId !== undefined
+      || !isAbsolute(workspace.root)
+    ) {
+      throw new Error('Local Session requires a local workspace without a host binding.');
+    }
+  } else if (
+    !session.hostId
+    || workspace.backend !== 'sftp'
+    || workspace.hostId !== session.hostId
+    || !posix.isAbsolute(workspace.root)
+  ) {
+    throw new Error('SSH Session requires an SFTP workspace bound to the same Host.');
+  }
+  return {
+    backend: workspace.backend,
+    root: workspace.root,
+    ...(workspace.hostId === undefined ? {} : { hostId: workspace.hostId }),
   };
 }
 
@@ -274,6 +317,31 @@ export class SessionStore {
       updatedAt: new Date().toISOString(),
     };
     this.save(updated);
+    return updated;
+  }
+
+  setWorkspace(
+    sessionId: string,
+    workspace: WorkspaceBinding | undefined,
+  ): SessionRecord {
+    const current = this.get(sessionId);
+    const validatedWorkspace = validateWorkspaceBinding(current, workspace);
+    if (
+      current.workspace?.backend === validatedWorkspace?.backend
+      && current.workspace?.root === validatedWorkspace?.root
+      && current.workspace?.hostId === validatedWorkspace?.hostId
+    ) return current;
+
+    const updated: SessionRecord = {
+      ...current,
+      workspace: validatedWorkspace,
+      updatedAt: new Date().toISOString(),
+    };
+    this.save(updated);
+    this.audit(sessionId, 'workspace_changed', 'user', {
+      previousWorkspace: current.workspace ? { ...current.workspace } : null,
+      workspace: updated.workspace ? { ...updated.workspace } : null,
+    });
     return updated;
   }
 

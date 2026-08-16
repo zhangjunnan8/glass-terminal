@@ -16,9 +16,11 @@ import { TERMINAL_CHANNELS } from '../shared/terminal';
 import type { CreateTerminalRequest } from '../shared/terminal';
 import { SESSION_CHANNELS } from '../shared/session';
 import type {
+  ClearWorkspaceRequest,
   DeleteSessionRequest,
   ReadSessionHistoryDetailRequest,
   RenameSessionRequest,
+  SetWorkspaceRequest,
   UpgradeSessionRequest,
 } from '../shared/session';
 import { SFTP_CHANNELS } from '../shared/sftp';
@@ -120,6 +122,11 @@ function requireProviderStore(): ProviderStore {
 function requireCodexAppServerService(): CodexAppServerService {
   if (!codexAppServerService) throw new Error('Codex App Server service is not ready.');
   return codexAppServerService;
+}
+
+function requireAgentService(): AgentService {
+  if (!agentService) throw new Error('Agent service is not ready.');
+  return agentService;
 }
 
 function assertTrustedSender(event: IpcMainInvokeEvent): void {
@@ -277,6 +284,53 @@ handleTrusted(
   (event, request: UpgradeSessionRequest) => (
     requireSessionManager().upgrade(event.sender, request.terminalId)
   ),
+);
+handleTrusted(
+  SESSION_CHANNELS.setWorkspace,
+  (event, request: SetWorkspaceRequest) => {
+    const service = requireAgentService();
+    const beforeCommit = () => (
+      service.assertWorkspaceChangeAllowed(event.sender, request.terminalId)
+    );
+    beforeCommit();
+    const descriptor = terminalService.descriptor(event.sender, request.terminalId);
+    if (descriptor.transport !== 'ssh') {
+      throw new Error('Local workspace roots must be selected with the system folder picker.');
+    }
+    return requireSessionManager().setWorkspace(event.sender, request, beforeCommit);
+  },
+);
+handleTrusted(
+  SESSION_CHANNELS.clearWorkspace,
+  (event, request: ClearWorkspaceRequest) => {
+    requireAgentService().assertWorkspaceChangeAllowed(event.sender, request.terminalId);
+    return requireSessionManager().clearWorkspace(event.sender, request);
+  },
+);
+handleTrusted(
+  SESSION_CHANNELS.chooseLocalWorkspace,
+  async (event, request: UpgradeSessionRequest) => {
+    const service = requireAgentService();
+    service.assertWorkspaceChangeAllowed(event.sender, request.terminalId);
+    const descriptor = terminalService.descriptor(event.sender, request.terminalId);
+    if (descriptor.transport !== 'local') {
+      throw new Error('The system folder picker is only available for local terminals.');
+    }
+    const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+    if (!ownerWindow) throw new Error('Unable to open the workspace folder picker.');
+    const selection = await dialog.showOpenDialog(ownerWindow, {
+      title: '选择 Workspace 根目录',
+      properties: ['openDirectory'],
+    });
+    if (selection.canceled || !selection.filePaths[0]) return null;
+    // The Agent may have started, entered a draining state, or enabled file
+    // tools while the native folder picker was open.
+    service.assertWorkspaceChangeAllowed(event.sender, request.terminalId);
+    return requireSessionManager().setWorkspace(event.sender, {
+      terminalId: request.terminalId,
+      root: selection.filePaths[0],
+    }, () => service.assertWorkspaceChangeAllowed(event.sender, request.terminalId));
+  },
 );
 
 handleTrusted(
@@ -510,6 +564,7 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
     new SessionStore(join(app.getPath('userData'), 'sessions')),
     terminalService,
     hostStore,
+    remoteFilesystemProvider,
   );
   hostService = new HostService(
     hostStore,

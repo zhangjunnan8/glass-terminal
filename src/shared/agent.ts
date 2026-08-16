@@ -83,7 +83,7 @@ export interface AgentSessionView {
   fullTakeover: boolean;
   /** Explicit, in-memory permission for Generic Provider file tools. Never persisted. */
   fileAccessMode: AgentFileAccessMode;
-  /** Canonical Session cwd captured when file access was enabled. */
+  /** Canonical explicit Session Workspace Root captured when file access was enabled. */
   fileAccessRoot?: string;
   messages: AgentChatItem[];
   streamingMessageId?: string;

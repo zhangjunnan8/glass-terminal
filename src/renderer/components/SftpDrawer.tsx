@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type {
   SftpDirectoryListing,
   SftpEntry,
@@ -15,6 +15,8 @@ interface SftpTerminal {
 
 interface SftpDrawerProps {
   terminal: SftpTerminal | null;
+  workspaceRoot?: string;
+  onSetWorkspace?(terminalId: string, path: string): Promise<void> | void;
   onClose(): void;
 }
 
@@ -29,6 +31,12 @@ function parentPath(path: string): string {
   return `/${parts.join('/')}` || '/';
 }
 
+function sameRemotePath(left: string | undefined, right: string | undefined): boolean {
+  if (!left || !right) return false;
+  const normalized = (path: string) => path.replace(/\/+$/u, '') || '/';
+  return normalized(left) === normalized(right);
+}
+
 function humanBytes(bytes: number): string {
   if (bytes < 1_024) return `${bytes} B`;
   if (bytes < 1_048_576) return `${(bytes / 1_024).toFixed(1)} KiB`;
@@ -41,14 +49,25 @@ function mergeJobs(current: TransferJobSnapshot[], updates: TransferJobSnapshot[
   return [...merged.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
 }
 
-export function SftpDrawer({ terminal, onClose }: SftpDrawerProps) {
+export function SftpDrawer({
+  terminal,
+  workspaceRoot,
+  onSetWorkspace,
+  onClose,
+}: SftpDrawerProps) {
   const [listing, setListing] = useState<SftpDirectoryListing | null>(null);
   const [transfers, setTransfers] = useState<TransferJobSnapshot[]>([]);
   const [pathInput, setPathInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [workspacePending, setWorkspacePending] = useState(false);
   const [transfersCollapsed, setTransfersCollapsed] = useState(false);
   const available = terminal?.transport === 'ssh' && terminal.status === 'connected';
+  const activeTerminalIdRef = useRef<string | null>(available ? terminal.id : null);
+  const directoryRequestRef = useRef(0);
+  const transferListRequestRef = useRef(0);
+  const workspaceRequestRef = useRef(0);
+  activeTerminalIdRef.current = available ? terminal.id : null;
 
   const visibleTransfers = useMemo(
     () => transfers.filter((job) => job.terminalId === terminal?.id),
@@ -57,16 +76,26 @@ export function SftpDrawer({ terminal, onClose }: SftpDrawerProps) {
 
   async function loadDirectory(path?: string) {
     if (!terminal || !available) return;
+    const terminalId = terminal.id;
+    const requestId = ++directoryRequestRef.current;
+    const isCurrentRequest = () => (
+      activeTerminalIdRef.current === terminalId
+      && directoryRequestRef.current === requestId
+    );
     setLoading(true);
     setError(null);
     try {
-      const next = await window.aiTerminal.sftp.listDirectory(terminal.id, path);
+      const next = await window.aiTerminal.sftp.listDirectory(terminalId, path);
+      if (!isCurrentRequest()) return;
+      if (next.terminalId !== terminalId) {
+        throw new Error('远程目录响应与当前终端不匹配。');
+      }
       setListing(next);
       setPathInput(next.path);
     } catch (caught) {
-      setError(errorMessage(caught));
+      if (isCurrentRequest()) setError(errorMessage(caught));
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) setLoading(false);
     }
   }
 
@@ -78,16 +107,33 @@ export function SftpDrawer({ terminal, onClose }: SftpDrawerProps) {
   }, []);
 
   useEffect(() => {
+    directoryRequestRef.current += 1;
+    transferListRequestRef.current += 1;
+    workspaceRequestRef.current += 1;
     setListing(null);
     setPathInput('');
     setError(null);
+    setLoading(false);
+    setWorkspacePending(false);
     if (!terminal || !available) return;
-    void Promise.all([
-      loadDirectory(),
-      window.aiTerminal.sftp.listTransfers(terminal.id).then((jobs) => {
+    const terminalId = terminal.id;
+    const transferRequestId = transferListRequestRef.current;
+    void loadDirectory();
+    void window.aiTerminal.sftp.listTransfers(terminalId).then((jobs) => {
+      if (
+        activeTerminalIdRef.current === terminalId
+        && transferListRequestRef.current === transferRequestId
+      ) {
         setTransfers((current) => mergeJobs(current, jobs));
-      }),
-    ]).catch((caught) => setError(errorMessage(caught)));
+      }
+    }).catch((caught) => {
+      if (
+        activeTerminalIdRef.current === terminalId
+        && transferListRequestRef.current === transferRequestId
+      ) {
+        setError(errorMessage(caught));
+      }
+    });
   }, [terminal?.id, available]);
 
   async function upload() {
@@ -114,6 +160,32 @@ export function SftpDrawer({ terminal, onClose }: SftpDrawerProps) {
       if (job) setTransfers((current) => mergeJobs(current, [job]));
     } catch (caught) {
       setError(errorMessage(caught));
+    }
+  }
+
+  async function setCurrentWorkspace() {
+    if (
+      !terminal
+      || !listing
+      || listing.terminalId !== terminal.id
+      || !onSetWorkspace
+      || sameRemotePath(listing.path, workspaceRoot)
+    ) return;
+    const terminalId = terminal.id;
+    const path = listing.path;
+    const requestId = ++workspaceRequestRef.current;
+    const isCurrentRequest = () => (
+      activeTerminalIdRef.current === terminalId
+      && workspaceRequestRef.current === requestId
+    );
+    setWorkspacePending(true);
+    setError(null);
+    try {
+      await onSetWorkspace(terminalId, path);
+    } catch (caught) {
+      if (isCurrentRequest()) setError(errorMessage(caught));
+    } finally {
+      if (isCurrentRequest()) setWorkspacePending(false);
     }
   }
 
@@ -147,6 +219,25 @@ export function SftpDrawer({ terminal, onClose }: SftpDrawerProps) {
             />
             <button type="submit" title="前往">前往</button>
             <button type="button" title="刷新" onClick={() => void loadDirectory(listing?.path)}>↻</button>
+            <button
+              type="button"
+              className={`sftp-workspace ${sameRemotePath(listing?.path, workspaceRoot) ? 'active' : ''}`}
+              aria-label={sameRemotePath(listing?.path, workspaceRoot)
+                ? `当前工作区 ${listing?.path ?? ''}`
+                : `将当前目录 ${listing?.path ?? ''} 设为工作区`}
+              disabled={
+                !listing
+                || !onSetWorkspace
+                || workspacePending
+                || sameRemotePath(listing.path, workspaceRoot)
+              }
+              title={sameRemotePath(listing?.path, workspaceRoot)
+                ? '当前目录已是工作区'
+                : onSetWorkspace ? '将当前目录设为工作区' : '当前不能修改工作区'}
+              onClick={() => void setCurrentWorkspace()}
+            >{sameRemotePath(listing?.path, workspaceRoot)
+                ? '当前工作区'
+                : workspacePending ? '设置中…' : '设为工作区'}</button>
             <button type="button" className="sftp-upload" onClick={() => void upload()}>上传</button>
           </form>
           {error && <div className="sftp-error">{error}</div>}

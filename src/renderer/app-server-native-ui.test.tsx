@@ -6,6 +6,7 @@ import type { AgentSessionView } from '../shared/agent';
 import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import type { DesktopBridge } from '../shared/ipc';
 import type { ProviderProfile } from '../shared/provider';
+import type { SessionRecord } from '../shared/session';
 import { App } from './App';
 
 vi.mock('./components/TerminalPane', () => ({
@@ -30,6 +31,32 @@ const provider: ProviderProfile = {
   createdAt: now,
   updatedAt: now,
 };
+
+function localSession(workspaceRoot?: string): SessionRecord {
+  return {
+    schemaVersion: 1,
+    id: 'session-1',
+    name: 'PowerShell session',
+    nameSource: 'automatic',
+    transport: 'local',
+    shellProfileId: 'shell-1',
+    shellKind: 'powershell',
+    targetSnapshot: { label: 'PowerShell' },
+    connectionState: 'connected',
+    status: 'active',
+    runtimeTerminalId: 'terminal-1',
+    cwd: '/terminal/current-directory',
+    workspace: workspaceRoot ? { backend: 'local', root: workspaceRoot } : undefined,
+    pinned: false,
+    preludeTruncated: false,
+    droppedPreludeBytes: 0,
+    startedAt: now,
+    promotedAt: now,
+    createdAt: now,
+    updatedAt: now,
+    lastConnectedAt: now,
+  };
+}
 
 function agentView(state: AgentSessionView['state'] = 'COMPLETED'): AgentSessionView {
   return {
@@ -148,6 +175,9 @@ function bridgeForCodex(snapshot: CodexAppServerSnapshot): DesktopBridge {
     sessions: {
       list: vi.fn().mockResolvedValue([]),
       upgrade: vi.fn(),
+      setWorkspace: vi.fn(),
+      clearWorkspace: vi.fn(),
+      chooseLocalWorkspace: vi.fn(),
       rename: vi.fn(),
       readTerminalHistory: vi.fn(),
       readHistoryDetail: vi.fn(),
@@ -294,8 +324,11 @@ describe('native Codex App Server renderer mode', () => {
 
   it('requires an explicit in-app confirmation before Generic Provider gains file write access', async () => {
     const bridge = bridgeForCodex(codexSnapshot());
+    vi.mocked(bridge.sessions.list).mockResolvedValue([
+      localSession('/workspace/explicit-project'),
+    ]);
     bridge.agent.setFileAccess = vi.fn().mockResolvedValue({
-      ...agentView(), revision: 2, fileAccessMode: 'read-write', fileAccessRoot: '/work/project',
+      ...agentView(), revision: 2, fileAccessMode: 'read-write', fileAccessRoot: '/stale-runtime-root',
     });
     Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
     await act(async () => root.render(<App />));
@@ -304,8 +337,10 @@ describe('native Codex App Server renderer mode', () => {
     const select = container.querySelector<HTMLSelectElement>('[data-testid="agent-file-access-mode"]')!;
     await act(async () => setSelectValue(select, 'read-write'));
     expect(bridge.agent.setFileAccess).not.toHaveBeenCalled();
-    expect(container.querySelector('[data-testid="file-access-confirmation"]')?.textContent)
-      .toContain('所有命令仍必须进入可见终端');
+    const confirmation = container.querySelector('[data-testid="file-access-confirmation"]');
+    expect(confirmation?.textContent).toContain('所有命令仍必须进入可见终端');
+    expect(confirmation?.textContent).toContain('/workspace/explicit-project');
+    expect(confirmation?.textContent).not.toContain('/terminal/current-directory');
 
     await act(async () => {
       container.querySelector<HTMLButtonElement>('[data-action="confirm-file-read-write"]')!.click();
@@ -315,7 +350,25 @@ describe('native Codex App Server renderer mode', () => {
       terminalId: 'terminal-1', mode: 'read-write',
       backend: { kind: 'generic-provider', providerId: provider.id },
     });
-    expect(container.textContent).toContain('绑定根：/work/project');
+    expect(container.textContent).toContain('绑定根：/workspace/explicit-project');
+    expect(container.textContent).not.toContain('绑定根：/stale-runtime-root');
+  });
+
+  it('blocks file access until an explicit Workspace Root is set and never falls back to cwd', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    vi.mocked(bridge.sessions.list).mockResolvedValue([localSession()]);
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    const select = container.querySelector<HTMLSelectElement>('[data-testid="agent-file-access-mode"]')!;
+    expect(select.disabled).toBe(true);
+    expect(container.querySelector('[data-testid="agent-workspace-required"]')?.textContent)
+      .toContain('请先设置 Workspace Root');
+    expect(container.querySelector('[data-testid="file-access-confirmation"]')).toBeNull();
+    expect(bridge.agent.setFileAccess).not.toHaveBeenCalled();
+    expect(container.querySelector('.agent-controls')?.textContent)
+      .not.toContain('/terminal/current-directory');
   });
 
   it('offers retract and edit only on the latest completed user message', async () => {
@@ -347,6 +400,60 @@ describe('native Codex App Server renderer mode', () => {
       action: 'replace',
       prompt: '最后一条命令',
     });
+  });
+
+  it.each([
+    ['THINKING', 'off', 'AI 正在运行'],
+    ['COMPLETED', 'read-only', '请先关闭 AI 文件访问'],
+  ] as const)(
+    'disables workspace changes while agent state is %s with file access %s',
+    async (state, fileAccessMode, expectedTitle) => {
+      const bridge = bridgeForCodex(codexSnapshot());
+      bridge.agent.getState = vi.fn().mockResolvedValue({
+        ...agentView(state),
+        fileAccessMode,
+      });
+      Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+      await act(async () => root.render(<App />));
+      await settle();
+      await settle();
+
+      const chooseWorkspace = container.querySelector<HTMLButtonElement>(
+        '[data-action="choose-workspace"]',
+      )!;
+      expect(chooseWorkspace.disabled).toBe(true);
+      expect(chooseWorkspace.title).toContain(expectedTitle);
+    },
+  );
+
+  it('keeps Workspace changes locked by Generic runtime access after selecting Codex', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    vi.mocked(bridge.sessions.list).mockResolvedValue([
+      localSession('/workspace/explicit-project'),
+    ]);
+    bridge.agent.getState = vi.fn().mockResolvedValue({
+      ...agentView(),
+      fileAccessMode: 'read-only',
+      fileAccessRoot: '/workspace/explicit-project',
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    const backendSelect = container.querySelector<HTMLSelectElement>(
+      '[data-testid="agent-backend-select"]',
+    )!;
+    const chooseWorkspace = container.querySelector<HTMLButtonElement>(
+      '[data-action="choose-workspace"]',
+    )!;
+    expect(chooseWorkspace.disabled).toBe(true);
+    expect(chooseWorkspace.title).toContain('请先关闭 AI 文件访问');
+
+    await act(async () => setSelectValue(backendSelect, CODEX_APP_SERVER_AGENT_BACKEND));
+
+    expect(chooseWorkspace.disabled).toBe(true);
+    expect(chooseWorkspace.title).toContain('请先关闭 AI 文件访问');
   });
 
   it('shows a one-click interrupt instead of edit controls while the latest prompt runs', async () => {

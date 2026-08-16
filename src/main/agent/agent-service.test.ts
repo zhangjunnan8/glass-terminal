@@ -300,7 +300,8 @@ class FakeTerminals {
     return () => { this.sensitiveSubmissionListener = undefined; };
   }
   state() { return { transport: 'ssh', shellKind: 'posix', status: 'connected' }; }
-  descriptor() {
+  descriptor(owner: WebContents, terminalId: string) {
+    if (owner.id !== 99 || terminalId !== 'terminal') throw new Error('Terminal not found.');
     return {
       id: 'terminal',
       title: 'Test',
@@ -459,6 +460,106 @@ function toolCall(id: string, command: string): AgentCompletion {
 }
 
 describe('AgentService shared-terminal controls', () => {
+  it('allows Workspace changes without a runtime and enforces runtime ownership', async () => {
+    const terminals = new FakeTerminals();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+    );
+    const owner = browserOwner();
+
+    expect(() => service.assertWorkspaceChangeAllowed(owner, 'terminal')).not.toThrow();
+    await service.setFileAccess(owner, {
+      terminalId: 'terminal',
+      mode: 'off',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+    });
+    expect(() => service.assertWorkspaceChangeAllowed(owner, 'terminal')).not.toThrow();
+    expect(() => service.assertWorkspaceChangeAllowed({
+      ...owner,
+      id: 100,
+    } as WebContents, 'terminal')).toThrow('Agent Session not found.');
+  });
+
+  it('rejects Workspace changes while Generic Provider file access is enabled', async () => {
+    const fileService = {
+      bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+    } as unknown as AgentFileService;
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      fileService,
+    );
+    const owner = browserOwner();
+
+    await service.setFileAccess(owner, {
+      terminalId: 'terminal',
+      mode: 'read-only',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+    });
+
+    expect(() => service.assertWorkspaceChangeAllowed(owner, 'terminal'))
+      .toThrow('请先关闭 Generic Provider 文件访问');
+  });
+
+  it('rejects Workspace changes while a Generic Provider turn is running', async () => {
+    const provider = new DeferredStreamingProvider();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      () => provider,
+    );
+    const owner = browserOwner();
+
+    service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Keep working.',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+    });
+
+    expect(() => service.assertWorkspaceChangeAllowed(owner, 'terminal'))
+      .toThrow('Agent 运行或正在停止时');
+    provider.finish('Done.');
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+  });
+
+  it('rejects Workspace changes while a native backend turn is draining', async () => {
+    const codex = new DeferredStreamingCodexAppServer();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      () => { throw new Error('Generic Provider must not be used.'); },
+      codex as unknown as CodexAppServerService,
+    );
+    const owner = browserOwner();
+    const running = service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Keep working.',
+      backend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      },
+    });
+    await waitFor(() => Boolean(codex.input));
+    service.interruptTurn(owner, {
+      terminalId: 'terminal',
+      messageId: running.messages.at(-1)!.id,
+    });
+
+    expect(service.getState(owner, 'terminal')?.backendTurnDraining).toBe(true);
+    expect(() => service.assertWorkspaceChangeAllowed(owner, 'terminal'))
+      .toThrow('Agent 运行或正在停止时');
+
+    codex.finishInterrupt();
+    await waitFor(() => service.getState(owner, 'terminal')?.backendTurnDraining === false);
+  });
+
   it('binds ephemeral file permission, audits content-free writes, and does not use a hidden command', async () => {
     const sessions = new FakeSessions();
     sessions.session = { ...sessions.session, cwd: '/work' };

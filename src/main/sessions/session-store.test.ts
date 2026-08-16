@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync } from 'node:fs';
@@ -120,6 +120,112 @@ describe('SessionStore', () => {
     expect(restored.effectiveUser).toBe('root');
     expect(restored.aiThreadId).toBe(threadId);
     expect(restored.agentBackend).toEqual({ kind: 'generic-provider', providerId: 'provider' });
+  });
+
+  it('persists, audits, and clears an explicit same-host workspace binding', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+
+    const updated = store.setWorkspace(session.id, {
+      backend: 'sftp',
+      root: '/srv/project',
+      hostId: 'host-1',
+    });
+
+    expect(updated.workspace).toEqual({
+      backend: 'sftp',
+      root: '/srv/project',
+      hostId: 'host-1',
+    });
+    expect(JSON.parse(
+      readFileSync(join(root, session.id, 'session.json'), 'utf8'),
+    ).workspace).toEqual(updated.workspace);
+    const cleared = store.setWorkspace(session.id, undefined);
+    expect(cleared.workspace).toBeUndefined();
+    expect(JSON.parse(
+      readFileSync(join(root, session.id, 'session.json'), 'utf8'),
+    ).workspace).toBeUndefined();
+    expect(store.readAudit(session.id).filter((event) => event.type === 'workspace_changed'))
+      .toMatchObject([
+        {
+          actor: 'user',
+          details: {
+            previousWorkspace: null,
+            workspace: updated.workspace,
+          },
+        },
+        {
+          actor: 'user',
+          details: {
+            previousWorkspace: updated.workspace,
+            workspace: null,
+          },
+        },
+      ]);
+  });
+
+  it('rejects workspace bindings that do not match the Session transport and Host', () => {
+    const store = new SessionStore(temporaryRoot());
+    const sshSession = createSession(store);
+    const localSession = store.create({
+      descriptor: {
+        id: 'local-terminal',
+        title: 'PowerShell',
+        profileId: 'powershell',
+        shellKind: 'powershell',
+        transport: 'local',
+      },
+      startedAt: new Date().toISOString(),
+      history: [],
+      preludeTruncated: false,
+      droppedPreludeBytes: 0,
+    });
+
+    expect(() => store.setWorkspace(sshSession.id, {
+      backend: 'local',
+      root: 'C:\\project',
+    })).toThrow('SSH Session requires an SFTP workspace');
+    expect(() => store.setWorkspace(sshSession.id, {
+      backend: 'sftp',
+      root: '/srv/project',
+      hostId: 'another-host',
+    })).toThrow('same Host');
+    expect(() => store.setWorkspace(sshSession.id, {
+      backend: 'sftp',
+      root: 'srv/project',
+      hostId: 'host-1',
+    })).toThrow('same Host');
+    expect(() => store.setWorkspace(localSession.id, {
+      backend: 'sftp',
+      root: '/srv/project',
+      hostId: 'host-1',
+    })).toThrow('Local Session requires a local workspace');
+    expect(() => store.setWorkspace(localSession.id, {
+      backend: 'local',
+      root: 'C:\\project',
+      hostId: 'host-1',
+    })).toThrow('without a host binding');
+  });
+
+  it('rejects malformed or cross-host workspace bindings while loading metadata', () => {
+    const invalidBindings = [
+      { backend: 'sftp', root: 42, hostId: 'host-1' },
+      { backend: 'sftp', root: '/srv/project', hostId: 'another-host' },
+      { backend: 'sftp', root: 'srv/project', hostId: 'host-1' },
+    ];
+
+    for (const workspace of invalidBindings) {
+      const root = temporaryRoot();
+      const store = new SessionStore(root);
+      const session = createSession(store);
+      const metadataPath = join(root, session.id, 'session.json');
+      const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
+      metadata.workspace = workspace;
+      writeFileSync(metadataPath, `${JSON.stringify(metadata)}\n`, 'utf8');
+
+      expect(() => new SessionStore(root)).toThrow(/workspace|same Host/i);
+    }
   });
 
   it('persists the local and upstream thread mapping for the isolated App Server backend', () => {

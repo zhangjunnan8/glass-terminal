@@ -473,6 +473,28 @@ export class AgentService {
     return cloneView(runtime);
   }
 
+  /**
+   * Workspace roots are part of the tool boundary for a Generic Provider
+   * runtime. Keep that boundary immutable while a turn can still use it, or
+   * while file tools remain authorized against the current root.
+   */
+  assertWorkspaceChangeAllowed(owner: WebContents, terminalId: string): void {
+    const runtime = this.runtimes.get(terminalId);
+    if (!runtime) {
+      // A missing Agent runtime is allowed, but the terminal still has to be
+      // live and owned by the calling renderer.
+      this.terminals.descriptor(owner, terminalId);
+      return;
+    }
+    if (runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
+    if (BUSY_STATES.has(runtime.state) || runtime.backendTurnDraining) {
+      throw new Error('Agent 运行或正在停止时不能更改 Workspace 根目录。');
+    }
+    if (runtime.fileAccessMode !== 'off') {
+      throw new Error('请先关闭 Generic Provider 文件访问，再更改 Workspace 根目录。');
+    }
+  }
+
   async setFileAccess(
     owner: WebContents,
     request: SetAgentFileAccessRequest,

@@ -235,11 +235,51 @@ describe('AgentLoop', () => {
     });
 
     expect(provider.requests[0].tools.map((tool) => tool.name)).toContain('file_read');
+    expect(provider.requests[0].tools.map((tool) => tool.name)).toContain('file_stat');
     expect(provider.requests[0].tools.map((tool) => tool.name)).not.toContain('file_write');
     expect(writeFile).not.toHaveBeenCalled();
     expect(provider.requests[1].messages).toContainEqual(expect.objectContaining({
       role: 'tool', content: expect.stringContaining('requires read-write access'),
     }));
+  });
+
+  it('executes file_stat as a read-only workspace tool and compacts its history', async () => {
+    let statResultSeen = false;
+    const provider: AgentProviderRuntime = {
+      async complete(request) {
+        if (!statResultSeen) {
+          statResultSeen = request.messages.some((message) => (
+            message.role === 'tool'
+            && message.toolCallId === 'stat-1'
+            && message.content.includes('2026-08-16T00:00:00.000Z')
+          ));
+        }
+        if (!statResultSeen) {
+          return { message: { role: 'assistant', content: null, toolCalls: [{
+            id: 'stat-1', name: 'file_stat', arguments: '{"path":"src/main.ts"}',
+          }] } };
+        }
+        return { message: { role: 'assistant', content: 'stat complete' } };
+      },
+    };
+    const stat = vi.fn(async (path: string) => ({
+      path: `/work/${path}`,
+      type: 'file' as const,
+      size: 42,
+      mode: 0o100644,
+      modifiedAt: '2026-08-16T00:00:00.000Z',
+    }));
+    const loop = new AgentLoop(provider, fakeToolGateway({ workspace: { stat } }));
+
+    const result = await loop.run({
+      systemPrompt: 'test', userPrompt: 'inspect', terminalContext: '',
+      fileAccessMode: 'read-only', signal: new AbortController().signal,
+    });
+
+    expect(stat).toHaveBeenCalledWith('src/main.ts');
+    expect(statResultSeen).toBe(true);
+    expect(JSON.stringify(result.messages)).not.toContain('2026-08-16T00:00:00.000Z');
+    expect(JSON.stringify(result.messages)).toContain('historyCompacted');
   });
 
   it('keeps a file read for one reasoning step then compacts file contents and write arguments', async () => {

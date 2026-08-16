@@ -1,10 +1,13 @@
 import { homedir } from 'node:os';
+import { isAbsolute, posix } from 'node:path';
 import type { WebContents } from 'electron';
 import type { HostStore } from '../hosts/host-store';
 import type {
+  ClearWorkspaceRequest,
   DeleteSessionRequest,
   ReadSessionHistoryDetailRequest,
   RenameSessionRequest,
+  SetWorkspaceRequest,
   SessionHistoryDetail,
   SessionRecord,
 } from '../../shared/session';
@@ -12,6 +15,8 @@ import type { SessionAuditEvent } from '../../shared/session';
 import type { AgentBackendRef } from '../../shared/agent';
 import type { TerminalDescriptor } from '../../shared/terminal';
 import type { TerminalService } from '../terminal/terminal-service';
+import { LocalFilesystemBackend } from '../filesystem/local-filesystem';
+import { RemoteFilesystemProvider } from '../filesystem/remote-filesystem';
 import {
   buildSshRestoreInput,
   inferShellContext,
@@ -28,6 +33,8 @@ export class SessionManager {
     private readonly store: SessionStore,
     private readonly terminals: TerminalService,
     private readonly hosts: HostStore,
+    private readonly remoteFilesystems = new RemoteFilesystemProvider(terminals),
+    private readonly localFilesystem = new LocalFilesystemBackend(),
   ) {
     this.removeJournalListener = terminals.onJournal((_terminalId, sessionId, event) => {
       this.store.appendTerminalEvents(sessionId, [event]);
@@ -144,6 +151,66 @@ export class SessionManager {
   sessionForTerminal(owner: WebContents, terminalId: string): SessionRecord | undefined {
     const sessionId = this.terminals.sessionId(owner, terminalId);
     return sessionId ? this.store.get(sessionId) : undefined;
+  }
+
+  async setWorkspace(
+    owner: WebContents,
+    request: SetWorkspaceRequest,
+    beforeCommit?: () => void,
+  ): Promise<SessionRecord> {
+    const session = this.upgrade(owner, request.terminalId);
+    const descriptor = this.terminals.descriptor(owner, request.terminalId);
+    if (
+      descriptor.transport !== session.transport
+      || descriptor.hostId !== session.hostId
+    ) throw new Error('Workspace target does not match the Session terminal.');
+
+    if (session.transport === 'local') {
+      if (!isAbsolute(request.root)) throw new Error('Local workspace root must be absolute.');
+      const root = await this.localFilesystem.realpath(request.root);
+      if (!isAbsolute(root)) throw new Error('Local workspace root must resolve absolutely.');
+      const attributes = await this.localFilesystem.stat(root);
+      if (attributes?.type !== 'directory') {
+        throw new Error('Local workspace root must be an existing directory.');
+      }
+      beforeCommit?.();
+      return this.store.setWorkspace(session.id, { backend: 'local', root });
+    }
+
+    if (!session.hostId) throw new Error('SSH Session is missing its Host binding.');
+    if (!posix.isAbsolute(request.root)) {
+      throw new Error('SSH workspace root must be an absolute POSIX path.');
+    }
+    const root = await this.remoteFilesystems.withFilesystem(
+      owner,
+      request.terminalId,
+      async (filesystem) => {
+        const canonicalRoot = await filesystem.realpath(request.root);
+        if (!posix.isAbsolute(canonicalRoot)) {
+          throw new Error('SSH workspace root must resolve to an absolute POSIX path.');
+        }
+        const attributes = await filesystem.stat(canonicalRoot);
+        if (attributes?.type !== 'directory') {
+          throw new Error('SSH workspace root must be an existing directory.');
+        }
+        return canonicalRoot;
+      },
+      session.hostId,
+    );
+    beforeCommit?.();
+    return this.store.setWorkspace(session.id, {
+      backend: 'sftp',
+      root,
+      hostId: session.hostId,
+    });
+  }
+
+  async clearWorkspace(
+    owner: WebContents,
+    request: ClearWorkspaceRequest,
+  ): Promise<SessionRecord> {
+    const session = this.upgrade(owner, request.terminalId);
+    return this.store.setWorkspace(session.id, undefined);
   }
 
   rename(request: RenameSessionRequest): SessionRecord {

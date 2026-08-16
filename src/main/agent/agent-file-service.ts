@@ -3,15 +3,15 @@ import {
   lstat,
   link,
   readFile,
-  realpath,
   rename,
-  stat,
   unlink,
   writeFile,
 } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, normalize, relative, resolve } from 'node:path';
 import { posix } from 'node:path';
 import type { WebContents } from 'electron';
+import type { WorkspaceBinding, WorkspaceStatResult } from '../../shared/tools';
+import { LocalFilesystemBackend } from '../filesystem/local-filesystem';
 import {
   RemoteFilesystemProvider,
   type RemoteFilesystem,
@@ -107,6 +107,11 @@ function assertWithinRoot(root: string, target: string, platform: 'local' | 'ssh
   ) throw new Error('文件路径超出当前会话工作目录。');
 }
 
+function normalizedRemotePath(path: string): string {
+  const normalized = posix.normalize(path);
+  return normalized === '/' ? normalized : normalized.replace(/\/+$/u, '');
+}
+
 const WINDOWS_RESERVED_FILE_STEM = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
 
 function assertSafeWindowsPath(root: string, target: string): void {
@@ -130,9 +135,11 @@ function assertBoundRootUnchanged(
   canonicalRoot: string,
   platform: 'local' | 'ssh',
 ): void {
-  const bound = platform === 'ssh' ? posix.normalize(boundRoot) : normalize(resolve(boundRoot));
+  const bound = platform === 'ssh'
+    ? normalizedRemotePath(boundRoot)
+    : normalize(resolve(boundRoot));
   const canonical = platform === 'ssh'
-    ? posix.normalize(canonicalRoot)
+    ? normalizedRemotePath(canonicalRoot)
     : normalize(resolve(canonicalRoot));
   const same = platform === 'local' && process.platform === 'win32'
     ? bound.toLocaleLowerCase('en-US') === canonical.toLocaleLowerCase('en-US')
@@ -140,31 +147,75 @@ function assertBoundRootUnchanged(
   if (!same) throw new Error('绑定的文件访问根目录已被替换或重定向；请关闭后重新授权。');
 }
 
+function assertWorkspaceMatchesSession(
+  transport: 'local' | 'ssh',
+  hostId: string | undefined,
+  workspace: WorkspaceBinding,
+): void {
+  if (transport === 'ssh') {
+    if (workspace.backend !== 'sftp') {
+      throw new Error('SSH Session 的 Workspace backend 必须是 sftp。');
+    }
+    if (!hostId || !workspace.hostId || workspace.hostId !== hostId) {
+      throw new Error('SSH Terminal 与 Workspace 必须绑定到同一 Host。');
+    }
+    return;
+  }
+  if (workspace.backend !== 'local') {
+    throw new Error('本地 Session 的 Workspace backend 必须是 local。');
+  }
+  if (workspace.hostId !== undefined) {
+    throw new Error('本地 Workspace 不能绑定远程 Host。');
+  }
+}
+
+function workspaceRootsMatch(
+  configuredRoot: string,
+  suppliedRoot: string,
+  transport: 'local' | 'ssh',
+): boolean {
+  if (transport === 'ssh') {
+    return normalizedRemotePath(configuredRoot) === normalizedRemotePath(suppliedRoot);
+  }
+  const configured = normalize(resolve(configuredRoot));
+  const supplied = normalize(resolve(suppliedRoot));
+  return process.platform === 'win32'
+    ? configured.toLocaleLowerCase('en-US') === supplied.toLocaleLowerCase('en-US')
+    : configured === supplied;
+}
+
 export class AgentFileService {
   constructor(
     private readonly terminals: TerminalService,
     private readonly sessions: SessionManager,
     private readonly remoteFilesystems = new RemoteFilesystemProvider(terminals),
+    private readonly localFilesystem: RemoteFilesystem = new LocalFilesystemBackend(),
   ) {}
 
   async bindWorkspaceRoot(owner: WebContents, terminalId: string): Promise<string> {
     const session = this.sessions.sessionForTerminal(owner, terminalId);
     if (!session) throw new Error('文件工具需要正式会话。');
-    if (!session.cwd) throw new Error('当前会话工作目录未知；请先在终端显示一个 Shell 提示符。');
+    const workspace = session.workspace;
+    if (!workspace) throw new Error('请先设置 Workspace Root。');
+    assertWorkspaceMatchesSession(session.transport, session.hostId, workspace);
     if (session.transport === 'ssh') {
-      if (!posix.isAbsolute(session.cwd)) throw new Error('远程会话工作目录必须是绝对路径。');
-      if (!session.hostId) throw new Error('远程会话缺少 Host 绑定。');
+      if (!posix.isAbsolute(workspace.root)) {
+        throw new Error('远程 Workspace Root 必须是绝对路径。');
+      }
       return this.remoteFilesystems.withFilesystem(owner, terminalId, async (filesystem) => {
-        const root = await filesystem.realpath(session.cwd!);
+        const root = await filesystem.realpath(workspace.root);
         const attributes = await filesystem.stat(root);
         if (attributes?.type !== 'directory') {
-          throw new Error('当前会话工作目录不是可访问的目录。');
+          throw new Error('Workspace Root 不是可访问的目录。');
         }
         return root;
-      }, session.hostId);
+      }, workspace.hostId);
     }
-    const root = await realpath(resolve(session.cwd));
-    if (!(await stat(root)).isDirectory()) throw new Error('当前会话工作目录不是可访问的目录。');
+    if (!isAbsolute(workspace.root)) throw new Error('本地 Workspace Root 必须是绝对路径。');
+    const root = await this.localFilesystem.realpath(workspace.root);
+    if ((await this.localFilesystem.stat(root))?.type !== 'directory') {
+      throw new Error('Workspace Root 不是可访问的目录。');
+    }
     return root;
   }
 
@@ -176,16 +227,16 @@ export class AgentFileService {
   ): Promise<AgentFileReadResult> {
     const target = this.resolveTarget(owner, terminalId, requestedPath, workspaceRoot);
     if (target.transport === 'local') {
-      const root = await realpath(target.root);
+      const root = await this.localFilesystem.realpath(target.root);
       assertBoundRootUnchanged(target.root, root, 'local');
-      const path = await realpath(target.requestedPath);
+      const path = await this.localFilesystem.realpath(target.requestedPath);
       assertWithinRoot(root, path, 'local');
-      const attributes = await stat(path);
-      if (!attributes.isFile()) throw new Error('目标不是普通文件。');
+      const attributes = await this.localFilesystem.stat(path);
+      if (attributes?.type !== 'file') throw new Error('目标不是普通文件。');
       if (attributes.size > MAX_AGENT_FILE_BYTES) {
         throw new Error(`文件为 ${attributes.size} 字节，超过 ${MAX_AGENT_FILE_BYTES} 字节读取限制。`);
       }
-      const buffer = await readFile(path);
+      const buffer = await this.localFilesystem.readFile(path);
       if (buffer.length > MAX_AGENT_FILE_BYTES) {
         throw new Error(`文件读取结果为 ${buffer.length} 字节，超过 ${MAX_AGENT_FILE_BYTES} 字节限制。`);
       }
@@ -217,23 +268,16 @@ export class AgentFileService {
   ): Promise<{ path: string; entries: AgentFileListEntry[]; truncated: boolean }> {
     const target = this.resolveTarget(owner, terminalId, requestedPath, workspaceRoot);
     if (target.transport === 'local') {
-      const root = await realpath(target.root);
+      const root = await this.localFilesystem.realpath(target.root);
       assertBoundRootUnchanged(target.root, root, 'local');
-      const path = await realpath(target.requestedPath);
+      const path = await this.localFilesystem.realpath(target.requestedPath);
       assertWithinRoot(root, path, 'local');
-      const { readdir } = await import('node:fs/promises');
-      const entries = await readdir(path, { withFileTypes: true });
+      const entries = await this.localFilesystem.listDirectory(path);
       const limited = entries.slice(0, MAX_AGENT_DIRECTORY_ENTRIES);
-      const mapped = await Promise.all(limited.map(async (entry) => {
-        const entryPath = resolve(path, entry.name);
-        const attributes = await lstat(entryPath);
-        return {
-          name: entry.name,
-          type: entry.isDirectory()
-            ? 'directory' as const
-            : entry.isFile() ? 'file' as const : entry.isSymbolicLink() ? 'symlink' as const : 'other' as const,
-          size: attributes.size,
-        };
+      const mapped = limited.map((entry) => ({
+        name: entry.name,
+        type: entry.stat.type,
+        size: entry.stat.size,
       }));
       return { path, entries: mapped, truncated: entries.length > limited.length };
     }
@@ -255,6 +299,43 @@ export class AgentFileService {
     });
   }
 
+  async statPath(
+    owner: WebContents,
+    terminalId: string,
+    requestedPath: string,
+    workspaceRoot?: string,
+  ): Promise<WorkspaceStatResult> {
+    const target = this.resolveTarget(owner, terminalId, requestedPath, workspaceRoot);
+    if (target.transport === 'local') {
+      const root = await this.localFilesystem.realpath(target.root);
+      assertBoundRootUnchanged(target.root, root, 'local');
+      const path = relative(target.root, target.requestedPath) === ''
+        ? root
+        : resolve(
+          await this.localFilesystem.realpath(dirname(target.requestedPath)),
+          basename(target.requestedPath),
+        );
+      assertWithinRoot(root, path, 'local');
+      const attributes = await this.localFilesystem.lstat(path);
+      if (!attributes) throw new Error(`文件或目录不存在：${requestedPath}`);
+      return { path, ...attributes };
+    }
+    return this.withRemoteFilesystem(owner, terminalId, target, async (filesystem) => {
+      const root = await filesystem.realpath(target.root);
+      assertBoundRootUnchanged(target.root, root, 'ssh');
+      const path = posix.relative(target.root, target.requestedPath) === ''
+        ? root
+        : posix.join(
+          await filesystem.realpath(posix.dirname(target.requestedPath)),
+          posix.basename(target.requestedPath),
+        );
+      assertWithinRoot(root, path, 'ssh');
+      const attributes = await filesystem.lstat(path);
+      if (!attributes) throw new Error(`文件或目录不存在：${requestedPath}`);
+      return { path, ...attributes };
+    });
+  }
+
   async writeText(
     owner: WebContents,
     terminalId: string,
@@ -266,9 +347,9 @@ export class AgentFileService {
     const bytes = boundedContent(content);
     const target = this.resolveTarget(owner, terminalId, requestedPath, workspaceRoot);
     if (target.transport === 'local') {
-      const root = await realpath(target.root);
+      const root = await this.localFilesystem.realpath(target.root);
       assertBoundRootUnchanged(target.root, root, 'local');
-      const parent = await realpath(dirname(target.requestedPath));
+      const parent = await this.localFilesystem.realpath(dirname(target.requestedPath));
       assertWithinRoot(root, parent, 'local');
       const path = resolve(parent, basename(target.requestedPath));
       const current = await this.optionalLocalFile(path);
@@ -367,16 +448,24 @@ export class AgentFileService {
     assertBoundedPath(requestedPath);
     const session = this.sessions.sessionForTerminal(owner, terminalId);
     if (!session) throw new Error('文件工具需要正式会话。');
-    const boundRoot = workspaceRoot ?? session.cwd;
-    if (!boundRoot) throw new Error('当前会话工作目录未知；请先在终端显示一个 Shell 提示符。');
+    const workspace = session.workspace;
+    if (!workspace) throw new Error('请先设置 Workspace Root。');
+    assertWorkspaceMatchesSession(session.transport, session.hostId, workspace);
+    if (
+      workspaceRoot !== undefined
+      && !workspaceRootsMatch(workspace.root, workspaceRoot, session.transport)
+    ) {
+      throw new Error('显式 Workspace Root 与 Session 绑定的 Workspace Root 不一致。');
+    }
+    const boundRoot = workspaceRoot ?? workspace.root;
     if (session.transport === 'ssh') {
       const root = posix.normalize(boundRoot);
-      if (!root.startsWith('/')) throw new Error('远程会话工作目录必须是绝对路径。');
-      if (!session.hostId) throw new Error('远程会话缺少 Host 绑定。');
+      if (!root.startsWith('/')) throw new Error('远程 Workspace Root 必须是绝对路径。');
       const path = posix.resolve(root, requestedPath);
       assertWithinRoot(root, path, 'ssh');
-      return { transport: 'ssh', root, requestedPath: path, hostId: session.hostId };
+      return { transport: 'ssh', root, requestedPath: path, hostId: workspace.hostId! };
     }
+    if (!isAbsolute(boundRoot)) throw new Error('本地 Workspace Root 必须是绝对路径。');
     const root = resolve(boundRoot);
     const path = resolve(root, requestedPath);
     assertWithinRoot(root, path, 'local');

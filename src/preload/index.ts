@@ -66,6 +66,12 @@ const hostBridge: DesktopBridge['hosts'] = {
 const sessionBridge: DesktopBridge['sessions'] = {
   list: (hostId) => ipcRenderer.invoke(SESSION_CHANNELS.list, hostId),
   upgrade: (request) => ipcRenderer.invoke(SESSION_CHANNELS.upgrade, request),
+  setWorkspace: (request) => ipcRenderer.invoke(SESSION_CHANNELS.setWorkspace, request),
+  clearWorkspace: (request) => ipcRenderer.invoke(SESSION_CHANNELS.clearWorkspace, request),
+  chooseLocalWorkspace: (request) => ipcRenderer.invoke(
+    SESSION_CHANNELS.chooseLocalWorkspace,
+    request,
+  ),
   rename: (request) => ipcRenderer.invoke(SESSION_CHANNELS.rename, request),
   readTerminalHistory: (sessionId) => ipcRenderer.invoke(
     SESSION_CHANNELS.readTerminalHistory,

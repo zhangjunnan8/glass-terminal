@@ -79,6 +79,7 @@ export interface SessionAuditEvent {
     | 'session_renamed'
     | 'session_reconnected'
     | 'session_disconnected'
+    | 'workspace_changed'
     | 'provider_changed'
     | 'command_requested'
     | 'command_approved'
@@ -98,6 +99,15 @@ export interface SessionAuditEvent {
 }
 
 export interface UpgradeSessionRequest {
+  terminalId: string;
+}
+
+export interface SetWorkspaceRequest {
+  terminalId: string;
+  root: string;
+}
+
+export interface ClearWorkspaceRequest {
   terminalId: string;
 }
 
@@ -133,6 +143,9 @@ export interface SessionHistoryDetail {
 export const SESSION_CHANNELS = {
   list: 'session:list',
   upgrade: 'session:upgrade-terminal',
+  setWorkspace: 'session:set-workspace',
+  clearWorkspace: 'session:clear-workspace',
+  chooseLocalWorkspace: 'session:choose-local-workspace',
   rename: 'session:rename',
   readTerminalHistory: 'session:read-terminal-history',
   readHistoryDetail: 'session:read-history-detail',

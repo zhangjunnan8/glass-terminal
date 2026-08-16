@@ -13,7 +13,7 @@
 
 - 默认 `off`；可按当前 Generic Agent Session 选择 `read-only` 或 `read-write`。
 - `read-write` 需要界面二次确认；权限不会跨应用重启持久化。
-- 授权时将正式 Session 的规范化 `cwd` 固定为根。之后终端切换目录不会扩大文件权限。
+- 授权时仅使用正式 Session 显式设置且规范化后的 `workspace.root`；不会从 `cwd` 推断。之后终端切换目录不会改变或扩大文件权限。
 - 本地文件使用 Node 文件 API；SSH 文件使用该可见终端现有 SSH Client 的 SFTP subsystem，不创建第二个 SSH 连接。
 - 路径穿越、越界符号链接、被替换的授权根、Windows 设备名/备用数据流都会被拒绝。
 - 覆盖现有文件必须携带最近一次读取返回的 SHA-256；修改使用临时文件和原子发布。

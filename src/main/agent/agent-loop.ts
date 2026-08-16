@@ -113,6 +113,16 @@ const FILE_READ_TOOLS: AgentToolDefinition[] = [
       additionalProperties: false,
     },
   },
+  {
+    name: 'file_stat',
+    description: 'Inspect one file, directory, or symbolic link inside the bound Session root without reading its contents or running a shell command.',
+    parameters: {
+      type: 'object',
+      required: ['path'],
+      properties: { path: { type: 'string', minLength: 1, maxLength: 4_096 } },
+      additionalProperties: false,
+    },
+  },
 ];
 
 const FILE_WRITE_TOOLS: AgentToolDefinition[] = [
@@ -160,7 +170,13 @@ const FILE_WRITE_TOOLS: AgentToolDefinition[] = [
   },
 ];
 
-const FILE_TOOL_NAMES = new Set(['file_list', 'file_read', 'file_patch', 'file_write']);
+const FILE_TOOL_NAMES = new Set([
+  'file_list',
+  'file_read',
+  'file_stat',
+  'file_patch',
+  'file_write',
+]);
 const FILE_WRITE_TOOL_NAMES = new Set(['file_patch', 'file_write']);
 const MAX_FILE_READ_BYTES_PER_TURN = 2 * 1024 * 1024;
 
@@ -344,6 +360,17 @@ export class AgentLoop {
         }
         const result = await this.gateway.workspace.readFile(args.path);
         return consumeFileResultBudget(JSON.stringify({ ok: true, ...result }), fileReadBudget);
+      }
+      case 'file_stat': {
+        if (fileAccessMode === 'off') throw new Error('file_stat is disabled.');
+        if (!this.gateway.workspace) throw new Error('file_stat is disabled.');
+        if (typeof args.path !== 'string' || !args.path || args.path.length > 4_096) {
+          throw new Error('file_stat requires a valid path.');
+        }
+        return consumeFileResultBudget(
+          JSON.stringify({ ok: true, ...await this.gateway.workspace.stat(args.path) }),
+          fileReadBudget,
+        );
       }
       case 'file_write': {
         if (fileAccessMode !== 'read-write') throw new Error('file_write requires read-write access.');

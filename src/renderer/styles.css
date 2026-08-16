@@ -342,7 +342,28 @@ button { border: 0; }
 .prompt-path { color: #aebbd0; }
 .cursor { display: inline-block; width: 7px; height: 15px; margin-left: 3px; vertical-align: -3px; background: #c5d1df; animation: blink 1.1s steps(2, start) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
-.terminal-statusbar { justify-content: flex-end; gap: 16px; border-top: 1px solid #141c27; background: #0d131c; }
+.terminal-statusbar { gap: 12px; border-top: 1px solid #141c27; background: #0d131c; }
+.terminal-status-meta, .terminal-workspace-binding { display: flex; min-width: 0; align-items: center; gap: 9px; }
+.terminal-status-meta { flex: 0 0 auto; }
+.terminal-workspace-binding { flex: 1; }
+.terminal-workspace-binding code {
+  max-width: min(42vw, 520px);
+  overflow: hidden;
+  color: #8fa3bb;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.terminal-workspace-binding button {
+  min-height: 24px;
+  padding: 2px 7px;
+  color: #9cabbf;
+  border: 1px solid #2b394b;
+  border-radius: 3px;
+  background: #141e2a;
+  cursor: pointer;
+  font: 11px system-ui, sans-serif;
+}
+.terminal-workspace-binding button:disabled { cursor: not-allowed; opacity: .45; }
 
 .agent-panel { grid-area: agent; display: flex; min-width: 0; position: relative; flex-direction: column; border-left: 1px solid #202a38; background: #0f1620; }
 .agent-panel-resizer { position: absolute; z-index: 40; top: 0; bottom: 0; left: -5px; width: 10px; outline: 0; cursor: col-resize; touch-action: none; }
@@ -471,10 +492,12 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .sftp-drawer > header small { margin-top: 2px; color: #8291a5; font-size: 12px; }
 .sftp-drawer > header button { min-width: 36px; min-height: 36px; color: #8b9aaf; background: transparent; cursor: pointer; font-size: 22px; }
 .sftp-unavailable, .sftp-loading, .transfer-empty { padding: 24px 16px; color: #8291a5; font-size: 14px; line-height: 1.55; }
-.sftp-pathbar { display: grid; grid-template-columns: auto minmax(110px, 1fr) auto auto auto; gap: 6px; padding: 10px; border-bottom: 1px solid #1f2a39; }
+.sftp-pathbar { display: grid; grid-template-columns: auto minmax(110px, 1fr) auto auto auto auto; gap: 6px; padding: 10px; border-bottom: 1px solid #1f2a39; }
 .sftp-pathbar input { min-width: 0; padding: 7px 8px; color: #bdc9d9; border: 1px solid #2a394c; border-radius: 3px; outline: 0; background: #090f17; font: 13px "Cascadia Mono", Consolas, monospace; }
 .sftp-pathbar input:focus { border-color: #438a78; }
 .sftp-pathbar button, .sftp-download, .transfer-job button { min-height: 34px; padding: 6px 8px; color: #a9b6c7; border: 1px solid #2a394c; border-radius: 3px; background: #151f2c; cursor: pointer; font-size: 13px; }
+.sftp-pathbar button:disabled { cursor: not-allowed; opacity: .48; }
+.sftp-pathbar .sftp-workspace.active { color: #75d9bb; border-color: #397a67; background: #10261f; }
 .sftp-pathbar .sftp-upload { color: #08130f; border-color: #5ac6a5; background: #5ac6a5; font-weight: 700; }
 .sftp-error { padding: 9px 11px; color: #f19aa0; border-bottom: 1px solid #4a252c; background: #251319; font-size: 13px; }
 .sftp-file-list { min-height: 140px; flex: 1; overflow-y: auto; }
@@ -885,6 +908,12 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .app-shell[data-theme="light"] .terminal-stack { background: #ffffff; }
 .app-shell[data-theme="light"] .terminal-pane .xterm-viewport { scrollbar-color: #b8c1cd #ffffff; }
 .app-shell[data-theme="light"] .terminal-statusbar { background: #f4f6f9; }
+.app-shell[data-theme="light"] .terminal-workspace-binding code { color: #516077; }
+.app-shell[data-theme="light"] .terminal-workspace-binding button {
+  color: #405065;
+  border-color: #c7d0db;
+  background: #eef1f5;
+}
 .app-shell[data-theme="light"] .terminal-placeholder { color: #465368; }
 .app-shell[data-theme="light"] .agent-panel { background: #f7f9fb; }
 .app-shell[data-theme="light"] .agent-header { border-color: #d4dae3; }
@@ -1054,6 +1083,11 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
   color: #ffffff;
   border-color: #16856d;
   background: #16856d;
+}
+.app-shell[data-theme="light"] .sftp-pathbar .sftp-workspace.active {
+  color: #096b58;
+  border-color: #8bc7b8;
+  background: #e4f5f0;
 }
 .app-shell[data-theme="light"] .sftp-entry,
 .app-shell[data-theme="light"] .transfer-job { border-color: #e0e5ec; }

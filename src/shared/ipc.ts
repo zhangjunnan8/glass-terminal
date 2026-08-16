@@ -17,9 +17,11 @@ import type {
   TerminalExitEvent,
 } from './terminal';
 import type {
+  ClearWorkspaceRequest,
   DeleteSessionRequest,
   ReadSessionHistoryDetailRequest,
   RenameSessionRequest,
+  SetWorkspaceRequest,
   SessionHistoryDetail,
   SessionRecord,
   UpgradeSessionRequest,
@@ -94,6 +96,9 @@ export interface DesktopBridge {
   sessions: {
     list(hostId?: string): Promise<SessionRecord[]>;
     upgrade(request: UpgradeSessionRequest): Promise<SessionRecord>;
+    setWorkspace(request: SetWorkspaceRequest): Promise<SessionRecord>;
+    clearWorkspace(request: ClearWorkspaceRequest): Promise<SessionRecord>;
+    chooseLocalWorkspace(request: UpgradeSessionRequest): Promise<SessionRecord | null>;
     rename(request: RenameSessionRequest): Promise<SessionRecord>;
     readTerminalHistory(sessionId: string): Promise<string>;
     readHistoryDetail(request: ReadSessionHistoryDetailRequest): Promise<SessionHistoryDetail>;

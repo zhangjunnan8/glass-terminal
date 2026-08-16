@@ -73,8 +73,8 @@ export class AgentFileWorkspaceAdapter implements WorkspaceTool {
     throw new Error('workspace_glob is not implemented by the compatibility backend.');
   }
 
-  async stat(): Promise<never> {
-    throw new Error('workspace_stat is not implemented by the compatibility backend.');
+  stat(path: string) {
+    return this.files.statPath(this.owner, this.terminalId, path, this.binding.root);
   }
 
   async mkdir(): Promise<never> {

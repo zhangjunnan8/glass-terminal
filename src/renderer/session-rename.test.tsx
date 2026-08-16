@@ -12,7 +12,29 @@ vi.mock('./components/TerminalPane', () => ({
 }));
 
 vi.mock('./components/SftpDrawer', () => ({
-  SftpDrawer: () => null,
+  SftpDrawer: ({
+    terminal,
+    workspaceRoot,
+    onSetWorkspace,
+    onClose,
+  }: {
+    terminal: { id: string } | null;
+    workspaceRoot?: string;
+    onSetWorkspace?(terminalId: string, path: string): Promise<void> | void;
+    onClose(): void;
+  }) => (
+    <aside data-testid="mock-sftp-drawer" data-workspace-root={workspaceRoot ?? ''}>
+      <button
+        type="button"
+        data-action="mock-set-sftp-workspace"
+        disabled={!onSetWorkspace}
+        onClick={() => {
+          if (terminal) void onSetWorkspace?.(terminal.id, '/srv/project');
+        }}
+      >设为工作区</button>
+      <button type="button" onClick={onClose}>关闭</button>
+    </aside>
+  ),
 }));
 
 const now = '2026-08-15T00:00:00.000Z';
@@ -103,6 +125,9 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
     sessions: {
       list: vi.fn().mockResolvedValue([session]),
       upgrade: vi.fn(),
+      setWorkspace: vi.fn().mockResolvedValue(session),
+      clearWorkspace: vi.fn().mockResolvedValue(session),
+      chooseLocalWorkspace: vi.fn().mockResolvedValue(null),
       rename,
       readTerminalHistory: vi.fn(),
       readHistoryDetail: vi.fn(),
@@ -290,6 +315,81 @@ describe('renderer host and session dialogs', () => {
     )!.click());
     expect(shell.dataset.agentPanelVisible).toBe('true');
     expect(container.querySelector('.agent-panel')).not.toBeNull();
+  });
+
+  it('sets an SSH workspace from the SFTP drawer, upserts the Session binding, and clears it', async () => {
+    const bridge = bridgeWith(vi.fn());
+    const withWorkspace: SessionRecord = {
+      ...session,
+      workspace: { backend: 'sftp', root: '/srv/project', hostId: host.id },
+    };
+    vi.mocked(bridge.sessions.list).mockResolvedValue([]);
+    vi.mocked(bridge.sessions.setWorkspace).mockResolvedValue(withWorkspace);
+    vi.mocked(bridge.sessions.clearWorkspace).mockResolvedValue({
+      ...withWorkspace,
+      workspace: undefined,
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    const binding = container.querySelector<HTMLElement>('[data-testid="terminal-workspace-binding"]')!;
+    expect(binding.textContent).toContain('未设置');
+    expect(container.querySelector('.terminal-status-meta')?.textContent).toContain('临时终端');
+
+    const choose = container.querySelector<HTMLButtonElement>('[data-action="choose-workspace"]')!;
+    expect(choose.getAttribute('aria-label')).toBe('选择远程工作区');
+    await act(async () => choose.click());
+    const setFromSftp = container.querySelector<HTMLButtonElement>(
+      '[data-action="mock-set-sftp-workspace"]',
+    )!;
+    await act(async () => setFromSftp.click());
+    await settle();
+
+    expect(bridge.sessions.setWorkspace).toHaveBeenCalledWith({
+      terminalId: 'terminal-1',
+      root: '/srv/project',
+    });
+    expect(binding.textContent).toContain('/srv/project');
+    expect(container.querySelector('.terminal-status-meta')?.textContent).toContain('正式会话');
+    expect(container.querySelector('[data-testid="mock-sftp-drawer"]')?.getAttribute(
+      'data-workspace-root',
+    )).toBe('/srv/project');
+
+    await act(async () => container.querySelector<HTMLButtonElement>(
+      '[data-action="clear-workspace"]',
+    )!.click());
+    await settle();
+    expect(bridge.sessions.clearWorkspace).toHaveBeenCalledWith({ terminalId: 'terminal-1' });
+    expect(binding.textContent).toContain('未设置');
+  });
+
+  it('uses the local directory chooser and leaves state unchanged when it is cancelled', async () => {
+    const bridge = bridgeWith(vi.fn());
+    vi.mocked(bridge.sessions.list).mockResolvedValue([]);
+    vi.mocked(bridge.terminal.create).mockResolvedValue({
+      id: 'terminal-1',
+      title: 'PowerShell',
+      profileId: 'shell-1',
+      shellKind: 'powershell',
+      transport: 'local',
+    });
+    vi.mocked(bridge.sessions.chooseLocalWorkspace).mockResolvedValue(null);
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    const choose = container.querySelector<HTMLButtonElement>('[data-action="choose-workspace"]')!;
+    expect(choose.getAttribute('aria-label')).toBe('选择本地工作区');
+    await act(async () => choose.click());
+    await settle();
+
+    expect(bridge.sessions.chooseLocalWorkspace).toHaveBeenCalledWith({
+      terminalId: 'terminal-1',
+    });
+    expect(container.querySelector('[data-testid="terminal-workspace-binding"]')?.textContent)
+      .toContain('未设置');
+    expect(container.querySelector('.terminal-status-meta')?.textContent).toContain('临时终端');
   });
 
   it('requires an unsaved password and leaves credential saving unchecked by default', async () => {
