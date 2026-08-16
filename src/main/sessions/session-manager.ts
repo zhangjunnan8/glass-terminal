@@ -24,7 +24,19 @@ import {
   ShellContextTracker,
 } from './session-context';
 import { conversationPreview, plainTerminalPreview } from './session-history';
-import { SessionStore } from './session-store';
+import {
+  SessionStore,
+  type SessionStorageProtection,
+} from './session-store';
+import type {
+  WorkspaceDiffArtifact,
+  WorkspaceOperationHandle,
+  WorkspaceOperationIntent,
+  WorkspaceOperationOutcome,
+  WorkspaceOperationRecord,
+  WorkspaceOperationRecovery,
+  WorkspaceOperationSource,
+} from './workspace-operation-journal';
 
 export class SessionManager {
   private readonly removeJournalListener: () => void;
@@ -265,8 +277,13 @@ export class SessionManager {
     await this.store.remove(session.id);
   }
 
-  bindAgentThread(sessionId: string, providerId: string, threadId: string): SessionRecord {
-    return this.store.bindAgentThread(sessionId, providerId, threadId);
+  bindAgentThread(
+    sessionId: string,
+    providerId: string,
+    threadId: string,
+    backendFingerprint: string,
+  ): SessionRecord {
+    return this.store.bindAgentThread(sessionId, providerId, threadId, backendFingerprint);
   }
 
   bindAgentBackendThread(
@@ -304,6 +321,34 @@ export class SessionManager {
     details: Record<string, unknown>,
   ): void {
     this.store.appendAudit(sessionId, type, actor, details);
+  }
+
+  beginWorkspaceOperation(
+    sessionId: string,
+    intent: WorkspaceOperationIntent,
+    diff?: WorkspaceDiffArtifact,
+    source?: WorkspaceOperationSource,
+  ): WorkspaceOperationHandle {
+    return this.store.beginWorkspaceOperation(sessionId, intent, diff, source);
+  }
+
+  finishWorkspaceOperation(
+    handle: WorkspaceOperationHandle,
+    outcome: WorkspaceOperationOutcome,
+  ): void {
+    this.store.finishWorkspaceOperation(handle, outcome);
+  }
+
+  readWorkspaceOperations(sessionId: string): WorkspaceOperationRecord[] {
+    return this.store.readWorkspaceOperations(sessionId);
+  }
+
+  recoverWorkspaceOperations(sessionId: string): WorkspaceOperationRecovery[] {
+    return this.store.recoverWorkspaceOperations(sessionId);
+  }
+
+  workspaceStorageProtection(sessionId: string): SessionStorageProtection {
+    return this.store.workspaceStorageProtection(sessionId);
   }
 
   close(): void {

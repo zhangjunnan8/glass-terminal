@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { WebContents } from 'electron';
 import {
   AGENT_CHANNELS,
@@ -9,6 +9,7 @@ import type {
   AgentBackendRef,
   AgentChatItem,
   AgentFileAccessMode,
+  AgentFileAccessPolicy,
   AgentRuntimeState,
   AgentSessionView,
   CommandActor,
@@ -63,6 +64,11 @@ interface ApprovalResolution {
 interface AgentRuntimeRecord extends AgentSessionView {
   owner: WebContents;
   ownerId: number;
+  fileAccessPolicy: AgentFileAccessPolicy;
+  fileAccessGeneration: number;
+  providerFingerprint?: string;
+  providerReady?: boolean;
+  providerConversationResetPending?: boolean;
   priorMessages: AgentMessage[];
   harnessBackend?: AgentBackend;
   harnessThread?: AgentBackendThread;
@@ -89,10 +95,189 @@ const BUSY_STATES = new Set<AgentRuntimeState>([
   'TAKEOVER_PENDING',
 ]);
 
+const MAX_FILE_ACCESS_PATHS = 16;
+
+function disabledFileAccessPolicy(): AgentFileAccessPolicy {
+  return {
+    read: false,
+    write: false,
+    create: false,
+    delete: false,
+    readablePaths: [],
+    writablePaths: [],
+    fullAccess: false,
+  };
+}
+
+function cloneFileAccessPolicy(policy: AgentFileAccessPolicy): AgentFileAccessPolicy {
+  return {
+    ...policy,
+    readablePaths: [...policy.readablePaths],
+    writablePaths: [...policy.writablePaths],
+  };
+}
+
+function providerFingerprint(profile: ProviderProfile): string {
+  return createHash('sha256').update(JSON.stringify([
+    profile.id,
+    profile.kind,
+    profile.baseUrl,
+    profile.modelId,
+    profile.recipientRevision,
+  ])).digest('hex');
+}
+
+function stringSetContains(
+  container: readonly string[],
+  candidate: readonly string[],
+  caseInsensitive: boolean,
+): boolean {
+  const values = new Set(container.map((value) => (
+    caseInsensitive ? value.toLocaleLowerCase('en-US') : value
+  )));
+  return candidate.every((value) => values.has(
+    caseInsensitive ? value.toLocaleLowerCase('en-US') : value,
+  ));
+}
+
+/** Conservative capability comparison: false means audit-before-commit. */
+function fileAccessPolicyIsSubset(
+  candidate: AgentFileAccessPolicy,
+  current: AgentFileAccessPolicy,
+  caseInsensitivePaths: boolean,
+): boolean {
+  for (const capability of ['read', 'write', 'create', 'delete'] as const) {
+    if (candidate[capability] && !current[capability]) return false;
+  }
+  if (candidate.fullAccess) return current.fullAccess;
+  if (current.fullAccess) return true;
+  return stringSetContains(
+    current.readablePaths,
+    candidate.readablePaths,
+    caseInsensitivePaths,
+  ) && stringSetContains(
+    current.writablePaths,
+    candidate.writablePaths,
+    caseInsensitivePaths,
+  );
+}
+
+function legacyFileAccessPolicy(
+  mode: AgentFileAccessMode,
+  workspaceRoot?: string,
+): AgentFileAccessPolicy {
+  if (mode === 'off') return disabledFileAccessPolicy();
+  if (!workspaceRoot) throw new Error('请先设置 Workspace Root。');
+  if (mode === 'read-only') {
+    return {
+      ...disabledFileAccessPolicy(),
+      read: true,
+      readablePaths: [workspaceRoot],
+    };
+  }
+  if (mode === 'full-access') {
+    return {
+      read: true,
+      write: true,
+      create: true,
+      delete: true,
+      readablePaths: [],
+      writablePaths: [],
+      fullAccess: true,
+    };
+  }
+  return {
+    read: true,
+    write: true,
+    create: true,
+    delete: true,
+    readablePaths: [workspaceRoot],
+    writablePaths: [workspaceRoot],
+    fullAccess: false,
+  };
+}
+
+function parseRequestedFileAccessPolicy(
+  mode: AgentFileAccessMode,
+  value: unknown,
+  workspaceRoot?: string,
+): AgentFileAccessPolicy {
+  if (value === undefined) return legacyFileAccessPolicy(mode, workspaceRoot);
+  if (!value || typeof value !== 'object') throw new Error('文件访问策略无效。');
+  const candidate = value as Partial<AgentFileAccessPolicy>;
+  for (const capability of ['read', 'write', 'create', 'delete', 'fullAccess'] as const) {
+    if (typeof candidate[capability] !== 'boolean') throw new Error('文件访问策略能力无效。');
+  }
+  if (!Array.isArray(candidate.readablePaths) || !Array.isArray(candidate.writablePaths)) {
+    throw new Error('文件访问策略路径无效。');
+  }
+  if (
+    candidate.readablePaths.length > MAX_FILE_ACCESS_PATHS
+    || candidate.writablePaths.length > MAX_FILE_ACCESS_PATHS
+    || [...candidate.readablePaths, ...candidate.writablePaths].some((path) => (
+      typeof path !== 'string' || !path || path.length > 4_096 || path.includes('\0')
+    ))
+  ) throw new Error(`文件访问策略每类最多允许 ${MAX_FILE_ACCESS_PATHS} 个有效路径。`);
+  const policy: AgentFileAccessPolicy = {
+    read: candidate.read!,
+    write: candidate.write!,
+    create: candidate.create!,
+    delete: candidate.delete!,
+    readablePaths: [...candidate.readablePaths],
+    writablePaths: [...candidate.writablePaths],
+    fullAccess: candidate.fullAccess!,
+  };
+  const mutationsEnabled = policy.write || policy.create || policy.delete;
+  if (mode === 'off') {
+    if (
+      policy.read || mutationsEnabled || policy.fullAccess
+      || policy.readablePaths.length || policy.writablePaths.length
+    ) throw new Error('关闭模式不能携带文件访问能力。');
+  } else if (mode === 'read-only') {
+    if (!policy.read || mutationsEnabled || policy.fullAccess || policy.writablePaths.length) {
+      throw new Error('只读模式不能授予写入、创建、删除或 Full Access。');
+    }
+  } else if (mode === 'read-write') {
+    if (policy.fullAccess) throw new Error('读写绑定根模式不能启用 Full Access。');
+  } else if (
+    !policy.fullAccess
+    || !policy.read
+    || !policy.write
+    || !policy.create
+    || !policy.delete
+    || policy.readablePaths.length
+    || policy.writablePaths.length
+  ) {
+    throw new Error('Full Access 必须显式授予全部文件能力且不使用路径范围。');
+  }
+  if (policy.read && !policy.fullAccess && !policy.readablePaths.length) {
+    throw new Error('读取能力至少需要一个 Readable Path。');
+  }
+  if (mutationsEnabled && !policy.fullAccess && !policy.writablePaths.length) {
+    throw new Error('写入、创建或删除能力至少需要一个 Writable Path。');
+  }
+  if (!policy.read && policy.readablePaths.length) {
+    throw new Error('未授予读取能力时不能配置 Readable Paths。');
+  }
+  if (!mutationsEnabled && policy.writablePaths.length) {
+    throw new Error('未授予修改能力时不能配置 Writable Paths。');
+  }
+  return policy;
+}
+
+function sameWorkspaceBinding(
+  left: WorkspaceBinding | undefined,
+  right: WorkspaceBinding | undefined,
+): boolean {
+  return left?.backend === right?.backend
+    && left?.root === right?.root
+    && left?.hostId === right?.hostId;
+}
+
 const SYSTEM_PROMPT = `You are the AI agent inside AI Terminal.
 You and the human operate the exact same visible terminal session. Use only the provided tools.
 Never invent command output. Read terminal state/history when needed, request one clear command at a time, inspect its structured result, and continue until the user's goal is handled.
-Every command must use terminal_execute so it appears in the visible terminal. Workspace tools, when explicitly enabled, operate directly inside the explicit Workspace Root and must never be emulated with a hidden shell. Use workspace_list, workspace_search, workspace_glob, and workspace_read_file for discovery, then prefer small workspace_apply_patch calls for edits; never use terminal cat/grep/sed/echo to emulate file tools or dump an entire repository.
+Every command must use terminal_execute so it appears in the visible terminal. Workspace tools, when explicitly enabled, operate only in their authorized filesystem scopes; relative paths start at the explicit Workspace Root. They must never be emulated with a hidden shell. Use workspace_list, workspace_search, workspace_glob, and workspace_read_file for discovery, then prefer small workspace_apply_patch calls for edits; never use terminal cat/grep/sed/echo to emulate file tools or dump an entire repository.
 Do not ask the user to send passwords, API keys, passphrases, OTPs, or other credentials through chat. Authentication is entered by the user directly in the visible terminal.
 Commands require explicit user approval unless the UI reports that Full Takeover is active.`;
 
@@ -108,6 +293,7 @@ function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
     terminalInputMode: runtime.terminalInputMode,
     fullTakeover: runtime.fullTakeover,
     fileAccessMode: runtime.fileAccessMode,
+    fileAccessPolicy: cloneFileAccessPolicy(runtime.fileAccessPolicy),
     fileAccessRoot: runtime.fileAccessRoot,
     messages: runtime.messages.map((message) => ({ ...message })),
     activities: runtime.activities.map((activity) => ({ ...activity })),
@@ -146,37 +332,6 @@ interface ReplayedConversation {
 }
 
 const MAX_CODEX_RESEEDED_HISTORY_CHARS = 24_000;
-const MAX_MUTATION_AUDIT_RESULT_CHARS = 256 * 1024;
-
-function mutationAuditDetails(result: string | undefined): {
-  path: string;
-  sha256: string;
-  bytes: number;
-} | undefined {
-  if (!result || result.length > MAX_MUTATION_AUDIT_RESULT_CHARS) return undefined;
-  try {
-    const completed = JSON.parse(result) as Record<string, unknown>;
-    if (
-      completed.ok !== true
-      || typeof completed.path !== 'string'
-      || !completed.path
-      || completed.path.length > 4_096
-      || /[\u0000-\u001F\u007F]/u.test(completed.path)
-      || typeof completed.sha256 !== 'string'
-      || !/^[a-f0-9]{64}$/iu.test(completed.sha256)
-      || typeof completed.bytes !== 'number'
-      || !Number.isSafeInteger(completed.bytes)
-      || completed.bytes < 0
-    ) return undefined;
-    return {
-      path: completed.path,
-      sha256: completed.sha256,
-      bytes: completed.bytes,
-    };
-  } catch {
-    return undefined;
-  }
-}
 
 function codexPromptWithLocalHistory(
   messages: AgentChatItem[],
@@ -343,6 +498,10 @@ export class AgentService {
     }
 
     const runtime = this.ensureRuntime(owner, request.terminalId, backend);
+    if (this.revokeChangedProviderAuthority(runtime)) {
+      this.emit(runtime);
+      throw new Error('Provider 配置已变化；旧对话未发送，请重新提交本轮请求。');
+    }
     this.addChat(runtime, 'user', prompt);
     return this.startPersistedPrompt(runtime, prompt);
   }
@@ -378,7 +537,7 @@ export class AgentService {
           applied: Boolean(interrupted),
         });
         this.emit(runtime);
-        return cloneView(runtime);
+        return this.cloneRuntime(runtime);
       }
       const paused = this.takeover(owner, { terminalId: request.terminalId }, 'user');
       if (!paused.pendingTakeover) return paused;
@@ -429,7 +588,7 @@ export class AgentService {
         interruptedRuntime.backendTurnDraining = true;
         this.emit(interruptedRuntime);
       });
-    return cloneView(runtime);
+    return this.cloneRuntime(runtime);
   }
 
   handleCodexAppServerRestarted(): void {
@@ -511,7 +670,7 @@ export class AgentService {
       return this.startPersistedPrompt(runtime, replacement);
     }
     this.emit(runtime);
-    return cloneView(runtime);
+    return this.cloneRuntime(runtime);
   }
 
   getState(owner: WebContents, terminalId: string): AgentSessionView | null {
@@ -526,7 +685,7 @@ export class AgentService {
       runtime = this.ensureRuntime(owner, terminalId, persistedBackend);
     }
     if (runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
-    return cloneView(runtime);
+    return this.cloneRuntime(runtime);
   }
 
   /**
@@ -555,36 +714,155 @@ export class AgentService {
     owner: WebContents,
     request: SetAgentFileAccessRequest,
   ): Promise<AgentSessionView> {
-    if (!(['off', 'read-only', 'read-write'] as AgentFileAccessMode[]).includes(request.mode)) {
+    if (!(
+      ['off', 'read-only', 'read-write', 'full-access'] as AgentFileAccessMode[]
+    ).includes(request.mode)) {
       throw new Error('未知的文件访问模式。');
     }
+    if (request.mode === 'full-access' && request.fullAccessConfirmed !== true) {
+      throw new Error('Full Filesystem Access 需要用户显式确认。');
+    }
+    const existing = this.runtimes.get(request.terminalId);
+    if (existing && existing.ownerId !== owner.id) throw new Error('Agent Session not found.');
+    if (existing && (BUSY_STATES.has(existing.state) || existing.backendTurnDraining)) {
+      throw new Error('智能体运行时不能更改文件访问权限。');
+    }
+
+    if (request.mode === 'off') {
+      const backend = this.genericBackendReference(request.backend);
+      const runtime = existing ?? this.ensureRuntime(owner, request.terminalId, backend);
+      if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
+        throw new Error('Codex 原生模式不使用 Generic Provider 文件工具。');
+      }
+      parseRequestedFileAccessPolicy('off', request.policy);
+      this.revokeChangedProviderAuthority(runtime);
+      runtime.fileAccessGeneration += 1;
+      const hadFileAccess = runtime.fileAccessMode !== 'off';
+      runtime.fileAccessMode = 'off';
+      runtime.fileAccessPolicy = disabledFileAccessPolicy();
+      runtime.fileAccessRoot = undefined;
+      runtime.error = undefined;
+      if (hadFileAccess) {
+        this.appendControlAudit(runtime, 'file_permission_changed', 'user', {
+          mode: 'off',
+          root: undefined,
+          policy: disabledFileAccessPolicy(),
+          ephemeral: true,
+        });
+      }
+      this.emit(runtime);
+      return this.cloneRuntime(runtime);
+    }
+
     const backend = this.selectBackend(request.backend);
     if (backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
       throw new Error('Codex 原生模式不使用 Generic Provider 文件工具。');
     }
-    const existing = this.runtimes.get(request.terminalId);
-    if (existing && (BUSY_STATES.has(existing.state) || existing.backendTurnDraining)) {
-      throw new Error('智能体运行时不能更改文件访问权限。');
+    const sessionBefore = this.sessions.sessionForTerminal(owner, request.terminalId);
+    const workspaceBefore = sessionBefore?.workspace
+      ? { ...sessionBefore.workspace }
+      : undefined;
+    this.assertLiveFileAccessTarget(owner, request.terminalId, sessionBefore, existing);
+    if (
+      request.expectedWorkspaceRoot !== undefined
+      && workspaceBefore?.root !== request.expectedWorkspaceRoot
+    ) {
+      throw new Error('Workspace Root 已变化，文件访问权限未修改。');
     }
     const runtime = this.ensureRuntime(owner, request.terminalId, backend);
-    const fileAccessRoot = request.mode === 'off'
-      ? undefined
-      : await this.fileService.bindWorkspaceRoot(owner, request.terminalId);
+    if (this.revokeChangedProviderAuthority(runtime)) {
+      this.emit(runtime);
+      throw new Error('Provider 配置已变化，请重新选择文件访问权限。');
+    }
+    this.assertLiveFileAccessTarget(owner, request.terminalId, sessionBefore, runtime);
+    runtime.fileAccessGeneration += 1;
+    const fileAccessGeneration = runtime.fileAccessGeneration;
+    const fileAccessRoot = await this.fileService.bindWorkspaceRoot(owner, request.terminalId);
+    const requestedPolicy = parseRequestedFileAccessPolicy(
+      request.mode,
+      request.policy,
+      fileAccessRoot,
+    );
+    const canonicalizePaths = async (paths: readonly string[]): Promise<string[]> => {
+      const canonical: string[] = [];
+      const seen = new Set<string>();
+      for (const path of paths) {
+        const resolved = await this.fileService.canonicalizeAccessRoot(
+          owner,
+          request.terminalId,
+          path,
+        );
+        const key = workspaceBefore?.backend === 'local' && process.platform === 'win32'
+          ? resolved.toLocaleLowerCase('en-US')
+          : resolved;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        canonical.push(resolved);
+      }
+      return canonical;
+    };
+    const fileAccessPolicy: AgentFileAccessPolicy = requestedPolicy.fullAccess
+      ? cloneFileAccessPolicy(requestedPolicy)
+      : {
+        ...requestedPolicy,
+        readablePaths: await canonicalizePaths(requestedPolicy.readablePaths),
+        writablePaths: await canonicalizePaths(requestedPolicy.writablePaths),
+      };
+    const sessionAfter = this.sessions.sessionForTerminal(owner, request.terminalId);
     if (
       this.runtimes.get(request.terminalId) !== runtime
+      || runtime.fileAccessGeneration !== fileAccessGeneration
       || BUSY_STATES.has(runtime.state)
       || runtime.backendTurnDraining
+      || runtime.state === 'FAILED'
+      || !sameWorkspaceBinding(workspaceBefore, sessionAfter?.workspace)
     ) throw new Error('智能体状态已变化，文件访问权限未修改。');
-    this.sessions.appendAudit(runtime.sessionId, 'file_permission_changed', 'user', {
+    this.assertLiveFileAccessTarget(owner, request.terminalId, sessionAfter, runtime);
+    if (this.revokeChangedProviderAuthority(runtime)) {
+      this.emit(runtime);
+      throw new Error('Provider 配置已变化，文件访问权限未修改。');
+    }
+    if (runtime.fileAccessGeneration !== fileAccessGeneration) {
+      throw new Error('智能体状态已变化，文件访问权限未修改。');
+    }
+    const auditDetails = {
       mode: request.mode,
       root: fileAccessRoot,
+      policy: cloneFileAccessPolicy(fileAccessPolicy),
       ephemeral: true,
-    });
+    };
+    const narrowsExistingAuthority = fileAccessPolicyIsSubset(
+      fileAccessPolicy,
+      runtime.fileAccessPolicy,
+      workspaceBefore?.backend === 'local' && process.platform === 'win32',
+    ) && (
+      runtime.fileAccessPolicy.fullAccess
+      || runtime.fileAccessRoot === fileAccessRoot
+    );
+    if (!narrowsExistingAuthority) {
+      // Never add authority unless its audit record was durably accepted.
+      this.sessions.appendAudit(
+        runtime.sessionId,
+        'file_permission_changed',
+        'user',
+        auditDetails,
+      );
+    }
     runtime.fileAccessMode = request.mode;
+    runtime.fileAccessPolicy = fileAccessPolicy;
     runtime.fileAccessRoot = fileAccessRoot;
     runtime.error = undefined;
+    if (narrowsExistingAuthority) {
+      // Revocation and strict narrowing are fail-closed even if audit storage is unavailable.
+      this.appendControlAudit(
+        runtime,
+        'file_permission_changed',
+        'user',
+        auditDetails,
+      );
+    }
     this.emit(runtime);
-    return cloneView(runtime);
+    return this.cloneRuntime(runtime);
   }
 
   resolveApproval(owner: WebContents, request: ResolveApprovalRequest): AgentSessionView {
@@ -630,7 +908,7 @@ export class AgentService {
     runtime.resolveApproval = undefined;
     this.emit(runtime);
     resolve({ decision: request.decision, command });
-    return cloneView(runtime);
+    return this.cloneRuntime(runtime);
   }
 
   setFullTakeover(owner: WebContents, request: SetFullTakeoverRequest): AgentSessionView {
@@ -651,7 +929,7 @@ export class AgentService {
         throw new Error('Codex App Server 使用独立内建执行环境，不使用 Full Takeover。');
       }
       runtime.fullTakeover = false;
-      return cloneView(runtime);
+      return this.cloneRuntime(runtime);
     }
     if (
       runtime
@@ -729,7 +1007,7 @@ export class AgentService {
         this.selectBackend(request.backend, request.providerId),
       );
     }
-    if (runtime.fullTakeover === request.enabled) return cloneView(runtime);
+    if (runtime.fullTakeover === request.enabled) return this.cloneRuntime(runtime);
     if (request.enabled) {
       this.sessions.appendAudit(runtime.sessionId, 'full_takeover_changed', 'user', {
         enabled: true,
@@ -742,7 +1020,7 @@ export class AgentService {
       });
     }
     this.emit(runtime);
-    return cloneView(runtime);
+    return this.cloneRuntime(runtime);
   }
 
   takeover(
@@ -754,9 +1032,9 @@ export class AgentService {
     if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
       throw new Error('Codex App Server 不操作用户终端，无需人工接管。');
     }
-    if (runtime.state === 'TAKEOVER_PENDING') return cloneView(runtime);
+    if (runtime.state === 'TAKEOVER_PENDING') return this.cloneRuntime(runtime);
     if (!BUSY_STATES.has(runtime.state) && !runtime.fullTakeover) {
-      return cloneView(runtime);
+      return this.cloneRuntime(runtime);
     }
 
     const partial = runtime.streamingMessageId
@@ -818,7 +1096,7 @@ export class AgentService {
       });
     }
     this.emit(runtime);
-    return cloneView(runtime);
+    return this.cloneRuntime(runtime);
   }
 
   resolveTakeover(owner: WebContents, request: ResolveTakeoverRequest): AgentSessionView {
@@ -853,7 +1131,7 @@ export class AgentService {
       applied,
     });
     this.emit(runtime);
-    return cloneView(runtime);
+    return this.cloneRuntime(runtime);
   }
 
   confirmShellReady(
@@ -882,7 +1160,7 @@ export class AgentService {
       executionId: request.executionId,
     });
     this.emit(runtime);
-    return cloneView(runtime);
+    return this.cloneRuntime(runtime);
   }
 
   closeTerminal(owner: WebContents, terminalId: string): void {
@@ -927,6 +1205,13 @@ export class AgentService {
     const signal = runtime.abortController!.signal;
     let streamedMessage: AgentChatItem | undefined;
     let acceptBackendEvents = true;
+    let turnToolsLive = true;
+    let workspaceTool: AgentFileWorkspaceAdapter | undefined;
+    const closeTurnTools = async (): Promise<void> => {
+      turnToolsLive = false;
+      acceptBackendEvents = false;
+      await workspaceTool?.waitForInFlight();
+    };
     const onEvent = (event: AgentBackendEvent): void => {
       if (!acceptBackendEvents || !this.isCurrentTurn(runtime, token)) return;
       if (event.type === 'tool_started' || event.type === 'tool_completed') {
@@ -936,22 +1221,6 @@ export class AgentService {
           new Date().toISOString(),
         );
         this.emit(runtime);
-      }
-      if (
-        event.type === 'tool_completed'
-        && (
-          event.toolCall?.name === 'workspace_write_file'
-          || event.toolCall?.name === 'workspace_apply_patch'
-          || event.toolCall?.name === 'file_write'
-          || event.toolCall?.name === 'file_patch'
-        )
-      ) {
-        const details = mutationAuditDetails(event.result);
-        if (details) {
-          this.sessions.appendAudit(runtime.sessionId, 'file_modified', 'ai', {
-            ...details,
-          });
-        }
       }
       if (event.type === 'assistant_delta' && event.text) {
         if (!streamedMessage) {
@@ -983,6 +1252,62 @@ export class AgentService {
     try {
       const boundSession = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
       if (!boundSession) throw new Error('当前终端没有可用的正式 Session。');
+      const turnFileAccessGeneration = runtime.fileAccessGeneration;
+      const turnFileAccessRoot = runtime.fileAccessRoot;
+      const turnProviderFingerprint = runtime.providerFingerprint;
+      const turnSessionWorkspace = boundSession.workspace
+        ? { ...boundSession.workspace }
+        : undefined;
+      const turnBindingIsLive = (): boolean => {
+        let currentSession: SessionRecord | undefined;
+        let terminalConnected = false;
+        try {
+          currentSession = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
+          terminalConnected = this.terminals.state(
+            runtime.owner,
+            runtime.terminalId,
+          ).status === 'connected';
+        } catch {
+          // A closed/replaced terminal is a revoked capability, never a reason
+          // to fall back to the immutable Adapter snapshot.
+        }
+        const currentProvider = runtime.backend.kind === 'generic-provider'
+          ? this.providerSecurityState(runtime.backend.providerId)
+          : undefined;
+        const providerStillBound = currentProvider?.ready === true
+          && currentProvider.fingerprint === turnProviderFingerprint;
+        return Boolean(
+          turnToolsLive
+          && this.isCurrentTurn(runtime, token)
+          && providerStillBound
+          && terminalConnected
+          && currentSession
+          && currentSession.id === runtime.sessionId
+          && currentSession.connectionState === 'connected'
+          && currentSession.runtimeTerminalId === runtime.terminalId
+          && currentSession.transport === boundSession.transport
+          && currentSession.hostId === boundSession.hostId
+        );
+      };
+      const assertTerminalToolLive = (): void => {
+        if (!turnBindingIsLive()) {
+          throw new Error('Terminal tool grant is no longer active.');
+        }
+      };
+      const assertWorkspaceToolLive = (): void => {
+        if (
+          !turnBindingIsLive()
+          || runtime.fileAccessGeneration !== turnFileAccessGeneration
+          || runtime.fileAccessRoot !== turnFileAccessRoot
+          || runtime.fileAccessMode === 'off'
+          || !sameWorkspaceBinding(turnSessionWorkspace, this.sessions.sessionForTerminal(
+            runtime.owner,
+            runtime.terminalId,
+          )?.workspace)
+        ) {
+          throw new Error('Workspace tool grant is no longer active.');
+        }
+      };
       const workspace: WorkspaceBinding | undefined = runtime.fileAccessRoot
         ? {
           backend: boundSession.transport === 'ssh' ? 'sftp' : 'local',
@@ -990,10 +1315,15 @@ export class AgentService {
           ...(boundSession.hostId ? { hostId: boundSession.hostId } : {}),
         }
         : boundSession.workspace;
+      const fileToolPermissions = workspacePermissions(
+        runtime.fileAccessMode,
+        workspace,
+        runtime.fileAccessPolicy,
+      );
       const toolContext = buildSessionToolContext(
         { ...boundSession, ...(workspace ? { workspace } : {}) },
         this.terminals.descriptor(runtime.owner, runtime.terminalId),
-        { workspacePermissions: workspacePermissions(runtime.fileAccessMode, workspace) },
+        { workspacePermissions: fileToolPermissions },
       );
       const terminalTool = new SharedTerminalTool({
         context: toolContext,
@@ -1001,13 +1331,16 @@ export class AgentService {
         terminals: this.terminals,
         sessions: this.sessions,
         execute: (command, reason) => this.requestCommand(runtime, token, { command, reason }),
+        assertLive: assertTerminalToolLive,
       });
-      const workspaceTool = workspace
+      workspaceTool = workspace
         ? new AgentFileWorkspaceAdapter(
           this.fileService,
           runtime.owner,
           runtime.terminalId,
           workspace,
+          fileToolPermissions,
+          assertWorkspaceToolLive,
         )
         : undefined;
       const gateway = new SessionToolGateway(toolContext, terminalTool, workspaceTool);
@@ -1055,7 +1388,7 @@ export class AgentService {
         signal,
         onEvent,
       });
-      acceptBackendEvents = false;
+      await closeTurnTools();
       if (!this.isCurrentTurn(runtime, token)) return;
       runtime.priorMessages = result.messages.filter((message) => message.role !== 'system');
       this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
@@ -1076,7 +1409,7 @@ export class AgentService {
       this.setHumanState(runtime, 'COMPLETED', controlLeaseId);
       this.emit(runtime);
     } catch (error) {
-      acceptBackendEvents = false;
+      await closeTurnTools();
       if (!this.isCurrentTurn(runtime, token)) return;
       if (streamedMessage?.content) {
         try { this.persistChatItem(runtime, streamedMessage); } catch { /* preserve original error */ }
@@ -1094,6 +1427,8 @@ export class AgentService {
       runtime.error = error instanceof Error ? error.message : String(error);
       this.setHumanState(runtime, signal.aborted ? 'PAUSED' : 'FAILED', controlLeaseId);
       this.emit(runtime);
+    } finally {
+      await closeTurnTools();
     }
   }
 
@@ -1553,11 +1888,27 @@ export class AgentService {
       ?? (session.providerId
         ? { kind: 'generic-provider' as const, providerId: session.providerId }
         : undefined);
-    const canReuseThread = sameBackend(persistedBackend, backend) && Boolean(session.aiThreadId);
+    const currentProvider = backend.kind === 'generic-provider'
+      ? this.providerSecurityState(backend.providerId)
+      : undefined;
+    const samePersistedBackend = sameBackend(persistedBackend, backend)
+      && Boolean(session.aiThreadId);
+    const canReuseThread = backend.kind === 'generic-provider'
+      ? samePersistedBackend
+        && currentProvider?.fingerprint !== undefined
+        && session.agentBackendFingerprint === currentProvider.fingerprint
+      : samePersistedBackend;
     const threadId = canReuseThread ? session.aiThreadId! : randomUUID();
     if (!canReuseThread) {
       if (backend.kind === 'generic-provider') {
-        this.sessions.bindAgentThread(session.id, backend.providerId, threadId);
+        if (currentProvider?.fingerprint) {
+          this.sessions.bindAgentThread(
+            session.id,
+            backend.providerId,
+            threadId,
+            currentProvider.fingerprint,
+          );
+        }
       } else {
         this.sessions.bindAgentBackendThread(session.id, backend, threadId);
       }
@@ -1579,7 +1930,13 @@ export class AgentService {
       terminalInputMode: 'human',
       fullTakeover: false,
       fileAccessMode: 'off',
+      fileAccessPolicy: disabledFileAccessPolicy(),
+      fileAccessGeneration: 0,
       fileAccessRoot: undefined,
+      providerFingerprint: currentProvider?.fingerprint,
+      providerReady: currentProvider?.ready,
+      providerConversationResetPending: backend.kind === 'generic-provider'
+        && currentProvider?.fingerprint === undefined,
       messages: replayed.messages,
       activities: [],
       priorMessages: replayed.priorMessages,
@@ -1590,6 +1947,118 @@ export class AgentService {
     };
     this.runtimes.set(terminalId, runtime);
     return runtime;
+  }
+
+  private genericBackendReference(
+    requested: AgentBackendRef,
+  ): Extract<AgentBackendRef, { kind: 'generic-provider' }> {
+    if (
+      !requested
+      || requested.kind !== 'generic-provider'
+      || typeof requested.providerId !== 'string'
+      || !requested.providerId.trim()
+    ) {
+      throw new Error('Generic Provider ID 无效。');
+    }
+    return { kind: 'generic-provider', providerId: requested.providerId };
+  }
+
+  private providerSecurityState(providerId: string): {
+    fingerprint?: string;
+    ready: boolean;
+  } {
+    try {
+      const profile = this.providers.get(providerId);
+      return {
+        fingerprint: providerFingerprint(profile),
+        ready: profile.status === 'ready',
+      };
+    } catch {
+      return { ready: false };
+    }
+  }
+
+  /**
+   * Provider profile IDs are mutable records. A changed endpoint/model/key revision
+   * must never inherit the old record's ephemeral filesystem authority.
+   */
+  private revokeChangedProviderAuthority(runtime: AgentRuntimeRecord): boolean {
+    if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) return false;
+    const currentProvider = this.providerSecurityState(runtime.backend.providerId);
+    const currentFingerprint = currentProvider.fingerprint;
+    const fingerprintChanged = currentFingerprint !== runtime.providerFingerprint;
+    const readinessLost = runtime.providerReady === true && !currentProvider.ready;
+    if (!fingerprintChanged && !runtime.providerConversationResetPending && !readinessLost) {
+      runtime.providerReady = currentProvider.ready;
+      return false;
+    }
+    if (fingerprintChanged) {
+      const turnWasActive = BUSY_STATES.has(runtime.state) || runtime.backendTurnDraining;
+      runtime.providerFingerprint = currentFingerprint;
+      runtime.providerReady = currentProvider.ready;
+      runtime.providerConversationResetPending = true;
+      this.invalidateRuntime(runtime, 'provider_changed');
+      runtime.pendingTakeover = undefined;
+      runtime.threadId = randomUUID();
+      runtime.providerThreadId = undefined;
+      runtime.priorMessages = [];
+      runtime.messages = [];
+      runtime.activities = [];
+      runtime.error = 'Provider 接收端、模型或凭据已变化；文件访问权限与旧对话绑定已撤销。';
+      if (turnWasActive) {
+        runtime.state = 'FAILED';
+        runtime.terminalInputMode = 'human';
+      }
+    } else if (readinessLost) {
+      const turnWasActive = BUSY_STATES.has(runtime.state) || runtime.backendTurnDraining;
+      runtime.providerReady = false;
+      this.invalidateRuntime(runtime, 'provider_changed');
+      runtime.pendingTakeover = undefined;
+      runtime.error = 'Provider 当前不可用；已撤销临时文件访问权限。';
+      if (turnWasActive) {
+        runtime.state = 'FAILED';
+        runtime.terminalInputMode = 'human';
+      }
+    }
+    if (runtime.providerConversationResetPending && currentFingerprint) {
+      try {
+        this.sessions.bindAgentThread(
+          runtime.sessionId,
+          runtime.backend.providerId,
+          runtime.threadId,
+          currentFingerprint,
+        );
+        runtime.providerConversationResetPending = false;
+      } catch (error) {
+        runtime.error = `Provider 配置已变化，但无法隔离旧对话：${
+          error instanceof Error ? error.message : String(error)
+        }`;
+      }
+    }
+    return true;
+  }
+
+  private assertLiveFileAccessTarget(
+    owner: WebContents,
+    terminalId: string,
+    session: SessionRecord | undefined,
+    runtime?: AgentRuntimeRecord,
+  ): asserts session is SessionRecord {
+    const terminalState = this.terminals.state(owner, terminalId);
+    if (
+      terminalState.status !== 'connected'
+      || !session
+      || session.connectionState !== 'connected'
+      || session.runtimeTerminalId !== terminalId
+      || runtime?.state === 'FAILED'
+    ) {
+      throw new Error('终端已断开，不能开启文件访问权限。');
+    }
+  }
+
+  private cloneRuntime(runtime: AgentRuntimeRecord): AgentSessionView {
+    if (this.revokeChangedProviderAuthority(runtime)) this.emit(runtime);
+    return cloneView(runtime);
   }
 
   private selectBackend(
@@ -1703,14 +2172,15 @@ export class AgentService {
 
   private invalidateRuntime(
     runtime: AgentRuntimeRecord,
-    reason: 'user' | 'takeover' | 'shutdown' = 'shutdown',
+    reason: 'user' | 'takeover' | 'shutdown' | 'provider_changed' = 'shutdown',
   ): void {
     runtime.turnToken += 1;
     runtime.streamingMessageId = undefined;
     runtime.backendTurnDraining = false;
     this.cancelStreamEmit(runtime);
     runtime.abortController?.abort();
-    this.interruptHarness(runtime, reason);
+    this.interruptHarness(runtime, reason === 'provider_changed' ? 'user' : reason);
+    this.revokeFileAccess(runtime, reason);
     runtime.activities = settleRunningToolActivities(
       runtime.activities,
       'cancelled',
@@ -1793,6 +2263,20 @@ export class AgentService {
     } catch (error) {
       console.error('Unable to persist Full Takeover shutdown:', error);
     }
+  }
+
+  private revokeFileAccess(runtime: AgentRuntimeRecord, reason: string): void {
+    runtime.fileAccessGeneration += 1;
+    if (runtime.fileAccessMode !== 'off') {
+      this.appendControlAudit(runtime, 'file_permission_changed', 'system', {
+        mode: 'off',
+        reason,
+        ephemeral: true,
+      });
+    }
+    runtime.fileAccessMode = 'off';
+    runtime.fileAccessPolicy = disabledFileAccessPolicy();
+    runtime.fileAccessRoot = undefined;
   }
 
   private appendControlAudit(
@@ -1910,6 +2394,7 @@ export class AgentService {
   }
 
   private emit(runtime: AgentRuntimeRecord): void {
+    this.revokeChangedProviderAuthority(runtime);
     runtime.revision = (this.revisionCounters.get(runtime.terminalId) ?? 0) + 1;
     this.revisionCounters.set(runtime.terminalId, runtime.revision);
     if (!runtime.owner.isDestroyed()) {

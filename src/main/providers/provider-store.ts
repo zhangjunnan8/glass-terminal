@@ -1,5 +1,15 @@
-import { randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import {
+  closeSync,
+  constants as fsConstants,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname } from 'node:path';
 import type {
   ProviderConnectionResult,
@@ -15,11 +25,34 @@ const MAX_MODELS_RESPONSE_BYTES = 1024 * 1024;
 const MAX_DISCOVERED_MODELS = 500;
 interface StoredProviderProfile extends ProviderProfile {
   apiKeyReference: string;
+  /** Durable private fence while the Credential Manager value is transitioning. */
+  recipientTransitionPending: boolean;
+}
+
+export interface ProviderRuntimeSnapshot {
+  profile: ProviderProfile;
+  apiKey: string;
+}
+
+function legacyRecipientRevision(
+  profile: Pick<StoredProviderProfile, 'id' | 'apiKeyReference' | 'createdAt'>,
+): string {
+  return createHash('sha256')
+    .update(`legacy\0${profile.id}\0${profile.apiKeyReference}\0${profile.createdAt}`)
+    .digest('hex');
 }
 
 function publicProfile(profile: StoredProviderProfile): ProviderProfile {
-  const { apiKeyReference: _reference, ...publicFields } = profile;
+  const {
+    apiKeyReference: _reference,
+    recipientTransitionPending: _transitionPending,
+    ...publicFields
+  } = profile;
   return publicFields;
+}
+
+function providerTransitionError(): Error {
+  return new Error('Provider recipient identity or credential is transitioning; retry after saving and testing it.');
 }
 
 function requiredText(value: unknown, field: string): string {
@@ -114,9 +147,14 @@ function parseProfiles(value: unknown): StoredProviderProfile[] {
     ) {
       throw new Error('Provider 元数据格式不受支持。');
     }
-    const status = profile.status === 'ready' || profile.status === 'error'
+    const recipientTransitionPending = profile.recipientTransitionPending === true;
+    const status = !recipientTransitionPending
+      && (profile.status === 'ready' || profile.status === 'error')
       ? profile.status
       : 'not-tested';
+    const createdAt = typeof profile.createdAt === 'string'
+      ? profile.createdAt
+      : new Date(0).toISOString();
     return {
       id: profile.id,
       name: profile.name,
@@ -124,12 +162,22 @@ function parseProfiles(value: unknown): StoredProviderProfile[] {
       baseUrl: profile.baseUrl,
       modelId: profile.modelId,
       apiKeyReference: profile.apiKeyReference,
+      recipientTransitionPending,
+      recipientRevision: typeof profile.recipientRevision === 'string'
+        && profile.recipientRevision.length > 0
+        && profile.recipientRevision.length <= 128
+        ? profile.recipientRevision
+        : legacyRecipientRevision({
+          id: profile.id,
+          apiKeyReference: profile.apiKeyReference,
+          createdAt,
+        }),
       apiKeyConfigured: profile.apiKeyConfigured === true,
       isDefault: profile.isDefault === true,
       status,
       lastTestedAt: typeof profile.lastTestedAt === 'string' ? profile.lastTestedAt : undefined,
       lastError: typeof profile.lastError === 'string' ? profile.lastError : undefined,
-      createdAt: typeof profile.createdAt === 'string' ? profile.createdAt : new Date(0).toISOString(),
+      createdAt,
       updatedAt: typeof profile.updatedAt === 'string' ? profile.updatedAt : new Date(0).toISOString(),
     };
   });
@@ -137,6 +185,8 @@ function parseProfiles(value: unknown): StoredProviderProfile[] {
 
 export class ProviderStore {
   private profiles: StoredProviderProfile[];
+  private mutationActive = false;
+  private readonly queuedMutations: Array<() => void> = [];
 
   constructor(
     private readonly filePath: string,
@@ -159,12 +209,52 @@ export class ProviderStore {
 
   async apiKey(providerId: string): Promise<string> {
     const provider = this.getStored(providerId);
+    if (provider.recipientTransitionPending) throw providerTransitionError();
+    const expectedRevision = provider.recipientRevision;
+    const expectedReference = provider.apiKeyReference;
     const secret = await this.secrets.get(provider.apiKeyReference);
-    if (!secret) throw new Error(`${provider.name} 尚未配置 API Key。`);
+    const current = this.assertCredentialRecipient(
+      providerId,
+      expectedRevision,
+      expectedReference,
+    );
+    if (!secret) throw new Error(`${current.name} 尚未配置 API Key。`);
     return secret;
   }
 
+  assertRuntimeRecipient(
+    providerId: string,
+    expectedRecipientRevision?: string,
+  ): ProviderProfile {
+    const provider = this.getStored(providerId);
+    if (
+      provider.recipientTransitionPending
+      || (
+        expectedRecipientRevision !== undefined
+        && provider.recipientRevision !== expectedRecipientRevision
+      )
+    ) throw providerTransitionError();
+    if (provider.status !== 'ready') {
+      throw new Error(`Provider ${provider.name} is not Ready.`);
+    }
+    return publicProfile(provider);
+  }
+
+  async runtimeSnapshot(
+    providerId: string,
+    expectedRecipientRevision: string,
+  ): Promise<ProviderRuntimeSnapshot> {
+    this.assertRuntimeRecipient(providerId, expectedRecipientRevision);
+    const apiKey = await this.apiKey(providerId);
+    const profile = this.assertRuntimeRecipient(providerId, expectedRecipientRevision);
+    return { profile, apiKey };
+  }
+
   async save(input: ProviderInput): Promise<ProviderProfile> {
+    return this.serializeMutation(() => this.saveExclusive(input));
+  }
+
+  private async saveExclusive(input: ProviderInput): Promise<ProviderProfile> {
     const now = new Date().toISOString();
     const existing = input.id
       ? this.profiles.find((profile) => profile.id === input.id)
@@ -174,15 +264,11 @@ export class ProviderStore {
     const baseUrl = normalizedBaseUrl(input.baseUrl);
     const modelId = requiredText(input.modelId, '模型 ID');
     const apiKeyReference = existing?.apiKeyReference ?? `AI Terminal/provider/${id}`;
-    let apiKeyConfigured = existing?.apiKeyConfigured ?? false;
     const suppliedKey = input.apiKey && input.apiKey.trim() ? input.apiKey : undefined;
     const keyReplaced = Boolean(suppliedKey);
-    if (suppliedKey) {
-      await this.secrets.set(apiKeyReference, suppliedKey);
-      apiKeyConfigured = true;
-    }
     const endpointChanged = existing
       && (existing.baseUrl !== baseUrl || existing.modelId !== modelId);
+    const recipientChanged = Boolean(endpointChanged || keyReplaced);
     const makeDefault = Boolean(input.makeDefault)
       || this.profiles.length === 0
       || existing?.isDefault === true;
@@ -193,7 +279,13 @@ export class ProviderStore {
       baseUrl,
       modelId,
       apiKeyReference,
-      apiKeyConfigured,
+      recipientTransitionPending: suppliedKey
+        ? true
+        : existing?.recipientTransitionPending ?? false,
+      recipientRevision: existing && !recipientChanged
+        ? existing.recipientRevision
+        : randomUUID(),
+      apiKeyConfigured: existing?.apiKeyConfigured ?? false,
       isDefault: makeDefault,
       status: endpointChanged || keyReplaced ? 'not-tested' : existing?.status ?? 'not-tested',
       lastTestedAt: endpointChanged || keyReplaced ? undefined : existing?.lastTestedAt,
@@ -201,15 +293,36 @@ export class ProviderStore {
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
-    this.profiles = this.profiles
+    const candidateProfiles = this.profiles
       .filter((candidate) => candidate.id !== profile.id)
       .map((candidate) => makeDefault ? { ...candidate, isDefault: false } : candidate);
-    this.profiles.push(profile);
-    this.write();
-    return publicProfile(profile);
+    candidateProfiles.push(profile);
+    // A credential replacement is a durable two-phase transition. Persisting
+    // the new recipient revision and private fence first guarantees that a
+    // metadata failure cannot silently replace the key under an old identity.
+    this.persistProfiles(candidateProfiles);
+    if (!suppliedKey) return publicProfile(profile);
+
+    // Any rejection here may be ambiguous (the platform store might have
+    // committed before reporting failure), so deliberately retain the new
+    // revision and pending fence. A later explicit save can complete recovery.
+    await this.secrets.set(apiKeyReference, suppliedKey);
+    const committed: StoredProviderProfile = {
+      ...profile,
+      apiKeyConfigured: true,
+      recipientTransitionPending: false,
+    };
+    this.persistProfiles(this.profiles.map((candidate) => (
+      candidate.id === committed.id ? committed : candidate
+    )));
+    return publicProfile(committed);
   }
 
   async remove(providerId: string): Promise<void> {
+    return this.serializeMutation(() => this.removeExclusive(providerId));
+  }
+
+  private async removeExclusive(providerId: string): Promise<void> {
     const provider = this.getStored(providerId);
     await this.secrets.remove(provider.apiKeyReference);
     const wasDefault = provider.isDefault;
@@ -218,18 +331,25 @@ export class ProviderStore {
     this.write();
   }
 
-  setDefault(providerId: string): ProviderProfile {
+  async setDefault(providerId: string): Promise<ProviderProfile> {
+    return this.serializeMutation(() => this.setDefaultExclusive(providerId));
+  }
+
+  private setDefaultExclusive(providerId: string): ProviderProfile {
     const selected = this.getStored(providerId);
-    this.profiles = this.profiles.map((profile) => ({
+    this.persistProfiles(this.profiles.map((profile) => ({
       ...profile,
       isDefault: profile.id === providerId,
       updatedAt: profile.id === providerId ? new Date().toISOString() : profile.updatedAt,
-    }));
-    this.write();
+    })));
     return this.get(selected.id);
   }
 
   async testConnection(providerId: string): Promise<ProviderConnectionResult> {
+    return this.serializeMutation(() => this.testConnectionExclusive(providerId));
+  }
+
+  private async testConnectionExclusive(providerId: string): Promise<ProviderConnectionResult> {
     const provider = this.get(providerId);
     const testedAt = new Date().toISOString();
     const controller = new AbortController();
@@ -266,6 +386,10 @@ export class ProviderStore {
       clearTimeout(timeout);
     }
     const current = this.getStored(providerId);
+    if (
+      current.recipientTransitionPending
+      || current.recipientRevision !== provider.recipientRevision
+    ) throw providerTransitionError();
     const updated: StoredProviderProfile = {
       ...current,
       status: result.status,
@@ -273,10 +397,9 @@ export class ProviderStore {
       lastError: result.ok ? undefined : result.message,
       updatedAt: testedAt,
     };
-    this.profiles = this.profiles.map((candidate) => (
+    this.persistProfiles(this.profiles.map((candidate) => (
       candidate.id === providerId ? updated : candidate
-    ));
-    this.write();
+    )));
     return result;
   }
 
@@ -287,17 +410,56 @@ export class ProviderStore {
     const suppliedKey = typeof input.apiKey === 'string' && input.apiKey.trim()
       ? input.apiKey
       : undefined;
-    const apiKey = suppliedKey ?? (input.providerId ? await this.apiKey(input.providerId) : undefined);
+    let apiKey = suppliedKey;
+    let requestBaseUrl = baseUrl;
+    let savedRecipient: {
+      providerId: string;
+      recipientRevision: string;
+      apiKeyReference: string;
+    } | undefined;
+    if (!apiKey && input.providerId) {
+      const provider = this.getStored(input.providerId);
+      if (provider.recipientTransitionPending) throw providerTransitionError();
+      // A saved credential is scoped to its saved recipient. Never treat
+      // providerId as a bearer-token lookup for a caller-controlled endpoint.
+      if (baseUrl !== provider.baseUrl) {
+        throw new Error('使用已保存的 API Key 时，Base URL 必须与当前 Provider 一致；其他地址请显式输入 API Key。');
+      }
+      savedRecipient = {
+        providerId: provider.id,
+        recipientRevision: provider.recipientRevision,
+        apiKeyReference: provider.apiKeyReference,
+      };
+      requestBaseUrl = provider.baseUrl;
+      apiKey = await this.secrets.get(savedRecipient.apiKeyReference);
+      const current = this.assertCredentialRecipient(
+        savedRecipient.providerId,
+        savedRecipient.recipientRevision,
+        savedRecipient.apiKeyReference,
+      );
+      if (current.baseUrl !== requestBaseUrl) throw providerTransitionError();
+    }
     if (!apiKey) throw new Error('请先输入 API Key，再自动检索模型。');
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15_000);
     try {
-      const response = await this.fetchImplementation(`${baseUrl}/models`, {
+      const requestOptions: RequestInit = {
         method: 'GET',
         headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
         signal: controller.signal,
         redirect: 'error',
-      });
+      };
+      // Recheck synchronously at the final dispatch boundary. No await or
+      // caller-controlled callback may separate this fence from fetch.
+      if (savedRecipient) {
+        const current = this.assertCredentialRecipient(
+          savedRecipient.providerId,
+          savedRecipient.recipientRevision,
+          savedRecipient.apiKeyReference,
+        );
+        if (current.baseUrl !== requestBaseUrl) throw providerTransitionError();
+      }
+      const response = await this.fetchImplementation(`${requestBaseUrl}/models`, requestOptions);
       if (!response.ok) throw new Error(`Provider 返回 HTTP ${response.status}。`);
       const models = modelIdsFromPayload(await readBoundedJson(response));
       return {
@@ -320,6 +482,20 @@ export class ProviderStore {
     return provider;
   }
 
+  private assertCredentialRecipient(
+    providerId: string,
+    expectedRecipientRevision: string,
+    expectedApiKeyReference: string,
+  ): StoredProviderProfile {
+    const provider = this.getStored(providerId);
+    if (
+      provider.recipientTransitionPending
+      || provider.recipientRevision !== expectedRecipientRevision
+      || provider.apiKeyReference !== expectedApiKeyReference
+    ) throw providerTransitionError();
+    return provider;
+  }
+
   private read(): StoredProviderProfile[] {
     try {
       return parseProfiles(JSON.parse(readFileSync(this.filePath, 'utf8')));
@@ -329,13 +505,82 @@ export class ProviderStore {
     }
   }
 
-  private write(): void {
+  private persistProfiles(profiles: StoredProviderProfile[]): void {
+    this.write(profiles);
+    this.profiles = profiles;
+  }
+
+  /**
+   * Provider metadata and credential-store mutations form one ordered log.
+   * In particular, credential writes must never overlap: a late completion
+   * from an older save could otherwise revive its recipient revision while
+   * leaving the key written by a newer save (or vice versa).
+   */
+  private serializeMutation<T>(operation: () => Promise<T> | T): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const execute = () => {
+        let result: Promise<T> | T;
+        try {
+          result = operation();
+        } catch (error) {
+          this.finishMutation();
+          reject(error);
+          return;
+        }
+        Promise.resolve(result).then(
+          (value) => {
+            resolve(value);
+            this.finishMutation();
+          },
+          (error) => {
+            reject(error);
+            this.finishMutation();
+          },
+        );
+      };
+      if (this.mutationActive) {
+        this.queuedMutations.push(execute);
+      } else {
+        this.mutationActive = true;
+        execute();
+      }
+    });
+  }
+
+  private finishMutation(): void {
+    const next = this.queuedMutations.shift();
+    if (next) next();
+    else this.mutationActive = false;
+  }
+
+  private write(profiles: readonly StoredProviderProfile[] = this.profiles): void {
     mkdirSync(dirname(this.filePath), { recursive: true });
     const temporaryPath = `${this.filePath}.tmp-${process.pid}-${randomUUID()}`;
-    writeFileSync(temporaryPath, `${JSON.stringify(this.profiles, null, 2)}\n`, {
-      encoding: 'utf8',
-      mode: 0o600,
-    });
-    renameSync(temporaryPath, this.filePath);
+    try {
+      writeFileSync(temporaryPath, `${JSON.stringify(profiles, null, 2)}\n`, {
+        encoding: 'utf8',
+        mode: 0o600,
+      });
+      // Windows rejects FlushFileBuffers on a read-only handle; O_RDWR gives
+      // fsyncSync a flush-capable handle without changing file contents.
+      const descriptor = openSync(temporaryPath, fsConstants.O_RDWR);
+      try {
+        fsyncSync(descriptor);
+      } finally {
+        closeSync(descriptor);
+      }
+      renameSync(temporaryPath, this.filePath);
+      if (process.platform !== 'win32') {
+        const directory = openSync(dirname(this.filePath), fsConstants.O_RDONLY);
+        try {
+          fsyncSync(directory);
+        } finally {
+          closeSync(directory);
+        }
+      }
+    } catch (error) {
+      try { unlinkSync(temporaryPath); } catch { /* best-effort failed-write cleanup */ }
+      throw error;
+    }
   }
 }

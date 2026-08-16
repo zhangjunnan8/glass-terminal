@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { mkdtempSync } from 'node:fs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { TerminalJournalEvent } from '../../shared/session';
@@ -111,7 +111,7 @@ describe('SessionStore', () => {
     const store = new SessionStore(root);
     const session = createSession(store);
     const threadId = '22222222-2222-2222-2222-222222222222';
-    store.bindAgentThread(session.id, 'provider', threadId);
+    store.bindAgentThread(session.id, 'provider', threadId, 'a'.repeat(64));
 
     store.updateShellContext(session.id, { cwd: '/srv/project', effectiveUser: 'root' });
 
@@ -163,6 +163,43 @@ describe('SessionStore', () => {
           },
         },
       ]);
+  });
+
+  it('persists typed Workspace operations without changing the terminal journal', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    const terminalBefore = store.readTerminalHistory(session.id);
+    const handle = store.beginWorkspaceOperation(session.id, {
+      operation: 'read',
+      backend: 'sftp',
+      target: { path: { scope: 'workspace', path: 'src/main.ts' } },
+    });
+
+    store.finishWorkspaceOperation(handle, {
+      outcome: 'succeeded',
+      sideEffectCommitted: false,
+      effect: { bytes: 128 },
+    });
+
+    expect(store.readWorkspaceOperations(session.id)).toMatchObject([
+      { sequence: 1, recordType: 'intent', operation: 'read' },
+      { sequence: 2, recordType: 'outcome', outcome: 'succeeded' },
+    ]);
+    expect(store.recoverWorkspaceOperations(session.id)[0]).toMatchObject({
+      sideEffectCommitted: false,
+    });
+    expect(store.workspaceStorageProtection(session.id)).toEqual({
+      root: resolve(root),
+      operationJournalPath: join(
+        resolve(root),
+        session.id,
+        'workspace',
+        'operations.jsonl',
+      ),
+    });
+    expect(store.readTerminalHistory(session.id)).toBe(terminalBefore);
+    expect(new SessionStore(root).readWorkspaceOperations(session.id)).toHaveLength(2);
   });
 
   it('rejects workspace bindings that do not match the Session transport and Host', () => {
@@ -259,7 +296,7 @@ describe('SessionStore', () => {
     expect(terminal.content).toBe('x'.repeat(32));
 
     const threadId = '33333333-3333-3333-3333-333333333333';
-    store.bindAgentThread(session.id, 'provider', threadId);
+    store.bindAgentThread(session.id, 'provider', threadId, 'b'.repeat(64));
     store.appendThreadEvent(session.id, threadId, {
       type: 'chat',
       item: {
@@ -293,7 +330,7 @@ describe('SessionStore', () => {
 
     store.markDisconnected(session.id, 0);
     const threadId = '44444444-4444-4444-4444-444444444444';
-    store.bindAgentThread(session.id, 'provider', threadId);
+    store.bindAgentThread(session.id, 'provider', threadId, 'c'.repeat(64));
     store.appendThreadEvent(session.id, threadId, { type: 'test' });
     await store.remove(session.id);
 

@@ -1,4 +1,7 @@
-import type { AgentFileAccessMode } from '../../shared/agent';
+import type {
+  AgentFileAccessMode,
+  AgentFileAccessPolicy,
+} from '../../shared/agent';
 import type { SessionRecord } from '../../shared/session';
 import type { TerminalDescriptor } from '../../shared/terminal';
 import type {
@@ -18,19 +21,28 @@ export const DEFAULT_TERMINAL_TOOL_PERMISSIONS: TerminalToolPermissions = {
 export function workspacePermissions(
   mode: AgentFileAccessMode,
   binding?: WorkspaceBinding,
+  policy?: AgentFileAccessPolicy,
 ): WorkspaceToolPermissions {
   const enabled = mode !== 'off' && Boolean(binding);
-  const writable = mode === 'read-write';
+  const modeCanWrite = mode === 'read-write' || mode === 'full-access';
+  const read = enabled && (policy?.read ?? true);
+  const write = enabled && modeCanWrite && (policy?.write ?? true);
+  const create = enabled && modeCanWrite && (policy?.create ?? true);
+  const deletePath = enabled && modeCanWrite && (policy?.delete ?? true);
+  const readablePaths = policy?.readablePaths ?? (binding ? [binding.root] : []);
+  const writablePaths = policy?.writablePaths ?? (binding ? [binding.root] : []);
   return {
     enabled,
     mode,
-    read: enabled,
-    write: enabled && writable,
-    create: enabled && writable,
-    delete: enabled && writable,
-    readablePaths: enabled && binding ? [binding.root] : [],
-    writablePaths: enabled && writable && binding ? [binding.root] : [],
-    fullAccess: false,
+    read,
+    write,
+    create,
+    delete: deletePath,
+    readablePaths: read ? [...readablePaths] : [],
+    writablePaths: (write || create || deletePath) ? [...writablePaths] : [],
+    fullAccess: enabled
+      && mode === 'full-access'
+      && (policy?.fullAccess ?? true),
   };
 }
 

@@ -1,6 +1,6 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { WebContents } from 'electron';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { HostStore } from '../hosts/host-store';
@@ -169,6 +169,55 @@ afterEach(() => {
 });
 
 describe('SessionManager reconnect restoration', () => {
+  it('forwards typed Workspace operation records without emitting terminal events', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-manager-operation-test-'));
+    roots.push(root);
+    const terminals = new FakeTerminals();
+    terminals.snapshots.set('audit-terminal', snapshot('audit-terminal', 'ready\r\n'));
+    const store = new SessionStore(join(root, 'sessions'));
+    const manager = new SessionManager(
+      store,
+      terminals as unknown as TerminalService,
+      { get: vi.fn(() => ({
+        id: 'host',
+        name: 'Ubuntu',
+        hostname: '192.0.2.10',
+        port: 22,
+        username: 'zjn',
+      })) } as unknown as HostStore,
+    );
+    const session = manager.upgrade(owner(), 'audit-terminal');
+    const terminalBefore = manager.readTerminalHistory(session.id);
+    const handle = manager.beginWorkspaceOperation(session.id, {
+      operation: 'stat',
+      backend: 'sftp',
+      target: { path: { scope: 'workspace', path: 'src/main.ts' } },
+    });
+
+    manager.finishWorkspaceOperation(handle, {
+      outcome: 'succeeded',
+      sideEffectCommitted: false,
+      effect: { bytes: 512 },
+    });
+
+    expect(manager.readWorkspaceOperations(session.id)).toHaveLength(2);
+    expect(manager.recoverWorkspaceOperations(session.id)[0]).toMatchObject({
+      intent: { operation: 'stat' },
+      sideEffectCommitted: false,
+    });
+    expect(manager.workspaceStorageProtection(session.id)).toEqual({
+      root: resolve(join(root, 'sessions')),
+      operationJournalPath: join(
+        resolve(join(root, 'sessions')),
+        session.id,
+        'workspace',
+        'operations.jsonl',
+      ),
+    });
+    expect(manager.readTerminalHistory(session.id)).toBe(terminalBefore);
+    manager.close();
+  });
+
   it('captures prompt context, restores it on reconnect, and exposes the rebound Session', () => {
     const root = mkdtempSync(join(tmpdir(), 'ai-terminal-manager-test-'));
     roots.push(root);
@@ -259,7 +308,7 @@ describe('SessionManager reconnect restoration', () => {
     const browser = owner();
     const created = manager.upgrade(browser, 'history-terminal');
     const threadId = '55555555-5555-5555-5555-555555555555';
-    manager.bindAgentThread(created.id, 'provider', threadId);
+    manager.bindAgentThread(created.id, 'provider', threadId, 'a'.repeat(64));
     manager.appendThreadEvent(created.id, threadId, {
       type: 'chat',
       item: {

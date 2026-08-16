@@ -43,6 +43,89 @@ function terminal(overrides: Partial<TerminalDescriptor> = {}): TerminalDescript
 }
 
 describe('Session tool context', () => {
+  it('builds mode-bounded granular workspace policies', () => {
+    const binding = { backend: 'local' as const, root: 'C:\\project' };
+    expect(workspacePermissions('off', binding)).toEqual({
+      enabled: false,
+      mode: 'off',
+      read: false,
+      write: false,
+      create: false,
+      delete: false,
+      readablePaths: [],
+      writablePaths: [],
+      fullAccess: false,
+    });
+
+    expect(workspacePermissions('read-only', binding, {
+      read: true,
+      write: true,
+      create: true,
+      delete: true,
+      readablePaths: ['C:\\project\\src'],
+      writablePaths: ['C:\\project\\src'],
+      fullAccess: true,
+    })).toEqual({
+      enabled: true,
+      mode: 'read-only',
+      read: true,
+      write: false,
+      create: false,
+      delete: false,
+      readablePaths: ['C:\\project\\src'],
+      writablePaths: [],
+      fullAccess: false,
+    });
+
+    expect(workspacePermissions('read-write', binding, {
+      read: false,
+      write: true,
+      create: false,
+      delete: true,
+      readablePaths: ['C:\\project\\read'],
+      writablePaths: ['C:\\project\\write'],
+      fullAccess: true,
+    })).toMatchObject({
+      enabled: true,
+      mode: 'read-write',
+      read: false,
+      write: true,
+      create: false,
+      delete: true,
+      readablePaths: [],
+      writablePaths: ['C:\\project\\write'],
+      fullAccess: false,
+    });
+  });
+
+  it('enables path-unbounded policy only for full-access mode', () => {
+    const binding = { backend: 'sftp' as const, root: '/srv/project', hostId: 'host-1' };
+    expect(workspacePermissions('full-access', binding)).toMatchObject({
+      enabled: true,
+      mode: 'full-access',
+      read: true,
+      write: true,
+      create: true,
+      delete: true,
+      fullAccess: true,
+    });
+    expect(workspacePermissions('full-access', binding, {
+      read: true,
+      write: false,
+      create: false,
+      delete: false,
+      readablePaths: [],
+      writablePaths: [],
+      fullAccess: true,
+    })).toMatchObject({
+      read: true,
+      write: false,
+      create: false,
+      delete: false,
+      fullAccess: true,
+    });
+  });
+
   it('binds one SSH terminal and SFTP workspace to the same Host', () => {
     const bound = session({
       workspace: { backend: 'sftp', root: '/home/user/project', hostId: 'host-1' },

@@ -1,4 +1,5 @@
 import type { WebContents } from 'electron';
+import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import {
   CODEX_APP_SERVER_AGENT_BACKEND,
@@ -234,6 +235,7 @@ class FakeSessions {
   persistedThreadEvents: Array<Record<string, unknown>> = [];
   readonly failAuditTypes = new Set<string>();
   failThreadEvents = false;
+  persistedThreadId?: string;
   session: SessionRecord = {
     schemaVersion: 1,
     id: '11111111-1111-1111-1111-111111111111',
@@ -263,12 +265,18 @@ class FakeSessions {
 
   upgrade() { return this.session; }
   sessionForTerminal() { return this.session; }
-  bindAgentThread(_sessionId: string, providerId: string, threadId: string) {
+  bindAgentThread(
+    _sessionId: string,
+    providerId: string,
+    threadId: string,
+    backendFingerprint: string,
+  ) {
     this.session = {
       ...this.session,
       providerId,
       agentBackend: { kind: 'generic-provider', providerId },
       aiThreadId: threadId,
+      agentBackendFingerprint: backendFingerprint,
       providerThreadId: undefined,
     };
     return this.session;
@@ -279,6 +287,7 @@ class FakeSessions {
       providerId: backend.kind === 'generic-provider' ? backend.providerId : undefined,
       agentBackend: backend,
       aiThreadId: threadId,
+      agentBackendFingerprint: undefined,
       providerThreadId: undefined,
     };
     return this.session;
@@ -288,7 +297,11 @@ class FakeSessions {
     this.session = { ...this.session, providerThreadId };
     return this.session;
   }
-  readThreadEvents() { return this.persistedThreadEvents; }
+  readThreadEvents(_sessionId: string, threadId: string) {
+    return this.persistedThreadId && this.persistedThreadId !== threadId
+      ? []
+      : this.persistedThreadEvents;
+  }
   appendThreadEvent(_sessionId: string, _threadId: string, event: Record<string, unknown>) {
     if (this.failThreadEvents) throw new Error('thread persistence failed');
     this.threadEvents.push(event);
@@ -435,6 +448,7 @@ class FakeTerminals {
   sensitiveSubmitted = false;
   current?: CommandExecution;
   private executionIndex = 0;
+  private connected = true;
   private controlLease?: string;
   private sensitiveLease?: string;
   private exitListener?: (terminalId: string, ownerId: number) => void;
@@ -452,6 +466,7 @@ class FakeTerminals {
     return () => { this.exitListener = undefined; };
   }
   exit(terminalId = 'terminal', ownerId = 99): void {
+    this.connected = false;
     this.exitListener?.(terminalId, ownerId);
   }
   onSensitiveSubmission(listener: (
@@ -463,7 +478,13 @@ class FakeTerminals {
     this.sensitiveSubmissionListener = listener;
     return () => { this.sensitiveSubmissionListener = undefined; };
   }
-  state() { return { transport: 'ssh', shellKind: 'posix', status: 'connected' }; }
+  state() {
+    return {
+      transport: 'ssh',
+      shellKind: 'posix',
+      status: this.connected ? 'connected' : 'exited',
+    };
+  }
   descriptor(owner: WebContents, terminalId: string) {
     if (owner.id !== 99 || terminalId !== 'terminal') throw new Error('Terminal not found.');
     return {
@@ -583,19 +604,38 @@ class FakeTerminals {
   }
 }
 
-function providerStore(): ProviderStore {
-  const profile: ProviderProfile = {
-    id: 'provider',
-    name: 'Provider',
+function readyProviderProfile(
+  id = 'provider',
+  overrides: Partial<ProviderProfile> = {},
+): ProviderProfile {
+  return {
+    id,
+    name: id === 'provider' ? 'Provider' : id,
     kind: 'generic-openai-compatible',
-    baseUrl: 'https://provider.example/v1',
+    baseUrl: `https://${id}.example/v1`,
     modelId: 'model',
+    recipientRevision: `recipient-${id}`,
     apiKeyConfigured: true,
     isDefault: true,
     status: 'ready',
     createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString(),
+    ...overrides,
   };
+}
+
+function recipientFingerprint(profile = readyProviderProfile()): string {
+  return createHash('sha256').update(JSON.stringify([
+    profile.id,
+    profile.kind,
+    profile.baseUrl,
+    profile.modelId,
+    profile.recipientRevision,
+  ])).digest('hex');
+}
+
+function providerStore(): ProviderStore {
+  const profile = readyProviderProfile();
   return {
     get: () => profile,
     list: () => [profile],
@@ -1086,7 +1126,7 @@ describe('AgentService shared-terminal controls', () => {
     service.close();
   });
 
-  it('does not audit an oversized malicious workspace mutation completion result', async () => {
+  it('does not persist a malicious workspace mutation result outside bounded activity state', async () => {
     const { backend, owner, service, sessions } = await startActivityHarness();
     const auditSecret = 'OVERSIZED_AUDIT_SECRET_f80d61';
     const call = activityCall('oversized-patch', 'workspace_apply_patch', {
@@ -1162,6 +1202,7 @@ describe('AgentService shared-terminal controls', () => {
       ...sessions.session,
       providerId: 'provider',
       agentBackend: { kind: 'generic-provider', providerId: 'provider' },
+      agentBackendFingerprint: recipientFingerprint(),
       aiThreadId: 'persisted-thread',
     };
     const persistedMessages: AgentMessage[] = [
@@ -1346,6 +1387,7 @@ describe('AgentService shared-terminal controls', () => {
   it('rejects Workspace changes while Generic Provider file access is enabled', async () => {
     const fileService = {
       bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+      canonicalizeAccessRoot: vi.fn(async (_owner, _terminalId, accessRoot) => accessRoot),
     } as unknown as AgentFileService;
     const service = new AgentService(
       new FakeTerminals() as unknown as TerminalService,
@@ -1365,6 +1407,1040 @@ describe('AgentService shared-terminal controls', () => {
 
     expect(() => service.assertWorkspaceChangeAllowed(owner, 'terminal'))
       .toThrow('请先关闭 Generic Provider 文件访问');
+  });
+
+  it('maps legacy file-access modes to ephemeral policies and returns isolated snapshots', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const fileService = {
+      bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+      canonicalizeAccessRoot: vi.fn(async (_owner, _terminalId, accessRoot) => accessRoot),
+    } as unknown as AgentFileService;
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      fileService,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+
+    const readOnly = await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend,
+    });
+    expect(readOnly.fileAccessPolicy).toEqual({
+      read: true,
+      write: false,
+      create: false,
+      delete: false,
+      readablePaths: ['/work'],
+      writablePaths: [],
+      fullAccess: false,
+    });
+    readOnly.fileAccessPolicy!.read = false;
+    readOnly.fileAccessPolicy!.readablePaths[0] = '/tampered';
+    expect(service.getState(owner, 'terminal')?.fileAccessPolicy).toEqual({
+      read: true,
+      write: false,
+      create: false,
+      delete: false,
+      readablePaths: ['/work'],
+      writablePaths: [],
+      fullAccess: false,
+    });
+
+    const readWrite = await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-write', backend,
+    });
+    expect(readWrite.fileAccessPolicy).toEqual({
+      read: true,
+      write: true,
+      create: true,
+      delete: true,
+      readablePaths: ['/work'],
+      writablePaths: ['/work'],
+      fullAccess: false,
+    });
+
+    const disabled = await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'off', backend,
+    });
+    expect(disabled).toMatchObject({
+      fileAccessMode: 'off',
+      fileAccessRoot: undefined,
+      fileAccessPolicy: {
+        read: false,
+        write: false,
+        create: false,
+        delete: false,
+        readablePaths: [],
+        writablePaths: [],
+        fullAccess: false,
+      },
+    });
+    expect(sessions.session).not.toHaveProperty('fileAccessPolicy');
+  });
+
+  it('canonicalizes, deduplicates, and preserves a granular policy snapshot', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const canonicalizeAccessRoot = vi.fn(async (
+      _owner: WebContents,
+      _terminalId: string,
+      accessRoot: string,
+    ) => accessRoot.startsWith('/read-') ? '/canonical-read' : '/canonical-create');
+    const fileService = {
+      bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+      canonicalizeAccessRoot,
+    } as unknown as AgentFileService;
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      fileService,
+    );
+
+    const view = await service.setFileAccess(browserOwner(), {
+      terminalId: 'terminal',
+      mode: 'read-write',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+      policy: {
+        read: true,
+        write: false,
+        create: true,
+        delete: false,
+        readablePaths: ['/read-alias', '/read-duplicate'],
+        writablePaths: ['/create-alias'],
+        fullAccess: false,
+      },
+    });
+
+    expect(view.fileAccessPolicy).toEqual({
+      read: true,
+      write: false,
+      create: true,
+      delete: false,
+      readablePaths: ['/canonical-read'],
+      writablePaths: ['/canonical-create'],
+      fullAccess: false,
+    });
+    expect(canonicalizeAccessRoot).toHaveBeenCalledTimes(3);
+  });
+
+  it('requires an explicit confirmation for Full Access and still requires a Workspace Root', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const bindWorkspaceRoot = vi.fn().mockResolvedValue('/work');
+    const canonicalizeAccessRoot = vi.fn(async (
+      _owner: WebContents,
+      _terminalId: string,
+      accessRoot: string,
+    ) => accessRoot);
+    const fileService = { bindWorkspaceRoot, canonicalizeAccessRoot } as unknown as AgentFileService;
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      fileService,
+    );
+    const owner = browserOwner();
+    const request = {
+      terminalId: 'terminal',
+      mode: 'full-access' as const,
+      backend: { kind: 'generic-provider', providerId: 'provider' } as const,
+    };
+
+    await expect(service.setFileAccess(owner, request)).rejects.toThrow('显式确认');
+    expect(bindWorkspaceRoot).not.toHaveBeenCalled();
+
+    const view = await service.setFileAccess(owner, {
+      ...request,
+      fullAccessConfirmed: true,
+    });
+    expect(view.fileAccessPolicy).toEqual({
+      read: true,
+      write: true,
+      create: true,
+      delete: true,
+      readablePaths: [],
+      writablePaths: [],
+      fullAccess: true,
+    });
+    expect(canonicalizeAccessRoot).not.toHaveBeenCalled();
+
+    const missingWorkspaceService = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      {
+        bindWorkspaceRoot: vi.fn().mockRejectedValue(new Error('请先设置 Workspace Root。')),
+      } as unknown as AgentFileService,
+    );
+    await expect(missingWorkspaceService.setFileAccess(browserOwner(), {
+      ...request,
+      fullAccessConfirmed: true,
+    })).rejects.toThrow('请先设置 Workspace Root');
+  });
+
+  it('rejects stale and asynchronously changed Workspace roots without granting access', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    let resolveCanonical: ((path: string) => void) | undefined;
+    const canonicalizeAccessRoot = vi.fn(() => new Promise<string>((resolve) => {
+      resolveCanonical = resolve;
+    }));
+    const bindWorkspaceRoot = vi.fn().mockResolvedValue('/work');
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      { bindWorkspaceRoot, canonicalizeAccessRoot } as unknown as AgentFileService,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+
+    await expect(service.setFileAccess(owner, {
+      terminalId: 'terminal',
+      mode: 'read-only',
+      backend,
+      expectedWorkspaceRoot: '/stale-work',
+    })).rejects.toThrow('Workspace Root 已变化');
+    expect(bindWorkspaceRoot).not.toHaveBeenCalled();
+
+    const pending = service.setFileAccess(owner, {
+      terminalId: 'terminal',
+      mode: 'read-only',
+      backend,
+      expectedWorkspaceRoot: '/work',
+      policy: {
+        read: true,
+        write: false,
+        create: false,
+        delete: false,
+        readablePaths: ['/scope'],
+        writablePaths: [],
+        fullAccess: false,
+      },
+    });
+    await waitFor(() => canonicalizeAccessRoot.mock.calls.length === 1);
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/replaced', hostId: 'host' },
+    };
+    resolveCanonical!('/scope');
+    await expect(pending).rejects.toThrow('状态已变化');
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      fileAccessMode: 'off',
+      fileAccessRoot: undefined,
+    });
+    expect(sessions.audits.filter((entry) => entry.type === 'file_permission_changed'))
+      .toHaveLength(0);
+  });
+
+  it('does not let an older asynchronous grant override a later explicit revoke', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    let resolveBinding: ((root: string) => void) | undefined;
+    const bindWorkspaceRoot = vi.fn(() => new Promise<string>((resolve) => {
+      resolveBinding = resolve;
+    }));
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      { bindWorkspaceRoot } as unknown as AgentFileService,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+
+    const pendingGrant = service.setFileAccess(owner, {
+      terminalId: 'terminal',
+      mode: 'full-access',
+      backend,
+      fullAccessConfirmed: true,
+      expectedWorkspaceRoot: '/work',
+    });
+    await waitFor(() => bindWorkspaceRoot.mock.calls.length === 1);
+    await service.setFileAccess(owner, { terminalId: 'terminal', mode: 'off', backend });
+    resolveBinding!('/work');
+
+    await expect(pendingGrant).rejects.toThrow('状态已变化');
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      fileAccessMode: 'off',
+      fileAccessRoot: undefined,
+      fileAccessPolicy: { fullAccess: false, read: false, write: false },
+    });
+    expect(sessions.audits.some((entry) => entry.details?.mode === 'full-access')).toBe(false);
+  });
+
+  it('does not let a pending grant restore authority after terminal exit', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const terminals = new FakeTerminals();
+    let resolveBinding: ((root: string) => void) | undefined;
+    const bindWorkspaceRoot = vi.fn(() => new Promise<string>((resolve) => {
+      resolveBinding = resolve;
+    }));
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      { bindWorkspaceRoot } as unknown as AgentFileService,
+    );
+    const owner = browserOwner();
+    const pendingGrant = service.setFileAccess(owner, {
+      terminalId: 'terminal',
+      mode: 'full-access',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+      fullAccessConfirmed: true,
+    });
+    await waitFor(() => bindWorkspaceRoot.mock.calls.length === 1);
+    terminals.exit();
+    resolveBinding!('/work');
+
+    await expect(pendingGrant).rejects.toThrow('状态已变化');
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      state: 'FAILED',
+      fileAccessMode: 'off',
+      fileAccessRoot: undefined,
+    });
+  });
+
+  it('does not let a pending grant cross a Generic Provider runtime switch', async () => {
+    const profiles = new Map([
+      ['provider-a', readyProviderProfile('provider-a')],
+      ['provider-b', readyProviderProfile('provider-b', { isDefault: false })],
+    ]);
+    const providers = {
+      get: (providerId: string) => {
+        const profile = profiles.get(providerId);
+        if (!profile) throw new Error('Provider not found.');
+        return profile;
+      },
+      list: () => [...profiles.values()],
+    } as unknown as ProviderStore;
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    let resolveBinding: ((root: string) => void) | undefined;
+    const bindWorkspaceRoot = vi.fn(() => new Promise<string>((resolve) => {
+      resolveBinding = resolve;
+    }));
+    const backendAdapter = new RecordingBackend();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providers,
+      undefined,
+      undefined,
+      { bindWorkspaceRoot } as unknown as AgentFileService,
+      () => backendAdapter,
+    );
+    const owner = browserOwner();
+    const pendingGrant = service.setFileAccess(owner, {
+      terminalId: 'terminal',
+      mode: 'full-access',
+      backend: { kind: 'generic-provider', providerId: 'provider-a' },
+      fullAccessConfirmed: true,
+    });
+    await waitFor(() => bindWorkspaceRoot.mock.calls.length === 1);
+    service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'switch provider',
+      backend: { kind: 'generic-provider', providerId: 'provider-b' },
+    });
+    resolveBinding!('/work');
+
+    await expect(pendingGrant).rejects.toThrow('状态已变化');
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      backend: { kind: 'generic-provider', providerId: 'provider-b' },
+      fileAccessMode: 'off',
+      fileAccessRoot: undefined,
+    });
+  });
+
+  it('rejects new non-off grants after the terminal or Session disconnects', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const terminals = new FakeTerminals();
+    const bindWorkspaceRoot = vi.fn().mockResolvedValue('/work');
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      { bindWorkspaceRoot } as unknown as AgentFileService,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+
+    await service.setFileAccess(owner, { terminalId: 'terminal', mode: 'off', backend });
+    terminals.exit();
+    await expect(service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend,
+    })).rejects.toThrow('终端已断开');
+    expect(bindWorkspaceRoot).not.toHaveBeenCalled();
+
+    const sessionOnlyService = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      Object.assign(new FakeSessions(), {
+        session: { ...sessions.session, connectionState: 'disconnected' },
+      }) as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      { bindWorkspaceRoot } as unknown as AgentFileService,
+    );
+    await expect(sessionOnlyService.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend,
+    })).rejects.toThrow('终端已断开');
+    expect(bindWorkspaceRoot).not.toHaveBeenCalled();
+  });
+
+  it('keeps revocation and strict downgrade fail-closed when audit persistence fails', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      {
+        bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+        canonicalizeAccessRoot: vi.fn(async (
+          _owner: WebContents, _terminalId: string, path: string,
+        ) => path),
+      } as unknown as AgentFileService,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+    await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'full-access', backend, fullAccessConfirmed: true,
+    });
+    sessions.failAuditTypes.add('file_permission_changed');
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    const downgraded = await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-write', backend,
+    });
+    expect(downgraded).toMatchObject({
+      fileAccessMode: 'read-write',
+      fileAccessPolicy: { fullAccess: false },
+    });
+    const revoked = await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'off', backend,
+    });
+    expect(revoked).toMatchObject({ fileAccessMode: 'off', fileAccessRoot: undefined });
+    consoleError.mockRestore();
+  });
+
+  it('never adds authority when the upgrade audit cannot be persisted', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      {
+        bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+        canonicalizeAccessRoot: vi.fn(async (
+          _owner: WebContents, _terminalId: string, path: string,
+        ) => path),
+      } as unknown as AgentFileService,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+    await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend,
+    });
+    sessions.failAuditTypes.add('file_permission_changed');
+
+    await expect(service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-write', backend,
+    })).rejects.toThrow('audit failed');
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      fileAccessMode: 'read-only',
+      fileAccessPolicy: { read: true, write: false, create: false, delete: false },
+    });
+  });
+
+  it('keeps SFTP scope comparisons case-sensitive before fail-closed audit', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      {
+        bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+        canonicalizeAccessRoot: vi.fn(async (
+          _owner: WebContents, _terminalId: string, path: string,
+        ) => path),
+      } as unknown as AgentFileService,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+    const policy = (path: string) => ({
+      read: true,
+      write: false,
+      create: false,
+      delete: false,
+      readablePaths: [path],
+      writablePaths: [],
+      fullAccess: false,
+    });
+    await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend, policy: policy('/Work'),
+    });
+    sessions.failAuditTypes.add('file_permission_changed');
+
+    await expect(service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend, policy: policy('/work'),
+    })).rejects.toThrow('audit failed');
+    expect(service.getState(owner, 'terminal')?.fileAccessPolicy?.readablePaths)
+      .toEqual(['/Work']);
+  });
+
+  it('preserves a Generic thread and file grant across harmless Provider metadata updates', async () => {
+    let profile = readyProviderProfile();
+    const providers = {
+      get: () => profile,
+      list: () => [profile],
+    } as unknown as ProviderStore;
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const backendAdapter = new RecordingBackend();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providers,
+      undefined,
+      undefined,
+      {
+        bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+        canonicalizeAccessRoot: vi.fn(async (
+          _owner: WebContents, _terminalId: string, path: string,
+        ) => path),
+      } as unknown as AgentFileService,
+      () => backendAdapter,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'first turn', backend });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    const originalThreadId = service.getState(owner, 'terminal')!.threadId;
+    await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend,
+    });
+
+    profile = {
+      ...profile,
+      isDefault: false,
+      lastTestedAt: new Date(2).toISOString(),
+      updatedAt: new Date(2).toISOString(),
+    };
+    expect(() => service.sendPrompt(owner, {
+      terminalId: 'terminal', prompt: 'second turn', backend,
+    })).not.toThrow();
+    await waitFor(() => backendAdapter.sendInputs.length === 2);
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      threadId: originalThreadId,
+      fileAccessMode: 'read-only',
+    });
+    expect(backendAdapter.priorMessagesAtSend[1]).not.toEqual([]);
+  });
+
+  it('does not resume persisted Generic history when its recipient fingerprint changed offline', async () => {
+    const oldProfile = readyProviderProfile('provider', {
+      recipientRevision: 'old-recipient',
+    });
+    const currentProfile = readyProviderProfile('provider', {
+      recipientRevision: 'replacement-recipient',
+    });
+    const providers = {
+      get: () => currentProfile,
+      list: () => [currentProfile],
+    } as unknown as ProviderStore;
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      providerId: 'provider',
+      agentBackend: { kind: 'generic-provider', providerId: 'provider' },
+      agentBackendFingerprint: recipientFingerprint(oldProfile),
+      aiThreadId: 'persisted-old-thread',
+    };
+    sessions.persistedThreadId = 'persisted-old-thread';
+    sessions.persistedThreadEvents = [{
+      type: 'turn',
+      id: 'old-recipient-turn',
+      messages: [
+        { role: 'user', content: 'private old-recipient prompt' },
+        { role: 'assistant', content: 'private old-recipient reply' },
+      ],
+    }];
+    const backendAdapter = new RecordingBackend();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providers,
+      undefined,
+      undefined,
+      undefined,
+      () => backendAdapter,
+    );
+
+    service.sendPrompt(browserOwner(), {
+      terminalId: 'terminal',
+      prompt: 'new recipient turn',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+    });
+    await waitFor(() => backendAdapter.sendInputs.length === 1);
+
+    expect(backendAdapter.resumeInputs).toEqual([]);
+    expect(backendAdapter.priorMessagesAtSend[0]).toEqual([]);
+    expect(backendAdapter.sendInputs[0]!.thread.id).not.toBe('persisted-old-thread');
+    expect(sessions.session.agentBackendFingerprint).toBe(recipientFingerprint(currentProfile));
+  });
+
+  it('revokes an old provider fingerprint before the same provider ID can run again', async () => {
+    let profile = readyProviderProfile();
+    const providers = {
+      get: () => profile,
+      list: () => [profile],
+    } as unknown as ProviderStore;
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const backendAdapter = new RecordingBackend();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providers,
+      undefined,
+      undefined,
+      {
+        bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+        canonicalizeAccessRoot: vi.fn(async (
+          _owner: WebContents, _terminalId: string, path: string,
+        ) => path),
+      } as unknown as AgentFileService,
+      () => backendAdapter,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'old recipient turn', backend });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    const oldThreadId = service.getState(owner, 'terminal')!.threadId;
+    await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend,
+    });
+    profile = readyProviderProfile('provider', {
+      baseUrl: 'https://replacement.example/v1',
+      recipientRevision: 'recipient-provider-replacement',
+      updatedAt: new Date(1).toISOString(),
+    });
+
+    expect(() => service.sendPrompt(owner, {
+      terminalId: 'terminal', prompt: 'must be retried', backend,
+    })).toThrow('旧对话未发送');
+    expect(backendAdapter.sendInputs).toHaveLength(1);
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      fileAccessMode: 'off',
+      messages: [],
+    });
+    expect(service.getState(owner, 'terminal')!.threadId).not.toBe(oldThreadId);
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'new recipient', backend });
+    await waitFor(() => backendAdapter.sendInputs.length === 2);
+    expect(backendAdapter.priorMessagesAtSend[1]).toEqual([]);
+    expect(backendAdapter.sendInputs[1].gateway.context.permissions.workspace.enabled).toBe(false);
+    expect(sessions.audits).toContainEqual({
+      type: 'file_permission_changed',
+      details: { mode: 'off', reason: 'provider_changed', ephemeral: true },
+    });
+  });
+
+  it('allows off to revoke authority after the provider is removed or becomes unavailable', async () => {
+    const profile = readyProviderProfile();
+    let providerAvailable = true;
+    const providers = {
+      get: () => {
+        if (!providerAvailable) throw new Error('Provider not found.');
+        return profile;
+      },
+      list: () => providerAvailable ? [profile] : [],
+    } as unknown as ProviderStore;
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providers,
+      undefined,
+      undefined,
+      {
+        bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+        canonicalizeAccessRoot: vi.fn(async (
+          _owner: WebContents, _terminalId: string, path: string,
+        ) => path),
+      } as unknown as AgentFileService,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+    await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend,
+    });
+    providerAvailable = false;
+
+    await expect(service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'off', backend,
+    })).resolves.toMatchObject({ fileAccessMode: 'off', fileAccessRoot: undefined });
+  });
+
+  it('makes a captured Workspace gateway live only for its originating turn', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const backendAdapter = new DeferredRecordingBackend();
+    const readText = vi.fn().mockResolvedValue({
+      path: '/work/inside.txt',
+      content: 'inside',
+      bytes: 6,
+      sha256: 'a'.repeat(64),
+    });
+    const recordPolicyRejection = vi.fn();
+    const fileService = {
+      bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+      canonicalizeAccessRoot: vi.fn(async (
+        _owner: WebContents, _terminalId: string, path: string,
+      ) => path),
+      readText,
+      recordPolicyRejection,
+    } as unknown as AgentFileService;
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      fileService,
+      () => backendAdapter,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+    await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend,
+    });
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'capture gateway', backend });
+    await waitFor(() => backendAdapter.sendInputs.length === 1);
+    const terminal = backendAdapter.sendInputs[0]!.gateway.terminal;
+    const workspace = backendAdapter.sendInputs[0]!.gateway.workspace!;
+    await expect(terminal.readHistory()).resolves.toContain('tester@host');
+    await expect(terminal.getState()).resolves.toMatchObject({ status: 'connected' });
+    await expect(workspace.readFile('inside.txt')).resolves.toMatchObject({ content: 'inside' });
+    expect(readText).toHaveBeenCalledTimes(1);
+
+    backendAdapter.finish();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    await expect(terminal.readHistory()).rejects.toThrow('no longer active');
+    await expect(terminal.getState()).rejects.toThrow('no longer active');
+    await expect(workspace.readFile('inside.txt')).rejects.toThrow('no longer active');
+    // A stale, out-of-scope request must fail at the liveness guard without
+    // writing its raw spelling to the policy-rejection journal.
+    await expect(workspace.readFile('/private/raw-secret-name.txt'))
+      .rejects.toThrow('no longer active');
+    expect(recordPolicyRejection).not.toHaveBeenCalled();
+
+    await service.setFileAccess(owner, { terminalId: 'terminal', mode: 'off', backend });
+    await expect(terminal.readHistory()).rejects.toThrow('no longer active');
+    await expect(terminal.getState()).rejects.toThrow('no longer active');
+    await expect(workspace.readFile('inside.txt')).rejects.toThrow('no longer active');
+  });
+
+  it('revokes tools when backend send settles and drains an already-dispatched Workspace call', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const backendAdapter = new DeferredRecordingBackend();
+    let resolveRead!: (value: {
+      path: string;
+      content: string;
+      bytes: number;
+      sha256: string;
+    }) => void;
+    const readText = vi.fn(() => new Promise<{
+      path: string;
+      content: string;
+      bytes: number;
+      sha256: string;
+    }>((resolve) => { resolveRead = resolve; }));
+    const fileService = {
+      bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+      canonicalizeAccessRoot: vi.fn(async (
+        _owner: WebContents, _terminalId: string, path: string,
+      ) => path),
+      readText,
+      recordPolicyRejection: vi.fn(),
+    } as unknown as AgentFileService;
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      fileService,
+      () => backendAdapter,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+    await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend,
+    });
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'drain gateway', backend });
+    await waitFor(() => backendAdapter.sendInputs.length === 1);
+    const terminal = backendAdapter.sendInputs[0]!.gateway.terminal;
+    const workspace = backendAdapter.sendInputs[0]!.gateway.workspace!;
+    const pendingRead = workspace.readFile('inside.txt');
+
+    backendAdapter.finish();
+    await Promise.resolve();
+    await expect(terminal.readHistory()).rejects.toThrow('no longer active');
+    expect(service.getState(owner, 'terminal')?.state).not.toBe('COMPLETED');
+    resolveRead({
+      path: '/work/inside.txt',
+      content: 'inside',
+      bytes: 6,
+      sha256: 'a'.repeat(64),
+    });
+
+    await expect(pendingRead).rejects.toThrow('no longer active');
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+  });
+
+  it('revokes a captured Workspace gateway on terminal exit or Provider fingerprint change', async () => {
+    const makeService = (options: {
+      terminals: FakeTerminals;
+      providers: ProviderStore;
+      backend: DeferredRecordingBackend;
+    }) => {
+      const sessions = new FakeSessions();
+      sessions.session = {
+        ...sessions.session,
+        workspace: { backend: 'sftp' as const, root: '/work', hostId: 'host' },
+      };
+      const fileService = {
+        bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+        canonicalizeAccessRoot: vi.fn(async (
+          _owner: WebContents, _terminalId: string, path: string,
+        ) => path),
+        readText: vi.fn().mockResolvedValue({
+          path: '/work/inside.txt', content: 'inside', bytes: 6, sha256: 'a'.repeat(64),
+        }),
+        recordPolicyRejection: vi.fn(),
+      } as unknown as AgentFileService;
+      return new AgentService(
+        options.terminals as unknown as TerminalService,
+        sessions as unknown as SessionManager,
+        options.providers,
+        undefined,
+        undefined,
+        fileService,
+        () => options.backend,
+      );
+    };
+    const owner = browserOwner();
+    const backendRef = { kind: 'generic-provider', providerId: 'provider' } as const;
+
+    const exitTerminals = new FakeTerminals();
+    const exitBackend = new DeferredRecordingBackend();
+    const exitService = makeService({
+      terminals: exitTerminals,
+      providers: providerStore(),
+      backend: exitBackend,
+    });
+    await exitService.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend: backendRef,
+    });
+    exitService.sendPrompt(owner, {
+      terminalId: 'terminal', prompt: 'terminal exit', backend: backendRef,
+    });
+    await waitFor(() => exitBackend.sendInputs.length === 1);
+    const exitTerminal = exitBackend.sendInputs[0]!.gateway.terminal;
+    const exitWorkspace = exitBackend.sendInputs[0]!.gateway.workspace!;
+    exitTerminals.exit();
+    await expect(exitTerminal.readHistory()).rejects.toThrow('no longer active');
+    await expect(exitTerminal.getState()).rejects.toThrow('no longer active');
+    await expect(exitWorkspace.readFile('inside.txt')).rejects.toThrow('no longer active');
+    exitBackend.finish();
+
+    let profile = readyProviderProfile();
+    const changedProviders = {
+      get: () => profile,
+      list: () => [profile],
+    } as unknown as ProviderStore;
+    const changedBackend = new DeferredRecordingBackend();
+    const changedService = makeService({
+      terminals: new FakeTerminals(),
+      providers: changedProviders,
+      backend: changedBackend,
+    });
+    await changedService.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend: backendRef,
+    });
+    changedService.sendPrompt(owner, {
+      terminalId: 'terminal', prompt: 'provider change', backend: backendRef,
+    });
+    await waitFor(() => changedBackend.sendInputs.length === 1);
+    const changedTerminal = changedBackend.sendInputs[0]!.gateway.terminal;
+    const changedWorkspace = changedBackend.sendInputs[0]!.gateway.workspace!;
+    profile = readyProviderProfile('provider', {
+      baseUrl: 'https://replacement.example/v1',
+      updatedAt: new Date(1).toISOString(),
+    });
+    await expect(changedTerminal.readHistory()).rejects.toThrow('no longer active');
+    await expect(changedTerminal.getState()).rejects.toThrow('no longer active');
+    await expect(changedWorkspace.readFile('inside.txt')).rejects.toThrow('no longer active');
+    changedBackend.finish();
+  });
+
+  it('revokes ephemeral file authority on terminal exit and backend replacement', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const terminals = new FakeTerminals();
+    const fileService = {
+      bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+      canonicalizeAccessRoot: vi.fn(async (
+        _owner: WebContents,
+        _terminalId: string,
+        accessRoot: string,
+      ) => accessRoot),
+    } as unknown as AgentFileService;
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+    const owner = browserOwner();
+    const terminalExitService = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      fileService,
+    );
+    await terminalExitService.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend,
+    });
+    terminals.exit();
+    expect(terminalExitService.getState(owner, 'terminal')).toMatchObject({
+      state: 'FAILED',
+      fileAccessMode: 'off',
+      fileAccessRoot: undefined,
+      fileAccessPolicy: { read: false, write: false, create: false, delete: false },
+    });
+
+    const replacementSessions = new FakeSessions();
+    replacementSessions.session = {
+      ...replacementSessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const replacementService = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      replacementSessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      new FakeCodexAppServer() as unknown as CodexAppServerService,
+      fileService,
+    );
+    await replacementService.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-only', backend,
+    });
+    replacementService.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Switch backend.',
+      backend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      },
+    });
+    await waitFor(() => replacementService.getState(owner, 'terminal')?.state === 'COMPLETED');
+    expect(replacementService.getState(owner, 'terminal')).toMatchObject({
+      fileAccessMode: 'off',
+      fileAccessRoot: undefined,
+      fileAccessPolicy: { read: false, write: false, create: false, delete: false },
+    });
+    expect(replacementSessions.audits).toContainEqual({
+      type: 'file_permission_changed',
+      details: { mode: 'off', reason: 'user', ephemeral: true },
+    });
   });
 
   it('rejects Workspace changes while a Generic Provider turn is running', async () => {
@@ -1422,7 +2498,7 @@ describe('AgentService shared-terminal controls', () => {
     await waitFor(() => service.getState(owner, 'terminal')?.backendTurnDraining === false);
   });
 
-  it('binds ephemeral file permission, audits content-free writes, and does not use a hidden command', async () => {
+  it('binds ephemeral file permission and does not use a hidden command or legacy mutation audit', async () => {
     const sessions = new FakeSessions();
     sessions.session = { ...sessions.session, cwd: '/work' };
     const terminals = new FakeTerminals();
@@ -1438,6 +2514,7 @@ describe('AgentService shared-terminal controls', () => {
     ]);
     const fileService = {
       bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+      canonicalizeAccessRoot: vi.fn(async (_owner, _terminalId, accessRoot) => accessRoot),
       writeText: vi.fn().mockResolvedValue({
         path: '/work/new.ts', bytes: 11, sha256: 'a'.repeat(64), created: true,
       }),
@@ -1467,14 +2544,31 @@ describe('AgentService shared-terminal controls', () => {
     expect(terminals.executions).toHaveLength(0);
     expect(fileService.writeText).toHaveBeenCalledWith(
       owner, 'terminal', 'new.ts', 'export {};\n', null, '/work',
+      expect.objectContaining({
+        readablePaths: ['/work'],
+        writablePaths: ['/work'],
+        fullAccess: false,
+        assertLive: expect.any(Function),
+      }),
     );
     expect(sessions.audits).toContainEqual({
       type: 'file_permission_changed',
-      details: { mode: 'read-write', root: '/work', ephemeral: true },
+      details: {
+        mode: 'read-write',
+        root: '/work',
+        ephemeral: true,
+        policy: {
+          read: true,
+          write: true,
+          create: true,
+          delete: true,
+          readablePaths: ['/work'],
+          writablePaths: ['/work'],
+          fullAccess: false,
+        },
+      },
     });
-    const modified = sessions.audits.find((audit) => audit.type === 'file_modified');
-    expect(modified?.details).toEqual({ path: '/work/new.ts', sha256: 'a'.repeat(64), bytes: 11 });
-    expect(JSON.stringify(modified)).not.toContain('export');
+    expect(sessions.audits.some((audit) => audit.type === 'file_modified')).toBe(false);
   });
 
   it('hydrates the persisted AI conversation when a Session reconnects to a new terminal', () => {
@@ -1484,6 +2578,7 @@ describe('AgentService shared-terminal controls', () => {
       runtimeTerminalId: 'reconnected-terminal',
       aiThreadId: '22222222-2222-2222-2222-222222222222',
       agentBackend: { kind: 'generic-provider', providerId: 'provider' },
+      agentBackendFingerprint: recipientFingerprint(),
       providerId: 'provider',
     };
     sessions.persistedThreadEvents = [{
@@ -2465,6 +3560,7 @@ describe('AgentService shared-terminal controls', () => {
       kind: 'generic-openai-compatible',
       baseUrl: 'https://a.example/v1',
       modelId: 'model-a',
+      recipientRevision: 'recipient-a',
       apiKeyConfigured: true,
       isDefault: true,
       status: 'ready',

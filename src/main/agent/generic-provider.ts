@@ -379,17 +379,25 @@ async function readBoundedResponseText(response: Response): Promise<string> {
 }
 
 export class GenericOpenAiProvider implements AgentProviderRuntime {
+  private readonly expectedRecipientRevision: string;
+
   constructor(
     private readonly providerId: string,
     private readonly providers: ProviderStore,
     private readonly fetchImplementation: typeof fetch = fetch,
-  ) {}
+  ) {
+    // Bind this replaceable runtime to one recipient identity. The same
+    // instance may serve several AgentLoop rounds, but it may never follow a
+    // mutable Provider ID to a new endpoint/model/credential.
+    this.expectedRecipientRevision = providers.get(providerId).recipientRevision;
+  }
 
   async complete(request: AgentCompletionRequest): Promise<AgentCompletion> {
-    const profile = this.providers.get(this.providerId);
-    if (profile.status !== 'ready') throw new Error(`Provider ${profile.name} is not Ready.`);
-    const apiKey = await this.providers.apiKey(profile.id);
-    const response = await this.fetchImplementation(`${profile.baseUrl}/chat/completions`, {
+    const { profile, apiKey } = await this.providers.runtimeSnapshot(
+      this.providerId,
+      this.expectedRecipientRevision,
+    );
+    const fetchOptions: RequestInit = {
       method: 'POST',
       redirect: 'error',
       signal: request.signal,
@@ -408,7 +416,18 @@ export class GenericOpenAiProvider implements AgentProviderRuntime {
         tool_choice: 'auto',
         stream: true,
       }),
-    });
+    };
+    // No await or user callback may occur between this synchronous identity
+    // fence and dispatch. A config/key transition between AgentLoop rounds or
+    // during the asynchronous secret read therefore cannot receive history.
+    this.providers.assertRuntimeRecipient(
+      this.providerId,
+      this.expectedRecipientRevision,
+    );
+    const response = await this.fetchImplementation(
+      `${profile.baseUrl}/chat/completions`,
+      fetchOptions,
+    );
     if (!response.ok) throw new Error(`Provider completion failed with HTTP ${response.status}.`);
     const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
     const streamed = contentType.includes('text/event-stream');

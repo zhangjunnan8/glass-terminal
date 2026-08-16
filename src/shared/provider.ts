@@ -7,6 +7,11 @@ export interface ProviderProfile {
   kind: ProviderKind;
   baseUrl: string;
   modelId: string;
+  /**
+   * Opaque, non-secret identity revision for endpoint/model/credential changes.
+   * Routine status tests, display-name edits, and default selection preserve it.
+   */
+  recipientRevision: string;
   apiKeyConfigured: boolean;
   isDefault: boolean;
   status: ProviderStatus;

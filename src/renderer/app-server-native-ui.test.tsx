@@ -25,6 +25,7 @@ const provider: ProviderProfile = {
   kind: 'generic-openai-compatible',
   baseUrl: 'https://api.example.com/v1',
   modelId: 'example-model',
+  recipientRevision: 'recipient-provider-1',
   apiKeyConfigured: true,
   isDefault: true,
   status: 'ready',
@@ -350,9 +351,277 @@ describe('native Codex App Server renderer mode', () => {
     expect(bridge.agent.setFileAccess).toHaveBeenCalledWith({
       terminalId: 'terminal-1', mode: 'read-write',
       backend: { kind: 'generic-provider', providerId: provider.id },
+      expectedWorkspaceRoot: '/workspace/explicit-project',
     });
     expect(container.textContent).toContain('绑定根：/workspace/explicit-project');
     expect(container.textContent).not.toContain('绑定根：/stale-runtime-root');
+  });
+
+  it('requires a distinct danger confirmation before enabling full filesystem access', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    vi.mocked(bridge.sessions.list).mockResolvedValue([
+      localSession('/workspace/explicit-project'),
+    ]);
+    bridge.agent.setFileAccess = vi.fn().mockResolvedValue({
+      ...agentView(), revision: 2, fileAccessMode: 'full-access',
+      fileAccessRoot: '/workspace/explicit-project',
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    const select = container.querySelector<HTMLSelectElement>(
+      '[data-testid="agent-file-access-mode"]',
+    )!;
+    await act(async () => setSelectValue(select, 'full-access'));
+
+    expect(bridge.agent.setFileAccess).not.toHaveBeenCalled();
+    const confirmation = container.querySelector<HTMLElement>(
+      '[data-testid="file-access-confirmation"]',
+    )!;
+    expect(confirmation.dataset.accessMode).toBe('full-access');
+    expect(confirmation.classList).toContain('full-access-risk');
+    expect(confirmation.textContent).toContain('允许 AI 访问完整文件系统');
+    expect(confirmation.textContent).toContain('任意路径');
+    expect(confirmation.textContent).toContain('不会提权');
+    expect(confirmation.textContent).toContain('/workspace/explicit-project');
+
+    await act(async () => {
+      confirmation.querySelector<HTMLButtonElement>(
+        '[data-action="confirm-full-filesystem-access"]',
+      )!.click();
+    });
+    await settle();
+
+    expect(bridge.agent.setFileAccess).toHaveBeenCalledWith({
+      terminalId: 'terminal-1',
+      mode: 'full-access',
+      backend: { kind: 'generic-provider', providerId: provider.id },
+      fullAccessConfirmed: true,
+      expectedWorkspaceRoot: '/workspace/explicit-project',
+    });
+  });
+
+  it('downgrades full filesystem access to bound-root read-write without another confirmation', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    vi.mocked(bridge.sessions.list).mockResolvedValue([
+      localSession('/workspace/explicit-project'),
+    ]);
+    bridge.agent.getState = vi.fn().mockResolvedValue({
+      ...agentView(),
+      fileAccessMode: 'full-access',
+      fileAccessRoot: '/workspace/explicit-project',
+    });
+    bridge.agent.setFileAccess = vi.fn().mockResolvedValue({
+      ...agentView(), revision: 2, fileAccessMode: 'read-write',
+      fileAccessRoot: '/workspace/explicit-project',
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    const select = container.querySelector<HTMLSelectElement>(
+      '[data-testid="agent-file-access-mode"]',
+    )!;
+    expect(select.value).toBe('full-access');
+    await act(async () => setSelectValue(select, 'read-write'));
+    await settle();
+
+    expect(container.querySelector('[data-testid="file-access-confirmation"]')).toBeNull();
+    expect(bridge.agent.setFileAccess).toHaveBeenCalledWith({
+      terminalId: 'terminal-1',
+      mode: 'read-write',
+      backend: { kind: 'generic-provider', providerId: provider.id },
+    });
+  });
+
+  it('does not treat one Generic Provider grant as authority for a newly selected Provider', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    const replacementProvider: ProviderProfile = {
+      ...provider,
+      id: 'provider-2',
+      name: 'Replacement provider',
+      isDefault: true,
+    };
+    vi.mocked(bridge.providers.list).mockResolvedValue([
+      replacementProvider,
+      { ...provider, isDefault: false },
+    ]);
+    vi.mocked(bridge.sessions.list).mockResolvedValue([
+      localSession('/workspace/explicit-project'),
+    ]);
+    bridge.agent.getState = vi.fn().mockResolvedValue({
+      ...agentView(),
+      fileAccessMode: 'full-access',
+      fileAccessRoot: '/workspace/explicit-project',
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    const select = container.querySelector<HTMLSelectElement>(
+      '[data-testid="agent-file-access-mode"]',
+    )!;
+    expect(select.value).toBe('off');
+    expect(container.querySelector('[data-testid="detached-file-access-grant"]')?.textContent)
+      .toContain(provider.name);
+
+    await act(async () => setSelectValue(select, 'read-write'));
+    expect(bridge.agent.setFileAccess).not.toHaveBeenCalled();
+    const confirmation = container.querySelector<HTMLElement>(
+      '[data-testid="file-access-confirmation"]',
+    )!;
+    expect(confirmation.dataset.accessMode).toBe('read-write');
+    await act(async () => {
+      confirmation.querySelector<HTMLButtonElement>('button')!.click();
+    });
+  });
+
+  it('keeps an explicit revoke available after the granted Provider is removed', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    vi.mocked(bridge.providers.list).mockResolvedValue([]);
+    vi.mocked(bridge.sessions.list).mockResolvedValue([
+      localSession('/workspace/explicit-project'),
+    ]);
+    bridge.agent.getState = vi.fn().mockResolvedValue({
+      ...agentView(),
+      fileAccessMode: 'read-only',
+      fileAccessRoot: '/workspace/explicit-project',
+    });
+    bridge.agent.setFileAccess = vi.fn().mockResolvedValue({
+      ...agentView(),
+      revision: 2,
+      fileAccessMode: 'off',
+      fileAccessRoot: undefined,
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    expect(container.querySelector<HTMLSelectElement>(
+      '[data-testid="agent-file-access-mode"]',
+    )?.disabled).toBe(true);
+    const revoke = container.querySelector<HTMLButtonElement>(
+      '[data-action="disable-active-file-access"]',
+    )!;
+    expect(revoke.disabled).toBe(false);
+    await act(async () => revoke.click());
+    await settle();
+
+    expect(bridge.agent.setFileAccess).toHaveBeenCalledWith({
+      terminalId: 'terminal-1',
+      mode: 'off',
+      backend: { kind: 'generic-provider', providerId: provider.id },
+    });
+  });
+
+  it('disables file-access grants when the active terminal disconnects', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    vi.mocked(bridge.sessions.list).mockResolvedValue([
+      localSession('/workspace/explicit-project'),
+    ]);
+    bridge.agent.getState = vi.fn().mockResolvedValue(agentView());
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    const onExit = vi.mocked(bridge.terminal.onExit).mock.calls[0]![0];
+    await act(async () => onExit({ terminalId: 'terminal-1', exitCode: 0 }));
+    await settle();
+
+    expect(container.querySelector<HTMLSelectElement>(
+      '[data-testid="agent-file-access-mode"]',
+    )?.disabled).toBe(true);
+  });
+
+  it('invalidates a file-access confirmation when its backend selection changes', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    vi.mocked(bridge.sessions.list).mockResolvedValue([
+      localSession('/workspace/explicit-project'),
+    ]);
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    await act(async () => setSelectValue(
+      container.querySelector<HTMLSelectElement>('[data-testid="agent-file-access-mode"]')!,
+      'full-access',
+    ));
+    expect(container.querySelector('[data-testid="file-access-confirmation"]')).not.toBeNull();
+
+    await act(async () => setSelectValue(
+      container.querySelector<HTMLSelectElement>('[data-testid="agent-backend-select"]')!,
+      CODEX_APP_SERVER_AGENT_BACKEND,
+    ));
+    await settle();
+
+    expect(container.querySelector('[data-testid="file-access-confirmation"]')).toBeNull();
+    expect(bridge.agent.setFileAccess).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="workspace-action-error"]')?.textContent)
+      .toContain('授权目标已变化');
+  });
+
+  it('invalidates a file-access confirmation when the Workspace Root changes', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    vi.mocked(bridge.sessions.list).mockResolvedValue([
+      localSession('/workspace/explicit-project'),
+    ]);
+    bridge.sessions.chooseLocalWorkspace = vi.fn().mockResolvedValue(
+      localSession('/workspace/replaced-project'),
+    );
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    await act(async () => setSelectValue(
+      container.querySelector<HTMLSelectElement>('[data-testid="agent-file-access-mode"]')!,
+      'full-access',
+    ));
+    expect(container.querySelector('[data-testid="file-access-confirmation"]')).not.toBeNull();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-action="choose-workspace"]')!.click();
+    });
+    await settle();
+
+    expect(container.querySelector('[data-testid="file-access-confirmation"]')).toBeNull();
+    expect(bridge.agent.setFileAccess).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="terminal-workspace-binding"]')?.textContent)
+      .toContain('/workspace/replaced-project');
+  });
+
+  it('invalidates a file-access confirmation after switching active terminals', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    vi.mocked(bridge.sessions.list).mockResolvedValue([
+      localSession('/workspace/explicit-project'),
+    ]);
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    await act(async () => setSelectValue(
+      container.querySelector<HTMLSelectElement>('[data-testid="agent-file-access-mode"]')!,
+      'full-access',
+    ));
+    expect(container.querySelector('[data-testid="file-access-confirmation"]')).not.toBeNull();
+
+    await act(async () => window.dispatchEvent(new CustomEvent('ai-terminal:terminal-opened', {
+      detail: {
+        id: 'terminal-2',
+        title: 'Other terminal',
+        profileId: 'shell-1',
+        shellKind: 'powershell',
+        transport: 'local',
+      },
+    })));
+    await settle();
+
+    expect(container.querySelector('[data-testid="file-access-confirmation"]')).toBeNull();
+    expect(bridge.agent.setFileAccess).not.toHaveBeenCalled();
   });
 
   it('blocks file access until an explicit Workspace Root is set and never falls back to cwd', async () => {
@@ -437,6 +706,12 @@ describe('native Codex App Server renderer mode', () => {
       fileAccessMode: 'read-only',
       fileAccessRoot: '/workspace/explicit-project',
     });
+    bridge.agent.setFileAccess = vi.fn().mockResolvedValue({
+      ...agentView(),
+      revision: 2,
+      fileAccessMode: 'off',
+      fileAccessRoot: undefined,
+    });
     Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
     await act(async () => root.render(<App />));
     await settle();
@@ -455,6 +730,21 @@ describe('native Codex App Server renderer mode', () => {
 
     expect(chooseWorkspace.disabled).toBe(true);
     expect(chooseWorkspace.title).toContain('请先关闭 AI 文件访问');
+
+    await act(async () => setSelectValue(backendSelect, 'generic-provider'));
+    const fileAccess = container.querySelector<HTMLSelectElement>(
+      '[data-testid="agent-file-access-mode"]',
+    )!;
+    expect(fileAccess.value).toBe('read-only');
+    await act(async () => setSelectValue(fileAccess, 'off'));
+    await settle();
+
+    expect(bridge.agent.setFileAccess).toHaveBeenCalledWith({
+      terminalId: 'terminal-1',
+      mode: 'off',
+      backend: { kind: 'generic-provider', providerId: provider.id },
+    });
+    expect(chooseWorkspace.disabled).toBe(false);
   });
 
   it('shows a one-click interrupt instead of edit controls while the latest prompt runs', async () => {

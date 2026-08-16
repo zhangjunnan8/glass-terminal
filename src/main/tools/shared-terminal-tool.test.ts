@@ -88,6 +88,7 @@ function setup(options: {
   execute?: (command: string, reason?: string) => Promise<TerminalCommandResult>;
   sendInput?: (input: string) => Promise<void> | void;
   interrupt?: (commandId?: string) => Promise<void> | void;
+  assertLive?: () => void;
 } = {}) {
   const owner = { id: 7 } as WebContents;
   let currentSession = options.session ?? makeSession();
@@ -131,6 +132,7 @@ function setup(options: {
     execute,
     ...(options.sendInput ? { sendInput: options.sendInput } : {}),
     ...(options.interrupt ? { interrupt: options.interrupt } : {}),
+    ...(options.assertLive ? { assertLive: options.assertLive } : {}),
   });
   return {
     tool,
@@ -192,6 +194,35 @@ describe('SharedTerminalTool', () => {
       fixture.tool.getState(),
     ];
     for (const call of calls) await expect(call).rejects.toThrow(/binding.*stale/i);
+    expect(fixture.execute).not.toHaveBeenCalled();
+    expect(sendInput).not.toHaveBeenCalled();
+    expect(interrupt).not.toHaveBeenCalled();
+    expect(fixture.sessionMock.readTerminalHistory).not.toHaveBeenCalled();
+    expect(fixture.terminalMock.state).not.toHaveBeenCalled();
+  });
+
+  it('rejects captured tools at the turn lease before reading state/history or delegating', async () => {
+    const revoked = new Error('Terminal tool grant is no longer active.');
+    const assertLive = vi.fn(() => { throw revoked; });
+    const sendInput = vi.fn();
+    const interrupt = vi.fn();
+    const fixture = setup({
+      context: makeContext({ sendInput: true }),
+      assertLive,
+      sendInput,
+      interrupt,
+    });
+
+    const calls = [
+      fixture.tool.execute('pwd'),
+      fixture.tool.sendInput('y\r'),
+      fixture.tool.interrupt('command-1'),
+      fixture.tool.readVisible(),
+      fixture.tool.readHistory(),
+      fixture.tool.getState(),
+    ];
+    for (const call of calls) await expect(call).rejects.toBe(revoked);
+    expect(assertLive).toHaveBeenCalledTimes(6);
     expect(fixture.execute).not.toHaveBeenCalled();
     expect(sendInput).not.toHaveBeenCalled();
     expect(interrupt).not.toHaveBeenCalled();

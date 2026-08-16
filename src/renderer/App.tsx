@@ -131,6 +131,7 @@ interface FileAccessChallenge {
   terminalId: string;
   target: string;
   root: string;
+  mode: Extract<AgentFileAccessMode, 'read-write' | 'full-access'>;
   backend: Extract<AgentBackendRef, { kind: 'generic-provider' }>;
 }
 
@@ -499,15 +500,32 @@ export function App() {
   const codexTerminalContextAccess = codexAppServer?.terminalContextAccess;
   const codexBackendSelected = selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND;
   const activeRuntimeFileAccessMode: AgentFileAccessMode = activeAgent?.fileAccessMode ?? 'off';
+  const activeGenericProviderId = activeAgent?.backend.kind === 'generic-provider'
+    ? activeAgent.backend.providerId
+    : undefined;
+  const selectedGenericBackendMatchesActive = Boolean(
+    selectedAgentBackend?.kind === 'generic-provider'
+    && activeGenericProviderId
+    && selectedAgentBackend.providerId === activeGenericProviderId,
+  );
   const selectedFileAccessMode: AgentFileAccessMode = !codexBackendSelected
-    && activeAgent?.backend.kind === 'generic-provider'
-    ? activeAgent.fileAccessMode
+    && selectedGenericBackendMatchesActive
+    ? activeRuntimeFileAccessMode
     : 'off';
+  const activeFileAccessProviderLabel = activeGenericProviderId
+    ? providers.find((provider) => provider.id === activeGenericProviderId)?.name
+      ?? activeGenericProviderId
+    : null;
   const activeWorkspaceRoot = activeSession?.workspace?.root;
   const selectedAgentBackendReady = selectedAgentBackendKind
     === CODEX_APP_SERVER_AGENT_BACKEND
     ? codexAgentAvailable
     : selectedGenericProvider?.status === 'ready';
+  const activeGenericFileAccessNeedsSeparateRevoke = Boolean(
+    activeAgent?.backend.kind === 'generic-provider'
+    && activeAgent.fileAccessMode !== 'off'
+    && (!selectedGenericBackendMatchesActive || !selectedAgentBackendReady)
+  );
   const selectedAgentBackendStatus = selectedAgentBackendKind
     === CODEX_APP_SERVER_AGENT_BACKEND
     ? codexAppServer
@@ -635,6 +653,26 @@ export function App() {
         : composerBlocked
           ? 'AI 正在运行，暂时不能修改工作区'
           : null;
+  const fileAccessChallengeIsCurrent = Boolean(
+    fileAccessChallenge
+    && activeTab?.id === fileAccessChallenge.terminalId
+    && activeTab.status === 'connected'
+    && !composerBlocked
+    && selectedAgentBackendReady
+    && selectedAgentBackend?.kind === 'generic-provider'
+    && selectedAgentBackend.providerId === fileAccessChallenge.backend.providerId
+    && activeWorkspaceRoot === fileAccessChallenge.root
+    && (fileAccessChallenge.mode === 'full-access'
+      ? selectedFileAccessMode !== 'full-access'
+      : selectedFileAccessMode !== 'read-write'
+        && selectedFileAccessMode !== 'full-access'),
+  );
+
+  useEffect(() => {
+    if (!fileAccessChallenge || fileAccessChallengeIsCurrent) return;
+    setFileAccessChallenge(null);
+    setWorkspaceActionError('文件访问授权目标已变化，请重新选择权限。');
+  }, [fileAccessChallenge, fileAccessChallengeIsCurrent]);
 
   useEffect(() => {
     if (!activeId) return;
@@ -1103,9 +1141,24 @@ export function App() {
     mode: AgentFileAccessMode,
     terminalId = activeTab?.id,
     backend = selectedAgentBackend,
+    fullAccessConfirmed = false,
+    expectedWorkspaceRoot?: string,
   ) {
     if (!terminalId || !backend || backend.kind !== 'generic-provider') return;
     setWorkspaceActionError(null);
+    if (
+      expectedWorkspaceRoot !== undefined
+      && (
+        activeTab?.id !== terminalId
+        || activeTab.status !== 'connected'
+        || selectedAgentBackend?.kind !== 'generic-provider'
+        || selectedAgentBackend.providerId !== backend.providerId
+        || activeWorkspaceRoot !== expectedWorkspaceRoot
+      )
+    ) {
+      setWorkspaceActionError('文件访问授权目标已变化，请重新选择权限。');
+      return;
+    }
     if (mode !== 'off') {
       const session = sessions.find((candidate) => (
         candidate.runtimeTerminalId === terminalId
@@ -1115,12 +1168,21 @@ export function App() {
         setWorkspaceActionError('请先为当前终端设置 Workspace Root，再开启 AI 文件访问。');
         return;
       }
+      if (
+        expectedWorkspaceRoot !== undefined
+        && session.workspace.root !== expectedWorkspaceRoot
+      ) {
+        setWorkspaceActionError('Workspace Root 已变化，请重新选择文件访问权限。');
+        return;
+      }
     }
     try {
       const state = await window.aiTerminal.agent.setFileAccess({
         terminalId,
         mode,
         backend,
+        ...(mode === 'full-access' ? { fullAccessConfirmed } : {}),
+        ...(expectedWorkspaceRoot !== undefined ? { expectedWorkspaceRoot } : {}),
       });
       setAgentStates((current) => mergeAgentState(current, state));
       setTabs((current) => current.map((tab) => (
@@ -2270,6 +2332,7 @@ export function App() {
                   value={selectedFileAccessMode}
                   disabled={
                     !activeTab
+                    || activeTab.status !== 'connected'
                     || composerBlocked
                     || !selectedAgentBackendReady
                     || (!activeWorkspaceRoot && activeRuntimeFileAccessMode === 'off')
@@ -2283,9 +2346,13 @@ export function App() {
                       );
                       return;
                     }
-                    if (
-                      mode === 'read-write'
+                    const requiresWriteConfirmation = mode === 'read-write'
                       && selectedFileAccessMode !== 'read-write'
+                      && selectedFileAccessMode !== 'full-access';
+                    const requiresFullAccessConfirmation = mode === 'full-access'
+                      && selectedFileAccessMode !== 'full-access';
+                    if (
+                      (requiresWriteConfirmation || requiresFullAccessConfirmation)
                       && activeTab
                       && workspaceRoot
                       && selectedAgentBackend?.kind === 'generic-provider'
@@ -2294,6 +2361,7 @@ export function App() {
                         terminalId: activeTab.id,
                         target: activeTab.title,
                         root: workspaceRoot,
+                        mode,
                         backend: selectedAgentBackend,
                       });
                       return;
@@ -2304,8 +2372,27 @@ export function App() {
                   <option value="off">关闭</option>
                   <option value="read-only">只读绑定根</option>
                   <option value="read-write">读写绑定根</option>
+                  <option value="full-access">FULL FILESYSTEM ACCESS</option>
                 </select>
               </label>
+              {activeGenericFileAccessNeedsSeparateRevoke
+                && activeAgent?.backend.kind === 'generic-provider' && (
+                <div className="agent-file-access-detached" data-testid="detached-file-access-grant">
+                  <span>
+                    当前文件授权属于 {activeFileAccessProviderLabel}，并未授予当前所选 Provider。
+                  </span>
+                  <button
+                    type="button"
+                    data-action="disable-active-file-access"
+                    disabled={composerBlocked}
+                    onClick={() => void setAgentFileAccess(
+                      'off',
+                      activeTab?.id,
+                      activeAgent.backend,
+                    )}
+                  >关闭现有授权</button>
+                </div>
+              )}
               {!activeWorkspaceRoot && activeRuntimeFileAccessMode === 'off' && (
                 <span className="agent-file-access-root" data-testid="agent-workspace-required">
                   请先设置 Workspace Root
@@ -3449,11 +3536,14 @@ export function App() {
       {fileAccessChallenge && (
         <div className="modal-backdrop">
           <div
-            className="modal compact-modal file-access-modal"
+            className={`modal compact-modal file-access-modal ${
+              fileAccessChallenge.mode === 'full-access' ? 'full-access-risk' : ''
+            }`}
             role="dialog"
             aria-modal="true"
             aria-labelledby="file-access-confirmation-title"
             data-testid="file-access-confirmation"
+            data-access-mode={fileAccessChallenge.mode}
             onKeyDown={(event) => {
               if (event.key !== 'Escape') return;
               event.preventDefault();
@@ -3461,26 +3551,57 @@ export function App() {
             }}
           >
             <div className="modal-header">
-              <strong id="file-access-confirmation-title">允许 AI 直接修改文件？</strong>
+              <strong id="file-access-confirmation-title">
+                {fileAccessChallenge.mode === 'full-access'
+                  ? '允许 AI 访问完整文件系统？'
+                  : '允许 AI 直接修改文件？'}
+              </strong>
             </div>
             <p>终端：<b>{fileAccessChallenge.target}</b></p>
             <p>绑定根目录：<code>{fileAccessChallenge.root}</code></p>
             <p className="risk-note">
-              允许后，Generic Provider 可在绑定根目录内创建、修改、重命名或删除文件与目录；这些修改不会经过终端，
-              也不能通过终端撤销。读取到的文件内容会作为 AI 请求上下文发送给当前 Provider。
-              权限只在本次应用运行期间有效。所有命令仍必须进入可见终端。
+              {fileAccessChallenge.mode === 'full-access' ? (
+                <>
+                  允许后，Generic Provider 可读取、创建、修改、重命名或删除当前本机/远程用户能访问的任意路径，
+                  软件不再限制 Readable/Writable Paths。它不会提权，仍受本机 OS 或当前 SSH/SFTP 用户权限限制；
+                  相对路径仍以上述 Workspace Root 为起点。权限只在本次应用运行期间有效。
+                </>
+              ) : (
+                <>
+                  允许后，Generic Provider 可在绑定根目录内创建、修改、重命名或删除文件与目录；这些修改不会经过终端，
+                  也不能通过终端撤销。读取到的文件内容会作为 AI 请求上下文发送给当前 Provider。
+                  权限只在本次应用运行期间有效。
+                </>
+              )}
+              所有命令仍必须进入可见终端。
             </p>
             <div className="modal-actions">
               <button autoFocus onClick={() => setFileAccessChallenge(null)}>取消</button>
               <button
                 className="danger-action"
-                data-action="confirm-file-read-write"
+                data-action={fileAccessChallenge.mode === 'full-access'
+                  ? 'confirm-full-filesystem-access'
+                  : 'confirm-file-read-write'}
+                disabled={!fileAccessChallengeIsCurrent}
                 onClick={() => {
                   const challenge = fileAccessChallenge;
+                  if (!fileAccessChallengeIsCurrent) {
+                    setFileAccessChallenge(null);
+                    setWorkspaceActionError('文件访问授权目标已变化，请重新选择权限。');
+                    return;
+                  }
                   setFileAccessChallenge(null);
-                  void setAgentFileAccess('read-write', challenge.terminalId, challenge.backend);
+                  void setAgentFileAccess(
+                    challenge.mode,
+                    challenge.terminalId,
+                    challenge.backend,
+                    challenge.mode === 'full-access',
+                    challenge.root,
+                  );
                 }}
-              >允许本次读写与删除</button>
+              >{fileAccessChallenge.mode === 'full-access'
+                  ? '我已了解风险，允许完整文件系统访问'
+                  : '允许本次读写与删除'}</button>
             </div>
           </div>
         </div>

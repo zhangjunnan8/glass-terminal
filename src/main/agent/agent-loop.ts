@@ -247,11 +247,46 @@ const WORKSPACE_MUTATION_TOOL_NAMES = new Set([
 const MAX_WORKSPACE_RESULT_BYTES_PER_TURN = 2 * 1024 * 1024;
 const MAX_WORKSPACE_ERROR_CHARS = 4_096;
 
-function toolsForMode(mode: AgentFileAccessMode): AgentToolDefinition[] {
-  if (mode === 'off') return TERMINAL_TOOLS;
-  return mode === 'read-only'
-    ? [...TERMINAL_TOOLS, ...WORKSPACE_READ_TOOLS]
-    : [...TERMINAL_TOOLS, ...WORKSPACE_READ_TOOLS, ...WORKSPACE_WRITE_TOOLS];
+function toolsForGateway(
+  mode: AgentFileAccessMode,
+  gateway: ToolGateway,
+): AgentToolDefinition[] {
+  const permissions = gateway.context.permissions.workspace;
+  const modeAllowsRead = mode !== 'off';
+  const contextModeAllowsWrite = permissions.mode === 'read-write'
+    || permissions.mode === 'full-access';
+  const modeAllowsWrite = contextModeAllowsWrite
+    && (mode === 'read-write' || mode === 'full-access');
+  const hasReadableScope = permissions.fullAccess || permissions.readablePaths.length > 0;
+  const hasWritableScope = permissions.fullAccess || permissions.writablePaths.length > 0;
+  if (!gateway.workspace || !permissions.enabled || !modeAllowsRead) return TERMINAL_TOOLS;
+
+  const tools = [...TERMINAL_TOOLS];
+  if (permissions.read && hasReadableScope) tools.push(...WORKSPACE_READ_TOOLS);
+  if (!modeAllowsWrite) return tools;
+
+  for (const tool of WORKSPACE_WRITE_TOOLS) {
+    const allowed = (() => {
+      switch (tool.name) {
+        case 'workspace_apply_patch':
+          return permissions.read && permissions.write
+            && hasReadableScope && hasWritableScope;
+        case 'workspace_write_file':
+          return (permissions.create && hasWritableScope)
+            || (permissions.read && permissions.write && hasReadableScope && hasWritableScope);
+        case 'workspace_mkdir':
+          return permissions.create && hasWritableScope;
+        case 'workspace_rename':
+          return permissions.write && permissions.create && permissions.delete && hasWritableScope;
+        case 'workspace_delete':
+          return permissions.delete && hasWritableScope;
+        default:
+          return false;
+      }
+    })();
+    if (allowed) tools.push(tool);
+  }
+  return tools;
 }
 
 function compactToolResult(content: string, toolName: string): string {
@@ -438,7 +473,7 @@ function writableWorkspace(
 ): WorkspaceTool {
   const permissions = gateway.context.permissions.workspace;
   if (
-    fileAccessMode !== 'read-write'
+    (fileAccessMode !== 'read-write' && fileAccessMode !== 'full-access')
     || !permissions.enabled
     || requiredPermissions.some((permission) => !permissions[permission])
   ) {
@@ -481,7 +516,7 @@ export class AgentLoop {
       throwIfTurnCancelled(input.signal);
       const completion = await this.provider.complete({
         messages,
-        tools: toolsForMode(fileAccessMode),
+        tools: toolsForGateway(fileAccessMode, this.gateway),
         signal: input.signal,
         onTextDelta: (delta) => {
           if (delta && !input.signal.aborted) {

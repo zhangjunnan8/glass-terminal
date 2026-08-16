@@ -56,6 +56,8 @@ export interface SessionRecord {
   workspace?: WorkspaceBinding;
   aiThreadId?: string;
   agentBackend?: AgentBackendRef;
+  /** SHA-256 identity of the Generic Provider recipient bound to aiThreadId. */
+  agentBackendFingerprint?: string;
   providerThreadId?: string;
   /** @deprecated Kept for schema-v1 Generic Provider sessions. */
   providerId?: string;

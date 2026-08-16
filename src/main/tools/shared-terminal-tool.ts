@@ -27,6 +27,8 @@ export interface SharedTerminalToolOptions {
   execute(command: string, reason?: string): Promise<TerminalCommandResult>;
   sendInput?(input: string): Promise<void> | void;
   interrupt?(commandId?: string): Promise<void> | void;
+  /** Main-process lease check for the runtime/turn that issued this tool. */
+  assertLive?(): void;
 }
 
 interface CurrentBinding {
@@ -50,6 +52,7 @@ export class SharedTerminalTool implements TerminalTool {
   constructor(private readonly options: SharedTerminalToolOptions) {}
 
   async execute(command: string, reason?: string): Promise<TerminalCommandResult> {
+    this.assertLive();
     this.assertCurrentBinding();
     this.assertPermission('execute');
     if (!command.trim()) throw new Error('Terminal command cannot be empty.');
@@ -57,6 +60,7 @@ export class SharedTerminalTool implements TerminalTool {
   }
 
   async sendInput(input: string): Promise<void> {
+    this.assertLive();
     this.assertCurrentBinding();
     this.assertPermission('sendInput');
     if (!this.options.sendInput) {
@@ -66,6 +70,7 @@ export class SharedTerminalTool implements TerminalTool {
   }
 
   async interrupt(commandId?: string): Promise<void> {
+    this.assertLive();
     this.assertCurrentBinding();
     this.assertPermission('interrupt');
     if (!this.options.interrupt) {
@@ -75,6 +80,7 @@ export class SharedTerminalTool implements TerminalTool {
   }
 
   async readVisible(options: { maxChars?: number } = {}): Promise<string> {
+    this.assertLive();
     const { session } = this.assertCurrentBinding();
     this.assertPermission('read');
     const maxChars = boundedCharacterLimit(
@@ -86,6 +92,7 @@ export class SharedTerminalTool implements TerminalTool {
   }
 
   async readHistory(options: { maxChars?: number } = {}): Promise<string> {
+    this.assertLive();
     const { session } = this.assertCurrentBinding();
     this.assertPermission('read');
     const maxChars = boundedCharacterLimit(
@@ -97,6 +104,7 @@ export class SharedTerminalTool implements TerminalTool {
   }
 
   async getState(): Promise<TerminalToolState> {
+    this.assertLive();
     const { session } = this.assertCurrentBinding();
     this.assertPermission('read');
     return {
@@ -113,6 +121,10 @@ export class SharedTerminalTool implements TerminalTool {
     if (!this.options.context.permissions.terminal[permission]) {
       throw new Error(`terminal.${permission} is disabled by Session permissions.`);
     }
+  }
+
+  private assertLive(): void {
+    this.options.assertLive?.();
   }
 
   private assertCurrentBinding(): CurrentBinding {

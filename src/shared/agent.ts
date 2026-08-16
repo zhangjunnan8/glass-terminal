@@ -12,7 +12,23 @@ export type AgentRuntimeState =
   | 'FAILED';
 
 export type TerminalInputMode = 'human' | 'locked' | 'secure-human';
-export type AgentFileAccessMode = 'off' | 'read-only' | 'read-write';
+export type AgentFileAccessMode = 'off' | 'read-only' | 'read-write' | 'full-access';
+
+/**
+ * Explicit, ephemeral capabilities granted to Generic Provider workspace tools.
+ * The access mode remains an upper bound: a policy can narrow a mode but cannot
+ * use (for example) `write: true` to turn read-only access into write access.
+ */
+export interface AgentFileAccessPolicy {
+  read: boolean;
+  write: boolean;
+  create: boolean;
+  delete: boolean;
+  readablePaths: string[];
+  writablePaths: string[];
+  /** Skip software path-range checks only; OS/SFTP user permissions still apply. */
+  fullAccess: boolean;
+}
 
 export const CODEX_APP_SERVER_AGENT_BACKEND = 'codex-app-server-isolated' as const;
 export const CODEX_APP_SERVER_AGENT_POLICY_VERSION = 1 as const;
@@ -97,6 +113,8 @@ export interface AgentSessionView {
   fullTakeover: boolean;
   /** Explicit, in-memory permission for Generic Provider file tools. Never persisted. */
   fileAccessMode: AgentFileAccessMode;
+  /** Optional for compatibility with persisted Alpha sessions and older render fixtures. */
+  fileAccessPolicy?: AgentFileAccessPolicy;
   /** Canonical explicit Session Workspace Root captured when file access was enabled. */
   fileAccessRoot?: string;
   messages: AgentChatItem[];
@@ -165,6 +183,11 @@ export interface SetAgentFileAccessRequest {
   terminalId: string;
   mode: AgentFileAccessMode;
   backend: AgentBackendRef;
+  /** Optional compare-and-set guard captured by a renderer confirmation dialog. */
+  expectedWorkspaceRoot?: string;
+  policy?: AgentFileAccessPolicy;
+  /** Required by the service/UI confirmation flow before enabling full-access. */
+  fullAccessConfirmed?: boolean;
 }
 
 export interface TakeoverRequest {

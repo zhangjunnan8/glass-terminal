@@ -5,7 +5,16 @@ import {
   unlink,
   writeFile,
 } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, normalize, relative, resolve, sep } from 'node:path';
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  normalize,
+  parse,
+  relative,
+  resolve,
+  sep,
+} from 'node:path';
 import { posix } from 'node:path';
 import type { WebContents } from 'electron';
 import type {
@@ -32,6 +41,17 @@ import {
   assertSafeWindowsResolvedPath,
 } from '../filesystem/workspace-path-security';
 import type { SessionManager } from '../sessions/session-manager';
+import type {
+  WorkspaceDiffArtifact,
+  WorkspaceOperation,
+  WorkspaceOperationCanonicalPath,
+  WorkspaceOperationEffect,
+  WorkspaceOperationFailure,
+  WorkspaceOperationHandle,
+  WorkspaceOperationIntent,
+  WorkspaceOperationOutcome,
+  WorkspaceOperationSource,
+} from '../sessions/workspace-operation-journal';
 import type { TerminalService } from '../terminal/terminal-service';
 
 const MAX_AGENT_FILE_BYTES = 512 * 1024;
@@ -42,6 +62,13 @@ const MAX_PATCH_INPUT_BYTES = 1024 * 1024;
 const MAX_RECURSIVE_DELETE_DEPTH = 32;
 const MAX_RECURSIVE_DELETE_ENTRIES = 10_000;
 const MAX_RECURSIVE_DELETE_DURATION_MS = 10_000;
+const AUDITED_MUTATIONS = new Set<WorkspaceOperation>([
+  'write',
+  'patch',
+  'mkdir',
+  'rename',
+  'delete',
+]);
 
 export interface AgentFileReadResult {
   path: string;
@@ -81,17 +108,74 @@ export interface AgentFileDeleteOptions {
   recursive?: boolean;
 }
 
+export type AgentFilePolicyAuditTarget =
+  | { path: string }
+  | { source: string; destination: string };
+
+export class WorkspaceOperationAuditPersistenceError extends Error {
+  readonly code = 'WORKSPACE_AUDIT_OUTCOME_UNAVAILABLE';
+  readonly retrySafe = false;
+
+  constructor(
+    readonly sideEffectCommitted: boolean | null,
+    cause: unknown,
+  ) {
+    super(
+      sideEffectCommitted === true
+        ? 'Workspace side effect committed but audit outcome is unavailable; do not retry without re-reading.'
+        : sideEffectCommitted === null
+          ? 'Workspace side effect may have committed but audit outcome is unavailable; do not retry without re-reading.'
+          : 'Workspace operation outcome audit is unavailable; retry is blocked until auditing recovers.',
+      { cause },
+    );
+    this.name = 'WorkspaceOperationAuditPersistenceError';
+  }
+}
+
+/**
+ * Canonical path grants captured when a WorkspaceTool is bound to a turn.
+ *
+ * AgentFileService deliberately receives this snapshot on every operation so
+ * direct/manual WorkspaceTool invocation cannot bypass the same path ranges
+ * enforced by the ToolGateway. Omitted authorization preserves the legacy,
+ * Workspace-Root-only boundary.
+ */
+export interface AgentFilePathAuthorization {
+  readonly readablePaths: readonly string[];
+  readonly writablePaths: readonly string[];
+  readonly fullAccess: boolean;
+  /** Turn-local main-process lease; never persisted or exposed to the model. */
+  readonly assertLive?: () => void;
+}
+
+type AgentFileAccessRequirement = 'read' | 'write' | 'read-write';
+
+interface NormalizedPathAuthorization {
+  readablePaths: string[];
+  writablePaths: string[];
+  fullAccess: boolean;
+  assertLive?: () => void;
+}
+
 type ResolvedTarget =
   | {
     transport: 'local';
+    sessionId: string;
+    /** Selected capability root, or the local volume/share root in Full Access. */
     root: string;
+    workspaceRoot: string;
     requestedPath: string;
+    authorization: NormalizedPathAuthorization;
   }
   | {
     transport: 'ssh';
+    sessionId: string;
+    /** Selected capability root, or POSIX / in Full Access. */
     root: string;
+    workspaceRoot: string;
     requestedPath: string;
     hostId: string;
+    authorization: NormalizedPathAuthorization;
   };
 
 interface PreparedWorkspaceTarget {
@@ -103,6 +187,29 @@ interface PreparedWorkspaceTarget {
 interface DeletePlanOperation {
   path: string;
   type: 'file' | 'directory';
+}
+
+interface BoundWorkspaceSession {
+  sessionId: string;
+  transport: 'local' | 'ssh';
+  hostId?: string;
+  workspace: WorkspaceBinding;
+}
+
+interface OperationAuditTracker {
+  readonly sessionId: string;
+  intent: WorkspaceOperationIntent;
+  handle?: WorkspaceOperationHandle;
+  beginAttempted: boolean;
+  finished: boolean;
+  filesystemMutationStarted: boolean;
+  cleanupFailed: boolean;
+  targetDispatched: boolean;
+  targetCommitted: boolean;
+  confirmedCommits: number;
+  plannedItems?: number;
+  auditSuppressed: boolean;
+  revokedBeforeIntent: boolean;
 }
 
 function sha256(content: Buffer | string): string {
@@ -136,6 +243,14 @@ function assertBoundedPath(requestedPath: string): void {
     || requestedPath.includes('\0')
     || requestedPath.length > MAX_AGENT_PATH_CHARS
   ) throw new Error(`文件路径无效或超过 ${MAX_AGENT_PATH_CHARS} 字符限制。`);
+}
+
+function assertNoWindowsRootRelativePath(requestedPath: string): void {
+  // `\foo` and `/foo` are rooted on whichever drive happens to be current;
+  // unlike C:\foo or a UNC path they are not stable, fully qualified grants.
+  if (/^[\\/](?![\\/])/u.test(requestedPath)) {
+    throw new Error('文件路径不能使用 Windows 驱动器根相对形式。');
+  }
 }
 
 function assertWithinRoot(root: string, target: string, platform: 'local' | 'ssh'): void {
@@ -228,6 +343,7 @@ export class AgentFileService {
       }
       return this.remoteFilesystems.withFilesystem(owner, terminalId, async (filesystem) => {
         const root = await filesystem.realpath(workspace.root);
+        assertBoundRootUnchanged(workspace.root, root, 'ssh');
         const attributes = await filesystem.stat(root);
         if (attributes?.type !== 'directory') {
           throw new Error('Workspace Root 不是可访问的目录。');
@@ -238,10 +354,83 @@ export class AgentFileService {
     if (process.platform === 'win32') assertSafeWindowsRequestedPath(workspace.root);
     if (!isAbsolute(workspace.root)) throw new Error('本地 Workspace Root 必须是绝对路径。');
     const root = await this.localFilesystem.realpath(workspace.root);
+    assertBoundRootUnchanged(workspace.root, root, 'local');
     if ((await this.localFilesystem.stat(root))?.type !== 'directory') {
       throw new Error('Workspace Root 不是可访问的目录。');
     }
     return root;
+  }
+
+  /**
+   * Canonicalize an existing directory for a later path grant while retaining
+   * the owning Session/terminal/Host identity. This is intentionally separate
+   * from normal Workspace operations: the path is not authorized until the
+   * caller stores the returned canonical root in a permission snapshot.
+   */
+  async canonicalizeAccessRoot(
+    owner: WebContents,
+    terminalId: string,
+    requestedPath: string,
+  ): Promise<string> {
+    assertBoundedPath(requestedPath);
+    const { transport, hostId, workspace } = this.requireBoundWorkspace(owner, terminalId);
+    if (transport === 'ssh') {
+      if (!posix.isAbsolute(requestedPath)) {
+        throw new Error('远程授权路径必须是绝对路径。');
+      }
+      const path = posix.normalize(requestedPath);
+      return this.remoteFilesystems.withFilesystem(owner, terminalId, async (filesystem) => {
+        const canonical = await filesystem.realpath(path);
+        if (!posix.isAbsolute(canonical)) throw new Error('远程授权路径解析结果不是绝对路径。');
+        if ((await filesystem.stat(canonical))?.type !== 'directory') {
+          throw new Error('授权路径不是可访问的目录。');
+        }
+        return normalizedRemotePath(canonical);
+      }, workspace.hostId ?? hostId);
+    }
+    if (process.platform === 'win32') {
+      assertSafeWindowsRequestedPath(requestedPath);
+      assertNoWindowsRootRelativePath(requestedPath);
+    }
+    if (!isAbsolute(requestedPath)) throw new Error('本地授权路径必须是绝对路径。');
+    const canonical = await this.localFilesystem.realpath(resolve(requestedPath));
+    if (!isAbsolute(canonical)) throw new Error('本地授权路径解析结果不是绝对路径。');
+    if (process.platform === 'win32') {
+      assertSafeWindowsRequestedPath(canonical);
+      assertSafeWindowsResolvedPath(parse(canonical).root, canonical);
+    }
+    if ((await this.localFilesystem.stat(canonical))?.type !== 'directory') {
+      throw new Error('授权路径不是可访问的目录。');
+    }
+    return normalize(canonical);
+  }
+
+  /** Main-process hook used only when PolicyWorkspaceTool rejects before delegation. */
+  recordPolicyRejection(
+    owner: WebContents,
+    terminalId: string,
+    operation: WorkspaceOperation,
+    requestedTarget: AgentFilePolicyAuditTarget,
+    workspaceRoot: string,
+    authorization: AgentFilePathAuthorization,
+    options: { recursive?: boolean } = {},
+  ): void {
+    const tracker = this.createAuditTracker(
+      owner,
+      terminalId,
+      operation,
+      requestedTarget,
+      workspaceRoot,
+      authorization,
+      options,
+    );
+    if (tracker.auditSuppressed) return;
+    this.beginOperationAudit(tracker, undefined, 'policy_workspace_tool');
+    this.finishOperationAudit(tracker, {
+      outcome: 'failed',
+      sideEffectCommitted: false,
+      failure: { code: 'permission', stage: 'prepare', retrySafe: true },
+    });
   }
 
   async readText(
@@ -249,11 +438,50 @@ export class AgentFileService {
     terminalId: string,
     requestedPath: string,
     workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
   ): Promise<AgentFileReadResult> {
-    const target = this.resolveTarget(owner, terminalId, requestedPath, workspaceRoot);
+    const tracker = this.createAuditTracker(
+      owner,
+      terminalId,
+      'read',
+      { path: requestedPath },
+      workspaceRoot,
+      authorization,
+    );
+    this.beginOperationAudit(tracker);
+    let result: AgentFileReadResult;
+    try {
+      result = await this.readTextUnjournaled(
+        owner,
+        terminalId,
+        requestedPath,
+        workspaceRoot,
+        authorization,
+      );
+    } catch (error) {
+      return this.throwAfterFailedOperation(tracker, error);
+    }
+    this.finishSuccessfulOperation(tracker, { bytes: result.bytes });
+    return result;
+  }
+
+  private async readTextUnjournaled(
+    owner: WebContents,
+    terminalId: string,
+    requestedPath: string,
+    workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
+  ): Promise<AgentFileReadResult> {
+    const target = this.resolveTarget(
+      owner,
+      terminalId,
+      requestedPath,
+      workspaceRoot,
+      authorization,
+      'read',
+    );
     if (target.transport === 'local') {
-      const root = await this.localFilesystem.realpath(target.root);
-      assertBoundRootUnchanged(target.root, root, 'local');
+      const { root } = await this.prepareAccessRoots(this.localFilesystem, target);
       const path = await this.localFilesystem.realpath(target.requestedPath);
       assertWithinRoot(root, path, 'local');
       const attributes = await this.localFilesystem.stat(path);
@@ -268,8 +496,7 @@ export class AgentFileService {
       return { path, content: assertUtf8Text(buffer, path), bytes: buffer.length, sha256: sha256(buffer) };
     }
     return this.withRemoteFilesystem(owner, terminalId, target, async (filesystem) => {
-      const root = await filesystem.realpath(target.root);
-      assertBoundRootUnchanged(target.root, root, 'ssh');
+      const { root } = await this.prepareAccessRoots(filesystem, target);
       const path = await filesystem.realpath(target.requestedPath);
       assertWithinRoot(root, path, 'ssh');
       const attributes = await filesystem.stat(path);
@@ -290,11 +517,53 @@ export class AgentFileService {
     terminalId: string,
     requestedPath = '.',
     workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
   ): Promise<{ path: string; entries: AgentFileListEntry[]; truncated: boolean }> {
-    const target = this.resolveTarget(owner, terminalId, requestedPath, workspaceRoot);
+    const tracker = this.createAuditTracker(
+      owner,
+      terminalId,
+      'list',
+      { path: requestedPath },
+      workspaceRoot,
+      authorization,
+    );
+    this.beginOperationAudit(tracker);
+    let result: { path: string; entries: AgentFileListEntry[]; truncated: boolean };
+    try {
+      result = await this.listUnjournaled(
+        owner,
+        terminalId,
+        requestedPath,
+        workspaceRoot,
+        authorization,
+      );
+    } catch (error) {
+      return this.throwAfterFailedOperation(tracker, error);
+    }
+    this.finishSuccessfulOperation(tracker, {
+      count: result.entries.length,
+      truncated: result.truncated,
+    });
+    return result;
+  }
+
+  private async listUnjournaled(
+    owner: WebContents,
+    terminalId: string,
+    requestedPath = '.',
+    workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
+  ): Promise<{ path: string; entries: AgentFileListEntry[]; truncated: boolean }> {
+    const target = this.resolveTarget(
+      owner,
+      terminalId,
+      requestedPath,
+      workspaceRoot,
+      authorization,
+      'read',
+    );
     if (target.transport === 'local') {
-      const root = await this.localFilesystem.realpath(target.root);
-      assertBoundRootUnchanged(target.root, root, 'local');
+      const { root } = await this.prepareAccessRoots(this.localFilesystem, target);
       const path = await this.localFilesystem.realpath(target.requestedPath);
       assertWithinRoot(root, path, 'local');
       const entries = await this.localFilesystem.listDirectory(path);
@@ -307,8 +576,7 @@ export class AgentFileService {
       return { path, entries: mapped, truncated: entries.length > limited.length };
     }
     return this.withRemoteFilesystem(owner, terminalId, target, async (filesystem) => {
-      const root = await filesystem.realpath(target.root);
-      assertBoundRootUnchanged(target.root, root, 'ssh');
+      const { root } = await this.prepareAccessRoots(filesystem, target);
       const path = await filesystem.realpath(target.requestedPath);
       assertWithinRoot(root, path, 'ssh');
       const entries = await filesystem.listDirectory(path);
@@ -329,12 +597,51 @@ export class AgentFileService {
     terminalId: string,
     requestedPath: string,
     workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
   ): Promise<WorkspaceStatResult> {
-    const target = this.resolveTarget(owner, terminalId, requestedPath, workspaceRoot);
+    const tracker = this.createAuditTracker(
+      owner,
+      terminalId,
+      'stat',
+      { path: requestedPath },
+      workspaceRoot,
+      authorization,
+    );
+    this.beginOperationAudit(tracker);
+    let result: WorkspaceStatResult;
+    try {
+      result = await this.statPathUnjournaled(
+        owner,
+        terminalId,
+        requestedPath,
+        workspaceRoot,
+        authorization,
+      );
+    } catch (error) {
+      return this.throwAfterFailedOperation(tracker, error);
+    }
+    this.finishSuccessfulOperation(tracker, { bytes: result.size });
+    return result;
+  }
+
+  private async statPathUnjournaled(
+    owner: WebContents,
+    terminalId: string,
+    requestedPath: string,
+    workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
+  ): Promise<WorkspaceStatResult> {
+    const target = this.resolveTarget(
+      owner,
+      terminalId,
+      requestedPath,
+      workspaceRoot,
+      authorization,
+      'read',
+    );
     if (target.transport === 'local') {
-      const root = await this.localFilesystem.realpath(target.root);
-      assertBoundRootUnchanged(target.root, root, 'local');
-      const path = relative(target.root, target.requestedPath) === ''
+      const { root } = await this.prepareAccessRoots(this.localFilesystem, target);
+      const path = workspaceRootsMatch(target.root, target.requestedPath, 'local')
         ? root
         : resolve(
           await this.localFilesystem.realpath(dirname(target.requestedPath)),
@@ -346,9 +653,8 @@ export class AgentFileService {
       return { path, ...attributes };
     }
     return this.withRemoteFilesystem(owner, terminalId, target, async (filesystem) => {
-      const root = await filesystem.realpath(target.root);
-      assertBoundRootUnchanged(target.root, root, 'ssh');
-      const path = posix.relative(target.root, target.requestedPath) === ''
+      const { root } = await this.prepareAccessRoots(filesystem, target);
+      const path = workspaceRootsMatch(target.root, target.requestedPath, 'ssh')
         ? root
         : posix.join(
           await filesystem.realpath(posix.dirname(target.requestedPath)),
@@ -368,34 +674,136 @@ export class AgentFileService {
     content: string,
     expectedSha256: string | null,
     workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
   ): Promise<AgentFileWriteResult> {
+    const tracker = this.createAuditTracker(
+      owner,
+      terminalId,
+      'write',
+      { path: requestedPath },
+      workspaceRoot,
+      authorization,
+    );
+    let result: AgentFileWriteResult;
+    try {
+      result = await this.writeTextUnjournaled(
+        owner,
+        terminalId,
+        requestedPath,
+        content,
+        expectedSha256,
+        workspaceRoot,
+        authorization,
+        tracker,
+      );
+    } catch (error) {
+      return this.throwAfterFailedOperation(tracker, error);
+    }
+    this.finishSuccessfulOperation(tracker, {
+      afterSha256: result.sha256,
+      bytes: result.bytes,
+      created: result.created,
+    });
+    return result;
+  }
+
+  private async writeTextUnjournaled(
+    owner: WebContents,
+    terminalId: string,
+    requestedPath: string,
+    content: string,
+    expectedSha256: string | null,
+    workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
+    tracker?: OperationAuditTracker,
+  ): Promise<AgentFileWriteResult> {
+    let target = this.resolveTarget(
+      owner,
+      terminalId,
+      requestedPath,
+      workspaceRoot,
+      authorization,
+      'write',
+    );
+    this.assertProtectedMutationTarget(
+      target.transport,
+      target.workspaceRoot,
+      target.requestedPath,
+      target.sessionId,
+    );
     const bytes = boundedContent(content);
-    const target = this.resolveTarget(owner, terminalId, requestedPath, workspaceRoot);
     if (target.transport === 'local') {
-      const prepared = await this.prepareMutationTarget(this.localFilesystem, target);
+      let prepared = await this.prepareMutationTarget(this.localFilesystem, target);
+      if (prepared.stat) {
+        target = this.retargetForRequirement(target, 'read-write');
+        prepared = await this.prepareMutationTarget(this.localFilesystem, target);
+      }
       const path = prepared.path;
       const parent = dirname(path);
-      const current = await this.optionalLocalFile(path);
+      // Do not read a destination that appeared after the authorized create
+      // preflight. The exclusive publish below will reject that race without
+      // turning create-only authority into implicit overwrite/read authority.
+      const current = prepared.stat ? await this.optionalLocalFile(path) : undefined;
       this.assertExpectedHash(path, current?.content, expectedSha256);
       const before = current ? assertUtf8Text(current.content, path) : undefined;
-      const diff = createWorkspaceDiff(this.relativeLabel(target), before, content);
+      const diff = createWorkspaceDiff(this.safeDiffLabel(target, path), before, content);
+      if (!tracker) throw new Error('Workspace write is missing its audit tracker.');
+      tracker.intent = {
+        ...tracker.intent,
+        target: { path: this.auditPathForTarget(target, path) },
+        expected: {
+          exists: current !== undefined,
+          type: 'file',
+          ...(expectedSha256 === null ? {} : { sha256: expectedSha256.toLowerCase() }),
+        },
+      };
+      this.assertMutationLive(target, tracker);
+      this.beginOperationAudit(tracker, {
+        body: diff.diff,
+        additions: diff.additions,
+        deletions: diff.deletions,
+        truncated: diff.diffTruncated,
+      });
       const temporary = resolve(parent, `.ai-terminal-${randomUUID()}.tmp`);
-      let temporaryCreated = false;
       try {
-        await writeFile(temporary, bytes, { mode: current?.mode ?? 0o600, flag: 'wx' });
-        temporaryCreated = true;
+        this.assertMutationLive(target, tracker);
+        tracker.filesystemMutationStarted = true;
+        await this.writeLocalTemporary(
+          temporary,
+          bytes,
+          current?.mode ?? 0o600,
+        );
         if (current) {
           const latest = await this.optionalLocalFile(path);
           this.assertExpectedHash(path, latest?.content, expectedSha256);
-          await rename(temporary, path);
+          this.assertMutationLive(target, tracker);
+          tracker.targetDispatched = true;
+          await this.publishLocalOverwrite(temporary, path);
+          tracker.targetCommitted = true;
+          tracker.confirmedCommits = 1;
         } else {
           // link() publishes the fully written inode only if the destination
           // is still absent, preserving the expectedSha256:null contract.
-          await link(temporary, path);
-          await unlink(temporary);
+          this.assertMutationLive(target, tracker);
+          tracker.targetDispatched = true;
+          await this.publishLocalCreate(temporary, path);
+          tracker.targetCommitted = true;
+          tracker.confirmedCommits = 1;
+          try {
+            await this.removeLocalTemporary(temporary);
+          } catch (error) {
+            tracker.cleanupFailed = true;
+            throw error;
+          }
         }
       } catch (error) {
-        if (temporaryCreated) await unlink(temporary).catch(() => undefined);
+        try {
+          await this.removeLocalTemporary(temporary);
+        } catch (cleanupError) {
+          if ((cleanupError as NodeJS.ErrnoException).code !== 'ENOENT') {
+            tracker.cleanupFailed = true;
+          }
+        }
         throw error;
       }
       return {
@@ -406,9 +814,26 @@ export class AgentFileService {
         ...diff,
       };
     }
+    if (!tracker) throw new Error('Workspace write is missing its audit tracker.');
     return this.withRemoteFilesystem(owner, terminalId, target, (filesystem) => (
-      this.writeRemoteText(filesystem, target, content, bytes, expectedSha256)
+      this.writeRemoteText(filesystem, target, content, bytes, expectedSha256, tracker)
     ));
+  }
+
+  private writeLocalTemporary(path: string, bytes: Buffer, mode: number): Promise<void> {
+    return writeFile(path, bytes, { mode, flag: 'wx' });
+  }
+
+  private publishLocalCreate(temporary: string, path: string): Promise<void> {
+    return link(temporary, path);
+  }
+
+  private publishLocalOverwrite(temporary: string, path: string): Promise<void> {
+    return rename(temporary, path);
+  }
+
+  private removeLocalTemporary(path: string): Promise<void> {
+    return unlink(path);
   }
 
   async applyPatch(
@@ -418,16 +843,86 @@ export class AgentFileService {
     expectedSha256: string,
     patches: AgentFilePatch[],
     workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
+  ): Promise<AgentFileWriteResult> {
+    const tracker = this.createAuditTracker(
+      owner,
+      terminalId,
+      'patch',
+      { path: requestedPath },
+      workspaceRoot,
+      authorization,
+    );
+    let result: AgentFileWriteResult;
+    try {
+      result = await this.applyPatchUnjournaled(
+        owner,
+        terminalId,
+        requestedPath,
+        expectedSha256,
+        patches,
+        workspaceRoot,
+        authorization,
+        tracker,
+      );
+    } catch (error) {
+      return this.throwAfterFailedOperation(tracker, error);
+    }
+    this.finishSuccessfulOperation(tracker, {
+      afterSha256: result.sha256,
+      bytes: result.bytes,
+      created: result.created,
+    });
+    return result;
+  }
+
+  private async applyPatchUnjournaled(
+    owner: WebContents,
+    terminalId: string,
+    requestedPath: string,
+    expectedSha256: string,
+    patches: AgentFilePatch[],
+    workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
+    tracker?: OperationAuditTracker,
   ): Promise<AgentFileWriteResult> {
     this.assertPatchInput(patches);
-    const target = this.resolveTarget(owner, terminalId, requestedPath, workspaceRoot);
+    const target = this.resolveTarget(
+      owner,
+      terminalId,
+      requestedPath,
+      workspaceRoot,
+      authorization,
+      'read-write',
+    );
+    this.assertProtectedMutationTarget(
+      target.transport,
+      target.workspaceRoot,
+      target.requestedPath,
+      target.sessionId,
+    );
     if (target.transport === 'local') {
-      const current = await this.readText(owner, terminalId, requestedPath, workspaceRoot);
+      const current = await this.readTextUnjournaled(
+        owner,
+        terminalId,
+        requestedPath,
+        workspaceRoot,
+        authorization,
+      );
       if (current.sha256 !== expectedSha256) {
         throw new Error('文件已变化；请重新读取后再应用补丁。');
       }
       const next = this.applyExactPatches(current.content, patches);
-      return this.writeText(owner, terminalId, requestedPath, next, expectedSha256, workspaceRoot);
+      return this.writeTextUnjournaled(
+        owner,
+        terminalId,
+        requestedPath,
+        next,
+        expectedSha256,
+        workspaceRoot,
+        authorization,
+        tracker,
+      );
     }
     return this.withRemoteFilesystem(owner, terminalId, target, async (filesystem) => {
       const current = await this.readRemoteText(filesystem, target);
@@ -441,6 +936,7 @@ export class AgentFileService {
         next,
         boundedContent(next),
         expectedSha256,
+        tracker!,
       );
     });
   }
@@ -451,12 +947,52 @@ export class AgentFileService {
     query: string,
     options: AgentFileSearchOptions = {},
     workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
+  ): Promise<WorkspaceSearchResult> {
+    const tracker = this.createAuditTracker(
+      owner,
+      terminalId,
+      'search',
+      { path: options.path ?? '.' },
+      workspaceRoot,
+      authorization,
+    );
+    this.beginOperationAudit(tracker);
+    let result: WorkspaceSearchResult;
+    try {
+      result = await this.searchUnjournaled(
+        owner,
+        terminalId,
+        query,
+        options,
+        workspaceRoot,
+        authorization,
+      );
+    } catch (error) {
+      return this.throwAfterFailedOperation(tracker, error);
+    }
+    this.finishSuccessfulOperation(tracker, {
+      count: result.matches.length,
+      truncated: result.truncated,
+    });
+    return result;
+  }
+
+  private async searchUnjournaled(
+    owner: WebContents,
+    terminalId: string,
+    query: string,
+    options: AgentFileSearchOptions = {},
+    workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
   ): Promise<WorkspaceSearchResult> {
     const target = this.resolveTarget(
       owner,
       terminalId,
       options.path ?? '.',
       workspaceRoot,
+      authorization,
+      'read',
     );
     return this.withTargetFilesystem(owner, terminalId, target, async (filesystem) => {
       const prepared = await this.prepareTraversalTarget(filesystem, target);
@@ -477,12 +1013,52 @@ export class AgentFileService {
     pattern: string,
     options: AgentFileSearchOptions = {},
     workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
+  ): Promise<WorkspaceGlobResult> {
+    const tracker = this.createAuditTracker(
+      owner,
+      terminalId,
+      'glob',
+      { path: options.path ?? '.' },
+      workspaceRoot,
+      authorization,
+    );
+    this.beginOperationAudit(tracker);
+    let result: WorkspaceGlobResult;
+    try {
+      result = await this.globUnjournaled(
+        owner,
+        terminalId,
+        pattern,
+        options,
+        workspaceRoot,
+        authorization,
+      );
+    } catch (error) {
+      return this.throwAfterFailedOperation(tracker, error);
+    }
+    this.finishSuccessfulOperation(tracker, {
+      count: result.paths.length,
+      truncated: result.truncated,
+    });
+    return result;
+  }
+
+  private async globUnjournaled(
+    owner: WebContents,
+    terminalId: string,
+    pattern: string,
+    options: AgentFileSearchOptions = {},
+    workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
   ): Promise<WorkspaceGlobResult> {
     const target = this.resolveTarget(
       owner,
       terminalId,
       options.path ?? '.',
       workspaceRoot,
+      authorization,
+      'read',
     );
     return this.withTargetFilesystem(owner, terminalId, target, async (filesystem) => {
       const prepared = await this.prepareTraversalTarget(filesystem, target);
@@ -503,13 +1079,46 @@ export class AgentFileService {
     terminalId: string,
     requestedPath: string,
     workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
   ): Promise<void> {
-    const target = this.resolveTarget(owner, terminalId, requestedPath, workspaceRoot);
-    return this.withTargetFilesystem(owner, terminalId, target, async (filesystem) => {
-      const prepared = await this.prepareMutationTarget(filesystem, target);
-      if (prepared.stat) throw new Error('目录或文件已存在。');
-      await filesystem.mkdir(prepared.path, 0o700);
-    });
+    const tracker = this.createAuditTracker(
+      owner,
+      terminalId,
+      'mkdir',
+      { path: requestedPath },
+      workspaceRoot,
+      authorization,
+    );
+    try {
+      const target = this.resolveTarget(
+        owner,
+        terminalId,
+        requestedPath,
+        workspaceRoot,
+        authorization,
+        'write',
+      );
+      await this.withTargetFilesystem(owner, terminalId, target, async (filesystem) => {
+        const prepared = await this.prepareMutationTarget(filesystem, target);
+        if (prepared.stat) throw new Error('目录或文件已存在。');
+        tracker.intent = {
+          ...tracker.intent,
+          target: { path: this.auditPathForTarget(target, prepared.path) },
+          expected: { exists: false },
+        };
+        this.assertMutationLive(target, tracker);
+        this.beginOperationAudit(tracker);
+        this.assertMutationLive(target, tracker);
+        tracker.filesystemMutationStarted = true;
+        tracker.targetDispatched = true;
+        await filesystem.mkdir(prepared.path, 0o700);
+        tracker.targetCommitted = true;
+        tracker.confirmedCommits = 1;
+      });
+    } catch (error) {
+      return this.throwAfterFailedOperation(tracker, error);
+    }
+    this.finishSuccessfulOperation(tracker);
   }
 
   async renamePath(
@@ -518,28 +1127,78 @@ export class AgentFileService {
     source: string,
     destination: string,
     workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
   ): Promise<void> {
-    const sourceTarget = this.resolveTarget(owner, terminalId, source, workspaceRoot);
-    const destinationTarget = this.resolveTarget(owner, terminalId, destination, workspaceRoot);
-    this.assertSameTargetWorkspace(sourceTarget, destinationTarget);
-    return this.withTargetFilesystem(owner, terminalId, sourceTarget, async (filesystem) => {
-      const preparedSource = await this.prepareMutationTarget(filesystem, sourceTarget);
-      if (!preparedSource.stat) throw new Error('重命名源不存在。');
-      if (preparedSource.stat.type === 'symlink') {
-        throw new Error('不允许重命名符号链接。');
-      }
-      const preparedDestination = await this.prepareMutationTarget(filesystem, destinationTarget);
-      if (preparedDestination.stat) throw new Error('重命名目标已存在。');
-      if (
-        preparedSource.stat.type === 'directory'
-        && this.pathIsWithin(
-          sourceTarget.transport,
-          preparedSource.path,
-          preparedDestination.path,
-        )
-      ) throw new Error('不能将目录重命名到它自身内部。');
-      await filesystem.rename(preparedSource.path, preparedDestination.path);
-    });
+    const tracker = this.createAuditTracker(
+      owner,
+      terminalId,
+      'rename',
+      { source, destination },
+      workspaceRoot,
+      authorization,
+    );
+    try {
+      const sourceTarget = this.resolveTarget(
+        owner,
+        terminalId,
+        source,
+        workspaceRoot,
+        authorization,
+        'write',
+      );
+      const destinationTarget = this.resolveTarget(
+        owner,
+        terminalId,
+        destination,
+        workspaceRoot,
+        authorization,
+        'write',
+      );
+      this.assertSameTargetWorkspace(sourceTarget, destinationTarget);
+      await this.withTargetFilesystem(owner, terminalId, sourceTarget, async (filesystem) => {
+        const preparedSource = await this.prepareMutationTarget(filesystem, sourceTarget);
+        if (!preparedSource.stat) throw new Error('重命名源不存在。');
+        if (preparedSource.stat.type === 'symlink') {
+          throw new Error('不允许重命名符号链接。');
+        }
+        const preparedDestination = await this.prepareMutationTarget(filesystem, destinationTarget);
+        if (preparedDestination.stat) throw new Error('重命名目标已存在。');
+        if (
+          preparedSource.stat.type === 'directory'
+          && this.pathIsWithin(
+            sourceTarget.transport,
+            preparedSource.path,
+            preparedDestination.path,
+          )
+        ) throw new Error('不能将目录重命名到它自身内部。');
+        tracker.intent = {
+          ...tracker.intent,
+          target: {
+            source: this.auditPathForTarget(sourceTarget, preparedSource.path),
+            destination: this.auditPathForTarget(destinationTarget, preparedDestination.path),
+          },
+          expected: {
+            exists: true,
+            ...(preparedSource.stat.type === 'directory' || preparedSource.stat.type === 'file'
+              ? { type: preparedSource.stat.type }
+              : {}),
+          },
+        };
+        this.assertMutationLive(sourceTarget, tracker);
+        this.assertMutationLive(destinationTarget, tracker);
+        this.beginOperationAudit(tracker);
+        this.assertMutationLive(sourceTarget, tracker);
+        this.assertMutationLive(destinationTarget, tracker);
+        tracker.filesystemMutationStarted = true;
+        tracker.targetDispatched = true;
+        await filesystem.rename(preparedSource.path, preparedDestination.path);
+        tracker.targetCommitted = true;
+        tracker.confirmedCommits = 1;
+      });
+    } catch (error) {
+      return this.throwAfterFailedOperation(tracker, error);
+    }
+    this.finishSuccessfulOperation(tracker);
   }
 
   async deletePath(
@@ -548,36 +1207,99 @@ export class AgentFileService {
     requestedPath: string,
     options: AgentFileDeleteOptions = {},
     workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
   ): Promise<void> {
-    const target = this.resolveTarget(owner, terminalId, requestedPath, workspaceRoot);
-    return this.withTargetFilesystem(owner, terminalId, target, async (filesystem) => {
-      const prepared = await this.prepareMutationTarget(filesystem, target);
-      if (!prepared.stat) throw new Error('删除目标不存在。');
-      if (prepared.stat.type !== 'directory') {
-        await filesystem.unlink(prepared.path);
-        return;
-      }
-      if (!options.recursive) {
-        await filesystem.rmdir(prepared.path);
-        return;
-      }
-      const plan = await this.preflightRecursiveDelete(
-        filesystem,
-        target.transport,
-        prepared.root,
-        prepared.path,
+    const tracker = this.createAuditTracker(
+      owner,
+      terminalId,
+      'delete',
+      { path: requestedPath },
+      workspaceRoot,
+      authorization,
+      { recursive: options.recursive },
+    );
+    try {
+      const target = this.resolveTarget(
+        owner,
+        terminalId,
+        requestedPath,
+        workspaceRoot,
+        authorization,
+        'write',
       );
-      for (const operation of plan) {
-        await this.revalidateDeleteOperation(
+      await this.withTargetFilesystem(owner, terminalId, target, async (filesystem) => {
+        const prepared = await this.prepareMutationTarget(filesystem, target);
+        if (!prepared.stat) throw new Error('删除目标不存在。');
+        tracker.intent = {
+          ...tracker.intent,
+          target: { path: this.auditPathForTarget(target, prepared.path) },
+          expected: {
+            exists: true,
+            ...(prepared.stat.type === 'directory' || prepared.stat.type === 'file'
+              ? { type: prepared.stat.type }
+              : {}),
+          },
+        };
+        if (prepared.stat.type !== 'directory') {
+          this.assertMutationLive(target, tracker);
+          this.beginOperationAudit(tracker);
+          this.assertMutationLive(target, tracker);
+          tracker.filesystemMutationStarted = true;
+          tracker.targetDispatched = true;
+          await filesystem.unlink(prepared.path);
+          tracker.targetCommitted = true;
+          tracker.confirmedCommits = 1;
+          return;
+        }
+        if (!options.recursive) {
+          this.assertMutationLive(target, tracker);
+          this.beginOperationAudit(tracker);
+          this.assertMutationLive(target, tracker);
+          tracker.filesystemMutationStarted = true;
+          tracker.targetDispatched = true;
+          await filesystem.rmdir(prepared.path);
+          tracker.targetCommitted = true;
+          tracker.confirmedCommits = 1;
+          return;
+        }
+        const plan = await this.preflightRecursiveDelete(
           filesystem,
           target.transport,
           prepared.root,
-          operation,
+          prepared.path,
         );
-        if (operation.type === 'directory') await filesystem.rmdir(operation.path);
-        else await filesystem.unlink(operation.path);
-      }
-    });
+        tracker.plannedItems = plan.length;
+        tracker.intent = { ...tracker.intent, plan: { items: plan.length } };
+        this.assertMutationLive(target, tracker);
+        this.beginOperationAudit(tracker);
+        for (const operation of plan) {
+          await this.revalidateDeleteOperation(
+            filesystem,
+            target.transport,
+            prepared.root,
+            operation,
+          );
+          this.assertMutationLive(target, tracker);
+          tracker.filesystemMutationStarted = true;
+          tracker.targetDispatched = true;
+          if (operation.type === 'directory') await filesystem.rmdir(operation.path);
+          else await filesystem.unlink(operation.path);
+          tracker.targetCommitted = true;
+          tracker.confirmedCommits += 1;
+        }
+      });
+    } catch (error) {
+      return this.throwAfterFailedOperation(tracker, error);
+    }
+    this.finishSuccessfulOperation(
+      tracker,
+      tracker.plannedItems === undefined
+        ? undefined
+        : {
+            itemsPlanned: tracker.plannedItems,
+            itemsCommitted: tracker.confirmedCommits,
+          },
+    );
   }
 
   private assertPatchInput(patches: AgentFilePatch[]): void {
@@ -610,8 +1332,7 @@ export class AgentFileService {
     filesystem: RemoteFilesystem,
     target: Extract<ResolvedTarget, { transport: 'ssh' }>,
   ): Promise<AgentFileReadResult> {
-    const root = await filesystem.realpath(target.root);
-    assertBoundRootUnchanged(target.root, root, 'ssh');
+    const { root } = await this.prepareAccessRoots(filesystem, target);
     const path = await filesystem.realpath(target.requestedPath);
     assertWithinRoot(root, path, 'ssh');
     const attributes = await filesystem.stat(path);
@@ -630,12 +1351,18 @@ export class AgentFileService {
 
   private async writeRemoteText(
     filesystem: RemoteFilesystem,
-    target: Extract<ResolvedTarget, { transport: 'ssh' }>,
+    initialTarget: Extract<ResolvedTarget, { transport: 'ssh' }>,
     content: string,
     bytes: Buffer,
     expectedSha256: string | null,
+    tracker: OperationAuditTracker,
   ): Promise<AgentFileWriteResult> {
-    const prepared = await this.prepareMutationTarget(filesystem, target);
+    let target = initialTarget;
+    let prepared = await this.prepareMutationTarget(filesystem, target);
+    if (prepared.stat) {
+      target = this.retargetForRequirement(target, 'read-write');
+      prepared = await this.prepareMutationTarget(filesystem, target);
+    }
     const attributes = prepared.stat;
     if (attributes?.type === 'symlink') throw new Error('不允许通过符号链接覆盖文件。');
     if (attributes && attributes.type !== 'file') throw new Error('目标不是普通文件。');
@@ -647,11 +1374,29 @@ export class AgentFileService {
       : undefined;
     this.assertExpectedHash(prepared.path, current, expectedSha256);
     const before = current ? assertUtf8Text(current, prepared.path) : undefined;
-    const diff = createWorkspaceDiff(this.relativeLabel(target), before, content);
+    const diff = createWorkspaceDiff(this.safeDiffLabel(target, prepared.path), before, content);
+    tracker.intent = {
+      ...tracker.intent,
+      target: { path: this.auditPathForTarget(target, prepared.path) },
+      expected: {
+        exists: current !== undefined,
+        type: 'file',
+        ...(expectedSha256 === null ? {} : { sha256: expectedSha256.toLowerCase() }),
+      },
+    };
+    this.assertMutationLive(target, tracker);
+    this.beginOperationAudit(tracker, {
+      body: diff.diff,
+      additions: diff.additions,
+      deletions: diff.deletions,
+      truncated: diff.diffTruncated,
+    });
     const parent = posix.dirname(prepared.path);
     const temporary = posix.join(parent, `.ai-terminal-${randomUUID()}.tmp`);
     let temporaryCreated = false;
     try {
+      this.assertMutationLive(target, tracker);
+      tracker.filesystemMutationStarted = true;
       await filesystem.writeFile(temporary, bytes, attributes?.mode, true);
       temporaryCreated = true;
       if (attributes) {
@@ -663,17 +1408,31 @@ export class AgentFileService {
         this.assertExpectedHash(prepared.path, latest, expectedSha256);
         // SFTP has no portable compare-and-swap rename. This second hash check
         // narrows (but cannot eliminate) the remaining check-to-rename race.
+        this.assertMutationLive(target, tracker);
+        tracker.targetDispatched = true;
         await filesystem.atomicReplace(temporary, prepared.path);
+        tracker.targetCommitted = true;
+        tracker.confirmedCommits = 1;
       } else {
         // Recheck absence immediately before rename. Standard SFTP rename can
         // still race another creator because no no-replace extension is portable.
         if (await filesystem.lstat(prepared.path)) {
           throw new Error('文件已在写入期间创建；请重新读取。');
         }
+        this.assertMutationLive(target, tracker);
+        tracker.targetDispatched = true;
         await filesystem.rename(temporary, prepared.path);
+        tracker.targetCommitted = true;
+        tracker.confirmedCommits = 1;
       }
     } catch (error) {
-      if (temporaryCreated) await filesystem.unlink(temporary).catch(() => undefined);
+      try {
+        if (temporaryCreated || await filesystem.lstat(temporary)) {
+          await filesystem.unlink(temporary);
+        }
+      } catch {
+        tracker.cleanupFailed = true;
+      }
       throw error;
     }
     return {
@@ -683,6 +1442,394 @@ export class AgentFileService {
       created: current === undefined,
       ...diff,
     };
+  }
+
+  private createAuditTracker(
+    owner: WebContents,
+    terminalId: string,
+    operation: WorkspaceOperation,
+    requestedTarget: AgentFilePolicyAuditTarget,
+    workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
+    options: { recursive?: boolean; planItems?: number } = {},
+  ): OperationAuditTracker {
+    const session = this.requireBoundWorkspace(owner, terminalId);
+    if (
+      workspaceRoot !== undefined
+      && !workspaceRootsMatch(session.workspace.root, workspaceRoot, session.transport)
+    ) throw new Error('显式 Workspace Root 与 Session 绑定的 Workspace Root 不一致。');
+    const boundRoot = workspaceRoot ?? session.workspace.root;
+    let auditSuppressed = false;
+    const auditPath = (requestedPath: string): WorkspaceOperationCanonicalPath => {
+      if (AUDITED_MUTATIONS.has(operation)) {
+        const relationship = this.protectedStorageRelationshipForRequest(
+          session,
+          boundRoot,
+          requestedPath,
+        );
+        if (relationship.protected) {
+          auditSuppressed ||= relationship.selfTargeting;
+          return this.rejectedAuditPath(requestedPath);
+        }
+      }
+      const coordinate = this.safeAuditPathForRequest(
+        session,
+        boundRoot,
+        requestedPath,
+        authorization,
+      );
+      // Workspace and filesystem roots are protected mutation targets, but
+      // the journal deliberately rejects `.` for those scopes because a
+      // successful mutation must never address either root. Preserve an audit
+      // trail for the prepare-time denial without admitting an impossible
+      // canonical mutation coordinate.
+      if (
+        AUDITED_MUTATIONS.has(operation)
+        && coordinate.scope !== 'rejected'
+        && coordinate.path === '.'
+        && (coordinate.scope === 'workspace' || coordinate.scope === 'filesystem')
+      ) return this.rejectedAuditPath(requestedPath);
+      return coordinate;
+    };
+    const target = 'path' in requestedTarget
+      ? {
+          path: auditPath(requestedTarget.path),
+        }
+      : {
+          source: auditPath(requestedTarget.source),
+          destination: auditPath(requestedTarget.destination),
+        };
+    const intent: WorkspaceOperationIntent = {
+      operation,
+      backend: session.transport === 'ssh' ? 'sftp' : 'local',
+      target,
+      ...(operation === 'delete' && options.recursive !== undefined
+        ? { recursive: options.recursive }
+        : {}),
+      ...(operation === 'delete' && options.planItems !== undefined
+        ? { plan: { items: options.planItems } }
+        : {}),
+    };
+    return {
+      sessionId: session.sessionId,
+      intent,
+      beginAttempted: false,
+      finished: false,
+      filesystemMutationStarted: false,
+      cleanupFailed: false,
+      targetDispatched: false,
+      targetCommitted: false,
+      confirmedCommits: 0,
+      auditSuppressed,
+      revokedBeforeIntent: false,
+      ...(options.planItems === undefined ? {} : { plannedItems: options.planItems }),
+    };
+  }
+
+  private auditPathForRequest(
+    session: BoundWorkspaceSession,
+    workspaceRoot: string,
+    requestedPath: string,
+    authorization?: AgentFilePathAuthorization,
+  ): WorkspaceOperationCanonicalPath {
+    assertBoundedPath(requestedPath);
+    if (session.transport === 'ssh') {
+      const canonicalWorkspace = posix.normalize(workspaceRoot);
+      if (!posix.isAbsolute(canonicalWorkspace)) {
+        throw new Error('远程 Workspace Root 必须是绝对路径。');
+      }
+      const path = posix.resolve(canonicalWorkspace, requestedPath);
+      const normalizedAuthorization = this.normalizeAuthorization(
+        'ssh',
+        canonicalWorkspace,
+        authorization,
+      );
+      return this.auditPathForAbsolute(
+        'ssh',
+        canonicalWorkspace,
+        path,
+        normalizedAuthorization,
+      );
+    }
+    const canonicalWorkspace = this.resolveLocalRequestedPath(workspaceRoot, '.');
+    const path = this.resolveLocalRequestedPath(canonicalWorkspace, requestedPath);
+    const normalizedAuthorization = this.normalizeAuthorization(
+      'local',
+      canonicalWorkspace,
+      authorization,
+    );
+    if (process.platform === 'win32') {
+      assertSafeWindowsResolvedPath(parse(path).root, path);
+    }
+    return this.auditPathForAbsolute(
+      'local',
+      canonicalWorkspace,
+      path,
+      normalizedAuthorization,
+    );
+  }
+
+  private safeAuditPathForRequest(
+    session: BoundWorkspaceSession,
+    workspaceRoot: string,
+    requestedPath: string,
+    authorization?: AgentFilePathAuthorization,
+  ): WorkspaceOperationCanonicalPath {
+    try {
+      return this.auditPathForRequest(session, workspaceRoot, requestedPath, authorization);
+    } catch {
+      return this.rejectedAuditPath(requestedPath);
+    }
+  }
+
+  private rejectedAuditPath(requestedPath: string): WorkspaceOperationCanonicalPath {
+    const boundedPrefix = typeof requestedPath === 'string'
+      ? requestedPath.slice(0, MAX_AGENT_PATH_CHARS)
+      : String(requestedPath).slice(0, MAX_AGENT_PATH_CHARS);
+    const length = typeof requestedPath === 'string' ? requestedPath.length : -1;
+    return {
+      scope: 'rejected',
+      pathHash: sha256(`${length}\0${boundedPrefix}`),
+    };
+  }
+
+  private resolveLocalRequestedPath(workspaceRoot: string, requestedPath: string): string {
+    assertBoundedPath(requestedPath);
+    if (process.platform === 'win32') {
+      assertSafeWindowsRequestedPath(workspaceRoot);
+      assertNoWindowsRootRelativePath(workspaceRoot);
+      assertSafeWindowsRequestedPath(requestedPath);
+      assertNoWindowsRootRelativePath(requestedPath);
+    }
+    if (!isAbsolute(workspaceRoot)) throw new Error('本地 Workspace Root 必须是绝对路径。');
+    const path = resolve(workspaceRoot, requestedPath);
+    if (process.platform === 'win32') {
+      assertSafeWindowsResolvedPath(parse(path).root, path);
+    }
+    return path;
+  }
+
+  private protectedStorageRelationshipForRequest(
+    session: BoundWorkspaceSession,
+    workspaceRoot: string,
+    requestedPath: string,
+  ): { protected: boolean; selfTargeting: boolean } {
+    if (session.transport === 'ssh') return { protected: false, selfTargeting: false };
+    try {
+      const path = this.resolveLocalRequestedPath(workspaceRoot, requestedPath);
+      return this.protectedStorageRelationship(session.sessionId, path);
+    } catch {
+      return { protected: false, selfTargeting: false };
+    }
+  }
+
+  private protectedStorageRelationship(
+    sessionId: string,
+    candidate: string,
+  ): { protected: boolean; selfTargeting: boolean } {
+    const protection = this.sessions.workspaceStorageProtection(sessionId);
+    if (!isAbsolute(protection.root) || !isAbsolute(protection.operationJournalPath)) {
+      throw new Error('Session storage protection paths must be absolute.');
+    }
+    const root = resolve(protection.root);
+    const journal = resolve(protection.operationJournalPath);
+    if (!this.pathIsWithin('local', root, journal)) {
+      throw new Error('Session operation journal is outside its protected storage root.');
+    }
+    const currentAuditRoot = dirname(journal);
+    const path = resolve(candidate);
+    return {
+      protected: this.pathIsWithin('local', root, path)
+        || this.pathIsWithin('local', path, root),
+      // Loading/appending the journal may create, chmod, validate, or clean
+      // operations.jsonl and diffs/. Never audit a denial into the same
+      // current-Session audit subtree (or one of its ancestors).
+      selfTargeting: this.pathIsWithin('local', currentAuditRoot, path)
+        || this.pathIsWithin('local', path, currentAuditRoot),
+    };
+  }
+
+  private auditPathForTarget(
+    target: ResolvedTarget,
+    path = target.requestedPath,
+  ): WorkspaceOperationCanonicalPath {
+    return this.auditPathForAbsolute(
+      target.transport,
+      target.workspaceRoot,
+      path,
+      target.authorization,
+      target.root,
+    );
+  }
+
+  private auditPathForAbsolute(
+    flavor: 'local' | 'ssh',
+    workspaceRoot: string,
+    path: string,
+    authorization: NormalizedPathAuthorization,
+    selectedRoot?: string,
+  ): WorkspaceOperationCanonicalPath {
+    if (this.pathIsWithin(flavor, workspaceRoot, path)) {
+      return {
+        scope: 'workspace',
+        path: this.canonicalRelativeAuditLabel(flavor, workspaceRoot, path),
+      };
+    }
+    let scope: 'authorized' | 'filesystem';
+    let root: string;
+    if (authorization.fullAccess) {
+      scope = 'filesystem';
+      root = flavor === 'ssh' ? '/' : normalize(parse(path).root);
+    } else {
+      const candidates = [
+        ...(selectedRoot ? [selectedRoot] : []),
+        ...authorization.readablePaths,
+        ...authorization.writablePaths,
+      ].filter((candidate, index, values) => (
+        values.indexOf(candidate) === index && this.pathIsWithin(flavor, candidate, path)
+      ));
+      candidates.sort((left, right) => right.length - left.length);
+      if (candidates.length) {
+        scope = 'authorized';
+        root = candidates[0]!;
+      } else {
+        scope = 'filesystem';
+        root = flavor === 'ssh' ? '/' : normalize(parse(path).root);
+      }
+    }
+    if (!root || !this.pathIsWithin(flavor, root, path)) {
+      throw new Error('无法为 Workspace 操作生成安全审计坐标。');
+    }
+    return {
+      scope,
+      rootId: sha256(`${flavor}\0${root}`),
+      path: this.canonicalRelativeAuditLabel(flavor, root, path),
+    };
+  }
+
+  private canonicalRelativeAuditLabel(
+    flavor: 'local' | 'ssh',
+    root: string,
+    path: string,
+  ): string {
+    const label = flavor === 'ssh' ? posix.relative(root, path) : relative(root, path);
+    if (
+      label === '..'
+      || label.startsWith(flavor === 'ssh' ? '../' : `..${sep}`)
+      || (flavor === 'ssh' ? posix.isAbsolute(label) : isAbsolute(label))
+    ) throw new Error('无法为 Workspace 操作生成相对审计路径。');
+    if (!label) return '.';
+    return flavor === 'local' ? label.split(sep).join('/') : label;
+  }
+
+  private safeDiffLabel(target: ResolvedTarget, path = target.requestedPath): string {
+    const coordinate = this.auditPathForTarget(target, path);
+    if (coordinate.scope === 'rejected') {
+      throw new Error('Resolved Workspace target cannot use a rejected audit coordinate.');
+    }
+    if (coordinate.scope === 'workspace') return `workspace/${coordinate.path}`;
+    return `${coordinate.scope}/${coordinate.rootId!.slice(0, 16)}/${coordinate.path}`;
+  }
+
+  private beginOperationAudit(
+    tracker: OperationAuditTracker,
+    diff?: WorkspaceDiffArtifact,
+    source: WorkspaceOperationSource = 'agent_file_service',
+  ): void {
+    tracker.beginAttempted = true;
+    tracker.handle = this.sessions.beginWorkspaceOperation(
+      tracker.sessionId,
+      tracker.intent,
+      diff,
+      source,
+    );
+  }
+
+  private finishOperationAudit(
+    tracker: OperationAuditTracker,
+    outcome: WorkspaceOperationOutcome,
+  ): void {
+    if (!tracker.handle) throw new Error('Workspace operation audit has no durable intent.');
+    this.sessions.finishWorkspaceOperation(tracker.handle, outcome);
+    tracker.finished = true;
+  }
+
+  private finishSuccessfulOperation(
+    tracker: OperationAuditTracker,
+    effect?: WorkspaceOperationEffect,
+  ): void {
+    const sideEffectCommitted = AUDITED_MUTATIONS.has(tracker.intent.operation);
+    try {
+      this.finishOperationAudit(tracker, {
+        outcome: 'succeeded',
+        sideEffectCommitted,
+        ...(effect === undefined ? {} : { effect }),
+      });
+    } catch (error) {
+      throw new WorkspaceOperationAuditPersistenceError(sideEffectCommitted, error);
+    }
+  }
+
+  private throwAfterFailedOperation(
+    tracker: OperationAuditTracker,
+    error: unknown,
+  ): never {
+    if (tracker.revokedBeforeIntent && !tracker.handle) throw error;
+    if (tracker.auditSuppressed && !tracker.handle) throw error;
+    if (!tracker.handle) {
+      if (tracker.beginAttempted) throw error;
+      this.beginOperationAudit(tracker);
+    }
+    const sideEffectCommitted = tracker.targetCommitted || tracker.confirmedCommits > 0
+      ? true
+      : tracker.intent.backend === 'sftp' && tracker.targetDispatched
+        ? null
+        : false;
+    const stage = tracker.cleanupFailed
+      ? 'cleanup'
+      : tracker.targetDispatched || tracker.targetCommitted
+        ? 'commit'
+      : tracker.filesystemMutationStarted
+        ? 'dispatch'
+        : 'prepare';
+    const effect = tracker.plannedItems === undefined
+      ? undefined
+      : {
+          itemsPlanned: tracker.plannedItems,
+          itemsCommitted: tracker.confirmedCommits,
+        };
+    try {
+      this.finishOperationAudit(tracker, {
+        outcome: 'failed',
+        sideEffectCommitted,
+        ...(effect === undefined ? {} : { effect }),
+        failure: {
+          code: this.safeFailureCode(error),
+          stage,
+          retrySafe: sideEffectCommitted === false && !tracker.cleanupFailed,
+        },
+      });
+    } catch (auditError) {
+      throw new WorkspaceOperationAuditPersistenceError(sideEffectCommitted, auditError);
+    }
+    throw error;
+  }
+
+  private safeFailureCode(error: unknown): WorkspaceOperationFailure['code'] {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      ? (error as { code?: unknown }).code
+      : undefined;
+    if (code === 'EACCES' || code === 'EPERM') return 'permission';
+    if (code === 'ENOENT') return 'not_found';
+    if (code === 'EEXIST') return 'conflict';
+    if (
+      code === 'ECONNABORTED'
+      || code === 'ECONNRESET'
+      || code === 'EPIPE'
+      || code === 'ENOTCONN'
+      || code === 'ETIMEDOUT'
+    ) return 'remote_disconnected';
+    return 'unknown';
   }
 
   private withTargetFilesystem<T>(
@@ -695,12 +1842,45 @@ export class AgentFileService {
     return this.withRemoteFilesystem(owner, terminalId, target, operation);
   }
 
+  private assertMutationLive(
+    target: ResolvedTarget,
+    tracker: OperationAuditTracker,
+  ): void {
+    try {
+      target.authorization.assertLive?.();
+    } catch (error) {
+      // Do not create a durable intent after the capability was revoked. If
+      // an intent already exists, the normal failure path still closes it.
+      if (!tracker.handle) tracker.revokedBeforeIntent = true;
+      throw error;
+    }
+  }
+
+  private async prepareAccessRoots(
+    filesystem: FilesystemBackend,
+    target: ResolvedTarget,
+  ): Promise<{ root: string; workspaceRoot: string }> {
+    const root = await filesystem.realpath(target.root);
+    assertBoundRootUnchanged(target.root, root, target.transport);
+    if ((await filesystem.lstat(root))?.type !== 'directory') {
+      throw new Error('已授权文件访问根目录已不可用。');
+    }
+    if (workspaceRootsMatch(target.workspaceRoot, target.root, target.transport)) {
+      return { root, workspaceRoot: root };
+    }
+    const workspaceRoot = await filesystem.realpath(target.workspaceRoot);
+    assertBoundRootUnchanged(target.workspaceRoot, workspaceRoot, target.transport);
+    if ((await filesystem.lstat(workspaceRoot))?.type !== 'directory') {
+      throw new Error('Workspace Root 已不可用。');
+    }
+    return { root, workspaceRoot };
+  }
+
   private async prepareTraversalTarget(
     filesystem: FilesystemBackend,
     target: ResolvedTarget,
   ): Promise<PreparedWorkspaceTarget & { stat: RemoteFileStat }> {
-    const root = await filesystem.realpath(target.root);
-    assertBoundRootUnchanged(target.root, root, target.transport);
+    const { root } = await this.prepareAccessRoots(filesystem, target);
     const lexicalStat = await filesystem.lstat(target.requestedPath);
     if (!lexicalStat) throw new Error('搜索或 Glob 起点不存在。');
     if (lexicalStat.type === 'symlink') throw new Error('搜索或 Glob 起点不能是符号链接。');
@@ -720,12 +1900,13 @@ export class AgentFileService {
     filesystem: FilesystemBackend,
     target: ResolvedTarget,
   ): Promise<PreparedWorkspaceTarget> {
-    const root = await filesystem.realpath(target.root);
-    assertBoundRootUnchanged(target.root, root, target.transport);
-    const relativeTarget = target.transport === 'ssh'
-      ? posix.relative(target.root, target.requestedPath)
-      : relative(target.root, target.requestedPath);
-    if (!relativeTarget) throw new Error('不允许修改或删除 Workspace Root。');
+    const { root, workspaceRoot } = await this.prepareAccessRoots(filesystem, target);
+    this.assertProtectedMutationTarget(
+      target.transport,
+      workspaceRoot,
+      target.requestedPath,
+      target.sessionId,
+    );
 
     const lexicalParent = target.transport === 'ssh'
       ? posix.dirname(target.requestedPath)
@@ -742,15 +1923,49 @@ export class AgentFileService {
       ? posix.join(parent, posix.basename(target.requestedPath))
       : resolve(parent, basename(target.requestedPath));
     assertWithinRoot(root, path, target.transport);
+    this.assertProtectedMutationTarget(
+      target.transport,
+      workspaceRoot,
+      path,
+      target.sessionId,
+    );
     return { root, path, stat: await filesystem.lstat(path) };
   }
 
   private assertSameTargetWorkspace(left: ResolvedTarget, right: ResolvedTarget): void {
     if (
       left.transport !== right.transport
-      || !workspaceRootsMatch(left.root, right.root, left.transport)
+      || left.sessionId !== right.sessionId
+      || !workspaceRootsMatch(left.workspaceRoot, right.workspaceRoot, left.transport)
       || (left.transport === 'ssh' && right.transport === 'ssh' && left.hostId !== right.hostId)
     ) throw new Error('重命名源和目标必须在同一 Workspace 中。');
+  }
+
+  private assertProtectedMutationTarget(
+    flavor: 'local' | 'ssh',
+    workspaceRoot: string,
+    candidate: string,
+    sessionId: string,
+  ): void {
+    const filesystemRoot = flavor === 'ssh'
+      ? '/'
+      : normalize(parse(candidate).root);
+    if (workspaceRootsMatch(candidate, filesystemRoot, flavor)) {
+      throw new Error('不允许修改或删除文件系统根目录。');
+    }
+    // Deleting or renaming an ancestor would also remove the bound Workspace
+    // Root, so protect both the exact root and every containing directory.
+    if (this.pathIsWithin(flavor, candidate, workspaceRoot)) {
+      throw new Error('不允许修改或删除 Workspace Root。');
+    }
+    if (
+      flavor === 'local'
+      && this.protectedStorageRelationship(sessionId, candidate).protected
+    ) {
+      throw new Error(
+        '应用 Session 和 Workspace 审计存储受保护，文件工具不能修改该路径或其祖先。',
+      );
+    }
   }
 
   private pathIsWithin(
@@ -873,30 +2088,17 @@ export class AgentFileService {
     // the residual race to the individual backend operation.
   }
 
-  private relativeLabel(target: ResolvedTarget): string {
-    const label = target.transport === 'ssh'
-      ? posix.relative(target.root, target.requestedPath)
-      : relative(target.root, target.requestedPath);
-    const fallback = target.transport === 'ssh'
-      ? posix.basename(target.requestedPath)
-      : basename(target.requestedPath);
-    return target.transport === 'local'
-      ? (label || fallback).split(sep).join('/')
-      : label || fallback;
-  }
-
   private resolveTarget(
     owner: WebContents,
     terminalId: string,
     requestedPath: string,
     workspaceRoot?: string,
+    authorization?: AgentFilePathAuthorization,
+    requirement: AgentFileAccessRequirement = 'read',
   ): ResolvedTarget {
     assertBoundedPath(requestedPath);
-    const session = this.sessions.sessionForTerminal(owner, terminalId);
-    if (!session) throw new Error('文件工具需要正式会话。');
-    const workspace = session.workspace;
-    if (!workspace) throw new Error('请先设置 Workspace Root。');
-    assertWorkspaceMatchesSession(session.transport, session.hostId, workspace);
+    const session = this.requireBoundWorkspace(owner, terminalId);
+    const { workspace } = session;
     if (
       workspaceRoot !== undefined
       && !workspaceRootsMatch(workspace.root, workspaceRoot, session.transport)
@@ -905,24 +2107,188 @@ export class AgentFileService {
     }
     const boundRoot = workspaceRoot ?? workspace.root;
     if (session.transport === 'ssh') {
-      const root = posix.normalize(boundRoot);
-      if (!root.startsWith('/')) throw new Error('远程 Workspace Root 必须是绝对路径。');
-      const path = posix.resolve(root, requestedPath);
+      const workspacePath = posix.normalize(boundRoot);
+      if (!posix.isAbsolute(workspacePath)) {
+        throw new Error('远程 Workspace Root 必须是绝对路径。');
+      }
+      const path = posix.resolve(workspacePath, requestedPath);
+      const normalizedAuthorization = this.normalizeAuthorization(
+        'ssh',
+        workspacePath,
+        authorization,
+      );
+      const root = this.selectAuthorizationRoot(
+        'ssh',
+        path,
+        normalizedAuthorization,
+        requirement,
+      );
       assertWithinRoot(root, path, 'ssh');
-      return { transport: 'ssh', root, requestedPath: path, hostId: workspace.hostId! };
+      return {
+        transport: 'ssh',
+        sessionId: session.sessionId,
+        root,
+        workspaceRoot: workspacePath,
+        requestedPath: path,
+        hostId: workspace.hostId!,
+        authorization: normalizedAuthorization,
+      };
     }
     if (process.platform === 'win32') {
       assertSafeWindowsRequestedPath(boundRoot);
+      assertNoWindowsRootRelativePath(boundRoot);
       // Validate the raw spelling before resolve() can reinterpret C:relative
       // or normalize an unsafe reserved/ADS segment out of sight.
       assertSafeWindowsRequestedPath(requestedPath);
+      assertNoWindowsRootRelativePath(requestedPath);
     }
     if (!isAbsolute(boundRoot)) throw new Error('本地 Workspace Root 必须是绝对路径。');
-    const root = resolve(boundRoot);
-    const path = resolve(root, requestedPath);
+    const workspacePath = resolve(boundRoot);
+    const path = resolve(workspacePath, requestedPath);
+    const normalizedAuthorization = this.normalizeAuthorization(
+      'local',
+      workspacePath,
+      authorization,
+    );
+    const root = this.selectAuthorizationRoot(
+      'local',
+      path,
+      normalizedAuthorization,
+      requirement,
+    );
     assertWithinRoot(root, path, 'local');
     if (process.platform === 'win32') assertSafeWindowsResolvedPath(root, path);
-    return { transport: 'local', root, requestedPath: path };
+    return {
+      transport: 'local',
+      sessionId: session.sessionId,
+      root,
+      workspaceRoot: workspacePath,
+      requestedPath: path,
+      authorization: normalizedAuthorization,
+    };
+  }
+
+  private requireBoundWorkspace(
+    owner: WebContents,
+    terminalId: string,
+  ): BoundWorkspaceSession {
+    const session = this.sessions.sessionForTerminal(owner, terminalId);
+    if (!session) throw new Error('文件工具需要正式会话。');
+    const workspace = session.workspace;
+    if (!workspace) throw new Error('请先设置 Workspace Root。');
+    assertWorkspaceMatchesSession(session.transport, session.hostId, workspace);
+    return {
+      sessionId: session.id,
+      transport: session.transport,
+      hostId: session.hostId,
+      workspace,
+    };
+  }
+
+  private normalizeAuthorization(
+    flavor: 'local' | 'ssh',
+    workspaceRoot: string,
+    authorization?: AgentFilePathAuthorization,
+  ): NormalizedPathAuthorization {
+    if (authorization === undefined) {
+      return {
+        readablePaths: [workspaceRoot],
+        writablePaths: [workspaceRoot],
+        fullAccess: false,
+      };
+    }
+    if (
+      !Array.isArray(authorization.readablePaths)
+      || !Array.isArray(authorization.writablePaths)
+      || typeof authorization.fullAccess !== 'boolean'
+      || (authorization.assertLive !== undefined && typeof authorization.assertLive !== 'function')
+    ) throw new Error('文件路径授权无效。');
+    if (authorization.fullAccess) {
+      return {
+        readablePaths: [],
+        writablePaths: [],
+        fullAccess: true,
+        ...(authorization.assertLive ? { assertLive: authorization.assertLive } : {}),
+      };
+    }
+    const normalizeRoots = (roots: readonly string[]) => {
+      const normalized: string[] = [];
+      for (const root of roots) {
+        if (typeof root !== 'string') throw new Error('文件路径授权无效。');
+        assertBoundedPath(root);
+        if (flavor === 'ssh') {
+          if (!posix.isAbsolute(root)) throw new Error('远程授权根必须是绝对路径。');
+          normalized.push(normalizedRemotePath(root));
+          continue;
+        }
+        if (process.platform === 'win32') {
+          assertSafeWindowsRequestedPath(root);
+          assertNoWindowsRootRelativePath(root);
+        }
+        if (!isAbsolute(root)) throw new Error('本地授权根必须是绝对路径。');
+        const normalizedRoot = normalize(resolve(root));
+        if (process.platform === 'win32') {
+          assertSafeWindowsResolvedPath(parse(normalizedRoot).root, normalizedRoot);
+        }
+        normalized.push(normalizedRoot);
+      }
+      return [...new Set(normalized)];
+    };
+    return {
+      readablePaths: normalizeRoots(authorization.readablePaths),
+      writablePaths: normalizeRoots(authorization.writablePaths),
+      fullAccess: false,
+      ...(authorization.assertLive ? { assertLive: authorization.assertLive } : {}),
+    };
+  }
+
+  private selectAuthorizationRoot(
+    flavor: 'local' | 'ssh',
+    candidate: string,
+    authorization: NormalizedPathAuthorization,
+    requirement: AgentFileAccessRequirement,
+  ): string {
+    if (authorization.fullAccess) {
+      const root = flavor === 'ssh' ? '/' : normalize(parse(candidate).root);
+      if (!root || (flavor === 'local' && !isAbsolute(root))) {
+        throw new Error('无法确定文件系统安全边界。');
+      }
+      return root;
+    }
+    const matching = (roots: string[]) => roots.filter((root) => (
+      this.pathIsWithin(flavor, root, candidate)
+    ));
+    const readable = matching(authorization.readablePaths);
+    const writable = matching(authorization.writablePaths);
+    let eligible: string[];
+    if (requirement === 'read') eligible = readable;
+    else if (requirement === 'write') eligible = writable;
+    else {
+      if (!readable.length || !writable.length) {
+        throw new Error('文件路径超出读写交集授权范围。');
+      }
+      eligible = [...readable, ...writable];
+    }
+    if (!eligible.length) {
+      throw new Error('文件路径超出当前会话工作目录或已授权范围。');
+    }
+    // All matching ancestors of one candidate are segment-nested; the most
+    // specific one is the safe canonical/symlink boundary for this call.
+    eligible.sort((left, right) => right.length - left.length);
+    return eligible[0]!;
+  }
+
+  private retargetForRequirement<T extends ResolvedTarget>(
+    target: T,
+    requirement: AgentFileAccessRequirement,
+  ): T {
+    const root = this.selectAuthorizationRoot(
+      target.transport,
+      target.requestedPath,
+      target.authorization,
+      requirement,
+    );
+    return { ...target, root };
   }
 
   private async optionalLocalFile(path: string): Promise<{

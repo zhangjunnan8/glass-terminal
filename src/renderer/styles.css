@@ -743,6 +743,8 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .split-actions { justify-content: space-between; }
 .full-takeover-modal { border-color: #87404a; box-shadow: 0 22px 70px #000c, 0 0 0 1px #9e435055; }
 .full-takeover-modal .risk-note { margin-top: 10px; padding: 8px; color: #e4aab0; border: 1px solid #63343b; border-radius: 4px; background: #29151a; }
+.file-access-modal.full-access-risk { border-color: #87404a; box-shadow: 0 22px 70px #000c, 0 0 0 1px #9e435055; }
+.file-access-modal.full-access-risk .risk-note { margin-top: 10px; padding: 8px; color: #e4aab0; border: 1px solid #63343b; border-radius: 4px; background: #29151a; }
 .connection-summary { margin-bottom: 14px; padding: 10px; color: #a0b2c7; border: 1px solid #253346; border-radius: 4px; background: #0b121b; font: 13px "Cascadia Code", Consolas, monospace; }
 .modal .credential-save-check { display: flex; height: auto; margin-top: 13px; flex-direction: row; align-items: center; gap: 9px; color: #c4d0df; font-size: 14px; cursor: pointer; }
 .modal .credential-save-check input { width: 18px; height: 18px; flex: 0 0 18px; accent-color: #67d2b0; }
@@ -790,6 +792,16 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
   font-size: 13px;
 }
 .agent-file-access-picker select:disabled { cursor: not-allowed; opacity: .5; }
+.agent-file-access-detached {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  color: #d5a86e;
+  font-size: 12px;
+}
+.agent-file-access-detached button { min-height: 30px; padding: 4px 8px; }
 .agent-header .agent-controls .agent-file-access-root {
   width: 100%;
   margin: 0;
@@ -801,6 +813,7 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
   white-space: nowrap;
 }
 .app-shell[data-theme="light"] .agent-file-access-picker { color: #59687c; }
+.app-shell[data-theme="light"] .agent-file-access-detached { color: #8a5a1f; }
 .app-shell[data-theme="light"] .agent-file-access-picker select {
   color: #263349;
   border-color: #cbd3de;
@@ -1176,6 +1189,15 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .app-shell[data-theme="light"] .full-takeover-modal .risk-note {
   color: #8d2637;
   border-color: #db9ca6;
+  background: #fff0f2;
+}
+.app-shell[data-theme="light"] .file-access-modal.full-access-risk {
+  border-color: #b86772;
+  box-shadow: 0 22px 70px #3c1c2240, 0 0 0 1px #b8677240;
+}
+.app-shell[data-theme="light"] .file-access-modal.full-access-risk .risk-note {
+  color: #8d303d;
+  border-color: #daa0a8;
   background: #fff0f2;
 }
 

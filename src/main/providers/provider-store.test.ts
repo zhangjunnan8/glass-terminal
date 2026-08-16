@@ -1,10 +1,18 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ProviderStore } from './provider-store';
 import { MemorySecretStore } from './secret-store';
 import { PROVIDER_TEMPLATES, providerTemplateForBaseUrl } from '../../shared/provider-templates';
+import { GenericOpenAiProvider } from '../agent/generic-provider';
 
 const roots: string[] = [];
 
@@ -80,6 +88,215 @@ describe('ProviderStore', () => {
     );
   });
 
+  it('changes recipient revision only for endpoint, model, or credential identity', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(
+      JSON.stringify({ data: [{ id: 'model-1' }, { id: 'model-2' }] }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ));
+    const { store } = fixture(fetchMock);
+    const original = await store.save({
+      name: 'Recipient',
+      baseUrl: 'https://provider.example/v1',
+      modelId: 'model-1',
+      apiKey: 'fake-1',
+    });
+
+    await store.testConnection(original.id);
+    expect(store.get(original.id).recipientRevision).toBe(original.recipientRevision);
+    await store.setDefault(original.id);
+    expect(store.get(original.id).recipientRevision).toBe(original.recipientRevision);
+    const renamed = await store.save({
+      id: original.id,
+      name: 'Display name only',
+      baseUrl: original.baseUrl,
+      modelId: original.modelId,
+    });
+    expect(renamed.recipientRevision).toBe(original.recipientRevision);
+
+    const moved = await store.save({
+      id: original.id,
+      name: renamed.name,
+      baseUrl: 'https://replacement.example/v1',
+      modelId: renamed.modelId,
+    });
+    expect(moved.recipientRevision).not.toBe(original.recipientRevision);
+    const rekeyed = await store.save({
+      id: original.id,
+      name: moved.name,
+      baseUrl: moved.baseUrl,
+      modelId: moved.modelId,
+      apiKey: 'fake-2',
+    });
+    expect(rekeyed.recipientRevision).not.toBe(moved.recipientRevision);
+  });
+
+  it('persists the transition fence before touching a replacement secret', async () => {
+    const { path, secrets, store } = fixture();
+    const original = await store.save({
+      name: 'Atomic recipient',
+      baseUrl: 'https://provider.example/v1',
+      modelId: 'model-1',
+      apiKey: 'original-secret',
+    });
+    const reference = JSON.parse(readFileSync(path, 'utf8'))[0].apiKeyReference as string;
+    const setSecret = vi.spyOn(secrets, 'set');
+    unlinkSync(path);
+    mkdirSync(path);
+
+    await expect(store.save({
+      id: original.id,
+      name: original.name,
+      baseUrl: original.baseUrl,
+      modelId: original.modelId,
+      apiKey: 'must-not-be-written',
+    })).rejects.toThrow();
+
+    expect(setSecret).not.toHaveBeenCalled();
+    expect(await secrets.get(reference)).toBe('original-secret');
+    expect(store.get(original.id).recipientRevision).toBe(original.recipientRevision);
+  });
+
+  it('keeps an ambiguous secret failure durably pending and blocks snapshots and dispatch', async () => {
+    const { path, secrets, store } = fixture();
+    const original = await store.save({
+      name: 'Pending recipient',
+      baseUrl: 'https://provider.example/v1',
+      modelId: 'model-1',
+      apiKey: 'original-secret',
+    });
+    vi.spyOn(secrets, 'set').mockRejectedValueOnce(new Error('ambiguous credential failure'));
+
+    await expect(store.save({
+      id: original.id,
+      name: original.name,
+      baseUrl: original.baseUrl,
+      modelId: original.modelId,
+      apiKey: 'possibly-committed-secret',
+    })).rejects.toThrow('ambiguous credential failure');
+
+    const pending = store.get(original.id);
+    expect(pending.recipientRevision).not.toBe(original.recipientRevision);
+    expect(pending.status).toBe('not-tested');
+    expect(JSON.parse(readFileSync(path, 'utf8'))[0]).toMatchObject({
+      recipientRevision: pending.recipientRevision,
+      recipientTransitionPending: true,
+    });
+    await expect(store.apiKey(original.id)).rejects.toThrow('transitioning');
+    await expect(store.runtimeSnapshot(
+      original.id,
+      pending.recipientRevision,
+    )).rejects.toThrow('transitioning');
+    const restarted = new ProviderStore(path, secrets);
+    await expect(restarted.runtimeSnapshot(
+      original.id,
+      pending.recipientRevision,
+    )).rejects.toThrow('transitioning');
+    const fetchMock = vi.fn<typeof fetch>();
+    const runtime = new GenericOpenAiProvider(original.id, restarted, fetchMock);
+    await expect(runtime.complete({
+      messages: [{ role: 'user', content: 'must not leave this process' }],
+      tools: [],
+      signal: new AbortController().signal,
+    })).rejects.toThrow('transitioning');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a runtime snapshot when recipient config changes during secret retrieval', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(
+      JSON.stringify({ data: [{ id: 'model-1' }] }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ));
+    const { secrets, store } = fixture(fetchMock);
+    const profile = await store.save({
+      name: 'Deferred recipient',
+      baseUrl: 'https://provider.example/v1',
+      modelId: 'model-1',
+      apiKey: 'original-secret',
+    });
+    await store.testConnection(profile.id);
+    let releaseSecret!: (secret: string) => void;
+    const secretRead = vi.spyOn(secrets, 'get').mockImplementationOnce(() => (
+      new Promise<string>((resolve) => { releaseSecret = resolve; })
+    ));
+
+    const snapshot = store.runtimeSnapshot(profile.id, profile.recipientRevision);
+    expect(secretRead).toHaveBeenCalledOnce();
+    await store.save({
+      id: profile.id,
+      name: profile.name,
+      baseUrl: 'https://replacement.example/v1',
+      modelId: profile.modelId,
+    });
+    releaseSecret('original-secret');
+
+    await expect(snapshot).rejects.toThrow('transitioning');
+  });
+
+  it('serializes concurrent rekeys even when the newer credential write is ready first', async () => {
+    const { path, secrets, store } = fixture();
+    const original = await store.save({
+      name: 'Serialized recipient',
+      baseUrl: 'https://provider.example/v1',
+      modelId: 'model-1',
+      apiKey: 'original-secret',
+    });
+    const reference = JSON.parse(readFileSync(path, 'utf8'))[0].apiKeyReference as string;
+    const writeSecret = secrets.set.bind(secrets);
+    let releaseOlder!: () => void;
+    const olderGate = new Promise<void>((resolve) => { releaseOlder = resolve; });
+    let releaseNewer!: () => void;
+    const newerGate = new Promise<void>((resolve) => { releaseNewer = resolve; });
+    // Model the newer platform write being immediately ready while the older
+    // write is still blocked. Serialization must keep it from starting early.
+    releaseNewer();
+    const setSecret = vi.spyOn(secrets, 'set').mockImplementation(async (key, secret) => {
+      await (secret === 'older-secret' ? olderGate : newerGate);
+      await writeSecret(key, secret);
+    });
+
+    const olderSave = store.save({
+      id: original.id,
+      name: original.name,
+      baseUrl: 'https://older.example/v1',
+      modelId: 'older-model',
+      apiKey: 'older-secret',
+    });
+    const olderRevision = store.get(original.id).recipientRevision;
+    const newerSave = store.save({
+      id: original.id,
+      name: original.name,
+      baseUrl: 'https://newer.example/v1',
+      modelId: 'newer-model',
+      apiKey: 'newer-secret',
+    });
+
+    expect(setSecret).toHaveBeenCalledTimes(1);
+    expect(setSecret).toHaveBeenLastCalledWith(reference, 'older-secret');
+    expect(store.get(original.id).recipientRevision).toBe(olderRevision);
+
+    releaseOlder();
+    const older = await olderSave;
+    expect(older.recipientRevision).toBe(olderRevision);
+    expect(setSecret).toHaveBeenCalledTimes(2);
+    expect(setSecret).toHaveBeenLastCalledWith(reference, 'newer-secret');
+    const newer = await newerSave;
+
+    const finalProfile = store.get(original.id);
+    expect(finalProfile).toMatchObject({
+      baseUrl: 'https://newer.example/v1',
+      modelId: 'newer-model',
+      recipientRevision: newer.recipientRevision,
+    });
+    expect(finalProfile.recipientRevision).not.toBe(older.recipientRevision);
+    expect(await secrets.get(reference)).toBe('newer-secret');
+    expect(JSON.parse(readFileSync(path, 'utf8'))[0]).toMatchObject({
+      baseUrl: finalProfile.baseUrl,
+      modelId: finalProfile.modelId,
+      recipientRevision: finalProfile.recipientRevision,
+      recipientTransitionPending: false,
+    });
+  });
+
   it('records a safe error and supports default selection and removal', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response('{}', { status: 401 }));
     const { path, secrets, store } = fixture(fetchMock);
@@ -107,7 +324,7 @@ describe('ProviderStore', () => {
     expect(result.message).toBe('Provider 返回 HTTP 401。');
     expect(readFileSync(path, 'utf8')).not.toContain('second-secret');
 
-    store.setDefault(first.id);
+    await store.setDefault(first.id);
     expect(store.list()[0].id).toBe(first.id);
     await store.remove(second.id);
     expect(store.list().map((profile) => profile.id)).toEqual([first.id]);
@@ -159,7 +376,55 @@ describe('ProviderStore', () => {
     expect(() => readFileSync(path, 'utf8')).toThrow();
   });
 
-  it('can discover with an existing saved key and keeps manual entry as the safe fallback', async () => {
+  it('never sends a saved provider key to a different discovery Base URL', async () => {
+    const fetchMock = vi.fn<typeof fetch>();
+    const { store } = fixture(fetchMock);
+    const profile = await store.save({
+      name: 'Bound discovery recipient',
+      baseUrl: 'https://saved.example/v1',
+      modelId: 'saved-model',
+      apiKey: 'saved-secret',
+    });
+
+    await expect(store.discoverModels({
+      baseUrl: 'https://untrusted.example/v1',
+      providerId: profile.id,
+    })).rejects.toThrow('显式输入 API Key');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('aborts saved-key discovery if recipient config changes during secret retrieval', async () => {
+    const fetchMock = vi.fn<typeof fetch>();
+    const { secrets, store } = fixture(fetchMock);
+    const profile = await store.save({
+      name: 'Deferred discovery recipient',
+      baseUrl: 'https://saved.example/v1',
+      modelId: 'saved-model',
+      apiKey: 'saved-secret',
+    });
+    let releaseSecret!: (secret: string) => void;
+    const secretRead = vi.spyOn(secrets, 'get').mockImplementationOnce(() => (
+      new Promise<string>((resolve) => { releaseSecret = resolve; })
+    ));
+
+    const discovery = store.discoverModels({
+      baseUrl: profile.baseUrl,
+      providerId: profile.id,
+    });
+    expect(secretRead).toHaveBeenCalledOnce();
+    await store.save({
+      id: profile.id,
+      name: profile.name,
+      baseUrl: 'https://replacement.example/v1',
+      modelId: profile.modelId,
+    });
+    releaseSecret('saved-secret');
+
+    await expect(discovery).rejects.toThrow('transitioning');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('discovers only from the exact saved URL when reusing its bound key', async () => {
     const fetchMock = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(new Response(JSON.stringify({ data: [] }), { status: 200 }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ data: [{ id: 'saved-model' }] }), { status: 200 }));

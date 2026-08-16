@@ -2,6 +2,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   readFileSync,
   readdirSync,
   renameSync,
@@ -11,32 +12,118 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, parse, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { WebContents } from 'electron';
 import type {
+  FilesystemBackend,
   RemoteFilesystem,
   RemoteFilesystemProvider,
   RemoteFileStat,
 } from '../filesystem/remote-filesystem';
 import { LocalFilesystemBackend } from '../filesystem/local-filesystem';
 import type { SessionManager } from '../sessions/session-manager';
+import { SessionStore } from '../sessions/session-store';
+import { WorkspaceOperationJournal } from '../sessions/workspace-operation-journal';
 import type { TerminalService } from '../terminal/terminal-service';
-import { AGENT_FILE_LIMITS, AgentFileService } from './agent-file-service';
+import {
+  AGENT_FILE_LIMITS,
+  AgentFileService,
+  WorkspaceOperationAuditPersistenceError,
+} from './agent-file-service';
 
 const roots: string[] = [];
+const TEST_SESSION_ID = '11111111-1111-4111-8111-111111111111';
 
-function createService(root: string): AgentFileService {
-  const sessions = {
-    sessionForTerminal: () => ({
-      id: 'session-id',
+function createSessionManager(
+  sessionForTerminal: () => unknown,
+  protectedRoot = join(tmpdir(), 'ai-terminal-test-protected-storage'),
+): SessionManager {
+  let sequence = 0;
+  return {
+    sessionForTerminal,
+    beginWorkspaceOperation: vi.fn((sessionId: string) => {
+      sequence += 1;
+      return {
+        sessionId,
+        operationId: `22222222-2222-4222-8222-${String(sequence).padStart(12, '0')}`,
+        intentSequence: sequence,
+      };
+    }),
+    finishWorkspaceOperation: vi.fn(),
+    workspaceStorageProtection: vi.fn((sessionId: string) => ({
+      root: protectedRoot,
+      operationJournalPath: join(
+        protectedRoot,
+        sessionId,
+        'workspace',
+        'operations.jsonl',
+      ),
+    })),
+  } as unknown as SessionManager;
+}
+
+function createServiceHarness(root: string): {
+  service: AgentFileService;
+  sessions: SessionManager;
+} {
+  const sessions = createSessionManager(() => ({
+      id: TEST_SESSION_ID,
       transport: 'local',
       cwd: root,
       workspace: { backend: 'local', root },
+    }));
+  return {
+    service: new AgentFileService({} as TerminalService, sessions),
+    sessions,
+  };
+}
+
+function createService(root: string): AgentFileService {
+  return createServiceHarness(root).service;
+}
+
+function createJournaledService(
+  container: string,
+  workspaceRoot: string,
+  localFilesystem: FilesystemBackend = new LocalFilesystemBackend(),
+): {
+  service: AgentFileService;
+  journal: WorkspaceOperationJournal;
+  auditRoot: string;
+} {
+  const auditRoot = join(container, 'sessions');
+  mkdirSync(join(auditRoot, TEST_SESSION_ID), { recursive: true });
+  const journal = new WorkspaceOperationJournal(auditRoot);
+  const sessions = {
+    sessionForTerminal: () => ({
+      id: TEST_SESSION_ID,
+      transport: 'local',
+      workspace: { backend: 'local', root: workspaceRoot },
+    }),
+    beginWorkspaceOperation: journal.begin.bind(journal),
+    finishWorkspaceOperation: journal.finish.bind(journal),
+    workspaceStorageProtection: () => ({
+      root: auditRoot,
+      operationJournalPath: join(
+        auditRoot,
+        TEST_SESSION_ID,
+        'workspace',
+        'operations.jsonl',
+      ),
     }),
   } as unknown as SessionManager;
-  return new AgentFileService({} as TerminalService, sessions);
+  return {
+    service: new AgentFileService(
+      {} as TerminalService,
+      sessions,
+      {} as RemoteFilesystemProvider,
+      localFilesystem,
+    ),
+    journal,
+    auditRoot,
+  };
 }
 
 function remoteStat(type: RemoteFileStat['type'], size = 0): RemoteFileStat {
@@ -78,15 +165,13 @@ function createSshService(filesystem: RemoteFilesystem) {
   const openSftp = vi.fn(() => {
     throw new Error('AgentFileService must not open SFTP directly.');
   });
-  const sessions = {
-    sessionForTerminal: () => ({
-      id: 'session-id',
+  const sessions = createSessionManager(() => ({
+      id: TEST_SESSION_ID,
       transport: 'ssh',
       hostId: 'host-1',
       cwd: '/work',
       workspace: { backend: 'sftp', root: '/work', hostId: 'host-1' },
-    }),
-  } as unknown as SessionManager;
+    }));
   return {
     service: new AgentFileService(
       { openSftp } as unknown as TerminalService,
@@ -95,6 +180,7 @@ function createSshService(filesystem: RemoteFilesystem) {
     ),
     withFilesystem,
     openSftp,
+    sessions,
   };
 }
 
@@ -132,6 +218,349 @@ describe('AgentFileService local workspace boundary', () => {
     expect(readFileSync(join(root, 'new.ts'), 'utf8')).toBe('export {};\n');
   });
 
+  it('emits exactly one intent and outcome for each top-level Workspace operation', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-audit-pairs-'));
+    roots.push(root);
+    writeFileSync(join(root, 'existing.txt'), 'needle old\n', 'utf8');
+    const { service, sessions } = createServiceHarness(root);
+    const owner = { id: 1 } as WebContents;
+    const expected = createHash('sha256').update('needle old\n').digest('hex');
+
+    await service.list(owner, 'terminal');
+    await service.readText(owner, 'terminal', 'existing.txt');
+    await service.statPath(owner, 'terminal', 'existing.txt');
+    await service.search(owner, 'terminal', 'CANARY-query-not-in-intent');
+    await service.glob(owner, 'terminal', '**/CANARY-pattern-not-in-intent');
+    await service.writeText(
+      owner,
+      'terminal',
+      'new.txt',
+      'CANARY-content-only-in-diff',
+      null,
+    );
+    await service.applyPatch(owner, 'terminal', 'existing.txt', expected, [{
+      search: 'old',
+      replace: 'CANARY-patch-replace-only-in-diff',
+    }]);
+    await service.mkdirPath(owner, 'terminal', 'created');
+    await service.renamePath(owner, 'terminal', 'created', 'renamed');
+    await service.deletePath(owner, 'terminal', 'renamed');
+
+    const begin = vi.mocked(sessions.beginWorkspaceOperation);
+    const finish = vi.mocked(sessions.finishWorkspaceOperation);
+    expect(begin.mock.calls.map((call) => call[1].operation)).toEqual([
+      'list',
+      'read',
+      'stat',
+      'search',
+      'glob',
+      'write',
+      'patch',
+      'mkdir',
+      'rename',
+      'delete',
+    ]);
+    expect(finish).toHaveBeenCalledTimes(10);
+    expect(begin.mock.calls.filter((call) => call[2] !== undefined).map((call) => (
+      call[1].operation
+    ))).toEqual(['write', 'patch']);
+    const intentJson = JSON.stringify(begin.mock.calls.map((call) => call[1]));
+    expect(intentJson).not.toContain('CANARY-query-not-in-intent');
+    expect(intentJson).not.toContain('CANARY-pattern-not-in-intent');
+    expect(intentJson).not.toContain('CANARY-content-only-in-diff');
+    expect(intentJson).not.toContain('CANARY-patch-replace-only-in-diff');
+  });
+
+  it('fails all five mutation kinds before touching the filesystem when durable begin fails', async () => {
+    const owner = { id: 1 } as WebContents;
+    const cases: Array<{
+      name: string;
+      prepare(root: string): Promise<() => Promise<unknown>> | (() => Promise<unknown>);
+      verify(root: string): void;
+    }> = [
+      {
+        name: 'write',
+        prepare: async (root) => {
+          const { service, sessions } = createServiceHarness(root);
+          vi.mocked(sessions.beginWorkspaceOperation).mockImplementation(() => {
+            throw new Error('CANARY-audit-begin-unavailable');
+          });
+          return () => service.writeText(owner, 'terminal', 'target.txt', 'new', null);
+        },
+        verify: (root) => {
+          expect(existsSync(join(root, 'target.txt'))).toBe(false);
+          expect(readdirSync(root)).toEqual([]);
+        },
+      },
+      {
+        name: 'patch',
+        prepare: async (root) => {
+          writeFileSync(join(root, 'target.txt'), 'old', 'utf8');
+          const { service, sessions } = createServiceHarness(root);
+          vi.mocked(sessions.beginWorkspaceOperation).mockImplementation(() => {
+            throw new Error('CANARY-audit-begin-unavailable');
+          });
+          const expectedSha256 = createHash('sha256').update('old').digest('hex');
+          return () => service.applyPatch(owner, 'terminal', 'target.txt', expectedSha256, [{
+            search: 'old', replace: 'new',
+          }]);
+        },
+        verify: (root) => {
+          expect(readFileSync(join(root, 'target.txt'), 'utf8')).toBe('old');
+          expect(readdirSync(root)).toEqual(['target.txt']);
+        },
+      },
+      {
+        name: 'mkdir',
+        prepare: async (root) => {
+          const { service, sessions } = createServiceHarness(root);
+          vi.mocked(sessions.beginWorkspaceOperation).mockImplementation(() => {
+            throw new Error('CANARY-audit-begin-unavailable');
+          });
+          return () => service.mkdirPath(owner, 'terminal', 'target');
+        },
+        verify: (root) => expect(existsSync(join(root, 'target'))).toBe(false),
+      },
+      {
+        name: 'rename',
+        prepare: async (root) => {
+          writeFileSync(join(root, 'source.txt'), 'keep', 'utf8');
+          const { service, sessions } = createServiceHarness(root);
+          vi.mocked(sessions.beginWorkspaceOperation).mockImplementation(() => {
+            throw new Error('CANARY-audit-begin-unavailable');
+          });
+          return () => service.renamePath(owner, 'terminal', 'source.txt', 'destination.txt');
+        },
+        verify: (root) => {
+          expect(readFileSync(join(root, 'source.txt'), 'utf8')).toBe('keep');
+          expect(existsSync(join(root, 'destination.txt'))).toBe(false);
+        },
+      },
+      {
+        name: 'delete',
+        prepare: async (root) => {
+          writeFileSync(join(root, 'target.txt'), 'keep', 'utf8');
+          const { service, sessions } = createServiceHarness(root);
+          vi.mocked(sessions.beginWorkspaceOperation).mockImplementation(() => {
+            throw new Error('CANARY-audit-begin-unavailable');
+          });
+          return () => service.deletePath(owner, 'terminal', 'target.txt');
+        },
+        verify: (root) => expect(readFileSync(join(root, 'target.txt'), 'utf8')).toBe('keep'),
+      },
+    ];
+
+    for (const testCase of cases) {
+      const root = mkdtempSync(join(tmpdir(), `ai-terminal-audit-${testCase.name}-`));
+      roots.push(root);
+      const invoke = await testCase.prepare(root);
+      await expect(invoke()).rejects.toThrow('CANARY-audit-begin-unavailable');
+      testCase.verify(root);
+    }
+  });
+
+  it('reports a committed non-retryable result when outcome persistence fails', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-audit-outcome-'));
+    roots.push(root);
+    const { service, sessions } = createServiceHarness(root);
+    vi.mocked(sessions.finishWorkspaceOperation).mockImplementation(() => {
+      throw new Error('CANARY-outcome-storage-failure');
+    });
+
+    let caught: unknown;
+    try {
+      await service.writeText(
+        { id: 1 } as WebContents,
+        'terminal',
+        'committed.txt',
+        'committed',
+        null,
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(WorkspaceOperationAuditPersistenceError);
+    expect(caught).toMatchObject({
+      code: 'WORKSPACE_AUDIT_OUTCOME_UNAVAILABLE',
+      retrySafe: false,
+      sideEffectCommitted: true,
+    });
+    expect((caught as Error).message).toContain('do not retry without re-reading');
+    expect((caught as Error).message).not.toContain('CANARY-outcome-storage-failure');
+    expect(readFileSync(join(root, 'committed.txt'), 'utf8')).toBe('committed');
+  });
+
+  it('records local create publication followed by temp cleanup failure as committed cleanup', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-local-create-cleanup-'));
+    roots.push(root);
+    const { service, sessions } = createServiceHarness(root);
+    const cleanupError = Object.assign(new Error('temporary cleanup failed'), { code: 'EACCES' });
+    const hooks = service as unknown as {
+      removeLocalTemporary(path: string): Promise<void>;
+    };
+    const removeTemporary = vi.spyOn(hooks, 'removeLocalTemporary')
+      .mockRejectedValueOnce(cleanupError)
+      .mockImplementation(async (path) => {
+        rmSync(path, { force: true });
+      });
+
+    await expect(service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'created.txt',
+      'created',
+      null,
+    )).rejects.toBe(cleanupError);
+
+    expect(readFileSync(join(root, 'created.txt'), 'utf8')).toBe('created');
+    expect(removeTemporary).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(sessions.finishWorkspaceOperation).mock.calls[0]![1]).toEqual({
+      outcome: 'failed',
+      sideEffectCommitted: true,
+      failure: { code: 'permission', stage: 'cleanup', retrySafe: false },
+    });
+  });
+
+  it('best-effort cleans a partially-created local temp and marks cleanup failure unsafe', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-local-temp-cleanup-'));
+    roots.push(root);
+    const { service, sessions } = createServiceHarness(root);
+    const writeError = Object.assign(new Error('partial temp write failed'), { code: 'EIO' });
+    const hooks = service as unknown as {
+      writeLocalTemporary(path: string, bytes: Buffer, mode: number): Promise<void>;
+      removeLocalTemporary(path: string): Promise<void>;
+    };
+    vi.spyOn(hooks, 'writeLocalTemporary').mockImplementation(async (path) => {
+      writeFileSync(path, 'partial', 'utf8');
+      throw writeError;
+    });
+    const removeTemporary = vi.spyOn(hooks, 'removeLocalTemporary')
+      .mockRejectedValue(Object.assign(new Error('cleanup denied'), { code: 'EACCES' }));
+
+    await expect(service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'target.txt',
+      'target',
+      null,
+    )).rejects.toBe(writeError);
+
+    expect(existsSync(join(root, 'target.txt'))).toBe(false);
+    expect(removeTemporary).toHaveBeenCalledOnce();
+    expect(readdirSync(root)).toEqual([expect.stringMatching(/^\.ai-terminal-.*\.tmp$/u)]);
+    expect(vi.mocked(sessions.finishWorkspaceOperation).mock.calls[0]![1]).toEqual({
+      outcome: 'failed',
+      sideEffectCommitted: false,
+      failure: { code: 'unknown', stage: 'cleanup', retrySafe: false },
+    });
+  });
+
+  it('keeps queries, patterns, bodies, patch text, rejected spellings, and raw errors out of JSONL', async () => {
+    const container = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-audit-jsonl-'));
+    roots.push(container);
+    const root = join(container, 'workspace-root');
+    mkdirSync(root);
+    writeFileSync(join(root, 'existing.txt'), 'CANARY-secret-patch-search\n', 'utf8');
+    writeFileSync(join(root, 'provider-error.txt'), 'unread', 'utf8');
+    const backend = new LocalFilesystemBackend();
+    const rawReadFile = backend.readFile.bind(backend);
+    vi.spyOn(backend, 'readFile').mockImplementation(async (path, maxBytes) => {
+      if (path.endsWith('provider-error.txt')) {
+        throw new Error('CANARY-raw-provider-error-with-host.example');
+      }
+      return rawReadFile(path, maxBytes);
+    });
+    const { service, journal, auditRoot } = createJournaledService(container, root, backend);
+    const owner = { id: 1 } as WebContents;
+    const expected = createHash('sha256')
+      .update('CANARY-secret-patch-search\n')
+      .digest('hex');
+
+    await service.search(owner, 'terminal', 'CANARY-secret-query');
+    await service.glob(owner, 'terminal', '**/CANARY-secret-pattern');
+    await service.writeText(
+      owner,
+      'terminal',
+      'new.txt',
+      'CANARY-secret-write-body',
+      null,
+    );
+    await service.applyPatch(owner, 'terminal', 'existing.txt', expected, [{
+      search: 'CANARY-secret-patch-search',
+      replace: 'CANARY-secret-patch-replace',
+    }]);
+    await expect(service.readText(owner, 'terminal', 'provider-error.txt'))
+      .rejects.toThrow('CANARY-raw-provider-error-with-host.example');
+    service.recordPolicyRejection(
+      owner,
+      'terminal',
+      'read',
+      { path: 'CANARY-invalid-nul\0tail' },
+      root,
+      { readablePaths: [root], writablePaths: [root], fullAccess: false },
+    );
+    service.recordPolicyRejection(
+      owner,
+      'terminal',
+      'write',
+      { path: `CANARY-overlong-${'x'.repeat(4_097)}` },
+      root,
+      { readablePaths: [root], writablePaths: [root], fullAccess: false },
+    );
+
+    const logPath = join(
+      auditRoot,
+      TEST_SESSION_ID,
+      'workspace',
+      'operations.jsonl',
+    );
+    const jsonl = readFileSync(logPath, 'utf8');
+    for (const canary of [
+      'CANARY-secret-query',
+      'CANARY-secret-pattern',
+      'CANARY-secret-write-body',
+      'CANARY-secret-patch-search',
+      'CANARY-secret-patch-replace',
+      'CANARY-raw-provider-error-with-host.example',
+      'CANARY-invalid-nul',
+      'CANARY-overlong',
+    ]) expect(jsonl).not.toContain(canary);
+    expect(jsonl).not.toContain('--- a/');
+
+    const records = journal.read(TEST_SESSION_ID);
+    expect(records).toHaveLength(14);
+    expect(records.filter((record) => record.recordType === 'intent').map((record) => (
+      record.operation
+    ))).toEqual(['search', 'glob', 'write', 'patch', 'read', 'read', 'write']);
+    const rejected = records.filter((record) => (
+      record.recordType === 'intent' && record.source === 'policy_workspace_tool'
+    ));
+    expect(rejected).toHaveLength(2);
+    for (const record of rejected) {
+      if (record.recordType !== 'intent' || !('path' in record.target)) continue;
+      expect(record.target.path).toEqual({
+        scope: 'rejected',
+        pathHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+      });
+    }
+
+    const patchIntents = records.filter((record) => (
+      record.recordType === 'intent'
+      && (record.operation === 'write' || record.operation === 'patch')
+    ));
+    expect(patchIntents).toHaveLength(3);
+    expect(patchIntents.filter((record) => record.recordType === 'intent' && record.diff))
+      .toHaveLength(2);
+    const diffBodies = readdirSync(join(auditRoot, TEST_SESSION_ID, 'workspace', 'diffs'))
+      .map((name) => readFileSync(
+        join(auditRoot, TEST_SESSION_ID, 'workspace', 'diffs', name),
+        'utf8',
+      ))
+      .join('\n');
+    expect(diffBodies).toContain('CANARY-secret-write-body');
+    expect(diffBodies).toContain('CANARY-secret-patch-replace');
+  });
+
   it('normalizes local diff header separators without changing backend paths', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-local-diff-label-'));
     roots.push(root);
@@ -148,7 +577,7 @@ describe('AgentFileService local workspace boundary', () => {
       current.sha256,
       [{ search: 'old', replace: 'new' }],
     );
-    expect(result.diff).toContain('--- a/src/demo.ts');
+    expect(result.diff).toContain('--- a/workspace/src/demo.ts');
     expect(result.diff).not.toContain('src\\demo.ts');
     expect(result.path).toBe(join(root, 'src', 'demo.ts'));
   });
@@ -189,6 +618,35 @@ describe('AgentFileService local workspace boundary', () => {
     expect(withFilesystem).not.toHaveBeenCalled();
   });
 
+  it('rejects a persisted local Workspace Root that now resolves through a link', async () => {
+    const container = mkdtempSync(join(tmpdir(), 'ai-terminal-linked-workspace-root-'));
+    roots.push(container);
+    const actual = join(container, 'actual');
+    const linked = join(container, 'linked');
+    mkdirSync(actual);
+    symlinkSync(actual, linked, process.platform === 'win32' ? 'junction' : 'dir');
+    const service = createService(linked);
+
+    await expect(service.bindWorkspaceRoot(
+      { id: 1 } as WebContents,
+      'terminal',
+    )).rejects.toThrow('替换或重定向');
+  });
+
+  it('rejects a persisted SFTP Workspace Root that realpaths elsewhere', async () => {
+    const filesystem = fakeRemoteFilesystem({
+      realpath: vi.fn(async (path: string) => path === '/work' ? '/actual-work' : path),
+      stat: vi.fn(async () => remoteStat('directory')),
+    });
+    const { service, withFilesystem } = createSshService(filesystem);
+
+    await expect(service.bindWorkspaceRoot(
+      { id: 1 } as WebContents,
+      'terminal',
+    )).rejects.toThrow('替换或重定向');
+    expect(withFilesystem).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps file access bound to session.workspace when cwd changes and rejects root overrides', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-workspace-root-'));
     const other = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-cwd-'));
@@ -201,9 +659,10 @@ describe('AgentFileService local workspace boundary', () => {
       cwd: root,
       workspace: { backend: 'local' as const, root },
     };
-    const service = new AgentFileService({} as TerminalService, {
-      sessionForTerminal: () => session,
-    } as unknown as SessionManager);
+    const service = new AgentFileService(
+      {} as TerminalService,
+      createSessionManager(() => session),
+    );
     const owner = { id: 1 } as WebContents;
 
     expect(await service.bindWorkspaceRoot(owner, 'terminal')).toBe(root);
@@ -250,6 +709,38 @@ describe('AgentFileService local workspace boundary', () => {
         .rejects.toThrow('备用数据流');
       await expect(service.writeText(owner, 'terminal', 'CON.txt', 'x', null))
         .rejects.toThrow('Windows 保留名称');
+    },
+  );
+
+  it.runIf(process.platform === 'win32')(
+    'records a policy-rejected Windows device path only as an opaque hash',
+    () => {
+      const container = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-device-audit-'));
+      roots.push(container);
+      const root = join(container, 'workspace-root');
+      mkdirSync(root);
+      const { service, journal } = createJournaledService(container, root);
+
+      service.recordPolicyRejection(
+        { id: 1 } as WebContents,
+        'terminal',
+        'read',
+        { path: 'CON.txt' },
+        root,
+        { readablePaths: [root], writablePaths: [root], fullAccess: false },
+      );
+
+      expect(journal.read(TEST_SESSION_ID)[0]).toMatchObject({
+        recordType: 'intent',
+        source: 'policy_workspace_tool',
+        target: {
+          path: {
+            scope: 'rejected',
+            pathHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+          },
+        },
+      });
+      expect(JSON.stringify(journal.read(TEST_SESSION_ID))).not.toContain('CON.txt');
     },
   );
 
@@ -314,19 +805,19 @@ describe('AgentFileService local workspace boundary', () => {
       stat: vi.fn(async (path: string) => (
         path === root ? remoteStat('directory') : remoteStat('file', 5)
       )),
-      lstat: vi.fn(async () => remoteStat('file', 5)),
+      lstat: vi.fn(async (path: string) => (
+        path === root ? remoteStat('directory') : remoteStat('file', 5)
+      )),
       readFile: vi.fn(async () => Buffer.from('hello')),
       listDirectory: vi.fn(async () => [{
         name: 'demo.ts', path: file, stat: remoteStat('file', 5),
       }]),
     });
-    const sessions = {
-      sessionForTerminal: () => ({
-        id: 'session-id',
+    const sessions = createSessionManager(() => ({
+        id: TEST_SESSION_ID,
         transport: 'local',
         workspace: { backend: 'local', root },
-      }),
-    } as unknown as SessionManager;
+      }));
     const service = new AgentFileService(
       {} as TerminalService,
       sessions,
@@ -405,7 +896,9 @@ describe('AgentFileService local workspace boundary', () => {
   it('rejects a remote final-component symlink before reading or replacing it', async () => {
     const readFile = vi.fn();
     const filesystem = fakeRemoteFilesystem({
-      lstat: vi.fn(async () => remoteStat('symlink')),
+      lstat: vi.fn(async (path: string) => (
+        path === '/work' ? remoteStat('directory') : remoteStat('symlink')
+      )),
       readFile,
     });
     const { service } = createSshService(filesystem);
@@ -423,7 +916,9 @@ describe('AgentFileService local workspace boundary', () => {
 
   it('returns remote stat metadata through the Host-bound filesystem', async () => {
     const filesystem = fakeRemoteFilesystem({
-      lstat: vi.fn(async () => remoteStat('file', 42)),
+      lstat: vi.fn(async (path: string) => (
+        path === '/work' ? remoteStat('directory') : remoteStat('file', 42)
+      )),
     });
     const { service, withFilesystem } = createSshService(filesystem);
     const owner = { id: 1 } as WebContents;
@@ -442,7 +937,9 @@ describe('AgentFileService local workspace boundary', () => {
 
   it('treats a leading backslash as a legal SSH filename, not a Windows absolute path', async () => {
     const filesystem = fakeRemoteFilesystem({
-      lstat: vi.fn(async () => remoteStat('file', 7)),
+      lstat: vi.fn(async (path: string) => (
+        path === '/work' ? remoteStat('directory') : remoteStat('file', 7)
+      )),
     });
     const { service } = createSshService(filesystem);
 
@@ -655,8 +1152,8 @@ describe('AgentFileService local workspace boundary', () => {
 
     expect(withFilesystem).toHaveBeenCalledTimes(1);
     expect(result).toMatchObject({ additions: 1, deletions: 1, diffTruncated: false });
-    expect(result.diff).toContain('--- a/src/demo.ts');
-    expect(result.diff).not.toContain('/work');
+    expect(result.diff).toContain('--- a/workspace/src/demo.ts');
+    expect(result.diff).not.toContain('/work/');
     expect(writeFile).toHaveBeenCalledWith(
       expect.stringMatching(/^\/work\/src\/\.ai-terminal-/u),
       Buffer.from('const value = 2;\n'),
@@ -698,6 +1195,90 @@ describe('AgentFileService local workspace boundary', () => {
     expect(withFilesystem).toHaveBeenCalledTimes(1);
     expect(atomicReplace).not.toHaveBeenCalled();
     expect(unlink).toHaveBeenCalledWith(expect.stringContaining('.ai-terminal-'));
+  });
+
+  it('records a rejected remote final publish as ambiguous and non-retryable', async () => {
+    const current = Buffer.from('old\n');
+    const disconnect = Object.assign(
+      new Error('CANARY-raw-sftp-error host.example'),
+      { code: 'ECONNRESET' },
+    );
+    const atomicReplace = vi.fn(async () => {
+      throw disconnect;
+    });
+    const filesystem = fakeRemoteFilesystem({
+      lstat: vi.fn(async (path: string) => (
+        path === '/work' ? remoteStat('directory') : remoteStat('file', current.length)
+      )),
+      readFile: vi.fn(async () => current),
+      atomicReplace,
+    });
+    const { service, sessions, withFilesystem } = createSshService(filesystem);
+    const expected = createHash('sha256').update(current).digest('hex');
+
+    await expect(service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'existing.txt',
+      'new\n',
+      expected,
+    )).rejects.toBe(disconnect);
+
+    expect(withFilesystem).toHaveBeenCalledTimes(1);
+    expect(sessions.beginWorkspaceOperation).toHaveBeenCalledTimes(1);
+    expect(sessions.finishWorkspaceOperation).toHaveBeenCalledTimes(1);
+    const outcome = vi.mocked(sessions.finishWorkspaceOperation).mock.calls[0]![1];
+    expect(outcome).toEqual({
+      outcome: 'failed',
+      sideEffectCommitted: null,
+      failure: {
+        code: 'remote_disconnected',
+        stage: 'commit',
+        retrySafe: false,
+      },
+    });
+    expect(JSON.stringify(outcome)).not.toContain('CANARY-raw-sftp-error');
+    expect(JSON.stringify(outcome)).not.toContain('host.example');
+  });
+
+  it('looks for a partially-created remote temp after write rejection and bounds cleanup failure', async () => {
+    const writeError = Object.assign(new Error('remote temp write rejected'), { code: 'EIO' });
+    const cleanupError = Object.assign(new Error('remote cleanup disconnected'), {
+      code: 'ECONNRESET',
+    });
+    const writeFile = vi.fn(async () => {
+      throw writeError;
+    });
+    const unlink = vi.fn(async () => {
+      throw cleanupError;
+    });
+    const filesystem = fakeRemoteFilesystem({
+      lstat: vi.fn(async (path: string) => {
+        if (path === '/work') return remoteStat('directory');
+        if (path.includes('/.ai-terminal-')) return remoteStat('file', 7);
+        return undefined;
+      }),
+      writeFile,
+      unlink,
+    });
+    const { service, sessions, withFilesystem } = createSshService(filesystem);
+
+    await expect(service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'new.txt',
+      'new',
+      null,
+    )).rejects.toBe(writeError);
+
+    expect(withFilesystem).toHaveBeenCalledTimes(1);
+    expect(writeFile).toHaveBeenCalledOnce();
+    expect(unlink).toHaveBeenCalledWith(expect.stringContaining('/.ai-terminal-'));
+    expect(vi.mocked(sessions.finishWorkspaceOperation).mock.calls[0]![1]).toEqual({
+      outcome: 'failed',
+      sideEffectCommitted: false,
+      failure: { code: 'unknown', stage: 'cleanup', retrySafe: false },
+    });
   });
 
   it('uses one remote lease for each mkdir, rename, and delete mutation', async () => {
@@ -769,6 +1350,52 @@ describe('AgentFileService local workspace boundary', () => {
       '/work/tree/nested',
       '/work/tree',
     ]);
+  });
+
+  it('records the confirmed lower bound when a remote recursive delete partially commits', async () => {
+    const stats = new Map<string, RemoteFileStat>([
+      ['/work', remoteStat('directory')],
+      ['/work/tree', remoteStat('directory')],
+      ['/work/tree/a.txt', remoteStat('file', 1)],
+      ['/work/tree/b.txt', remoteStat('file', 1)],
+    ]);
+    const disconnect = Object.assign(new Error('raw partial failure'), { code: 'ECONNRESET' });
+    const unlink = vi.fn(async (path: string) => {
+      if (path.endsWith('/b.txt')) throw disconnect;
+    });
+    const filesystem = fakeRemoteFilesystem({
+      lstat: vi.fn(async (path: string) => stats.get(path)),
+      listDirectory: vi.fn(async (path: string) => {
+        if (path !== '/work/tree') return [];
+        return [
+          { name: 'a.txt', path: '/work/tree/a.txt', stat: remoteStat('file', 1) },
+          { name: 'b.txt', path: '/work/tree/b.txt', stat: remoteStat('file', 1) },
+        ];
+      }),
+      unlink,
+    });
+    const { service, sessions, withFilesystem } = createSshService(filesystem);
+
+    await expect(service.deletePath(
+      { id: 1 } as WebContents,
+      'terminal',
+      'tree',
+      { recursive: true },
+    )).rejects.toBe(disconnect);
+
+    expect(withFilesystem).toHaveBeenCalledTimes(1);
+    expect(sessions.beginWorkspaceOperation).toHaveBeenCalledTimes(1);
+    expect(sessions.finishWorkspaceOperation).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sessions.finishWorkspaceOperation).mock.calls[0]![1]).toEqual({
+      outcome: 'failed',
+      sideEffectCommitted: true,
+      effect: { itemsPlanned: 3, itemsCommitted: 1 },
+      failure: {
+        code: 'remote_disconnected',
+        stage: 'commit',
+        retrySafe: false,
+      },
+    });
   });
 
   it('has zero mutation side effects when recursive delete preflight fails', async () => {
@@ -879,13 +1506,11 @@ describe('AgentFileService local workspace boundary', () => {
     vi.spyOn(backend, 'readFile')
       .mockResolvedValueOnce(Buffer.from('old\n'))
       .mockResolvedValueOnce(Buffer.from('raced\n'));
-    const sessions = {
-      sessionForTerminal: () => ({
-        id: 'session-id',
+    const sessions = createSessionManager(() => ({
+        id: TEST_SESSION_ID,
         transport: 'local',
         workspace: { backend: 'local', root },
-      }),
-    } as unknown as SessionManager;
+      }));
     const service = new AgentFileService(
       {} as TerminalService,
       sessions,
@@ -904,4 +1529,723 @@ describe('AgentFileService local workspace boundary', () => {
     expect(readFileSync(path, 'utf8')).toBe('old\n');
     expect(readdirSync(root)).toEqual(['demo.txt']);
   });
+
+  it('does not publish a deferred local write after its authorization is revoked', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-local-revoke-'));
+    roots.push(root);
+    const path = join(root, 'demo.txt');
+    writeFileSync(path, 'old\n', 'utf8');
+    const { service } = createServiceHarness(root);
+    const hooks = service as unknown as {
+      writeLocalTemporary(path: string, bytes: Buffer, mode: number): Promise<void>;
+    };
+    const writeLocalTemporary = hooks.writeLocalTemporary.bind(service);
+    let releaseTemporary!: () => void;
+    let markTemporaryReady!: () => void;
+    const temporaryRelease = new Promise<void>((resolve) => { releaseTemporary = resolve; });
+    const temporaryReady = new Promise<void>((resolve) => { markTemporaryReady = resolve; });
+    vi.spyOn(hooks, 'writeLocalTemporary').mockImplementation(async (...args) => {
+      await writeLocalTemporary(...args);
+      markTemporaryReady();
+      await temporaryRelease;
+    });
+    let live = true;
+    const authorization = {
+      readablePaths: [root],
+      writablePaths: [root],
+      fullAccess: false,
+      assertLive: () => {
+        if (!live) throw new Error('Workspace tool grant is no longer active.');
+      },
+    };
+    const expected = createHash('sha256').update('old\n').digest('hex');
+
+    const pending = service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'demo.txt',
+      'new\n',
+      expected,
+      root,
+      authorization,
+    );
+    await temporaryReady;
+    live = false;
+    releaseTemporary();
+
+    await expect(pending).rejects.toThrow('no longer active');
+    expect(readFileSync(path, 'utf8')).toBe('old\n');
+    expect(readdirSync(root)).toEqual(['demo.txt']);
+  });
+
+  it('allows an explicitly canonicalized local scope outside Workspace Root and rejects its sibling', async () => {
+    const container = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-local-scope-'));
+    roots.push(container);
+    const workspace = join(container, 'workspace');
+    const granted = join(container, 'granted');
+    const sibling = join(container, 'sibling');
+    mkdirSync(workspace);
+    mkdirSync(granted);
+    mkdirSync(sibling);
+    writeFileSync(join(granted, 'allowed.txt'), 'allowed', 'utf8');
+    writeFileSync(join(sibling, 'denied.txt'), 'denied', 'utf8');
+    const service = createService(workspace);
+    const owner = { id: 1 } as WebContents;
+
+    await expect(service.readText(owner, 'terminal', join(granted, 'allowed.txt')))
+      .rejects.toThrow('已授权范围');
+    const canonical = await service.canonicalizeAccessRoot(owner, 'terminal', granted);
+    const authorization = {
+      readablePaths: [canonical],
+      writablePaths: [canonical],
+      fullAccess: false,
+    };
+    await expect(service.readText(
+      owner,
+      'terminal',
+      join(granted, 'allowed.txt'),
+      workspace,
+      authorization,
+    )).resolves.toMatchObject({ content: 'allowed', path: join(granted, 'allowed.txt') });
+    const outsideWrite = await service.writeText(
+      owner,
+      'terminal',
+      join(granted, 'created.txt'),
+      'created',
+      null,
+      workspace,
+      authorization,
+    );
+    expect(outsideWrite.diff).toMatch(
+      /^\+\+\+ b\/authorized\/[0-9a-f]{16}\/created\.txt$/mu,
+    );
+    expect(outsideWrite.diff).not.toContain('../');
+    expect(outsideWrite.diff.split('\n').slice(0, 2).join('\n')).not.toContain('\\');
+    await expect(service.readText(
+      owner,
+      'terminal',
+      join(sibling, 'denied.txt'),
+      workspace,
+      authorization,
+    )).rejects.toThrow('已授权范围');
+  });
+
+  it('enforces readable, writable, and overwrite-intersection scopes independently', async () => {
+    const container = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-capability-scope-'));
+    roots.push(container);
+    const workspace = join(container, 'workspace');
+    const readable = join(container, 'readable');
+    const writable = join(container, 'writable');
+    const shared = join(container, 'shared');
+    for (const directory of [workspace, readable, writable, shared]) mkdirSync(directory);
+    writeFileSync(join(readable, 'read.txt'), 'read', 'utf8');
+    writeFileSync(join(writable, 'existing.txt'), 'old', 'utf8');
+    writeFileSync(join(shared, 'shared.txt'), 'old', 'utf8');
+    const service = createService(workspace);
+    const owner = { id: 1 } as WebContents;
+    const authorization = {
+      readablePaths: [readable, shared],
+      writablePaths: [writable, shared],
+      fullAccess: false,
+    };
+
+    await expect(service.readText(
+      owner, 'terminal', join(readable, 'read.txt'), workspace, authorization,
+    )).resolves.toMatchObject({ content: 'read' });
+    await expect(service.readText(
+      owner, 'terminal', join(writable, 'existing.txt'), workspace, authorization,
+    )).rejects.toThrow('已授权范围');
+
+    await service.writeText(
+      owner, 'terminal', join(writable, 'created.txt'), 'new', null, workspace, authorization,
+    );
+    expect(readFileSync(join(writable, 'created.txt'), 'utf8')).toBe('new');
+    const writableHash = createHash('sha256').update('old').digest('hex');
+    await expect(service.writeText(
+      owner,
+      'terminal',
+      join(writable, 'existing.txt'),
+      'changed',
+      writableHash,
+      workspace,
+      authorization,
+    )).rejects.toThrow('读写交集');
+    expect(readFileSync(join(writable, 'existing.txt'), 'utf8')).toBe('old');
+
+    const sharedHash = createHash('sha256').update('old').digest('hex');
+    await service.applyPatch(
+      owner,
+      'terminal',
+      join(shared, 'shared.txt'),
+      sharedHash,
+      [{ search: 'old', replace: 'patched' }],
+      workspace,
+      authorization,
+    );
+    expect(readFileSync(join(shared, 'shared.txt'), 'utf8')).toBe('patched');
+    await service.mkdirPath(
+      owner, 'terminal', join(writable, 'created-dir'), workspace, authorization,
+    );
+    await service.deletePath(
+      owner, 'terminal', join(writable, 'created.txt'), {}, workspace, authorization,
+    );
+    expect(existsSync(join(writable, 'created.txt'))).toBe(false);
+  });
+
+  it('does not read a destination that races a create-only grant', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-create-only-race-'));
+    roots.push(root);
+    const target = join(root, 'raced.txt');
+    writeFileSync(target, 'secret', 'utf8');
+    const backend = new LocalFilesystemBackend();
+    const originalLstat = backend.lstat.bind(backend);
+    vi.spyOn(backend, 'lstat').mockImplementation(async (path: string) => (
+      path === target ? undefined : originalLstat(path)
+    ));
+    const readFile = vi.spyOn(backend, 'readFile');
+    const service = new AgentFileService(
+      {} as TerminalService,
+      createSessionManager(() => ({
+          id: TEST_SESSION_ID,
+          transport: 'local',
+          workspace: { backend: 'local', root },
+        })),
+      {} as RemoteFilesystemProvider,
+      backend,
+    );
+
+    await expect(service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      target,
+      'replacement',
+      null,
+      root,
+      { readablePaths: [], writablePaths: [root], fullAccess: false },
+    )).rejects.toBeDefined();
+    expect(readFile).not.toHaveBeenCalled();
+    expect(readFileSync(target, 'utf8')).toBe('secret');
+    expect(readdirSync(root)).toEqual(['raced.txt']);
+  });
+
+  it('supports Full Access outside Workspace Root but protects Workspace ancestors', async () => {
+    const container = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-full-access-'));
+    roots.push(container);
+    const workspace = join(container, 'workspace');
+    const outside = join(container, 'outside');
+    mkdirSync(workspace);
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'outside.txt'), 'outside', 'utf8');
+    const service = createService(workspace);
+    const owner = { id: 1 } as WebContents;
+    const fullAccess = { readablePaths: [], writablePaths: [], fullAccess: true };
+
+    await expect(service.readText(
+      owner, 'terminal', join(outside, 'outside.txt'), workspace, fullAccess,
+    )).resolves.toMatchObject({ content: 'outside' });
+    const outsideWrite = await service.writeText(
+      owner, 'terminal', join(outside, 'created.txt'), 'created', null, workspace, fullAccess,
+    );
+    expect(readFileSync(join(outside, 'created.txt'), 'utf8')).toBe('created');
+    expect(outsideWrite.diff).toMatch(/^\+\+\+ b\/filesystem\/[0-9a-f]{16}\//mu);
+    expect(outsideWrite.diff).not.toContain('../');
+    expect(outsideWrite.diff).not.toMatch(/^--- a\/[A-Za-z]:/mu);
+    expect(outsideWrite.diff).not.toMatch(/^--- a\/\\\\/mu);
+    await expect(service.deletePath(
+      owner, 'terminal', workspace, { recursive: true }, workspace, fullAccess,
+    )).rejects.toThrow('Workspace Root');
+    await expect(service.deletePath(
+      owner, 'terminal', container, { recursive: true }, workspace, fullAccess,
+    )).rejects.toThrow('Workspace Root');
+    expect(existsSync(workspace)).toBe(true);
+  });
+
+  it('durably audits a rejected Workspace Root mutation', async () => {
+    const container = mkdtempSync(join(tmpdir(), 'ai-terminal-root-mutation-audit-'));
+    roots.push(container);
+    const workspace = join(container, 'workspace-root');
+    mkdirSync(workspace);
+    const auditRoot = join(container, 'sessions');
+    const store = new SessionStore(auditRoot);
+    const session = store.create({
+      descriptor: {
+        id: 'terminal',
+        title: 'Local',
+        profileId: 'powershell',
+        shellKind: 'powershell',
+        transport: 'local',
+      },
+      startedAt: new Date().toISOString(),
+      history: [],
+      preludeTruncated: false,
+      droppedPreludeBytes: 0,
+    });
+    store.setWorkspace(session.id, { backend: 'local', root: workspace });
+    const sessions = {
+      sessionForTerminal: () => store.get(session.id),
+      beginWorkspaceOperation: store.beginWorkspaceOperation.bind(store),
+      finishWorkspaceOperation: store.finishWorkspaceOperation.bind(store),
+      workspaceStorageProtection: store.workspaceStorageProtection.bind(store),
+    } as unknown as SessionManager;
+    const service = new AgentFileService({} as TerminalService, sessions);
+    const owner = { id: 1 } as WebContents;
+    const fullAccess = { readablePaths: [], writablePaths: [], fullAccess: true };
+
+    await expect(service.deletePath(
+      owner,
+      'terminal',
+      '.',
+      { recursive: true },
+      workspace,
+      fullAccess,
+    )).rejects.toThrow('Workspace Root');
+
+    expect(existsSync(workspace)).toBe(true);
+    expect(store.readWorkspaceOperations(session.id)).toMatchObject([
+      {
+        recordType: 'intent',
+        operation: 'delete',
+        target: {
+          path: {
+            scope: 'rejected',
+            pathHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+          },
+        },
+      },
+      {
+        recordType: 'outcome',
+        outcome: 'failed',
+        sideEffectCommitted: false,
+        failure: { stage: 'prepare', retrySafe: true },
+      },
+    ]);
+    const jsonl = readFileSync(
+      join(auditRoot, session.id, 'workspace', 'operations.jsonl'),
+      'utf8',
+    );
+    expect(jsonl).not.toContain(workspace);
+    expect(jsonl).not.toContain(JSON.stringify(workspace).slice(1, -1));
+  });
+
+  it('protects Session and audit storage from every local Full Access mutation', async () => {
+    const container = mkdtempSync(join(tmpdir(), 'ai-terminal-protected-session-storage-'));
+    roots.push(container);
+    const workspace = join(container, 'workspace-root');
+    mkdirSync(workspace);
+    const { service, journal, auditRoot } = createJournaledService(container, workspace);
+    const owner = { id: 1 } as WebContents;
+    const fullAccess = { readablePaths: [], writablePaths: [], fullAccess: true };
+
+    // Establish the authoritative journal before testing self-targeting paths.
+    await service.list(owner, 'terminal', '.', workspace, fullAccess);
+    const sessionPath = join(auditRoot, TEST_SESSION_ID);
+    const metadataPath = join(sessionPath, 'session.json');
+    const protectedSource = join(sessionPath, 'protected-source.txt');
+    const operationLog = join(sessionPath, 'workspace', 'operations.jsonl');
+    writeFileSync(metadataPath, 'metadata-sentinel', 'utf8');
+    writeFileSync(protectedSource, 'source-sentinel', 'utf8');
+    const renameSource = join(workspace, 'rename-source.txt');
+    writeFileSync(renameSource, 'workspace-source', 'utf8');
+    const protectedNewFile = join(auditRoot, 'another-session', 'new.txt');
+    const protectedDiff = join(sessionPath, 'workspace', 'diffs', 'forbidden.patch');
+    const protectedNewDirectory = join(auditRoot, 'another-session', 'new-dir');
+    const protectedRenameDestination = join(auditRoot, 'another-session', 'renamed.txt');
+
+    await expect(service.writeText(
+      owner,
+      'terminal',
+      protectedNewFile,
+      'blocked-write',
+      null,
+      workspace,
+      fullAccess,
+    )).rejects.toThrow(/Session.*审计存储/u);
+    const logBeforeDiffTarget = readFileSync(operationLog);
+    await expect(service.writeText(
+      owner,
+      'terminal',
+      protectedDiff,
+      'blocked-diff-write',
+      null,
+      workspace,
+      fullAccess,
+    )).rejects.toThrow(/Session.*审计存储/u);
+    expect(readFileSync(operationLog)).toEqual(logBeforeDiffTarget);
+    await expect(service.applyPatch(
+      owner,
+      'terminal',
+      metadataPath,
+      createHash('sha256').update('metadata-sentinel').digest('hex'),
+      [{ search: 'metadata', replace: 'changed' }],
+      workspace,
+      fullAccess,
+    )).rejects.toThrow(/Session.*审计存储/u);
+    await expect(service.mkdirPath(
+      owner,
+      'terminal',
+      protectedNewDirectory,
+      workspace,
+      fullAccess,
+    )).rejects.toThrow(/Session.*审计存储/u);
+    await expect(service.renamePath(
+      owner,
+      'terminal',
+      protectedSource,
+      join(workspace, 'renamed-out.txt'),
+      workspace,
+      fullAccess,
+    )).rejects.toThrow(/Session.*审计存储/u);
+    await expect(service.renamePath(
+      owner,
+      'terminal',
+      renameSource,
+      protectedRenameDestination,
+      workspace,
+      fullAccess,
+    )).rejects.toThrow(/Session.*审计存储/u);
+    await expect(service.deletePath(
+      owner,
+      'terminal',
+      metadataPath,
+      {},
+      workspace,
+      fullAccess,
+    )).rejects.toThrow(/Session.*审计存储/u);
+
+    expect(existsSync(protectedNewFile)).toBe(false);
+    expect(existsSync(protectedDiff)).toBe(false);
+    expect(existsSync(protectedNewDirectory)).toBe(false);
+    expect(readFileSync(metadataPath, 'utf8')).toBe('metadata-sentinel');
+    expect(readFileSync(protectedSource, 'utf8')).toBe('source-sentinel');
+    expect(readFileSync(renameSource, 'utf8')).toBe('workspace-source');
+    expect(existsSync(join(workspace, 'renamed-out.txt'))).toBe(false);
+    expect(existsSync(protectedRenameDestination)).toBe(false);
+
+    const logBeforeSelfTarget = readFileSync(operationLog);
+    const logSha256 = createHash('sha256').update(logBeforeSelfTarget).digest('hex');
+    await expect(service.writeText(
+      owner,
+      'terminal',
+      operationLog,
+      'blocked-self-write',
+      logSha256,
+      workspace,
+      fullAccess,
+    )).rejects.toThrow(/Session.*审计存储/u);
+    await expect(service.applyPatch(
+      owner,
+      'terminal',
+      operationLog,
+      logSha256,
+      [{ search: 'never-read', replace: 'never-written' }],
+      workspace,
+      fullAccess,
+    )).rejects.toThrow(/Session.*审计存储/u);
+    expect(readFileSync(operationLog)).toEqual(logBeforeSelfTarget);
+
+    const logBeforeAncestor = readFileSync(operationLog);
+    await expect(service.deletePath(
+      owner,
+      'terminal',
+      auditRoot,
+      { recursive: true },
+      workspace,
+      fullAccess,
+    )).rejects.toThrow(/Session.*审计存储/u);
+    expect(readFileSync(operationLog)).toEqual(logBeforeAncestor);
+    expect(existsSync(auditRoot)).toBe(true);
+
+    const records = journal.read(TEST_SESSION_ID);
+    const intents = records.filter((record) => record.recordType === 'intent');
+    const outcomes = records.filter((record) => record.recordType === 'outcome');
+    expect(intents.map((record) => record.operation)).toEqual([
+      'list',
+      'write',
+      'patch',
+      'mkdir',
+      'rename',
+      'rename',
+      'delete',
+    ]);
+    expect(outcomes).toHaveLength(7);
+    for (const outcome of outcomes.slice(1)) {
+      expect(outcome).toMatchObject({
+        outcome: 'failed',
+        sideEffectCommitted: false,
+        failure: { stage: 'prepare', retrySafe: true },
+      });
+    }
+    const jsonl = readFileSync(operationLog, 'utf8');
+    expect(jsonl).not.toContain(auditRoot);
+    expect(jsonl).not.toContain('session.json');
+    expect(jsonl).not.toContain('operations.jsonl');
+    expect(jsonl).not.toContain('forbidden.patch');
+    const protectedCoordinates = intents.slice(1).flatMap((record) => {
+      if (!('source' in record.target)) return [record.target.path];
+      return [record.target.source, record.target.destination];
+    }).filter((coordinate) => coordinate.scope === 'rejected');
+    expect(protectedCoordinates).toHaveLength(6);
+  });
+
+  it('protects the physical Session root when its configured path has a linked ancestor', async () => {
+    const container = mkdtempSync(join(tmpdir(), 'ai-terminal-canonical-session-root-'));
+    roots.push(container);
+    const physicalParent = join(container, 'physical-parent');
+    const linkedParent = join(container, 'linked-parent');
+    const workspace = join(container, 'workspace-root');
+    mkdirSync(physicalParent);
+    mkdirSync(workspace);
+    symlinkSync(
+      physicalParent,
+      linkedParent,
+      process.platform === 'win32' ? 'junction' : 'dir',
+    );
+    const lexicalSessionsRoot = join(linkedParent, 'sessions');
+    const store = new SessionStore(lexicalSessionsRoot);
+    const session = store.create({
+      descriptor: {
+        id: 'terminal',
+        title: 'Local',
+        profileId: 'powershell',
+        shellKind: 'powershell',
+        transport: 'local',
+      },
+      startedAt: new Date().toISOString(),
+      history: [],
+      preludeTruncated: false,
+      droppedPreludeBytes: 0,
+    });
+    store.setWorkspace(session.id, { backend: 'local', root: workspace });
+    const sessions = {
+      sessionForTerminal: () => store.get(session.id),
+      beginWorkspaceOperation: store.beginWorkspaceOperation.bind(store),
+      finishWorkspaceOperation: store.finishWorkspaceOperation.bind(store),
+      workspaceStorageProtection: store.workspaceStorageProtection.bind(store),
+    } as unknown as SessionManager;
+    const service = new AgentFileService({} as TerminalService, sessions);
+    const owner = { id: 1 } as WebContents;
+    const fullAccess = { readablePaths: [], writablePaths: [], fullAccess: true };
+
+    await service.list(owner, 'terminal', '.', workspace, fullAccess);
+    const protection = store.workspaceStorageProtection(session.id);
+    const physicalSessionsRoot = realpathSync(resolve(physicalParent, 'sessions'));
+    expect(protection).toEqual({
+      root: physicalSessionsRoot,
+      operationJournalPath: join(
+        physicalSessionsRoot,
+        session.id,
+        'workspace',
+        'operations.jsonl',
+      ),
+    });
+    const protectedTarget = join(
+      physicalSessionsRoot,
+      session.id,
+      'canonical-alias-target.txt',
+    );
+    writeFileSync(protectedTarget, 'sentinel', 'utf8');
+
+    await expect(service.writeText(
+      owner,
+      'terminal',
+      protectedTarget,
+      'changed',
+      createHash('sha256').update('sentinel').digest('hex'),
+      workspace,
+      fullAccess,
+    )).rejects.toThrow(/Session.*审计存储/u);
+
+    expect(readFileSync(protectedTarget, 'utf8')).toBe('sentinel');
+    expect(store.readWorkspaceOperations(session.id)).toMatchObject([
+      { recordType: 'intent', operation: 'list' },
+      { recordType: 'outcome', outcome: 'succeeded' },
+      {
+        recordType: 'intent',
+        operation: 'write',
+        target: {
+          path: {
+            scope: 'rejected',
+            pathHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+          },
+        },
+      },
+      {
+        recordType: 'outcome',
+        outcome: 'failed',
+        sideEffectCommitted: false,
+      },
+    ]);
+    const jsonl = readFileSync(protection.operationJournalPath, 'utf8');
+    expect(jsonl).not.toContain(physicalSessionsRoot);
+    expect(jsonl).not.toContain('canonical-alias-target.txt');
+    expect(store.recoverWorkspaceOperations(session.id)[1]).toMatchObject({
+      sideEffectCommitted: false,
+    });
+  });
+
+  it('allows rename only when both endpoints are within writable scopes', async () => {
+    const container = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-rename-scopes-'));
+    roots.push(container);
+    const workspace = join(container, 'workspace');
+    const left = join(container, 'left');
+    const right = join(container, 'right');
+    const denied = join(container, 'denied');
+    for (const directory of [workspace, left, right, denied]) mkdirSync(directory);
+    writeFileSync(join(left, 'source.txt'), 'source', 'utf8');
+    const service = createService(workspace);
+    const owner = { id: 1 } as WebContents;
+    const authorization = {
+      readablePaths: [],
+      writablePaths: [left, right],
+      fullAccess: false,
+    };
+
+    await service.renamePath(
+      owner,
+      'terminal',
+      join(left, 'source.txt'),
+      join(right, 'destination.txt'),
+      workspace,
+      authorization,
+    );
+    expect(readFileSync(join(right, 'destination.txt'), 'utf8')).toBe('source');
+    await expect(service.renamePath(
+      owner,
+      'terminal',
+      join(right, 'destination.txt'),
+      join(denied, 'destination.txt'),
+      workspace,
+      authorization,
+    )).rejects.toThrow('已授权范围');
+  });
+
+  it('keeps remote scopes and Full Access on the current Host with one SFTP lease per call', async () => {
+    const readFile = vi.fn(async (path: string) => Buffer.from(path));
+    const filesystem = fakeRemoteFilesystem({
+      stat: vi.fn(async (path: string) => (
+        path.endsWith('.txt') ? remoteStat('file', Buffer.byteLength(path)) : remoteStat('directory')
+      )),
+      lstat: vi.fn(async (path: string) => (
+        path.endsWith('.txt') ? remoteStat('file', Buffer.byteLength(path)) : remoteStat('directory')
+      )),
+      readFile,
+    });
+    const { service, withFilesystem } = createSshService(filesystem);
+    const owner = { id: 1 } as WebContents;
+    const scoped = {
+      readablePaths: ['/granted'],
+      writablePaths: ['/granted'],
+      fullAccess: false,
+    };
+
+    await expect(service.readText(
+      owner, 'terminal', '/granted/allowed.txt', '/work', scoped,
+    )).resolves.toMatchObject({ content: '/granted/allowed.txt' });
+    expect(withFilesystem).toHaveBeenCalledTimes(1);
+    expect(withFilesystem.mock.calls[0]?.[3]).toBe('host-1');
+    await expect(service.readText(
+      owner, 'terminal', '/sibling/denied.txt', '/work', scoped,
+    )).rejects.toThrow('已授权范围');
+    expect(withFilesystem).toHaveBeenCalledTimes(1);
+
+    await expect(service.readText(
+      owner,
+      'terminal',
+      '/elsewhere/full.txt',
+      '/work',
+      { readablePaths: [], writablePaths: [], fullAccess: true },
+    )).resolves.toMatchObject({ content: '/elsewhere/full.txt' });
+    expect(withFilesystem).toHaveBeenCalledTimes(2);
+    expect(withFilesystem.mock.calls[1]?.[3]).toBe('host-1');
+  });
+
+  it('canonicalizes a remote grant in one Host-bound lease and protects POSIX root', async () => {
+    const unlink = vi.fn(async () => undefined);
+    const rmdir = vi.fn(async () => undefined);
+    const filesystem = fakeRemoteFilesystem({
+      realpath: vi.fn(async (path: string) => path === '/grant-link' ? '/canonical/grant' : path),
+      stat: vi.fn(async (path: string) => (
+        path === '/canonical/grant' ? remoteStat('directory') : undefined
+      )),
+      lstat: vi.fn(async () => remoteStat('directory')),
+      unlink,
+      rmdir,
+    });
+    const { service, withFilesystem } = createSshService(filesystem);
+    const owner = { id: 1 } as WebContents;
+
+    await expect(service.canonicalizeAccessRoot(owner, 'terminal', '/grant-link'))
+      .resolves.toBe('/canonical/grant');
+    expect(withFilesystem).toHaveBeenCalledTimes(1);
+    expect(withFilesystem.mock.calls[0]?.[3]).toBe('host-1');
+    await expect(service.canonicalizeAccessRoot(owner, 'terminal', 'relative'))
+      .rejects.toThrow('绝对路径');
+    expect(withFilesystem).toHaveBeenCalledTimes(1);
+
+    await expect(service.deletePath(
+      owner,
+      'terminal',
+      '/',
+      { recursive: true },
+      '/work',
+      { readablePaths: [], writablePaths: [], fullAccess: true },
+    )).rejects.toThrow('文件系统根目录');
+    expect(withFilesystem).toHaveBeenCalledTimes(2);
+    expect(unlink).not.toHaveBeenCalled();
+    expect(rmdir).not.toHaveBeenCalled();
+  });
+
+  it('protects the local filesystem root before invoking mutation primitives', async () => {
+    const filesystemRoot = parse(resolve(process.cwd())).root;
+    const workspace = resolve(filesystemRoot, 'safe-workspace');
+    const rmdir = vi.fn(async () => undefined);
+    const backend = {
+      ...fakeRemoteFilesystem({
+        realpath: vi.fn(async (path: string) => path),
+        lstat: vi.fn(async () => remoteStat('directory')),
+        rmdir,
+      }),
+    } as FilesystemBackend;
+    const service = new AgentFileService(
+      {} as TerminalService,
+      createSessionManager(() => ({
+          id: TEST_SESSION_ID,
+          transport: 'local',
+          workspace: { backend: 'local', root: workspace },
+        })),
+      {} as RemoteFilesystemProvider,
+      backend,
+    );
+
+    await expect(service.deletePath(
+      { id: 1 } as WebContents,
+      'terminal',
+      filesystemRoot,
+      { recursive: true },
+      workspace,
+      { readablePaths: [], writablePaths: [], fullAccess: true },
+    )).rejects.toThrow('文件系统根目录');
+    expect(rmdir).not.toHaveBeenCalled();
+  });
+
+  it.runIf(process.platform === 'win32')(
+    'keeps Windows device, drive-relative, and ADS spellings blocked in Full Access',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-full-windows-'));
+      roots.push(root);
+      const service = createService(root);
+      const owner = { id: 1 } as WebContents;
+      const fullAccess = { readablePaths: [], writablePaths: [], fullAccess: true };
+
+      await expect(service.statPath(owner, 'terminal', '\\\\?\\C:\\Windows', root, fullAccess))
+        .rejects.toThrow('设备命名空间');
+      await expect(service.statPath(owner, 'terminal', 'C:relative.txt', root, fullAccess))
+        .rejects.toThrow('驱动器相对');
+      await expect(service.statPath(owner, 'terminal', '\\Windows', root, fullAccess))
+        .rejects.toThrow('驱动器根相对');
+      await expect(service.writeText(
+        owner, 'terminal', join(root, 'visible.txt:hidden'), 'x', null, root, fullAccess,
+      )).rejects.toThrow('备用数据流');
+    },
+  );
 });

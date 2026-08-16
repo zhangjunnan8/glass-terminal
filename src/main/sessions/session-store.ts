@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  realpathSync,
   readSync,
   readFileSync,
   readdirSync,
@@ -26,6 +27,16 @@ import type {
 import type { AgentBackendRef } from '../../shared/agent';
 import type { TerminalDescriptor } from '../../shared/terminal';
 import type { WorkspaceBinding } from '../../shared/tools';
+import {
+  WorkspaceOperationJournal,
+  type WorkspaceDiffArtifact,
+  type WorkspaceOperationHandle,
+  type WorkspaceOperationIntent,
+  type WorkspaceOperationOutcome,
+  type WorkspaceOperationRecord,
+  type WorkspaceOperationRecovery,
+  type WorkspaceOperationSource,
+} from './workspace-operation-journal';
 
 const LOG_SCHEMA_VERSION = 1;
 const TARGET_CHUNK_BYTES = 64 * 1024;
@@ -33,6 +44,7 @@ const FLUSH_DELAY_MS = 200;
 const RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
 const MAX_SESSION_LOG_BYTES = 200 * 1024 * 1024;
 const AUDIT_SEQUENCE_TAIL_BYTES = 256 * 1024;
+const PROVIDER_FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/u;
 
 interface LogChunk {
   sequence: number;
@@ -99,6 +111,14 @@ export interface CreateSessionInput {
   targetSnapshot?: SessionRecord['targetSnapshot'];
 }
 
+/** Main-process-only filesystem boundary that Workspace operations must never mutate. */
+export interface SessionStorageProtection {
+  /** Root containing every persisted Session, terminal journal, and Workspace audit. */
+  root: string;
+  /** Current Session's operation log, used to avoid self-targeting denial records. */
+  operationJournalPath: string;
+}
+
 function atomicWriteJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
   const temporaryPath = `${path}.tmp-${process.pid}-${randomUUID()}`;
@@ -128,6 +148,10 @@ function parseSession(value: unknown, source: string): SessionRecord {
     ...(candidate as SessionRecord),
     targetSnapshot: candidate.targetSnapshot ?? { label: candidate.name },
   };
+  record.agentBackendFingerprint = typeof candidate.agentBackendFingerprint === 'string'
+    && PROVIDER_FINGERPRINT_PATTERN.test(candidate.agentBackendFingerprint)
+    ? candidate.agentBackendFingerprint
+    : undefined;
   record.workspace = validateWorkspaceBinding(record, candidate.workspace, source);
   return record;
 }
@@ -179,9 +203,11 @@ function jsonLines(events: TerminalJournalEvent[]): string {
 export class SessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly pendingLogs = new Map<string, PendingLog>();
+  private readonly workspaceOperations: WorkspaceOperationJournal;
   private auditSequence = 0;
 
   constructor(private readonly rootPath: string) {
+    this.workspaceOperations = new WorkspaceOperationJournal(rootPath);
     this.load();
     this.markInterruptedSessions();
   }
@@ -498,11 +524,17 @@ export class SessionStore {
       });
   }
 
-  bindAgentThread(sessionId: string, providerId: string, threadId: string): SessionRecord {
+  bindAgentThread(
+    sessionId: string,
+    providerId: string,
+    threadId: string,
+    backendFingerprint: string,
+  ): SessionRecord {
     return this.bindAgentBackendThread(
       sessionId,
       { kind: 'generic-provider', providerId },
       threadId,
+      backendFingerprint,
     );
   }
 
@@ -510,12 +542,23 @@ export class SessionStore {
     sessionId: string,
     backend: AgentBackendRef,
     threadId: string,
+    backendFingerprint?: string,
   ): SessionRecord {
+    if (
+      backend.kind === 'generic-provider'
+      && (
+        typeof backendFingerprint !== 'string'
+        || !PROVIDER_FINGERPRINT_PATTERN.test(backendFingerprint)
+      )
+    ) throw new Error('Generic Provider thread requires a valid recipient fingerprint.');
     const current = this.get(sessionId);
     const updated: SessionRecord = {
       ...current,
       aiThreadId: threadId,
       agentBackend: backend,
+      agentBackendFingerprint: backend.kind === 'generic-provider'
+        ? backendFingerprint
+        : undefined,
       providerThreadId: undefined,
       providerId: backend.kind === 'generic-provider' ? backend.providerId : undefined,
       updatedAt: new Date().toISOString(),
@@ -648,6 +691,55 @@ export class SessionStore {
   ): void {
     this.get(sessionId);
     this.audit(sessionId, type, actor, details);
+  }
+
+  beginWorkspaceOperation(
+    sessionId: string,
+    intent: WorkspaceOperationIntent,
+    diff?: WorkspaceDiffArtifact,
+    source?: WorkspaceOperationSource,
+  ): WorkspaceOperationHandle {
+    this.get(sessionId);
+    return this.workspaceOperations.begin(sessionId, intent, diff, source);
+  }
+
+  finishWorkspaceOperation(
+    handle: WorkspaceOperationHandle,
+    outcome: WorkspaceOperationOutcome,
+  ): void {
+    this.get(handle.sessionId);
+    this.workspaceOperations.finish(handle, outcome);
+  }
+
+  readWorkspaceOperations(sessionId: string): WorkspaceOperationRecord[] {
+    this.get(sessionId);
+    return this.workspaceOperations.read(sessionId);
+  }
+
+  recoverWorkspaceOperations(sessionId: string): WorkspaceOperationRecovery[] {
+    this.get(sessionId);
+    return this.workspaceOperations.recover(sessionId);
+  }
+
+  workspaceStorageProtection(sessionId: string): SessionStorageProtection {
+    this.get(sessionId);
+    // Full Access may address the same storage through a different lexical
+    // spelling (for example, a junction/symlink ancestor). Always publish the
+    // physical root used by the OS so AgentFileService compares aliases in one
+    // canonical coordinate space. A missing/unresolvable root is fail-closed.
+    const root = realpathSync(resolve(this.rootPath));
+    if (!statSync(root).isDirectory()) {
+      throw new Error('Session storage protection root is not a directory.');
+    }
+    return {
+      root,
+      operationJournalPath: join(
+        root,
+        sessionId,
+        'workspace',
+        'operations.jsonl',
+      ),
+    };
   }
 
   private load(): void {

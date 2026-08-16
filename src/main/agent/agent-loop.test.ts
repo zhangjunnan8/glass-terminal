@@ -345,6 +345,109 @@ describe('AgentLoop', () => {
     }));
   });
 
+  it('advertises workspace schemas from granular gateway capabilities', async () => {
+    const provider = new SequencedProvider([
+      { message: { role: 'assistant', content: 'capabilities inspected' } },
+    ]);
+    const loop = new AgentLoop(provider, fakeToolGateway({
+      workspacePermissions: {
+        read: false,
+        write: false,
+        create: true,
+        delete: true,
+        writablePaths: ['/work'],
+      },
+    }));
+
+    await loop.run({
+      systemPrompt: 'test', userPrompt: 'inspect', terminalContext: '',
+      fileAccessMode: 'read-write', signal: new AbortController().signal,
+    });
+
+    const advertised = provider.requests[0].tools.map((tool) => tool.name);
+    expect(advertised).toEqual(expect.arrayContaining([
+      'workspace_write_file',
+      'workspace_mkdir',
+      'workspace_delete',
+    ]));
+    expect(advertised).not.toEqual(expect.arrayContaining([
+      'workspace_list',
+      'workspace_read_file',
+      'workspace_stat',
+      'workspace_search',
+      'workspace_glob',
+      'workspace_apply_patch',
+      'workspace_rename',
+    ]));
+  });
+
+  it('does not advertise capabilities with no usable path scope', async () => {
+    const provider = new SequencedProvider([
+      { message: { role: 'assistant', content: 'no scoped tools' } },
+    ]);
+    const loop = new AgentLoop(provider, fakeToolGateway({
+      workspacePermissions: {
+        read: true,
+        write: true,
+        create: true,
+        delete: true,
+        readablePaths: [],
+        writablePaths: [],
+        fullAccess: false,
+      },
+    }));
+
+    await loop.run({
+      systemPrompt: 'test', userPrompt: 'inspect', terminalContext: '',
+      fileAccessMode: 'read-write', signal: new AbortController().signal,
+    });
+
+    expect(provider.requests[0].tools.map((tool) => tool.name)
+      .filter((name) => name.startsWith('workspace_'))).toEqual([]);
+  });
+
+  it('treats full-access as write-capable without bypassing granular flags', async () => {
+    const provider = new SequencedProvider([
+      { message: { role: 'assistant', content: null, toolCalls: [{
+        id: 'create-1',
+        name: 'workspace_write_file',
+        arguments: '{"path":"D:\\\\outside\\\\new.ts","content":"x","expectedSha256":null}',
+      }] } },
+      { message: { role: 'assistant', content: 'created' } },
+    ]);
+    const writeFile = vi.fn().mockResolvedValue({
+      path: 'D:\\outside\\new.ts',
+      bytes: 1,
+      sha256: 'b'.repeat(64),
+      created: true,
+    });
+    const loop = new AgentLoop(provider, fakeToolGateway({
+      workspace: { writeFile },
+      workspacePermissions: { mode: 'full-access', fullAccess: true, create: true },
+    }));
+
+    await loop.run({
+      systemPrompt: 'test', userPrompt: 'create', terminalContext: '',
+      fileAccessMode: 'full-access', signal: new AbortController().signal,
+    });
+
+    expect(provider.requests[0].tools.map((tool) => tool.name)).toContain('workspace_write_file');
+    expect(writeFile).toHaveBeenCalledOnce();
+
+    const noCreateProvider = new SequencedProvider([
+      { message: { role: 'assistant', content: 'no create tool' } },
+    ]);
+    const noCreateLoop = new AgentLoop(noCreateProvider, fakeToolGateway({
+      workspacePermissions: { mode: 'full-access', fullAccess: true, create: false },
+    }));
+    await noCreateLoop.run({
+      systemPrompt: 'test', userPrompt: 'inspect', terminalContext: '',
+      fileAccessMode: 'full-access', signal: new AbortController().signal,
+    });
+    expect(noCreateProvider.requests[0].tools.map((tool) => tool.name))
+      .not.toContain('workspace_mkdir');
+  });
+
   it('executes workspace_stat as a read-only tool and compacts its history', async () => {
     let statResultSeen = false;
     const provider: AgentProviderRuntime = {
@@ -977,6 +1080,149 @@ describe('AgentLoop', () => {
 });
 
 describe('GenericOpenAiProvider', () => {
+  function runtimeProviderStore(
+    profile: ProviderProfile,
+    apiKey = 'request-only-secret',
+  ): ProviderStore {
+    const assertRuntimeRecipient = (
+      _providerId: string,
+      expectedRecipientRevision?: string,
+    ) => {
+      if (
+        profile.status !== 'ready'
+        || (
+          expectedRecipientRevision !== undefined
+          && profile.recipientRevision !== expectedRecipientRevision
+        )
+      ) throw new Error('Provider recipient changed.');
+      return profile;
+    };
+    return {
+      get: () => profile,
+      apiKey: async () => apiKey,
+      assertRuntimeRecipient,
+      runtimeSnapshot: async (_providerId: string, expectedRecipientRevision: string) => ({
+        profile: assertRuntimeRecipient(_providerId, expectedRecipientRevision),
+        apiKey,
+      }),
+    } as unknown as ProviderStore;
+  }
+
+  it('rechecks recipient identity immediately before network dispatch', async () => {
+    const original: ProviderProfile = {
+      id: 'provider-race', name: 'Original', kind: 'generic-openai-compatible',
+      baseUrl: 'https://old.example/v1', modelId: 'old-model',
+      recipientRevision: 'old-recipient', apiKeyConfigured: true,
+      isDefault: true, status: 'ready', createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+    let current = original;
+    const replacement: ProviderProfile = {
+      ...original,
+      baseUrl: 'https://new.example/v1',
+      recipientRevision: 'new-recipient',
+      updatedAt: new Date(1).toISOString(),
+    };
+    const assertRuntimeRecipient = (
+      _providerId: string,
+      expectedRecipientRevision?: string,
+    ) => {
+      if (current.recipientRevision !== expectedRecipientRevision) {
+        throw new Error('Provider recipient changed before dispatch.');
+      }
+      return current;
+    };
+    const store = {
+      get: () => current,
+      runtimeSnapshot: async () => {
+        queueMicrotask(() => { current = replacement; });
+        return { profile: original, apiKey: 'old-secret' };
+      },
+      assertRuntimeRecipient,
+    } as unknown as ProviderStore;
+    const fetchMock = vi.fn<typeof fetch>();
+    const runtime = new GenericOpenAiProvider(original.id, store, fetchMock);
+
+    await expect(runtime.complete({
+      messages: [{ role: 'user', content: 'must stay with old recipient' }],
+      tools: [],
+      signal: new AbortController().signal,
+    })).rejects.toThrow('changed before dispatch');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('never sends accumulated AgentLoop history after the recipient changes between rounds', async () => {
+    const original: ProviderProfile = {
+      id: 'provider-rounds', name: 'Original', kind: 'generic-openai-compatible',
+      baseUrl: 'https://old.example/v1', modelId: 'old-model',
+      recipientRevision: 'old-recipient', apiKeyConfigured: true,
+      isDefault: true, status: 'ready', createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    };
+    let current = original;
+    const replacement: ProviderProfile = {
+      ...original,
+      baseUrl: 'https://new.example/v1',
+      modelId: 'new-model',
+      recipientRevision: 'new-recipient',
+      updatedAt: new Date(1).toISOString(),
+    };
+    const store = {
+      get: () => current,
+      assertRuntimeRecipient: (
+        _providerId: string,
+        expectedRecipientRevision?: string,
+      ) => {
+        if (current.recipientRevision !== expectedRecipientRevision) {
+          throw new Error('Provider recipient changed between rounds.');
+        }
+        return current;
+      },
+      runtimeSnapshot: async (
+        _providerId: string,
+        expectedRecipientRevision: string,
+      ) => {
+        if (current.recipientRevision !== expectedRecipientRevision) {
+          throw new Error('Provider recipient changed between rounds.');
+        }
+        return { profile: current, apiKey: 'old-secret' };
+      },
+    } as unknown as ProviderStore;
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
+      choices: [{
+        finish_reason: 'tool_calls',
+        message: {
+          role: 'assistant', content: null,
+          tool_calls: [{
+            id: 'read-1', type: 'function',
+            function: { name: 'terminal_read', arguments: '{}' },
+          }],
+        },
+      }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    const runtime = new GenericOpenAiProvider(original.id, store, fetchMock);
+    const loop = new AgentLoop(runtime, fakeToolGateway({
+      terminal: {
+        readVisible: async () => {
+          current = replacement;
+          return 'visible output';
+        },
+      },
+    }));
+
+    await expect(loop.run({
+      systemPrompt: 'system',
+      userPrompt: 'old-recipient private prompt',
+      terminalContext: '',
+      signal: new AbortController().signal,
+    })).rejects.toThrow('changed between rounds');
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock.mock.calls[0]![0]).toBe('https://old.example/v1/chat/completions');
+    expect(fetchMock.mock.calls.some(([url]) => String(url).startsWith(replacement.baseUrl)))
+      .toBe(false);
+  });
+
   it('parses split SSE deltas and reconstructs streamed tool calls', async () => {
     const profile: ProviderProfile = {
       id: 'provider-1',
@@ -984,16 +1230,14 @@ describe('GenericOpenAiProvider', () => {
       kind: 'generic-openai-compatible',
       baseUrl: 'https://provider.example/v1',
       modelId: 'model-1',
+      recipientRevision: 'recipient-provider-1',
       apiKeyConfigured: true,
       isDefault: true,
       status: 'ready',
       createdAt: new Date(0).toISOString(),
       updatedAt: new Date(0).toISOString(),
     };
-    const providerStore = {
-      get: () => profile,
-      apiKey: async () => 'request-only-secret',
-    } as unknown as ProviderStore;
+    const providerStore = runtimeProviderStore(profile);
     const wire = [
       'data: {"choices":[{"delta":{"content":"正在"}}]}\n\n',
       'data: {"choices":[{"delta":{"content":"处理"}}]}\n\n',
@@ -1070,16 +1314,14 @@ describe('GenericOpenAiProvider', () => {
       kind: 'generic-openai-compatible',
       baseUrl: 'https://provider.example/v1',
       modelId: 'model-1',
+      recipientRevision: 'recipient-provider-1',
       apiKeyConfigured: true,
       isDefault: true,
       status: 'ready',
       createdAt: new Date(0).toISOString(),
       updatedAt: new Date(0).toISOString(),
     };
-    const providerStore = {
-      get: () => profile,
-      apiKey: async () => 'request-only-secret',
-    } as unknown as ProviderStore;
+    const providerStore = runtimeProviderStore(profile);
     const wire = 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"terminal_execute","arguments":"{\\"command\\":\\"whoami\\"}"}}]}}]}\n\n' + suffix;
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(wire, {
       status: 200,
@@ -1097,14 +1339,12 @@ describe('GenericOpenAiProvider', () => {
   it('stops reading an oversized non-SSE response before buffering it all', async () => {
     const profile: ProviderProfile = {
       id: 'provider-1', name: 'Mock Provider', kind: 'generic-openai-compatible',
-      baseUrl: 'https://provider.example/v1', modelId: 'model-1', apiKeyConfigured: true,
+      baseUrl: 'https://provider.example/v1', modelId: 'model-1',
+      recipientRevision: 'recipient-provider-1', apiKeyConfigured: true,
       isDefault: true, status: 'ready', createdAt: new Date(0).toISOString(),
       updatedAt: new Date(0).toISOString(),
     };
-    const providerStore = {
-      get: () => profile,
-      apiKey: async () => 'request-only-secret',
-    } as unknown as ProviderStore;
+    const providerStore = runtimeProviderStore(profile);
     const chunk = new Uint8Array(2 * 1024 * 1024);
     let pulls = 0;
     let cancelled = false;
@@ -1136,14 +1376,12 @@ describe('GenericOpenAiProvider', () => {
   it('rejects an oversized streamed tool call instead of returning truncated arguments', async () => {
     const profile: ProviderProfile = {
       id: 'provider-1', name: 'Mock Provider', kind: 'generic-openai-compatible',
-      baseUrl: 'https://provider.example/v1', modelId: 'model-1', apiKeyConfigured: true,
+      baseUrl: 'https://provider.example/v1', modelId: 'model-1',
+      recipientRevision: 'recipient-provider-1', apiKeyConfigured: true,
       isDefault: true, status: 'ready', createdAt: new Date(0).toISOString(),
       updatedAt: new Date(0).toISOString(),
     };
-    const providerStore = {
-      get: () => profile,
-      apiKey: async () => 'request-only-secret',
-    } as unknown as ProviderStore;
+    const providerStore = runtimeProviderStore(profile);
     const argumentsFragment = 'x'.repeat(1024 * 1024 + 1);
     const wire = `data: ${JSON.stringify({
       choices: [{
@@ -1175,14 +1413,12 @@ describe('GenericOpenAiProvider', () => {
   it('allows normal SSE protocol overhead beyond the old four MiB aggregate limit', async () => {
     const profile: ProviderProfile = {
       id: 'provider-1', name: 'Mock Provider', kind: 'generic-openai-compatible',
-      baseUrl: 'https://provider.example/v1', modelId: 'model-1', apiKeyConfigured: true,
+      baseUrl: 'https://provider.example/v1', modelId: 'model-1',
+      recipientRevision: 'recipient-provider-1', apiKeyConfigured: true,
       isDefault: true, status: 'ready', createdAt: new Date(0).toISOString(),
       updatedAt: new Date(0).toISOString(),
     };
-    const providerStore = {
-      get: () => profile,
-      apiKey: async () => 'request-only-secret',
-    } as unknown as ProviderStore;
+    const providerStore = runtimeProviderStore(profile);
     const paddingLine = `: ${'x'.repeat(1022)}\n`;
     const wire = paddingLine.repeat(4_200)
       + 'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
@@ -1207,14 +1443,12 @@ describe('GenericOpenAiProvider', () => {
     async (finishReason) => {
       const profile: ProviderProfile = {
         id: 'provider-1', name: 'Mock Provider', kind: 'generic-openai-compatible',
-        baseUrl: 'https://provider.example/v1', modelId: 'model-1', apiKeyConfigured: true,
+        baseUrl: 'https://provider.example/v1', modelId: 'model-1',
+        recipientRevision: 'recipient-provider-1', apiKeyConfigured: true,
         isDefault: true, status: 'ready', createdAt: new Date(0).toISOString(),
         updatedAt: new Date(0).toISOString(),
       };
-      const providerStore = {
-        get: () => profile,
-        apiKey: async () => 'request-only-secret',
-      } as unknown as ProviderStore;
+      const providerStore = runtimeProviderStore(profile);
       const payload = {
         choices: [{
           ...(finishReason ? { finish_reason: finishReason } : {}),
@@ -1249,16 +1483,14 @@ describe('GenericOpenAiProvider', () => {
       kind: 'generic-openai-compatible',
       baseUrl: 'https://provider.example/v1',
       modelId: 'model-1',
+      recipientRevision: 'recipient-provider-1',
       apiKeyConfigured: true,
       isDefault: true,
       status: 'ready',
       createdAt: new Date(0).toISOString(),
       updatedAt: new Date(0).toISOString(),
     };
-    const providerStore = {
-      get: () => profile,
-      apiKey: async () => 'request-only-secret',
-    } as unknown as ProviderStore;
+    const providerStore = runtimeProviderStore(profile);
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
       choices: [{
         finish_reason: 'tool_calls',

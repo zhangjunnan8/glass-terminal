@@ -4,6 +4,31 @@ import type {
   ToolGateway,
   WorkspaceTool,
 } from '../../shared/tools';
+import { PolicyWorkspaceTool } from './policy-workspace-tool';
+
+function immutableContextSnapshot(context: SessionToolContext): SessionToolContext {
+  const snapshot: SessionToolContext = {
+    sessionId: context.sessionId,
+    terminal: { ...context.terminal },
+    ...(context.workspace ? { workspace: { ...context.workspace } } : {}),
+    permissions: {
+      terminal: { ...context.permissions.terminal },
+      workspace: {
+        ...context.permissions.workspace,
+        readablePaths: [...context.permissions.workspace.readablePaths],
+        writablePaths: [...context.permissions.workspace.writablePaths],
+      },
+    },
+  };
+  Object.freeze(snapshot.permissions.workspace.readablePaths);
+  Object.freeze(snapshot.permissions.workspace.writablePaths);
+  Object.freeze(snapshot.permissions.workspace);
+  Object.freeze(snapshot.permissions.terminal);
+  Object.freeze(snapshot.permissions);
+  Object.freeze(snapshot.terminal);
+  if (snapshot.workspace) Object.freeze(snapshot.workspace);
+  return Object.freeze(snapshot);
+}
 
 export class SessionToolGateway implements ToolGateway {
   readonly context: SessionToolContext;
@@ -15,13 +40,24 @@ export class SessionToolGateway implements ToolGateway {
     terminal: TerminalTool,
     workspace?: WorkspaceTool,
   ) {
-    if (context.permissions.workspace.enabled && !workspace) {
+    this.context = immutableContextSnapshot(context);
+    const workspaceEnabled = this.context.permissions.workspace.enabled
+      && this.context.permissions.workspace.mode !== 'off';
+    if (workspaceEnabled && !workspace) {
       throw new Error('An enabled Session workspace requires a WorkspaceTool.');
     }
-    this.context = context;
+    if (workspaceEnabled && !this.context.workspace) {
+      throw new Error('An enabled Session workspace requires a Workspace Root.');
+    }
     this.terminal = terminal;
     // Disabled workspace permissions mean the Harness must not receive file tools,
     // even if a backend happens to have been constructed by a compatibility layer.
-    this.workspace = context.permissions.workspace.enabled ? workspace : undefined;
+    this.workspace = workspaceEnabled && workspace
+      ? new PolicyWorkspaceTool(
+        workspace,
+        this.context.workspace!,
+        this.context.permissions.workspace,
+      )
+      : undefined;
   }
 }
