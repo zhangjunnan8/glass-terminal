@@ -41,7 +41,7 @@
 - `codex app-server` 只由 Electron main 进程以 stdio 启动；renderer 不能访问子进程或任意 JSON-RPC。
 - OAuth token 由 Codex/App Server 自己保存与刷新；AI Terminal 不会读取、拷贝或导出 token。
 - 浏览器授权地址仅在 main 进程持有并限制为 HTTPS；renderer 只收到显示所需状态。
-- 原生 Turn 使用私有工作区、`workspaceWrite` 沙箱、关闭网络与 `approvalPolicy: "never"`。内建命令/文件项由 Codex 内部连续运行，不会触发可见终端的审批或输入锁。
+- 原生 Turn 优先使用 App Server 的内建 `:workspace` 权限配置，将写入限制在当前工作区。只有旧版 App Server 不支持权限配置发现时，才降级为关闭网络的 `workspaceWrite` 沙箱。内建命令/文件项由 Codex 内部连续运行，不会触发可见终端的审批或输入锁。
 - 终端读权限会持久化为布尔配置，不保存终端文本；关闭后新的 Turn 不再得到 `terminal_read`。
 - App Server 崩溃、退出登录或模型绑定失效时，原生 Agent 立即变为不可用。
 - 打包态忽略开发服务器环境变量；高权限 IPC 会复核受信主窗口、main frame 和精确 renderer 来源。
@@ -49,6 +49,7 @@
 ## 实现概要
 
 - 默认 stdio JSONL 传输；启动后先 `initialize`，再发送 `initialized`。
+- 原生 Turn 先通过 `permissionProfile/list` 确认 `:workspace` 可用，然后在 Thread/Turn 中传入 `permissions: ":workspace"`；不再发送已废弃的 `workspaceWrite.readOnlyAccess`。
 - 账号使用 `account/read`、`account/login/start`、`account/login/cancel` 与 `account/logout`。
 - 模型使用分页 `model/list`，模型 ID 和推理强度由界面选择。
 - 每个请求有独立 ID 和超时；进程退出会拒绝未决请求并使 UI 状态失效。

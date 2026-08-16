@@ -95,6 +95,12 @@ class FakeAppServerConnection implements AppServerConnection {
     if (method === 'model/list') {
       return Promise.resolve({ data: this.models, nextCursor: null }) as Promise<T>;
     }
+    if (method === 'permissionProfile/list') {
+      return Promise.resolve({
+        data: [{ id: ':workspace', description: null, allowed: true }],
+        nextCursor: null,
+      }) as Promise<T>;
+    }
     if (method === 'account/logout') return Promise.resolve({}) as Promise<T>;
     if (method === 'thread/start') {
       return Promise.resolve({ thread: { id: PROVIDER_THREAD_ID } }) as Promise<T>;

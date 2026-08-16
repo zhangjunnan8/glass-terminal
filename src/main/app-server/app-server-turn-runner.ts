@@ -13,9 +13,13 @@ const MAX_TOOL_CALL_IDS = 256;
 const MAX_PENDING_NOTIFICATIONS = 256;
 const MAX_PENDING_NOTIFICATION_BYTES = 512 * 1024;
 const MAX_PROTOCOL_ID_CHARS = 256;
-// `thread/start` and `thread/resume` use the CLI-facing kebab-case enum.
-// This is distinct from turn/start's structured sandboxPolicy.type enum.
+const MAX_PERMISSION_PROFILE_PAGES = 8;
+const WORKSPACE_PERMISSION_PROFILE = ':workspace';
+// Legacy `thread/start` and `thread/resume` use the CLI-facing kebab-case enum.
+// This fallback is distinct from turn/start's structured sandboxPolicy.type enum.
 const THREAD_WORKSPACE_SANDBOX = 'workspace-write';
+
+type WorkspacePermissionMode = 'profile' | 'legacy-sandbox';
 
 const DEVELOPER_INSTRUCTIONS = `You are the native Codex agent embedded in AI Terminal.
 Use Codex's built-in shell and file tools inside the Codex-managed workspace for all execution and filesystem work.
@@ -155,6 +159,16 @@ function errorMessage(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).slice(0, 1_000);
 }
 
+function permissionProfileListUnsupported(error: unknown): boolean {
+  const message = errorMessage(error).toLowerCase();
+  return message.includes('method not found')
+    || message.includes('unknown method')
+    || (
+      message.includes('permissionprofile/list')
+      && (message.includes('not supported') || message.includes('unsupported'))
+    );
+}
+
 function abortError(message = 'Codex App Server Turn 已中断。'): Error {
   const error = new Error(message);
   error.name = 'AbortError';
@@ -240,6 +254,7 @@ export class CodexAppServerTurnRunner {
   private sequence = 0;
   private disposed = false;
   private active?: ActiveTurn;
+  private workspacePermissionMode?: WorkspacePermissionMode;
   private quarantinedAttachmentGeneration?: number;
   private removeNotificationListener?: () => void;
   private removeRequestHandler?: () => void;
@@ -378,9 +393,11 @@ export class CodexAppServerTurnRunner {
   }
 
   private async startTurn(active: ActiveTurn): Promise<void> {
+    const permissionMode = await this.resolveWorkspacePermissionMode(active);
+    this.assertActive(active);
     const threadId = active.input.threadId
-      ? await this.resumeThread(active, active.input.threadId)
-      : await this.startThread(active);
+      ? await this.resumeThread(active, active.input.threadId, permissionMode)
+      : await this.startThread(active, permissionMode);
     this.assertActive(active);
     active.threadId = threadId;
     active.input.onThreadBound?.(threadId);
@@ -397,16 +414,15 @@ export class CodexAppServerTurnRunner {
       cwd: this.workspaceRoot,
       runtimeWorkspaceRoots: [this.workspaceRoot],
       approvalPolicy: 'never',
-      sandboxPolicy: {
-        type: 'workspaceWrite',
-        writableRoots: [this.workspaceRoot],
-        readOnlyAccess: {
-          type: 'restricted',
-          includePlatformDefaults: true,
-          readableRoots: [this.workspaceRoot],
-        },
-        networkAccess: false,
-      },
+      ...(permissionMode === 'profile'
+        ? { permissions: WORKSPACE_PERMISSION_PROFILE }
+        : {
+          sandboxPolicy: {
+            type: 'workspaceWrite',
+            writableRoots: [this.workspaceRoot],
+            networkAccess: false,
+          },
+        }),
       model: active.input.model,
       ...(active.input.reasoningEffort
         ? { effort: active.input.reasoningEffort }
@@ -429,13 +445,18 @@ export class CodexAppServerTurnRunner {
     this.maybeComplete(active);
   }
 
-  private async startThread(active: ActiveTurn): Promise<string> {
+  private async startThread(
+    active: ActiveTurn,
+    permissionMode: WorkspacePermissionMode,
+  ): Promise<string> {
     const response = await active.connection.request<ThreadResponse>('thread/start', {
       model: active.input.model,
       cwd: this.workspaceRoot,
       runtimeWorkspaceRoots: [this.workspaceRoot],
       approvalPolicy: 'never',
-      sandbox: THREAD_WORKSPACE_SANDBOX,
+      ...(permissionMode === 'profile'
+        ? { permissions: WORKSPACE_PERMISSION_PROFILE }
+        : { sandbox: THREAD_WORKSPACE_SANDBOX }),
       developerInstructions: DEVELOPER_INSTRUCTIONS,
       dynamicTools: active.input.terminalContextAccess
         ? [CODEX_TERMINAL_READ_DYNAMIC_TOOL]
@@ -446,14 +467,20 @@ export class CodexAppServerTurnRunner {
     return this.parseThreadId(response, 'thread/start');
   }
 
-  private async resumeThread(active: ActiveTurn, expectedThreadId: string): Promise<string> {
+  private async resumeThread(
+    active: ActiveTurn,
+    expectedThreadId: string,
+    permissionMode: WorkspacePermissionMode,
+  ): Promise<string> {
     const response = await active.connection.request<ThreadResponse>('thread/resume', {
       threadId: expectedThreadId,
       model: active.input.model,
       cwd: this.workspaceRoot,
       runtimeWorkspaceRoots: [this.workspaceRoot],
       approvalPolicy: 'never',
-      sandbox: THREAD_WORKSPACE_SANDBOX,
+      ...(permissionMode === 'profile'
+        ? { permissions: WORKSPACE_PERMISSION_PROFILE }
+        : { sandbox: THREAD_WORKSPACE_SANDBOX }),
       developerInstructions: DEVELOPER_INSTRUCTIONS,
       dynamicTools: active.input.terminalContextAccess
         ? [CODEX_TERMINAL_READ_DYNAMIC_TOOL]
@@ -466,6 +493,55 @@ export class CodexAppServerTurnRunner {
       throw new Error('App Server thread/resume 返回了不匹配的 thread.id。');
     }
     return threadId;
+  }
+
+  private async resolveWorkspacePermissionMode(
+    active: ActiveTurn,
+  ): Promise<WorkspacePermissionMode> {
+    if (this.workspacePermissionMode) return this.workspacePermissionMode;
+
+    let cursor: string | undefined;
+    for (let page = 0; page < MAX_PERMISSION_PROFILE_PAGES; page += 1) {
+      let response: unknown;
+      try {
+        response = await active.connection.request('permissionProfile/list', {
+          cwd: this.workspaceRoot,
+          ...(cursor ? { cursor } : {}),
+        });
+      } catch (error) {
+        this.assertActive(active);
+        if (page === 0 && permissionProfileListUnsupported(error)) {
+          this.workspacePermissionMode = 'legacy-sandbox';
+          return this.workspacePermissionMode;
+        }
+        throw error;
+      }
+      this.assertActive(active);
+      if (!isRecord(response) || !Array.isArray(response.data)) {
+        throw new Error('App Server permissionProfile/list 返回了无效响应。');
+      }
+      for (const value of response.data) {
+        if (!isRecord(value)) {
+          throw new Error('App Server permissionProfile/list 返回了无效配置项。');
+        }
+        const id = protocolId(value.id, 'App Server permission profile id');
+        if (id !== WORKSPACE_PERMISSION_PROFILE) continue;
+        if (value.allowed !== true) {
+          throw new Error(
+            'Codex App Server 当前管理策略不允许 :workspace 权限配置，未降级到更宽松的沙箱。',
+          );
+        }
+        this.workspacePermissionMode = 'profile';
+        return this.workspacePermissionMode;
+      }
+
+      if (response.nextCursor === null || response.nextCursor === undefined) break;
+      cursor = protocolId(
+        response.nextCursor,
+        'App Server permissionProfile/list nextCursor',
+      );
+    }
+    throw new Error('Codex App Server 未提供可用的 :workspace 权限配置。');
   }
 
   private parseThreadId(response: unknown, method: string): string {
@@ -1002,6 +1078,7 @@ export class CodexAppServerTurnRunner {
 
   private detachInternal(error: Error): void {
     this.attachmentGeneration += 1;
+    this.workspacePermissionMode = undefined;
     const removeNotificationListener = this.removeNotificationListener;
     const removeRequestHandler = this.removeRequestHandler;
     const removeExitListener = this.removeExitListener;

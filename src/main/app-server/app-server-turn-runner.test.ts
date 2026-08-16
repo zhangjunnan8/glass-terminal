@@ -34,6 +34,12 @@ class FakeConnection implements AppServerConnection {
   request<T>(method: string, params?: unknown): Promise<T> {
     this.requests.push({ method, params });
     if (this.responder) return Promise.resolve(this.responder(method, params)) as Promise<T>;
+    if (method === 'permissionProfile/list') {
+      return Promise.resolve({
+        data: [{ id: ':workspace', description: null, allowed: true }],
+        nextCursor: null,
+      }) as Promise<T>;
+    }
     if (method === 'thread/start') {
       return Promise.resolve({ thread: { id: 'thread-new' } }) as Promise<T>;
     }
@@ -127,7 +133,7 @@ function completeTurn(
 }
 
 describe('CodexAppServerTurnRunner native mode', () => {
-  it('uses native workspaceWrite tools and exposes only terminal_read when allowed', async () => {
+  it('uses the native workspace permission profile and exposes only terminal_read when allowed', async () => {
     const workspaceRoot = resolve('app-server-agent-workspace');
     const connection = new FakeConnection();
     const runner = new CodexAppServerTurnRunner(workspaceRoot);
@@ -135,17 +141,20 @@ describe('CodexAppServerTurnRunner native mode', () => {
     runner.attach(connection);
 
     const resultPromise = runner.run(createInput({ tools, reasoningEffort: 'high' }));
+    const profileList = await waitForRequest(connection, 'permissionProfile/list');
     const threadStart = await waitForRequest(connection, 'thread/start');
     const turnStart = await waitForRequest(connection, 'turn/start');
 
+    expect(profileList.params).toEqual({ cwd: workspaceRoot });
     expect(threadStart.params).toMatchObject({
       cwd: workspaceRoot,
       runtimeWorkspaceRoots: [workspaceRoot],
       approvalPolicy: 'never',
-      sandbox: 'workspace-write',
+      permissions: ':workspace',
       dynamicTools: CODEX_TERMINAL_DYNAMIC_TOOLS,
       serviceName: 'ai_terminal',
     });
+    expect(asRecord(threadStart.params)).not.toHaveProperty('sandbox');
     expect(asRecord(threadStart.params).developerInstructions).toEqual(expect.stringContaining(
       "Use Codex's built-in shell and file tools",
     ));
@@ -153,13 +162,11 @@ describe('CodexAppServerTurnRunner native mode', () => {
       cwd: workspaceRoot,
       runtimeWorkspaceRoots: [workspaceRoot],
       approvalPolicy: 'never',
-      sandboxPolicy: {
-        type: 'workspaceWrite',
-        writableRoots: [workspaceRoot],
-        networkAccess: false,
-      },
+      permissions: ':workspace',
       effort: 'high',
     });
+    expect(asRecord(turnStart.params)).not.toHaveProperty('sandboxPolicy');
+    expect(JSON.stringify(turnStart.params)).not.toContain('readOnlyAccess');
 
     const read = asRecord(await connection.invoke('item/tool/call', {
       threadId: 'thread-new', turnId: 'turn-1', callId: 'read-1',
@@ -254,8 +261,9 @@ describe('CodexAppServerTurnRunner native mode', () => {
     const resume = await waitForRequest(connection, 'thread/resume');
     expect(resume.params).toMatchObject({
       threadId: 'thread-existing', approvalPolicy: 'never',
-      sandbox: 'workspace-write', dynamicTools: [],
+      permissions: ':workspace', dynamicTools: [],
     });
+    expect(asRecord(resume.params)).not.toHaveProperty('sandbox');
     await waitForRequest(connection, 'turn/start');
     completeTurn(connection, 'thread-existing');
     await expect(resultPromise).resolves.toMatchObject({ threadId: 'thread-existing' });
@@ -282,6 +290,9 @@ describe('CodexAppServerTurnRunner native mode', () => {
   it('rejects the interrupt and quarantines the connection when stop is not acknowledged', async () => {
     const connection = new FakeConnection();
     connection.responder = (method) => {
+      if (method === 'permissionProfile/list') {
+        return { data: [{ id: ':workspace', allowed: true }], nextCursor: null };
+      }
       if (method === 'thread/start') return { thread: { id: 'thread-new' } };
       if (method === 'turn/start') {
         return { turn: { id: 'turn-1', status: 'inProgress', items: [] } };
@@ -304,6 +315,9 @@ describe('CodexAppServerTurnRunner native mode', () => {
     const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));
     let threadStarts = 0;
     connection.responder = (method, params) => {
+      if (method === 'permissionProfile/list') {
+        return { data: [{ id: ':workspace', allowed: true }], nextCursor: null };
+      }
       if (method === 'thread/start') {
         threadStarts += 1;
         if (threadStarts === 1) {
@@ -330,5 +344,56 @@ describe('CodexAppServerTurnRunner native mode', () => {
       threadId: 'thread-retry', status: 'completed',
     });
     expect(threadStarts).toBe(2);
+    expect(connection.requests.filter(({ method }) => method === 'permissionProfile/list'))
+      .toHaveLength(1);
+  });
+
+  it('falls back to the legacy workspace sandbox only when profile discovery is unsupported', async () => {
+    const connection = new FakeConnection();
+    connection.responder = (method, params) => {
+      if (method === 'permissionProfile/list') {
+        throw new Error('Codex App Server：Method not found: permissionProfile/list');
+      }
+      if (method === 'thread/start') return { thread: { id: 'thread-legacy' } };
+      if (method === 'turn/start') {
+        return { turn: { id: 'turn-1', status: 'inProgress', items: [] } };
+      }
+      throw new Error(`Unexpected request: ${method} ${JSON.stringify(params)}`);
+    };
+    const workspaceRoot = resolve('app-server-agent-workspace');
+    const runner = new CodexAppServerTurnRunner(workspaceRoot);
+    runner.attach(connection);
+
+    const resultPromise = runner.run(createInput());
+    const threadStart = await waitForRequest(connection, 'thread/start');
+    const turnStart = await waitForRequest(connection, 'turn/start');
+    expect(threadStart.params).toMatchObject({ sandbox: 'workspace-write' });
+    expect(asRecord(threadStart.params)).not.toHaveProperty('permissions');
+    expect(turnStart.params).toMatchObject({
+      sandboxPolicy: {
+        type: 'workspaceWrite',
+        writableRoots: [workspaceRoot],
+        networkAccess: false,
+      },
+    });
+    expect(asRecord(turnStart.params)).not.toHaveProperty('permissions');
+    expect(JSON.stringify(turnStart.params)).not.toContain('readOnlyAccess');
+    completeTurn(connection, 'thread-legacy');
+    await expect(resultPromise).resolves.toMatchObject({ status: 'completed' });
+  });
+
+  it('fails closed when the managed policy denies the workspace permission profile', async () => {
+    const connection = new FakeConnection();
+    connection.responder = (method) => {
+      if (method === 'permissionProfile/list') {
+        return { data: [{ id: ':workspace', allowed: false }], nextCursor: null };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    };
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));
+    runner.attach(connection);
+
+    await expect(runner.run(createInput())).rejects.toThrow('不允许 :workspace');
+    expect(connection.requests.some(({ method }) => method === 'thread/start')).toBe(false);
   });
 });
