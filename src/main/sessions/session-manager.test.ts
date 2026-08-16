@@ -163,4 +163,63 @@ describe('SessionManager reconnect restoration', () => {
     expect(terminals.bindings.has('changed-target-terminal')).toBe(false);
     manager.close();
   });
+
+  it('previews persisted content and deletes only an unchanged disconnected Session', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-manager-history-test-'));
+    roots.push(root);
+    const terminals = new FakeTerminals();
+    terminals.snapshots.set('history-terminal', snapshot(
+      'history-terminal',
+      '\u001b[32mzjn@ubuntu:~$\u001b[0m echo history\r\nhistory\r\n',
+    ));
+    const hosts = {
+      get: vi.fn(() => ({
+        id: 'host',
+        name: 'Ubuntu',
+        hostname: '192.0.2.10',
+        port: 22,
+        username: 'zjn',
+      })),
+    } as unknown as HostStore;
+    const store = new SessionStore(join(root, 'sessions'));
+    const manager = new SessionManager(
+      store,
+      terminals as unknown as TerminalService,
+      hosts,
+    );
+    const browser = owner();
+    const created = manager.upgrade(browser, 'history-terminal');
+    const threadId = '55555555-5555-5555-5555-555555555555';
+    manager.bindAgentThread(created.id, 'provider', threadId);
+    manager.appendThreadEvent(created.id, threadId, {
+      type: 'chat',
+      item: {
+        id: 'message-1',
+        role: 'user',
+        content: 'inspect this session',
+        createdAt: new Date(3).toISOString(),
+      },
+    });
+
+    const detail = manager.readHistoryDetail({ sessionId: created.id });
+    expect(detail.terminal.content).toContain('echo history');
+    expect(detail.terminal.content).not.toContain('\u001b[');
+    expect(detail.conversation.messages[0]?.content).toBe('inspect this session');
+
+    terminals.emitExit('history-terminal');
+    await expect(manager.remove(browser, {
+      sessionId: created.id,
+      expectedUpdatedAt: created.updatedAt,
+      expectedRuntimeTerminalId: created.runtimeTerminalId,
+    })).rejects.toThrow('会话状态已发生变化');
+
+    const disconnected = manager.list()[0]!;
+    await manager.remove(browser, {
+      sessionId: disconnected.id,
+      expectedUpdatedAt: disconnected.updatedAt,
+      expectedRuntimeTerminalId: disconnected.runtimeTerminalId,
+    });
+    expect(manager.list()).toEqual([]);
+    manager.close();
+  });
 });

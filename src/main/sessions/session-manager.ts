@@ -1,7 +1,13 @@
 import { homedir } from 'node:os';
 import type { WebContents } from 'electron';
 import type { HostStore } from '../hosts/host-store';
-import type { RenameSessionRequest, SessionRecord } from '../../shared/session';
+import type {
+  DeleteSessionRequest,
+  ReadSessionHistoryDetailRequest,
+  RenameSessionRequest,
+  SessionHistoryDetail,
+  SessionRecord,
+} from '../../shared/session';
 import type { SessionAuditEvent } from '../../shared/session';
 import type { AgentBackendRef } from '../../shared/agent';
 import type { TerminalDescriptor } from '../../shared/terminal';
@@ -11,6 +17,7 @@ import {
   inferShellContext,
   ShellContextTracker,
 } from './session-context';
+import { conversationPreview, plainTerminalPreview } from './session-history';
 import { SessionStore } from './session-store';
 
 export class SessionManager {
@@ -145,6 +152,47 @@ export class SessionManager {
 
   readTerminalHistory(sessionId: string): string {
     return this.store.readTerminalHistory(sessionId);
+  }
+
+  readHistoryDetail(request: ReadSessionHistoryDetailRequest): SessionHistoryDetail {
+    const session = this.store.get(request.sessionId);
+    const terminal = this.store.readRecentTerminalHistory(session.id);
+    const recentEvents = session.aiThreadId
+      ? this.store.readRecentThreadEvents(session.id, session.aiThreadId)
+      : { events: [], truncated: false };
+    return {
+      session: { ...session, targetSnapshot: { ...session.targetSnapshot } },
+      terminal: {
+        content: plainTerminalPreview(terminal.content),
+        truncated: terminal.truncated,
+      },
+      conversation: conversationPreview(recentEvents.events, recentEvents.truncated),
+    };
+  }
+
+  async remove(owner: WebContents, request: DeleteSessionRequest): Promise<void> {
+    const session = this.store.get(request.sessionId);
+    if (
+      session.updatedAt !== request.expectedUpdatedAt
+      || session.runtimeTerminalId !== request.expectedRuntimeTerminalId
+    ) {
+      throw new Error('会话状态已发生变化；请刷新历史后重新确认删除。');
+    }
+    if (session.connectionState === 'connected' || session.status === 'active') {
+      // Resolve the exact renderer-owned binding when possible, but never let
+      // stale metadata make deletion of a nominally active Session possible.
+      try {
+        const boundSessionId = this.terminals.sessionId(owner, session.runtimeTerminalId);
+        if (boundSessionId && boundSessionId !== session.id) {
+          throw new Error('Terminal ownership does not match the Session.');
+        }
+      } catch {
+        // The active-state refusal below remains authoritative.
+      }
+      throw new Error('活动或正在运行的会话不能删除，请先关闭对应终端。');
+    }
+    this.contextTrackers.delete(session.id);
+    await this.store.remove(session.id);
   }
 
   bindAgentThread(sessionId: string, providerId: string, threadId: string): SessionRecord {

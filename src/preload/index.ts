@@ -71,6 +71,11 @@ const sessionBridge: DesktopBridge['sessions'] = {
     SESSION_CHANNELS.readTerminalHistory,
     sessionId,
   ),
+  readHistoryDetail: (request) => ipcRenderer.invoke(
+    SESSION_CHANNELS.readHistoryDetail,
+    request,
+  ),
+  remove: (request) => ipcRenderer.invoke(SESSION_CHANNELS.remove, request),
 };
 
 const sftpBridge: DesktopBridge['sftp'] = {

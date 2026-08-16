@@ -1,5 +1,5 @@
 import type { TerminalDescriptor } from './terminal';
-import type { AgentBackendRef } from './agent';
+import type { AgentBackendRef, AgentChatItem } from './agent';
 
 export type SessionNameSource = 'automatic' | 'manual';
 export type SessionConnectionState = 'connected' | 'disconnected';
@@ -82,6 +82,7 @@ export interface SessionAuditEvent {
     | 'command_edited'
     | 'command_rejected'
     | 'command_completed'
+    | 'file_modified'
     | 'agent_paused'
     | 'full_takeover_changed'
     | 'interactive_auth'
@@ -102,9 +103,34 @@ export interface RenameSessionRequest {
   source?: SessionNameSource;
 }
 
+export interface ReadSessionHistoryDetailRequest {
+  sessionId: string;
+}
+
+export interface DeleteSessionRequest {
+  sessionId: string;
+  /** Optimistic concurrency guard so a stale renderer cannot delete a changed Session. */
+  expectedUpdatedAt: string;
+  expectedRuntimeTerminalId: string;
+}
+
+export interface SessionHistoryDetail {
+  session: SessionRecord;
+  terminal: {
+    content: string;
+    truncated: boolean;
+  };
+  conversation: {
+    messages: AgentChatItem[];
+    truncated: boolean;
+  };
+}
+
 export const SESSION_CHANNELS = {
   list: 'session:list',
   upgrade: 'session:upgrade-terminal',
   rename: 'session:rename',
   readTerminalHistory: 'session:read-terminal-history',
+  readHistoryDetail: 'session:read-history-detail',
+  remove: 'session:remove',
 } as const;

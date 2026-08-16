@@ -1,15 +1,20 @@
 import { randomUUID } from 'node:crypto';
 import {
   appendFileSync,
+  closeSync,
   existsSync,
   mkdirSync,
+  openSync,
+  readSync,
   readFileSync,
   readdirSync,
   renameSync,
   rmSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import type {
@@ -26,6 +31,7 @@ const TARGET_CHUNK_BYTES = 64 * 1024;
 const FLUSH_DELAY_MS = 200;
 const RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
 const MAX_SESSION_LOG_BYTES = 200 * 1024 * 1024;
+const AUDIT_SEQUENCE_TAIL_BYTES = 256 * 1024;
 
 interface LogChunk {
   sequence: number;
@@ -44,6 +50,41 @@ interface PendingLog {
   events: TerminalJournalEvent[];
   bytes: number;
   timer?: NodeJS.Timeout;
+}
+
+interface FileTail {
+  text: string;
+  truncated: boolean;
+}
+
+function readUtf8FileTail(path: string, maxBytes: number): FileTail {
+  const size = statSync(path).size;
+  const offset = Math.max(0, size - maxBytes);
+  const length = size - offset;
+  const buffer = Buffer.alloc(length);
+  const descriptor = openSync(path, 'r');
+  try {
+    let totalRead = 0;
+    while (totalRead < length) {
+      const bytesRead = readSync(
+        descriptor,
+        buffer,
+        totalRead,
+        length - totalRead,
+        offset + totalRead,
+      );
+      if (bytesRead === 0) break;
+      totalRead += bytesRead;
+    }
+    let text = buffer.subarray(0, totalRead).toString('utf8');
+    if (offset > 0) {
+      const firstNewline = text.indexOf('\n');
+      text = firstNewline >= 0 ? text.slice(firstNewline + 1) : '';
+    }
+    return { text, truncated: offset > 0 };
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 export interface CreateSessionInput {
@@ -323,6 +364,56 @@ export class SessionStore {
     }).join('');
   }
 
+  readRecentTerminalHistory(
+    sessionId: string,
+    maxCharacters = 120_000,
+  ): { content: string; truncated: boolean } {
+    this.get(sessionId);
+    if (!Number.isSafeInteger(maxCharacters) || maxCharacters < 1) {
+      throw new Error('Invalid terminal history preview limit.');
+    }
+    this.flush(sessionId);
+    const index = this.readLogIndex(sessionId);
+    const pieces: string[] = [];
+    let remaining = maxCharacters;
+    let truncated = false;
+
+    for (let chunkIndex = index.chunks.length - 1; chunkIndex >= 0; chunkIndex -= 1) {
+      const chunk = index.chunks[chunkIndex]!;
+      const compressed = readFileSync(this.safeChunkPath(sessionId, chunk.file));
+      const events: TerminalJournalEvent[] = [];
+      for (const line of gunzipSync(compressed).toString('utf8').split('\n')) {
+        if (!line) continue;
+        try {
+          events.push(JSON.parse(line) as TerminalJournalEvent);
+        } catch {
+          // A corrupt partial line does not make the rest of the preview unreadable.
+        }
+      }
+      const text = events.map((event) => {
+        if (event.kind === 'output') return event.data;
+        if (event.kind === 'gap') {
+          return `\r\n[Earlier terminal output truncated: ${event.droppedBytes} bytes]\r\n`;
+        }
+        return '';
+      }).join('');
+      if (text.length > remaining) {
+        pieces.unshift(text.slice(-remaining));
+        truncated = true;
+        remaining = 0;
+        break;
+      }
+      pieces.unshift(text);
+      remaining -= text.length;
+      if (remaining === 0 && chunkIndex > 0) {
+        truncated = true;
+        break;
+      }
+    }
+
+    return { content: pieces.join(''), truncated };
+  }
+
   readAudit(sessionId: string): SessionAuditEvent[] {
     this.get(sessionId);
     const path = join(this.sessionPath(sessionId), 'audit.jsonl');
@@ -415,6 +506,72 @@ export class SessionStore {
     });
   }
 
+  readRecentThreadEvents(
+    sessionId: string,
+    threadId: string,
+    maxBytes = 2 * 1024 * 1024,
+  ): { events: Array<Record<string, unknown>>; truncated: boolean } {
+    this.get(sessionId);
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 1) {
+      throw new Error('Invalid AI conversation preview limit.');
+    }
+    const path = this.threadPath(sessionId, threadId);
+    if (!existsSync(path)) return { events: [], truncated: false };
+    const tail = readUtf8FileTail(path, maxBytes);
+    const events = tail.text.split('\n').filter(Boolean).flatMap((line) => {
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    });
+    return { events, truncated: tail.truncated };
+  }
+
+  async remove(sessionId: string): Promise<void> {
+    const session = this.get(sessionId);
+    if (session.connectionState === 'connected' || session.status === 'active') {
+      throw new Error('活动或正在运行的会话不能删除，请先关闭对应终端。');
+    }
+    if (!/^[0-9a-f-]{36}$/i.test(session.id) || session.id !== sessionId) {
+      throw new Error('Invalid Session identifier.');
+    }
+    this.flush(sessionId);
+
+    const sourcePath = this.sessionPath(sessionId);
+    const root = resolve(this.rootPath);
+    if (dirname(sourcePath) !== root || basename(sourcePath) !== sessionId) {
+      throw new Error('Invalid Session deletion path.');
+    }
+    const deletingName = `.deleting-${sessionId}-${randomUUID()}`;
+    const deletingPath = resolve(root, deletingName);
+    if (dirname(deletingPath) !== root || basename(deletingPath) !== deletingName) {
+      throw new Error('Invalid Session deletion path.');
+    }
+
+    renameSync(sourcePath, deletingPath);
+    this.sessions.delete(sessionId);
+    try {
+      await rm(deletingPath, {
+        recursive: true,
+        force: false,
+        maxRetries: 2,
+        retryDelay: 50,
+      });
+    } catch (error) {
+      try {
+        renameSync(deletingPath, sourcePath);
+        this.sessions.set(sessionId, session);
+      } catch (restoreError) {
+        throw new AggregateError(
+          [error, restoreError],
+          '删除会话失败，且无法自动恢复已隔离的会话目录。',
+        );
+      }
+      throw error;
+    }
+  }
+
   appendAudit(
     sessionId: string,
     type: SessionAuditEvent['type'],
@@ -436,9 +593,10 @@ export class SessionStore {
         throw new Error(`Session directory does not match metadata: ${entry.name}`);
       }
       this.sessions.set(record.id, record);
-      for (const event of this.readAudit(record.id)) {
-        this.auditSequence = Math.max(this.auditSequence, event.sequence ?? 0);
-      }
+      this.auditSequence = Math.max(
+        this.auditSequence,
+        this.readLastAuditSequence(record.id),
+      );
     }
   }
 
@@ -489,6 +647,32 @@ export class SessionStore {
   private nextAuditSequence(): number {
     this.auditSequence += 1;
     return this.auditSequence;
+  }
+
+  private readLastAuditSequence(sessionId: string): number {
+    const path = join(this.sessionPath(sessionId), 'audit.jsonl');
+    if (!existsSync(path)) return 0;
+    const size = statSync(path).size;
+    let windowBytes = Math.min(size, AUDIT_SEQUENCE_TAIL_BYTES);
+    while (windowBytes > 0) {
+      const tail = readUtf8FileTail(path, windowBytes);
+      const lines = tail.text.split('\n');
+      for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = lines[index];
+        if (!line) continue;
+        try {
+          const event = JSON.parse(line) as Partial<SessionAuditEvent>;
+          if (Number.isSafeInteger(event.sequence) && (event.sequence ?? 0) >= 0) {
+            return event.sequence!;
+          }
+        } catch {
+          // Ignore corrupt or partial records and continue backwards.
+        }
+      }
+      if (!tail.truncated) break;
+      windowBytes = Math.min(size, windowBytes * 2);
+    }
+    return 0;
   }
 
   private writeChunkAt(

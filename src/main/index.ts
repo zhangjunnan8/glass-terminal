@@ -15,7 +15,12 @@ import type {
 import { TERMINAL_CHANNELS } from '../shared/terminal';
 import type { CreateTerminalRequest } from '../shared/terminal';
 import { SESSION_CHANNELS } from '../shared/session';
-import type { RenameSessionRequest, UpgradeSessionRequest } from '../shared/session';
+import type {
+  DeleteSessionRequest,
+  ReadSessionHistoryDetailRequest,
+  RenameSessionRequest,
+  UpgradeSessionRequest,
+} from '../shared/session';
 import { SFTP_CHANNELS } from '../shared/sftp';
 import type { DownloadSelectionRequest, UploadSelectionRequest } from '../shared/sftp';
 import { PROVIDER_CHANNELS } from '../shared/provider';
@@ -460,6 +465,16 @@ handleTrusted(
 handleTrusted(
   SESSION_CHANNELS.readTerminalHistory,
   (_event, sessionId: string) => requireSessionManager().readTerminalHistory(sessionId),
+);
+handleTrusted(
+  SESSION_CHANNELS.readHistoryDetail,
+  (_event, request: ReadSessionHistoryDetailRequest) => (
+    requireSessionManager().readHistoryDetail(request)
+  ),
+);
+handleTrusted(
+  SESSION_CHANNELS.remove,
+  (event, request: DeleteSessionRequest) => requireSessionManager().remove(event.sender, request),
 );
 
 if (ownsSingleInstance) void app.whenReady().then(async () => {

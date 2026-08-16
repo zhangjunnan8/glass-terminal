@@ -17,7 +17,10 @@ import type {
   TerminalExitEvent,
 } from './terminal';
 import type {
+  DeleteSessionRequest,
+  ReadSessionHistoryDetailRequest,
   RenameSessionRequest,
+  SessionHistoryDetail,
   SessionRecord,
   UpgradeSessionRequest,
 } from './session';
@@ -92,6 +95,8 @@ export interface DesktopBridge {
     upgrade(request: UpgradeSessionRequest): Promise<SessionRecord>;
     rename(request: RenameSessionRequest): Promise<SessionRecord>;
     readTerminalHistory(sessionId: string): Promise<string>;
+    readHistoryDetail(request: ReadSessionHistoryDetailRequest): Promise<SessionHistoryDetail>;
+    remove(request: DeleteSessionRequest): Promise<void>;
   };
   sftp: {
     listDirectory(terminalId: string, path?: string): Promise<SftpDirectoryListing>;

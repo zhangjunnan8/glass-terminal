@@ -2,7 +2,7 @@ import { existsSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync } from 'node:fs';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { TerminalJournalEvent } from '../../shared/session';
 import { SessionStore } from './session-store';
 
@@ -142,5 +142,96 @@ describe('SessionStore', () => {
     });
     expect(restored.providerId).toBeUndefined();
     expect(restored.providerThreadId).toBe('upstream-thread-opaque');
+  });
+
+  it('reads bounded recent terminal and AI history previews', () => {
+    const store = new SessionStore(temporaryRoot());
+    const session = createSession(store);
+    store.appendTerminalEvents(session.id, [output(2, `marker-${'x'.repeat(120)}`)]);
+    const terminal = store.readRecentTerminalHistory(session.id, 32);
+    expect(terminal.truncated).toBe(true);
+    expect(terminal.content).toBe('x'.repeat(32));
+
+    const threadId = '33333333-3333-3333-3333-333333333333';
+    store.bindAgentThread(session.id, 'provider', threadId);
+    store.appendThreadEvent(session.id, threadId, {
+      type: 'chat',
+      item: {
+        id: 'old',
+        role: 'user',
+        content: 'old'.repeat(500),
+        createdAt: new Date(0).toISOString(),
+      },
+    });
+    store.appendThreadEvent(session.id, threadId, {
+      type: 'chat',
+      item: {
+        id: 'recent',
+        role: 'assistant',
+        content: 'recent answer',
+        createdAt: new Date(1).toISOString(),
+      },
+    });
+    const conversation = store.readRecentThreadEvents(session.id, threadId, 300);
+    expect(conversation.truncated).toBe(true);
+    expect(conversation.events).toHaveLength(1);
+    expect(JSON.stringify(conversation.events[0])).toContain('recent answer');
+  });
+
+  it('refuses active deletion and removes the entire disconnected Session directory', async () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    await expect(store.remove(session.id)).rejects.toThrow('活动或正在运行');
+    expect(existsSync(join(root, session.id))).toBe(true);
+
+    store.markDisconnected(session.id, 0);
+    const threadId = '44444444-4444-4444-4444-444444444444';
+    store.bindAgentThread(session.id, 'provider', threadId);
+    store.appendThreadEvent(session.id, threadId, { type: 'test' });
+    await store.remove(session.id);
+
+    expect(store.list()).toEqual([]);
+    expect(existsSync(join(root, session.id))).toBe(false);
+    expect(readdirSync(root).filter((name) => name.includes(session.id))).toEqual([]);
+  });
+
+  it('restores the audit sequence from a bounded file tail instead of parsing full history', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    for (let index = 0; index < 350; index += 1) {
+      store.appendAudit(session.id, 'command_requested', 'ai', {
+        index,
+        padding: 'x'.repeat(1_024),
+      });
+    }
+    const previousSequence = store.readAudit(session.id).at(-1)!.sequence;
+    const fullAuditRead = vi.spyOn(SessionStore.prototype, 'readAudit');
+
+    const restored = new SessionStore(root);
+
+    expect(fullAuditRead).not.toHaveBeenCalled();
+    fullAuditRead.mockRestore();
+    const next = createSession(restored);
+    expect(restored.readAudit(next.id)[0]!.sequence).toBeGreaterThan(previousSequence);
+  });
+
+  it('expands the audit tail window when the final valid record exceeds 256 KiB', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    store.appendAudit(session.id, 'command_requested', 'ai', {
+      command: 'x'.repeat(320 * 1024),
+    });
+    const previousSequence = store.readAudit(session.id).at(-1)!.sequence;
+    const fullAuditRead = vi.spyOn(SessionStore.prototype, 'readAudit');
+
+    const restored = new SessionStore(root);
+
+    expect(fullAuditRead).not.toHaveBeenCalled();
+    fullAuditRead.mockRestore();
+    const next = createSession(restored);
+    expect(restored.readAudit(next.id)[0]!.sequence).toBeGreaterThan(previousSequence);
   });
 });
