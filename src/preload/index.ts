@@ -148,6 +148,7 @@ const agentBridge: DesktopBridge['agent'] = {
   interruptTurn: (request) => ipcRenderer.invoke(AGENT_CHANNELS.interruptTurn, request),
   revisePrompt: (request) => ipcRenderer.invoke(AGENT_CHANNELS.revisePrompt, request),
   getState: (terminalId) => ipcRenderer.invoke(AGENT_CHANNELS.getState, terminalId),
+  setFileAccess: (request) => ipcRenderer.invoke(AGENT_CHANNELS.setFileAccess, request),
   resolveApproval: (request) => ipcRenderer.invoke(AGENT_CHANNELS.resolveApproval, request),
   setFullTakeover: (request) => ipcRenderer.invoke(AGENT_CHANNELS.setFullTakeover, request),
   takeover: (request) => ipcRenderer.invoke(AGENT_CHANNELS.takeover, request),

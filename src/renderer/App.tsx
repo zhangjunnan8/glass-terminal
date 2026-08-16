@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type {
   CSSProperties,
   DragEvent as ReactDragEvent,
@@ -28,6 +28,7 @@ import {
 } from '../shared/agent';
 import type {
   AgentBackendRef,
+  AgentFileAccessMode,
   AgentRuntimeState,
   AgentSessionView,
 } from '../shared/agent';
@@ -39,7 +40,6 @@ import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
 import { mergeAgentState } from './agent-state';
 import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
-import { AgentMessageContent } from './components/AgentMessageContent';
 import {
   isAgentOutputNearBottom,
   scrollAgentOutputToBottom,
@@ -65,6 +65,16 @@ import {
   roleLabel,
   sessionStatusLabel,
 } from './ui-text';
+
+const AgentMessageContent = lazy(async () => {
+  const module = await import('./components/AgentMessageContent');
+  return { default: module.AgentMessageContent };
+});
+
+const SessionHistoryDialog = lazy(async () => {
+  const module = await import('./components/SessionHistoryDialog');
+  return { default: module.SessionHistoryDialog };
+});
 
 interface TerminalTab extends TerminalDescriptor {
   createdAt: number;
@@ -113,6 +123,13 @@ interface FullTakeoverChallenge {
   approvalId?: string;
   command?: string;
   editedCommand?: string;
+}
+
+interface FileAccessChallenge {
+  terminalId: string;
+  target: string;
+  root: string;
+  backend: Extract<AgentBackendRef, { kind: 'generic-provider' }>;
 }
 
 type AgentBackendKind = AgentBackendRef['kind'];
@@ -169,7 +186,6 @@ export function App() {
   const [hosts, setHosts] = useState<HostProfile[]>([]);
   const [hostFolders, setHostFolders] = useState<HostFolder[]>([]);
   const [collapsedHostFolders, setCollapsedHostFolders] = useState<Set<string>>(() => new Set());
-  const [ungroupedHostsCollapsed, setUngroupedHostsCollapsed] = useState(false);
   const [hostFolderDialog, setHostFolderDialog] = useState<HostFolderDialog | null>(null);
   const [hostFolderNameDraft, setHostFolderNameDraft] = useState('');
   const [hostFolderError, setHostFolderError] = useState<string | null>(null);
@@ -229,11 +245,13 @@ export function App() {
   const [connectingHost, setConnectingHost] = useState<HostProfile | null>(null);
   const [reconnectingSessionId, setReconnectingSessionId] = useState<string | null>(null);
   const [renamingSession, setRenamingSession] = useState<SessionRecord | null>(null);
+  const [viewingSessionHistory, setViewingSessionHistory] = useState<SessionRecord | null>(null);
   const [sessionRenameDraft, setSessionRenameDraft] = useState('');
   const [sessionRenameError, setSessionRenameError] = useState<string | null>(null);
   const [sessionRenamePending, setSessionRenamePending] = useState(false);
   const [trustChallenge, setTrustChallenge] = useState<TrustChallenge | null>(null);
   const [fullTakeoverChallenge, setFullTakeoverChallenge] = useState<FullTakeoverChallenge | null>(null);
+  const [fileAccessChallenge, setFileAccessChallenge] = useState<FileAccessChallenge | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [workspaceActionError, setWorkspaceActionError] = useState<string | null>(null);
@@ -460,6 +478,10 @@ export function App() {
   const codexAgentAvailable = codexAppServer?.agentAvailable === true;
   const codexTerminalContextAccess = codexAppServer?.terminalContextAccess;
   const codexBackendSelected = selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND;
+  const selectedFileAccessMode: AgentFileAccessMode = !codexBackendSelected
+    && activeAgent?.backend.kind === 'generic-provider'
+    ? activeAgent.fileAccessMode
+    : 'off';
   const selectedAgentBackendReady = selectedAgentBackendKind
     === CODEX_APP_SERVER_AGENT_BACKEND
     ? codexAgentAvailable
@@ -1036,6 +1058,29 @@ export function App() {
     }
   }
 
+  async function setAgentFileAccess(
+    mode: AgentFileAccessMode,
+    terminalId = activeTab?.id,
+    backend = selectedAgentBackend,
+  ) {
+    if (!terminalId || !backend || backend.kind !== 'generic-provider') return;
+    setWorkspaceActionError(null);
+    try {
+      const state = await window.aiTerminal.agent.setFileAccess({
+        terminalId,
+        mode,
+        backend,
+      });
+      setAgentStates((current) => mergeAgentState(current, state));
+      setTabs((current) => current.map((tab) => (
+        tab.id === terminalId ? { ...tab, sessionId: state.sessionId } : tab
+      )));
+      await refreshSessions();
+    } catch (error) {
+      setWorkspaceActionError(errorMessage(error));
+    }
+  }
+
   async function requestAgentTakeover() {
     if (!activeTab) return;
     setWorkspaceActionError(null);
@@ -1094,6 +1139,21 @@ export function App() {
     setRenamingSession(session);
     setSessionRenameDraft(session.name);
     setSessionRenameError(null);
+  }
+
+  function openSessionHistory(session: SessionRecord) {
+    setWorkspaceActionError(null);
+    setViewingSessionHistory(session);
+  }
+
+  function handleSessionDeleted(sessionId: string) {
+    setSessions((current) => current.filter((session) => session.id !== sessionId));
+    const remainingTabs = tabs.filter((tab) => tab.sessionId !== sessionId);
+    setTabs(remainingTabs);
+    if (activeId && tabs.some((tab) => tab.id === activeId && tab.sessionId === sessionId)) {
+      setActiveId(remainingTabs.at(-1)?.id ?? null);
+    }
+    setViewingSessionHistory(null);
   }
 
   function closeSessionRename() {
@@ -1242,8 +1302,6 @@ export function App() {
           next.delete(folderId);
           return next;
         });
-      } else {
-        setUngroupedHostsCollapsed(false);
       }
     } catch (error) {
       setWorkspaceActionError(errorMessage(error));
@@ -1320,17 +1378,28 @@ export function App() {
 
   async function removeHost(host: HostProfile) {
     if (!window.confirm(`确定删除主机“${host.name}”吗？`)) return;
+    const previouslySelectedHostId = selectedHostId;
+    setWorkspaceActionError(null);
+    setHosts((current) => current.filter((candidate) => candidate.id !== host.id));
+    setSelectedHostId((current) => current === host.id ? null : current);
+    setHostCredentialMessage(null);
     try {
       await window.aiTerminal.hosts.remove(host.id);
-      if (selectedHostId === host.id) setSelectedHostId(null);
-      setHostCredentialMessage(null);
-      await refreshHosts();
     } catch (error) {
+      const message = errorMessage(error);
+      setHosts((current) => current.some((candidate) => candidate.id === host.id)
+        ? current
+        : [...current, host]);
+      if (previouslySelectedHostId === host.id) {
+        setSelectedHostId((current) => current ?? host.id);
+      }
       setHostCredentialMessage({
         hostId: host.id,
         tone: 'error',
-        text: errorMessage(error),
+        text: message,
       });
+      setWorkspaceActionError(message);
+      await refreshHosts().catch(() => undefined);
     }
   }
 
@@ -1449,8 +1518,6 @@ export function App() {
         next.delete(host.folderId!);
         return next;
       });
-    } else {
-      setUngroupedHostsCollapsed(false);
     }
   }
 
@@ -1547,6 +1614,12 @@ export function App() {
                         <small>{sessionStatusLabel(session.status)} · {new Date(session.updatedAt).toLocaleString('zh-CN')}</small>
                       </span>
                       <span className="session-history-actions">
+                        <button
+                          type="button"
+                          data-action="view-session-history"
+                          data-session-id={session.id}
+                          onClick={() => openSessionHistory(session)}
+                        >查看</button>
                         <button
                           type="button"
                           title="重命名会话"
@@ -1809,39 +1882,20 @@ export function App() {
                   );
                 })}
 
-                {(!normalizedSidebarSearch || filteredUngroupedHosts.length > 0) && <section
-                  className="host-folder ungrouped-hosts"
-                  data-folder-id="ungrouped"
+                {filteredUngroupedHosts.map((host) => renderHostTreeEntry(host, null))}
+
+                <div
+                  className="host-root-drop"
+                  data-drop-zone="host-root"
                   onDragOver={(event) => {
                     if (hostTreeDrag?.kind === 'host') allowHostTreeDrop(event);
                   }}
                   onDrop={(event) => {
+                    if (hostTreeDrag?.kind !== 'host') return;
                     event.preventDefault();
                     void moveDraggedHost(null, null);
                   }}
-                >
-                  <div className="host-folder-heading">
-                    <button
-                      type="button"
-                      className="host-folder-toggle"
-                      aria-expanded={!ungroupedHostsCollapsed}
-                      onClick={() => setUngroupedHostsCollapsed((current) => !current)}
-                    >
-                      <span className="host-folder-chevron" aria-hidden="true">›</span>
-                      <span aria-hidden="true">□</span>
-                      <strong>未分组</strong>
-                      <small>{hosts.filter((host) => !host.folderId).length}</small>
-                    </button>
-                  </div>
-                  <div className={`host-folder-contents ${normalizedSidebarSearch || !ungroupedHostsCollapsed ? 'open' : ''}`} aria-hidden={!normalizedSidebarSearch && ungroupedHostsCollapsed}>
-                    <div>
-                      {filteredUngroupedHosts.map((host) => renderHostTreeEntry(host, null))}
-                      {filteredUngroupedHosts.length === 0 && (
-                        <div className="host-folder-empty">拖拽主机到此处</div>
-                      )}
-                    </div>
-                  </div>
-                </section>}
+                >拖到此处移出文件夹</div>
 
                 <div
                   className="host-folder-end-drop"
@@ -1875,17 +1929,16 @@ export function App() {
                   <article className="history-sidebar-row" key={session.id}>
                     <button
                       className="history-session-main"
-                      disabled={!runtimeTab && !host}
-                      onClick={() => {
-                        if (runtimeTab) setActiveId(runtimeTab.id);
-                        else if (host) openSshConnection(host, session.id);
-                      }}
+                      data-action="view-session-history"
+                      data-session-id={session.id}
+                      onClick={() => openSessionHistory(session)}
                     >
                       <strong>{session.name}</strong>
                       <small>{host?.name ?? (session.transport === 'ssh' ? '主机' : '本地 Shell')}</small>
                       <small>{sessionStatusLabel(session.status)} · {new Date(session.updatedAt).toLocaleString('zh-CN')}</small>
                     </button>
                     <div className="history-session-actions">
+                      <button onClick={() => openSessionHistory(session)}>查看内容</button>
                       <button onClick={() => openSessionRename(session)}>重命名</button>
                       {host && (
                         <button
@@ -2072,6 +2125,48 @@ export function App() {
           </div>
           {!codexBackendSelected && (
             <div className="agent-controls">
+              <label
+                className="agent-file-access-picker"
+                title="开启后，读取到的文件内容会发送给当前 Generic Provider；权限仅在本次应用运行中有效。"
+              >
+                <span>文件访问</span>
+                <select
+                  aria-label="Generic Provider 文件访问权限"
+                  data-testid="agent-file-access-mode"
+                  value={selectedFileAccessMode}
+                  disabled={!activeTab || composerBlocked || !selectedAgentBackendReady}
+                  onChange={(event) => {
+                    const mode = event.target.value as AgentFileAccessMode;
+                    if (
+                      mode === 'read-write'
+                      && selectedFileAccessMode !== 'read-write'
+                      && activeTab
+                      && selectedAgentBackend?.kind === 'generic-provider'
+                    ) {
+                      const session = sessions.find((item) => (
+                        item.runtimeTerminalId === activeTab.id || item.id === activeTab.sessionId
+                      ));
+                      setFileAccessChallenge({
+                        terminalId: activeTab.id,
+                        target: activeTab.title,
+                        root: activeAgent?.fileAccessRoot ?? session?.cwd ?? '当前正式 Session cwd（确认时绑定）',
+                        backend: selectedAgentBackend,
+                      });
+                      return;
+                    }
+                    void setAgentFileAccess(mode);
+                  }}
+                >
+                  <option value="off">关闭</option>
+                  <option value="read-only">只读绑定根</option>
+                  <option value="read-write">读写绑定根</option>
+                </select>
+              </label>
+              {selectedFileAccessMode !== 'off' && activeAgent?.fileAccessRoot && (
+                <span className="agent-file-access-root" title={activeAgent.fileAccessRoot}>
+                  绑定根：{activeAgent.fileAccessRoot}
+                </span>
+              )}
               {activeAgent?.fullTakeover && <span className="takeover-badge">AI 全接管</span>}
               <button
                 className="take-control"
@@ -2170,11 +2265,13 @@ export function App() {
             return (
             <article className={`agent-message ${message.role}`} key={message.id}>
               <span>{roleLabel(message.role)}</span>
-              <AgentMessageContent
-                role={message.role}
-                content={message.content}
-                streaming={activeAgent.streamingMessageId === message.id}
-              />
+              <Suspense fallback={<p className="agent-plain-message">{message.content}</p>}>
+                <AgentMessageContent
+                  role={message.role}
+                  content={message.content}
+                  streaming={activeAgent.streamingMessageId === message.id}
+                />
+              </Suspense>
               {latestUser && (
                 <div className="agent-message-actions" data-testid="latest-user-message-actions">
                   <small title="终端输出、命令执行和审计记录都会保留">
@@ -2322,6 +2419,21 @@ export function App() {
           </div>
         </form>
       </aside>
+      )}
+
+      {viewingSessionHistory && (
+        <Suspense fallback={(
+          <div className="modal-backdrop">
+            <div className="modal compact-modal" role="status">正在打开会话历史…</div>
+          </div>
+        )}>
+          <SessionHistoryDialog
+            session={viewingSessionHistory}
+            onClose={() => setViewingSessionHistory(null)}
+            onDeleted={handleSessionDeleted}
+            onError={setWorkspaceActionError}
+          />
+        </Suspense>
       )}
 
       {renamingSession && (
@@ -3170,6 +3282,46 @@ export function App() {
                 </div>
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {fileAccessChallenge && (
+        <div className="modal-backdrop">
+          <div
+            className="modal compact-modal file-access-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="file-access-confirmation-title"
+            data-testid="file-access-confirmation"
+            onKeyDown={(event) => {
+              if (event.key !== 'Escape') return;
+              event.preventDefault();
+              setFileAccessChallenge(null);
+            }}
+          >
+            <div className="modal-header">
+              <strong id="file-access-confirmation-title">允许 AI 直接修改文件？</strong>
+            </div>
+            <p>终端：<b>{fileAccessChallenge.target}</b></p>
+            <p>绑定根目录：<code>{fileAccessChallenge.root}</code></p>
+            <p className="risk-note">
+              允许后，Generic Provider 可直接修改绑定根目录内的文件；这些修改不会经过终端，
+              也不能通过终端撤销。读取到的文件内容会作为 AI 请求上下文发送给当前 Provider。
+              权限只在本次应用运行期间有效。所有命令仍必须进入可见终端。
+            </p>
+            <div className="modal-actions">
+              <button autoFocus onClick={() => setFileAccessChallenge(null)}>取消</button>
+              <button
+                className="danger-action"
+                data-action="confirm-file-read-write"
+                onClick={() => {
+                  const challenge = fileAccessChallenge;
+                  setFileAccessChallenge(null);
+                  void setAgentFileAccess('read-write', challenge.terminalId, challenge.backend);
+                }}
+              >允许本次读写</button>
+            </div>
           </div>
         </div>
       )}

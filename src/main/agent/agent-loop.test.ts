@@ -141,6 +141,100 @@ describe('AgentLoop', () => {
     const toolMessage = provider.requests[1].messages.find((message) => message.role === 'tool');
     expect(toolMessage?.content).toContain('Unsupported terminal tool');
   });
+
+  it('exposes file tools only at the explicit access level and denies an unadvertised write', async () => {
+    const provider = new SequencedProvider([
+      { message: { role: 'assistant', content: null, toolCalls: [{
+        id: 'write-1', name: 'file_write',
+        arguments: '{"path":"a.ts","content":"x","expectedSha256":null}',
+      }] } },
+      { message: { role: 'assistant', content: 'Write was denied.' } },
+    ]);
+    const writeFile = vi.fn();
+    const loop = new AgentLoop(provider, {
+      readTerminal: async () => '', getTerminalState: async () => ({}),
+      executeCommand: vi.fn(), writeFile,
+    });
+
+    await loop.run({
+      systemPrompt: 'test', userPrompt: 'test', terminalContext: '',
+      fileAccessMode: 'read-only', signal: new AbortController().signal,
+    });
+
+    expect(provider.requests[0].tools.map((tool) => tool.name)).toContain('file_read');
+    expect(provider.requests[0].tools.map((tool) => tool.name)).not.toContain('file_write');
+    expect(writeFile).not.toHaveBeenCalled();
+    expect(provider.requests[1].messages).toContainEqual(expect.objectContaining({
+      role: 'tool', content: expect.stringContaining('requires read-write access'),
+    }));
+  });
+
+  it('keeps a file read for one reasoning step then compacts file contents and write arguments', async () => {
+    let requestIndex = 0;
+    const provider: AgentProviderRuntime = {
+      async complete(request) {
+        requestIndex += 1;
+        if (requestIndex === 1) return { message: { role: 'assistant', content: null, toolCalls: [{
+          id: 'read-1', name: 'file_read', arguments: '{"path":"a.ts"}',
+        }] } };
+        if (requestIndex === 2) {
+          expect(request.messages).toContainEqual(expect.objectContaining({
+            role: 'tool', toolCallId: 'read-1', content: expect.stringContaining('const value = 1'),
+          }));
+          return { message: { role: 'assistant', content: null, toolCalls: [{
+            id: 'patch-1', name: 'file_patch', arguments: JSON.stringify({
+              path: 'a.ts', expectedSha256: 'a'.repeat(64),
+              patches: [{ search: '1', replace: '2' }],
+            }),
+          }] } };
+        }
+        return { message: { role: 'assistant', content: 'done' } };
+      },
+    };
+    const loop = new AgentLoop(provider, {
+      readTerminal: async () => '', getTerminalState: async () => ({}), executeCommand: vi.fn(),
+      readFile: async () => ({
+        path: '/work/a.ts', content: 'const value = 1;', bytes: 16, sha256: 'a'.repeat(64),
+      }),
+      patchFile: async () => ({
+        path: '/work/a.ts', bytes: 16, sha256: 'b'.repeat(64), created: false,
+      }),
+    });
+
+    const result = await loop.run({
+      systemPrompt: 'test', userPrompt: 'test', terminalContext: '',
+      fileAccessMode: 'read-write', signal: new AbortController().signal,
+    });
+    expect(JSON.stringify(result.messages)).not.toContain('const value = 1');
+    expect(JSON.stringify(result.messages)).not.toContain('"search":"1"');
+    expect(JSON.stringify(result.messages)).toContain('historyCompacted');
+  });
+
+  it('caps aggregate file read and directory-list results for one turn', async () => {
+    const completedResults: string[] = [];
+    const calls = Array.from({ length: 64 }, (_, index) => ({
+      id: `list-${index}`, name: 'file_list', arguments: '{"path":"."}',
+    }));
+    const provider = new SequencedProvider([
+      { message: { role: 'assistant', content: null, toolCalls: calls } },
+      { message: { role: 'assistant', content: 'batched' } },
+    ]);
+    const loop = new AgentLoop(provider, {
+      readTerminal: async () => '', getTerminalState: async () => ({}), executeCommand: vi.fn(),
+      listFiles: async () => ({
+        path: '/work', truncated: false,
+        entries: [{ name: 'x'.repeat(40_000), type: 'file', size: 1 }],
+      }),
+    }, (event) => {
+      if (event.type === 'tool_completed' && event.result) completedResults.push(event.result);
+    });
+
+    await loop.run({
+      systemPrompt: 'test', userPrompt: 'test', terminalContext: '',
+      fileAccessMode: 'read-only', signal: new AbortController().signal,
+    });
+    expect(completedResults.some((result) => result.includes('读取/列表结果超过'))).toBe(true);
+  });
 });
 
 describe('GenericOpenAiProvider', () => {

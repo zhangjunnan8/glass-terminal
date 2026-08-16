@@ -40,7 +40,7 @@ const groupedHost: HostProfile = {
 const ungroupedHost: HostProfile = {
   ...groupedHost,
   id: 'host-2',
-  name: '未分组主机',
+  name: '根级主机',
   hostname: '192.0.2.20',
   folderId: undefined,
 };
@@ -146,6 +146,12 @@ function dragEvent(type: string) {
   return event;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
 describe('主机分组与协议界面', () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -179,7 +185,9 @@ describe('主机分组与协议界面', () => {
     await openHosts();
 
     expect(container.querySelector('[data-folder-id="folder-1"]')?.textContent).toContain('生产环境');
-    expect(container.querySelector('[data-folder-id="ungrouped"]')?.textContent).toContain('未分组主机');
+    expect(container.querySelector('[data-folder-id="ungrouped"]')).toBeNull();
+    const hostTree = container.querySelector<HTMLElement>('[data-testid="host-tree"]')!;
+    expect(container.querySelector('[data-host-id="host-2"]')?.parentElement).toBe(hostTree);
     const item = container.querySelector<HTMLElement>('[data-host-id="host-1"]')!;
     const details = item.querySelector<HTMLElement>('[data-testid="host-details-host-1"]')!;
     expect(details.classList.contains('open')).toBe(false);
@@ -216,7 +224,7 @@ describe('主机分组与协议界面', () => {
 
     await act(async () => handle.dispatchEvent(dragEvent('dragstart')));
     await act(async () => {
-      container.querySelector<HTMLElement>('[data-folder-id="ungrouped"]')!
+      container.querySelector<HTMLElement>('[data-drop-zone="host-root"]')!
         .dispatchEvent(dragEvent('drop'));
     });
     await settle();
@@ -237,13 +245,51 @@ describe('主机分组与协议界面', () => {
         .dispatchEvent(dragEvent('dragstart'));
     });
     await act(async () => {
-      container.querySelector<HTMLElement>('[data-folder-id="ungrouped"]')!
+      container.querySelector<HTMLElement>('[data-drop-zone="host-root"]')!
         .dispatchEvent(dragEvent('drop'));
     });
     await settle();
 
     expect(container.querySelector('[data-testid="workspace-action-error"]')?.textContent)
       .toContain('无法保存主机排序');
+  });
+
+  it('删除主机时立即更新列表，成功后不再重新拉取全部主机', async () => {
+    const removal = deferred<void>();
+    vi.mocked(bridge.hosts.remove).mockReturnValue(removal.promise);
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    await openHosts();
+    const item = container.querySelector<HTMLElement>('[data-host-id="host-1"]')!;
+    await act(async () => item.querySelector<HTMLButtonElement>('.host-row')!.click());
+
+    await act(async () => {
+      item.querySelector<HTMLButtonElement>('.selected-host-card .danger-text')!.click();
+    });
+
+    expect(bridge.hosts.remove).toHaveBeenCalledWith(groupedHost.id);
+    expect(container.querySelector('[data-host-id="host-1"]')).toBeNull();
+    expect(bridge.hosts.list).toHaveBeenCalledTimes(1);
+
+    removal.resolve();
+    await settle();
+    expect(bridge.hosts.list).toHaveBeenCalledTimes(1);
+  });
+
+  it('主机删除失败时从权威存储恢复列表并显示错误', async () => {
+    vi.mocked(bridge.hosts.remove).mockRejectedValue(new Error('无法写入主机配置'));
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    await openHosts();
+    const item = container.querySelector<HTMLElement>('[data-host-id="host-1"]')!;
+    await act(async () => item.querySelector<HTMLButtonElement>('.host-row')!.click());
+    await act(async () => {
+      item.querySelector<HTMLButtonElement>('.selected-host-card .danger-text')!.click();
+    });
+    await settle();
+
+    expect(container.querySelector('[data-host-id="host-1"]')).not.toBeNull();
+    expect(bridge.hosts.list).toHaveBeenCalledTimes(2);
+    expect(container.querySelector('[data-testid="workspace-action-error"]')?.textContent)
+      .toContain('无法写入主机配置');
   });
 
   it('在新建主机对话框显示协议标签，未接入协议禁止保存', async () => {

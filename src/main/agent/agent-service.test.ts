@@ -21,6 +21,7 @@ import type {
   TerminalService,
 } from '../terminal/terminal-service';
 import type { AgentCompletion, AgentCompletionRequest, AgentProviderRuntime } from './agent-loop';
+import type { AgentFileService } from './agent-file-service';
 import { AgentService } from './agent-service';
 
 async function waitFor(predicate: () => boolean, timeout = 2_000): Promise<void> {
@@ -444,6 +445,61 @@ function toolCall(id: string, command: string): AgentCompletion {
 }
 
 describe('AgentService shared-terminal controls', () => {
+  it('binds ephemeral file permission, audits content-free writes, and does not use a hidden command', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = { ...sessions.session, cwd: '/work' };
+    const terminals = new FakeTerminals();
+    const provider = new FakeProvider([
+      { message: { role: 'assistant', content: null, toolCalls: [{
+        id: 'write-1',
+        name: 'file_write',
+        arguments: JSON.stringify({
+          path: 'new.ts', content: 'export {};\n', expectedSha256: null,
+        }),
+      }] } },
+      { message: { role: 'assistant', content: 'written' } },
+    ]);
+    const fileService = {
+      bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+      writeText: vi.fn().mockResolvedValue({
+        path: '/work/new.ts', bytes: 11, sha256: 'a'.repeat(64), created: true,
+      }),
+    } as unknown as AgentFileService;
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      () => provider,
+      undefined,
+      fileService,
+    );
+    const owner = browserOwner();
+
+    const permission = await service.setFileAccess(owner, {
+      terminalId: 'terminal', mode: 'read-write',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+    });
+    expect(permission).toMatchObject({ fileAccessMode: 'read-write', fileAccessRoot: '/work' });
+    sessions.session = { ...sessions.session, cwd: '/' };
+    service.sendPrompt(owner, {
+      terminalId: 'terminal', prompt: 'create it',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(terminals.executions).toHaveLength(0);
+    expect(fileService.writeText).toHaveBeenCalledWith(
+      owner, 'terminal', 'new.ts', 'export {};\n', null, '/work',
+    );
+    expect(sessions.audits).toContainEqual({
+      type: 'file_permission_changed',
+      details: { mode: 'read-write', root: '/work', ephemeral: true },
+    });
+    const modified = sessions.audits.find((audit) => audit.type === 'file_modified');
+    expect(modified?.details).toEqual({ path: '/work/new.ts', sha256: 'a'.repeat(64), bytes: 11 });
+    expect(JSON.stringify(modified)).not.toContain('export');
+  });
+
   it('hydrates the persisted AI conversation when a Session reconnects to a new terminal', () => {
     const sessions = new FakeSessions();
     sessions.session = {

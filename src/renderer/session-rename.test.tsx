@@ -105,6 +105,8 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       upgrade: vi.fn(),
       rename,
       readTerminalHistory: vi.fn(),
+      readHistoryDetail: vi.fn(),
+      remove: vi.fn(),
     },
     providers: {
       list: vi.fn().mockResolvedValue([]),
@@ -135,6 +137,7 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       interruptTurn: vi.fn(),
       revisePrompt: vi.fn(),
       getState: vi.fn().mockResolvedValue(undefined),
+      setFileAccess: vi.fn(),
       resolveApproval: vi.fn(),
       setFullTakeover: vi.fn(),
       takeover: vi.fn(),

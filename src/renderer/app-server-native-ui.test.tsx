@@ -42,6 +42,7 @@ function agentView(state: AgentSessionView['state'] = 'COMPLETED'): AgentSession
     state,
     terminalInputMode: state === 'THINKING' ? 'locked' : 'human',
     fullTakeover: false,
+    fileAccessMode: 'off',
     messages: [
       { id: 'user-1', role: 'user', content: '第一条', createdAt: now },
       { id: 'assistant-1', role: 'assistant', content: '第一条回复', createdAt: now },
@@ -149,6 +150,8 @@ function bridgeForCodex(snapshot: CodexAppServerSnapshot): DesktopBridge {
       upgrade: vi.fn(),
       rename: vi.fn(),
       readTerminalHistory: vi.fn(),
+      readHistoryDetail: vi.fn(),
+      remove: vi.fn(),
     },
     providers: {
       list: vi.fn().mockResolvedValue([provider]),
@@ -179,6 +182,7 @@ function bridgeForCodex(snapshot: CodexAppServerSnapshot): DesktopBridge {
       interruptTurn: vi.fn(),
       revisePrompt: vi.fn(),
       getState: vi.fn().mockResolvedValue(undefined),
+      setFileAccess: vi.fn(),
       resolveApproval: vi.fn(),
       setFullTakeover: vi.fn(),
       takeover: vi.fn(),
@@ -286,6 +290,32 @@ describe('native Codex App Server renderer mode', () => {
     expect(shell.dataset.theme).toBe('light');
     expect(window.localStorage.getItem('ai-terminal:ui-theme')).toBe('light');
     expect(toggle.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('requires an explicit in-app confirmation before Generic Provider gains file write access', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    bridge.agent.setFileAccess = vi.fn().mockResolvedValue({
+      ...agentView(), revision: 2, fileAccessMode: 'read-write', fileAccessRoot: '/work/project',
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    const select = container.querySelector<HTMLSelectElement>('[data-testid="agent-file-access-mode"]')!;
+    await act(async () => setSelectValue(select, 'read-write'));
+    expect(bridge.agent.setFileAccess).not.toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="file-access-confirmation"]')?.textContent)
+      .toContain('所有命令仍必须进入可见终端');
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-action="confirm-file-read-write"]')!.click();
+    });
+    await settle();
+    expect(bridge.agent.setFileAccess).toHaveBeenCalledWith({
+      terminalId: 'terminal-1', mode: 'read-write',
+      backend: { kind: 'generic-provider', providerId: provider.id },
+    });
+    expect(container.textContent).toContain('绑定根：/work/project');
   });
 
   it('offers retract and edit only on the latest completed user message', async () => {

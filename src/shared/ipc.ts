@@ -45,6 +45,7 @@ import type {
   ResolveTakeoverRequest,
   ReviseAgentPromptRequest,
   SendAgentPromptRequest,
+  SetAgentFileAccessRequest,
   SetFullTakeoverRequest,
   TakeoverRequest,
 } from './agent';
@@ -143,6 +144,7 @@ export interface DesktopBridge {
     interruptTurn(request: InterruptAgentTurnRequest): Promise<AgentSessionView>;
     revisePrompt(request: ReviseAgentPromptRequest): Promise<AgentSessionView>;
     getState(terminalId: string): Promise<AgentSessionView | null>;
+    setFileAccess(request: SetAgentFileAccessRequest): Promise<AgentSessionView>;
     resolveApproval(request: ResolveApprovalRequest): Promise<AgentSessionView>;
     setFullTakeover(request: SetFullTakeoverRequest): Promise<AgentSessionView>;
     takeover(request: TakeoverRequest): Promise<AgentSessionView>;

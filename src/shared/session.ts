@@ -83,6 +83,7 @@ export interface SessionAuditEvent {
     | 'command_rejected'
     | 'command_completed'
     | 'file_modified'
+    | 'file_permission_changed'
     | 'agent_paused'
     | 'full_takeover_changed'
     | 'interactive_auth'

@@ -12,6 +12,7 @@ export type AgentRuntimeState =
   | 'FAILED';
 
 export type TerminalInputMode = 'human' | 'locked' | 'secure-human';
+export type AgentFileAccessMode = 'off' | 'read-only' | 'read-write';
 
 export const CODEX_APP_SERVER_AGENT_BACKEND = 'codex-app-server-isolated' as const;
 export const CODEX_APP_SERVER_AGENT_POLICY_VERSION = 1 as const;
@@ -80,6 +81,10 @@ export interface AgentSessionView {
   state: AgentRuntimeState;
   terminalInputMode: TerminalInputMode;
   fullTakeover: boolean;
+  /** Explicit, in-memory permission for Generic Provider file tools. Never persisted. */
+  fileAccessMode: AgentFileAccessMode;
+  /** Canonical Session cwd captured when file access was enabled. */
+  fileAccessRoot?: string;
   messages: AgentChatItem[];
   streamingMessageId?: string;
   /** App Server interrupt is still draining; terminal input is human-owned but a new turn is unsafe. */
@@ -140,6 +145,12 @@ export interface SetFullTakeoverRequest {
   editedCommand?: string;
 }
 
+export interface SetAgentFileAccessRequest {
+  terminalId: string;
+  mode: AgentFileAccessMode;
+  backend: AgentBackendRef;
+}
+
 export interface TakeoverRequest {
   terminalId: string;
 }
@@ -163,6 +174,7 @@ export const AGENT_CHANNELS = {
   getState: 'agent:get-state',
   resolveApproval: 'agent:resolve-approval',
   setFullTakeover: 'agent:set-full-takeover',
+  setFileAccess: 'agent:set-file-access',
   takeover: 'agent:takeover',
   resolveTakeover: 'agent:resolve-takeover',
   confirmShellReady: 'agent:confirm-shell-ready',

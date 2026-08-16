@@ -33,6 +33,7 @@ import type {
   ResolveTakeoverRequest,
   ReviseAgentPromptRequest,
   SendAgentPromptRequest,
+  SetAgentFileAccessRequest,
   SetFullTakeoverRequest,
   TakeoverRequest,
 } from '../shared/agent';
@@ -425,6 +426,10 @@ handleTrusted(AGENT_CHANNELS.revisePrompt, (event, request: ReviseAgentPromptReq
 handleTrusted(AGENT_CHANNELS.getState, (event, terminalId: string) => {
   if (!agentService) throw new Error('Agent service is not ready.');
   return agentService.getState(event.sender, terminalId);
+});
+handleTrusted(AGENT_CHANNELS.setFileAccess, (event, request: SetAgentFileAccessRequest) => {
+  if (!agentService) throw new Error('Agent service is not ready.');
+  return agentService.setFileAccess(event.sender, request);
 });
 handleTrusted(
   AGENT_CHANNELS.resolveApproval,

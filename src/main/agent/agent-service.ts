@@ -8,6 +8,7 @@ import {
 import type {
   AgentBackendRef,
   AgentChatItem,
+  AgentFileAccessMode,
   AgentRuntimeState,
   AgentSessionView,
   CommandActor,
@@ -20,6 +21,7 @@ import type {
   ReviseAgentPromptRequest,
   SendAgentPromptRequest,
   SetFullTakeoverRequest,
+  SetAgentFileAccessRequest,
   TakeoverRequest,
   TerminalInputMode,
 } from '../../shared/agent';
@@ -30,6 +32,7 @@ import type { SessionManager } from '../sessions/session-manager';
 import type { TerminalService } from '../terminal/terminal-service';
 import { AgentLoop } from './agent-loop';
 import type { AgentCommandResult, AgentMessage, AgentProviderRuntime } from './agent-loop';
+import { AgentFileService } from './agent-file-service';
 import { GenericOpenAiProvider } from './generic-provider';
 import type { CodexAppServerService } from '../app-server/app-server-service';
 
@@ -64,8 +67,9 @@ const BUSY_STATES = new Set<AgentRuntimeState>([
 ]);
 
 const SYSTEM_PROMPT = `You are the AI agent inside AI Terminal.
-You and the human operate the exact same visible terminal session. Use only the provided terminal tools.
+You and the human operate the exact same visible terminal session. Use only the provided tools.
 Never invent command output. Read terminal state/history when needed, request one clear command at a time, inspect its structured result, and continue until the user's goal is handled.
+Every command must use terminal_execute so it appears in the visible terminal. File tools, when explicitly enabled, operate directly inside the bound Session root and must never be emulated with a hidden shell. Prefer precise file_patch calls and small batches; never dump or rewrite an entire repository when targeted edits suffice.
 Do not ask the user to send passwords, API keys, passphrases, OTPs, or other credentials through chat. Authentication is entered by the user directly in the visible terminal.
 Commands require explicit user approval unless the UI reports that Full Takeover is active.`;
 
@@ -80,6 +84,8 @@ function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
     state: runtime.state,
     terminalInputMode: runtime.terminalInputMode,
     fullTakeover: runtime.fullTakeover,
+    fileAccessMode: runtime.fileAccessMode,
+    fileAccessRoot: runtime.fileAccessRoot,
     messages: runtime.messages.map((message) => ({ ...message })),
     streamingMessageId: runtime.streamingMessageId,
     backendTurnDraining: runtime.backendTurnDraining,
@@ -210,6 +216,7 @@ export class AgentService {
   private readonly revisionCounters = new Map<string, number>();
   private readonly removeExitListener: () => void;
   private readonly removeSensitiveSubmissionListener: () => void;
+  private readonly fileService: AgentFileService;
 
   constructor(
     private readonly terminals: TerminalService,
@@ -219,7 +226,9 @@ export class AgentService {
       providerId,
     ) => new GenericOpenAiProvider(providerId, providers),
     private readonly codexAppServer?: CodexAppServerService,
+    fileService?: AgentFileService,
   ) {
+    this.fileService = fileService ?? new AgentFileService(terminals, sessions);
     this.removeExitListener = terminals.onExit((terminalId, ownerId) => {
       this.handleTerminalExit(terminalId, ownerId);
     });
@@ -430,6 +439,42 @@ export class AgentService {
       runtime = this.ensureRuntime(owner, terminalId, persistedBackend);
     }
     if (runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
+    return cloneView(runtime);
+  }
+
+  async setFileAccess(
+    owner: WebContents,
+    request: SetAgentFileAccessRequest,
+  ): Promise<AgentSessionView> {
+    if (!(['off', 'read-only', 'read-write'] as AgentFileAccessMode[]).includes(request.mode)) {
+      throw new Error('未知的文件访问模式。');
+    }
+    const backend = this.selectBackend(request.backend);
+    if (backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
+      throw new Error('Codex 原生模式不使用 Generic Provider 文件工具。');
+    }
+    const existing = this.runtimes.get(request.terminalId);
+    if (existing && (BUSY_STATES.has(existing.state) || existing.backendTurnDraining)) {
+      throw new Error('智能体运行时不能更改文件访问权限。');
+    }
+    const runtime = this.ensureRuntime(owner, request.terminalId, backend);
+    const fileAccessRoot = request.mode === 'off'
+      ? undefined
+      : await this.fileService.bindWorkspaceRoot(owner, request.terminalId);
+    if (
+      this.runtimes.get(request.terminalId) !== runtime
+      || BUSY_STATES.has(runtime.state)
+      || runtime.backendTurnDraining
+    ) throw new Error('智能体状态已变化，文件访问权限未修改。');
+    this.sessions.appendAudit(runtime.sessionId, 'file_permission_changed', 'user', {
+      mode: request.mode,
+      root: fileAccessRoot,
+      ephemeral: true,
+    });
+    runtime.fileAccessMode = request.mode;
+    runtime.fileAccessRoot = fileAccessRoot;
+    runtime.error = undefined;
+    this.emit(runtime);
     return cloneView(runtime);
   }
 
@@ -769,6 +814,50 @@ export class AgentService {
         fullTakeover: runtime.fullTakeover,
       }),
       executeCommand: (request) => this.requestCommand(runtime, token, request),
+      listFiles: ({ path }) => this.fileService.list(
+        runtime.owner,
+        runtime.terminalId,
+        path,
+        runtime.fileAccessRoot,
+      ),
+      readFile: ({ path }) => this.fileService.readText(
+        runtime.owner,
+        runtime.terminalId,
+        path,
+        runtime.fileAccessRoot,
+      ),
+      writeFile: async ({ path, content, expectedSha256 }) => {
+        const result = await this.fileService.writeText(
+          runtime.owner,
+          runtime.terminalId,
+          path,
+          content,
+          expectedSha256,
+          runtime.fileAccessRoot,
+        );
+        this.sessions.appendAudit(runtime.sessionId, 'file_modified', 'ai', {
+          path: result.path,
+          sha256: result.sha256,
+          bytes: result.bytes,
+        });
+        return result;
+      },
+      patchFile: async ({ path, expectedSha256, patches }) => {
+        const result = await this.fileService.applyPatch(
+          runtime.owner,
+          runtime.terminalId,
+          path,
+          expectedSha256,
+          patches,
+          runtime.fileAccessRoot,
+        );
+        this.sessions.appendAudit(runtime.sessionId, 'file_modified', 'ai', {
+          path: result.path,
+          sha256: result.sha256,
+          bytes: result.bytes,
+        });
+        return result;
+      },
     }, (event) => {
       if (!this.isCurrentTurn(runtime, token)) return;
       if (event.type === 'assistant_delta' && event.text) {
@@ -805,6 +894,7 @@ export class AgentService {
         userPrompt: prompt,
         terminalContext: context,
         priorMessages: runtime.priorMessages,
+        fileAccessMode: runtime.fileAccessMode,
         signal,
       });
       if (!this.isCurrentTurn(runtime, token)) return;
@@ -1285,6 +1375,8 @@ export class AgentService {
       state: 'USER_CONTROL',
       terminalInputMode: 'human',
       fullTakeover: false,
+      fileAccessMode: 'off',
+      fileAccessRoot: undefined,
       messages: replayed.messages,
       priorMessages: replayed.priorMessages,
       providerThreadId: canReuseThread && backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
