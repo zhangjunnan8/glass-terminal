@@ -28,14 +28,22 @@ import type {
 import type { ProviderProfile } from '../../shared/provider';
 import type { CodexVisibleTerminalContext } from '../../shared/codex-app-server';
 import type { SessionAuditEvent, SessionRecord } from '../../shared/session';
+import type { TerminalCommandResult, WorkspaceBinding } from '../../shared/tools';
 import type { ProviderStore } from '../providers/provider-store';
 import type { SessionManager } from '../sessions/session-manager';
 import type { TerminalService } from '../terminal/terminal-service';
 import { AgentLoop } from './agent-loop';
-import type { AgentCommandResult, AgentMessage, AgentProviderRuntime } from './agent-loop';
+import type { AgentMessage, AgentProviderRuntime } from './agent-loop';
 import { AgentFileService } from './agent-file-service';
 import { GenericOpenAiProvider } from './generic-provider';
 import type { CodexAppServerService } from '../app-server/app-server-service';
+import { SharedTerminalTool } from '../tools/shared-terminal-tool';
+import { SessionToolGateway } from '../tools/tool-gateway';
+import {
+  buildSessionToolContext,
+  workspacePermissions,
+} from '../tools/session-tool-context';
+import { AgentFileWorkspaceAdapter } from '../tools/agent-file-workspace-adapter';
 
 interface ApprovalResolution {
   decision: 'execute' | 'edit' | 'reject';
@@ -826,63 +834,59 @@ export class AgentService {
     if (!controlLeaseId) throw new Error('Generic Agent control lease is missing.');
     const signal = runtime.abortController!.signal;
     const provider = this.providerFactory(runtime.providerId);
+    const boundSession = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
+    if (!boundSession) throw new Error('当前终端没有可用的正式 Session。');
+    const workspace: WorkspaceBinding | undefined = runtime.fileAccessRoot
+      ? {
+        backend: boundSession.transport === 'ssh' ? 'sftp' : 'local',
+        root: runtime.fileAccessRoot,
+        ...(boundSession.hostId ? { hostId: boundSession.hostId } : {}),
+      }
+      : boundSession.workspace;
+    const context = buildSessionToolContext(
+      { ...boundSession, ...(workspace ? { workspace } : {}) },
+      this.terminals.descriptor(runtime.owner, runtime.terminalId),
+      { workspacePermissions: workspacePermissions(runtime.fileAccessMode, workspace) },
+    );
+    const terminalTool = new SharedTerminalTool({
+      context,
+      owner: runtime.owner,
+      terminals: this.terminals,
+      sessions: this.sessions,
+      execute: (command, reason) => this.requestCommand(runtime, token, { command, reason }),
+    });
+    const workspaceTool = workspace
+      ? new AgentFileWorkspaceAdapter(
+        this.fileService,
+        runtime.owner,
+        runtime.terminalId,
+        workspace,
+      )
+      : undefined;
+    const gateway = new SessionToolGateway(context, terminalTool, workspaceTool);
     let streamedMessage: AgentChatItem | undefined;
-    const loop = new AgentLoop(provider, {
-      readTerminal: async ({ maxChars }) => (
-        this.sessions.readTerminalHistory(runtime.sessionId).slice(-maxChars)
-      ),
-      getTerminalState: async () => ({
-        ...this.terminals.state(runtime.owner, runtime.terminalId),
-        controlState: runtime.state,
-        fullTakeover: runtime.fullTakeover,
-      }),
-      executeCommand: (request) => this.requestCommand(runtime, token, request),
-      listFiles: ({ path }) => this.fileService.list(
-        runtime.owner,
-        runtime.terminalId,
-        path,
-        runtime.fileAccessRoot,
-      ),
-      readFile: ({ path }) => this.fileService.readText(
-        runtime.owner,
-        runtime.terminalId,
-        path,
-        runtime.fileAccessRoot,
-      ),
-      writeFile: async ({ path, content, expectedSha256 }) => {
-        const result = await this.fileService.writeText(
-          runtime.owner,
-          runtime.terminalId,
-          path,
-          content,
-          expectedSha256,
-          runtime.fileAccessRoot,
-        );
-        this.sessions.appendAudit(runtime.sessionId, 'file_modified', 'ai', {
-          path: result.path,
-          sha256: result.sha256,
-          bytes: result.bytes,
-        });
-        return result;
-      },
-      patchFile: async ({ path, expectedSha256, patches }) => {
-        const result = await this.fileService.applyPatch(
-          runtime.owner,
-          runtime.terminalId,
-          path,
-          expectedSha256,
-          patches,
-          runtime.fileAccessRoot,
-        );
-        this.sessions.appendAudit(runtime.sessionId, 'file_modified', 'ai', {
-          path: result.path,
-          sha256: result.sha256,
-          bytes: result.bytes,
-        });
-        return result;
-      },
-    }, (event) => {
+    const loop = new AgentLoop(provider, gateway, (event) => {
       if (!this.isCurrentTurn(runtime, token)) return;
+      if (
+        event.type === 'tool_completed'
+        && (event.toolCall?.name === 'file_write' || event.toolCall?.name === 'file_patch')
+      ) {
+        let completed: Record<string, unknown> | undefined;
+        try {
+          completed = event.result
+            ? JSON.parse(event.result) as Record<string, unknown>
+            : undefined;
+        } catch {
+          // A malformed tool result is handled by the Agent loop; never log its content.
+        }
+        if (completed?.ok === true) {
+          this.sessions.appendAudit(runtime.sessionId, 'file_modified', 'ai', {
+            path: completed.path,
+            sha256: completed.sha256,
+            bytes: completed.bytes,
+          });
+        }
+      }
       if (event.type === 'assistant_delta' && event.text) {
         if (!streamedMessage) {
           streamedMessage = {
@@ -1121,7 +1125,7 @@ export class AgentService {
     runtime: AgentRuntimeRecord,
     token: number,
     request: { command: string; reason?: string },
-  ): Promise<AgentCommandResult> {
+  ): Promise<TerminalCommandResult> {
     if (!this.isCurrentTurn(runtime, token)) throw new Error('Agent turn is no longer active.');
     const approval: CommandApproval = {
       id: randomUUID(),
@@ -1158,11 +1162,17 @@ export class AgentService {
       runtime.pendingApproval = undefined;
       if (!this.isCurrentTurn(runtime, token)) throw new Error('Agent turn is no longer active.');
       if (resolution.decision === 'reject') {
+        const finishedAt = Date.now();
+        const startedAt = Date.parse(approval.requestedAt);
         return {
-          executionId: approval.id,
+          commandId: approval.id,
           command: approval.command,
           status: 'rejected',
+          exitCode: null,
           output: 'User rejected this command.',
+          startedAt,
+          finishedAt,
+          durationMs: Math.max(0, finishedAt - startedAt),
         };
       }
     }
@@ -1274,11 +1284,13 @@ export class AgentService {
     this.setLockedState(runtime, 'THINKING');
     this.emit(runtime);
     return {
-      executionId: execution.id,
+      commandId: execution.id,
       command: execution.command,
       status: execution.status === 'running' ? 'failed' : execution.status,
-      exitCode: execution.exitCode,
+      exitCode: execution.exitCode ?? null,
       output: execution.output,
+      startedAt: Date.parse(execution.startedAt),
+      finishedAt: execution.endedAt ? Date.parse(execution.endedAt) : undefined,
       durationMs: execution.durationMs,
     };
   }

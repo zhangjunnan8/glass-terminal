@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { ProviderProfile } from '../../shared/provider';
+import type { ToolGateway, WorkspaceTool } from '../../shared/tools';
 import type { ProviderStore } from '../providers/provider-store';
 import {
   AgentLoop,
@@ -24,6 +25,84 @@ class SequencedProvider implements AgentProviderRuntime {
   }
 }
 
+function fakeToolGateway(overrides: {
+  terminal?: Partial<ToolGateway['terminal']>;
+  workspace?: Partial<WorkspaceTool> | null;
+} = {}): ToolGateway {
+  const terminal: ToolGateway['terminal'] = {
+    execute: async (command) => ({
+      commandId: 'unused',
+      command,
+      status: 'completed',
+      exitCode: null,
+      output: '',
+      startedAt: 0,
+    }),
+    sendInput: async () => undefined,
+    interrupt: async () => undefined,
+    readVisible: async () => '',
+    readHistory: async () => '',
+    getState: async () => ({
+      terminalId: 'terminal-1',
+      sessionId: 'session-1',
+      transport: 'local',
+      shellKind: 'powershell',
+      status: 'connected',
+      terminalInputMode: 'human',
+    }),
+    ...overrides.terminal,
+  };
+  const workspace: WorkspaceTool = {
+    listDirectory: async (path = '.') => ({ path, entries: [], truncated: false }),
+    readFile: async (path) => ({ path, content: '', bytes: 0, sha256: 'a'.repeat(64) }),
+    writeFile: async (path, content, expectedSha256) => ({
+      path,
+      bytes: Buffer.byteLength(content, 'utf8'),
+      sha256: expectedSha256 ?? 'a'.repeat(64),
+      created: expectedSha256 === null,
+    }),
+    applyPatch: async (path, expectedSha256) => ({
+      path,
+      bytes: 0,
+      sha256: expectedSha256,
+      created: false,
+    }),
+    search: async (query) => ({ query, matches: [], filesScanned: 0, truncated: false }),
+    glob: async (pattern) => ({ pattern, paths: [], truncated: false }),
+    stat: async (path) => ({ path, type: 'file', size: 0 }),
+    mkdir: async () => undefined,
+    rename: async () => undefined,
+    delete: async () => undefined,
+    ...(overrides.workspace ?? {}),
+  };
+  const context: ToolGateway['context'] = {
+    sessionId: 'session-1',
+    terminal: { type: 'local', terminalId: 'terminal-1' },
+    ...(overrides.workspace === null ? {} : {
+      workspace: { backend: 'local' as const, root: '/work' },
+    }),
+    permissions: {
+      terminal: { read: true, execute: true, sendInput: true, interrupt: true },
+      workspace: {
+        enabled: overrides.workspace !== null,
+        mode: 'read-write',
+        read: true,
+        write: true,
+        create: true,
+        delete: true,
+        readablePaths: ['/work'],
+        writablePaths: ['/work'],
+        fullAccess: false,
+      },
+    },
+  };
+  return {
+    context,
+    terminal,
+    ...(overrides.workspace === null ? {} : { workspace }),
+  };
+}
+
 describe('AgentLoop', () => {
   it('forwards provider text deltas before publishing the completed assistant message', async () => {
     const events: Array<{ type: string; text?: string }> = [];
@@ -35,16 +114,7 @@ describe('AgentLoop', () => {
         return { message: { role: 'assistant', content: '正在生成' } };
       },
     };
-    const loop = new AgentLoop(provider, {
-      readTerminal: async () => '',
-      getTerminalState: async () => ({}),
-      executeCommand: async () => ({
-        executionId: 'unused',
-        command: 'unused',
-        status: 'completed',
-        output: '',
-      }),
-    }, (event) => events.push(event));
+    const loop = new AgentLoop(provider, fakeToolGateway(), (event) => events.push(event));
 
     await loop.run({
       systemPrompt: 'Use terminal tools.',
@@ -83,18 +153,26 @@ describe('AgentLoop', () => {
       { message: { role: 'assistant', content: 'The command completed successfully.' } },
     ]);
     const executeCommand = vi.fn().mockResolvedValue({
-      executionId: 'execution-1',
+      commandId: 'execution-1',
       command: 'pwd',
       status: 'completed',
       exitCode: 0,
       output: '/home/tester\n',
+      startedAt: 0,
       durationMs: 12,
     });
-    const loop = new AgentLoop(provider, {
-      readTerminal: async () => 'visible terminal',
-      getTerminalState: async () => ({ transport: 'ssh' }),
-      executeCommand,
-    });
+    const loop = new AgentLoop(provider, fakeToolGateway({ terminal: {
+      readVisible: async () => 'visible terminal',
+      getState: async () => ({
+        terminalId: 'terminal-1',
+        sessionId: 'session-1',
+        transport: 'ssh',
+        shellKind: 'bash',
+        status: 'connected',
+        terminalInputMode: 'human',
+      }),
+      execute: executeCommand,
+    } }));
 
     const result = await loop.run({
       systemPrompt: 'Use terminal tools.',
@@ -105,7 +183,7 @@ describe('AgentLoop', () => {
 
     expect(result.rounds).toBe(3);
     expect(result.finalText).toBe('The command completed successfully.');
-    expect(executeCommand).toHaveBeenCalledWith({ command: 'pwd', reason: 'inspect cwd' });
+    expect(executeCommand).toHaveBeenCalledWith('pwd', 'inspect cwd');
     expect(provider.requests[2].messages).toContainEqual(expect.objectContaining({
       role: 'tool',
       toolCallId: 'exec-1',
@@ -124,11 +202,9 @@ describe('AgentLoop', () => {
       { message: { role: 'assistant', content: 'I cannot use that tool.' } },
     ]);
     const executeCommand = vi.fn();
-    const loop = new AgentLoop(provider, {
-      readTerminal: async () => '',
-      getTerminalState: async () => ({}),
-      executeCommand,
-    });
+    const loop = new AgentLoop(provider, fakeToolGateway({ terminal: {
+      execute: executeCommand,
+    } }));
 
     await loop.run({
       systemPrompt: 'Use terminal tools.',
@@ -151,10 +227,7 @@ describe('AgentLoop', () => {
       { message: { role: 'assistant', content: 'Write was denied.' } },
     ]);
     const writeFile = vi.fn();
-    const loop = new AgentLoop(provider, {
-      readTerminal: async () => '', getTerminalState: async () => ({}),
-      executeCommand: vi.fn(), writeFile,
-    });
+    const loop = new AgentLoop(provider, fakeToolGateway({ workspace: { writeFile } }));
 
     await loop.run({
       systemPrompt: 'test', userPrompt: 'test', terminalContext: '',
@@ -191,15 +264,14 @@ describe('AgentLoop', () => {
         return { message: { role: 'assistant', content: 'done' } };
       },
     };
-    const loop = new AgentLoop(provider, {
-      readTerminal: async () => '', getTerminalState: async () => ({}), executeCommand: vi.fn(),
+    const loop = new AgentLoop(provider, fakeToolGateway({ workspace: {
       readFile: async () => ({
         path: '/work/a.ts', content: 'const value = 1;', bytes: 16, sha256: 'a'.repeat(64),
       }),
-      patchFile: async () => ({
+      applyPatch: async () => ({
         path: '/work/a.ts', bytes: 16, sha256: 'b'.repeat(64), created: false,
       }),
-    });
+    } }));
 
     const result = await loop.run({
       systemPrompt: 'test', userPrompt: 'test', terminalContext: '',
@@ -219,13 +291,14 @@ describe('AgentLoop', () => {
       { message: { role: 'assistant', content: null, toolCalls: calls } },
       { message: { role: 'assistant', content: 'batched' } },
     ]);
-    const loop = new AgentLoop(provider, {
-      readTerminal: async () => '', getTerminalState: async () => ({}), executeCommand: vi.fn(),
-      listFiles: async () => ({
+    const loop = new AgentLoop(provider, fakeToolGateway({ workspace: {
+      listDirectory: async () => ({
         path: '/work', truncated: false,
-        entries: [{ name: 'x'.repeat(40_000), type: 'file', size: 1 }],
+        entries: [{
+          name: 'x'.repeat(40_000), path: '/work/x', type: 'file', size: 1,
+        }],
       }),
-    }, (event) => {
+    } }), (event) => {
       if (event.type === 'tool_completed' && event.result) completedResults.push(event.result);
     });
 

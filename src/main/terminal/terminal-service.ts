@@ -367,6 +367,10 @@ export class TerminalService {
     };
   }
 
+  descriptor(owner: WebContents, terminalId: string): TerminalDescriptor {
+    return { ...this.requireOwned(owner, terminalId).descriptor };
+  }
+
   bindSession(owner: WebContents, terminalId: string, sessionId: string): void {
     const record = this.requireOwned(owner, terminalId);
     if (record.sessionId && record.sessionId !== sessionId) {

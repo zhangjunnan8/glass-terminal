@@ -1,11 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { AgentFileAccessMode } from '../../shared/agent';
-import type {
-  AgentFileListEntry,
-  AgentFilePatch,
-  AgentFileReadResult,
-  AgentFileWriteResult,
-} from './agent-file-service';
+import type { ToolGateway } from '../../shared/tools';
 
 export type AgentMessage =
   | { role: 'system' | 'user'; content: string }
@@ -41,37 +36,6 @@ export interface AgentCompletion {
 
 export interface AgentProviderRuntime {
   complete(request: AgentCompletionRequest): Promise<AgentCompletion>;
-}
-
-export interface AgentCommandResult {
-  executionId: string;
-  command: string;
-  status: 'completed' | 'failed' | 'rejected' | 'cancelled';
-  exitCode?: number;
-  output: string;
-  durationMs?: number;
-}
-
-export interface AgentLoopTools {
-  readTerminal(request: { maxChars: number }): Promise<string>;
-  getTerminalState(): Promise<Record<string, unknown>>;
-  executeCommand(request: { command: string; reason?: string }): Promise<AgentCommandResult>;
-  listFiles?(request: { path: string }): Promise<{
-    path: string;
-    entries: AgentFileListEntry[];
-    truncated: boolean;
-  }>;
-  readFile?(request: { path: string }): Promise<AgentFileReadResult>;
-  writeFile?(request: {
-    path: string;
-    content: string;
-    expectedSha256: string | null;
-  }): Promise<AgentFileWriteResult>;
-  patchFile?(request: {
-    path: string;
-    expectedSha256: string;
-    patches: AgentFilePatch[];
-  }): Promise<AgentFileWriteResult>;
 }
 
 export interface AgentLoopEvent {
@@ -271,7 +235,7 @@ function parseArguments(call: AgentToolCall): Record<string, unknown> {
 export class AgentLoop {
   constructor(
     private readonly provider: AgentProviderRuntime,
-    private readonly tools: AgentLoopTools,
+    private readonly gateway: ToolGateway,
     private readonly onEvent: (event: AgentLoopEvent) => void = () => undefined,
     private readonly maxRounds = 12,
   ) {}
@@ -345,42 +309,45 @@ export class AgentLoop {
       case 'terminal_read': {
         const requested = typeof args.maxChars === 'number' ? args.maxChars : 8_000;
         const maxChars = Math.min(30_000, Math.max(100, Math.floor(requested)));
-        return JSON.stringify({ ok: true, output: await this.tools.readTerminal({ maxChars }) });
+        return JSON.stringify({
+          ok: true,
+          output: await this.gateway.terminal.readVisible({ maxChars }),
+        });
       }
       case 'terminal_state':
-        return JSON.stringify({ ok: true, state: await this.tools.getTerminalState() });
+        return JSON.stringify({ ok: true, state: await this.gateway.terminal.getState() });
       case 'terminal_execute': {
         if (typeof args.command !== 'string' || !args.command.trim()) {
           throw new Error('terminal_execute requires a non-empty command.');
         }
-        const result = await this.tools.executeCommand({
-          command: args.command,
-          reason: typeof args.reason === 'string' ? args.reason : undefined,
-        });
+        const result = await this.gateway.terminal.execute(
+          args.command,
+          typeof args.reason === 'string' ? args.reason : undefined,
+        );
         return JSON.stringify({ ok: result.status === 'completed', ...result });
       }
       case 'file_list': {
         if (fileAccessMode === 'off') throw new Error('file_list is disabled.');
-        if (!this.tools.listFiles) throw new Error('file_list is disabled.');
+        if (!this.gateway.workspace) throw new Error('file_list is disabled.');
         const path = typeof args.path === 'string' ? args.path : '.';
         if (!path || path.length > 4_096) throw new Error('file_list path is invalid.');
         return consumeFileResultBudget(
-          JSON.stringify({ ok: true, ...await this.tools.listFiles({ path }) }),
+          JSON.stringify({ ok: true, ...await this.gateway.workspace.listDirectory(path) }),
           fileReadBudget,
         );
       }
       case 'file_read': {
         if (fileAccessMode === 'off') throw new Error('file_read is disabled.');
-        if (!this.tools.readFile) throw new Error('file_read is disabled.');
+        if (!this.gateway.workspace) throw new Error('file_read is disabled.');
         if (typeof args.path !== 'string' || !args.path || args.path.length > 4_096) {
           throw new Error('file_read requires a valid path.');
         }
-        const result = await this.tools.readFile({ path: args.path });
+        const result = await this.gateway.workspace.readFile(args.path);
         return consumeFileResultBudget(JSON.stringify({ ok: true, ...result }), fileReadBudget);
       }
       case 'file_write': {
         if (fileAccessMode !== 'read-write') throw new Error('file_write requires read-write access.');
-        if (!this.tools.writeFile) throw new Error('file_write is disabled.');
+        if (!this.gateway.workspace) throw new Error('file_write is disabled.');
         if (typeof args.path !== 'string' || !args.path || args.path.length > 4_096) {
           throw new Error('file_write requires a valid path.');
         }
@@ -391,15 +358,18 @@ export class AgentLoop {
         if (args.expectedSha256 !== null && typeof args.expectedSha256 !== 'string') {
           throw new Error('file_write requires expectedSha256 (or null for a new file).');
         }
-        return JSON.stringify({ ok: true, ...await this.tools.writeFile({
-          path: args.path,
-          content: args.content,
-          expectedSha256: args.expectedSha256,
-        }) });
+        return JSON.stringify({
+          ok: true,
+          ...await this.gateway.workspace.writeFile(
+            args.path,
+            args.content,
+            args.expectedSha256,
+          ),
+        });
       }
       case 'file_patch': {
         if (fileAccessMode !== 'read-write') throw new Error('file_patch requires read-write access.');
-        if (!this.tools.patchFile) throw new Error('file_patch is disabled.');
+        if (!this.gateway.workspace) throw new Error('file_patch is disabled.');
         if (typeof args.path !== 'string' || !args.path || args.path.length > 4_096) {
           throw new Error('file_patch requires a valid path.');
         }
@@ -422,11 +392,14 @@ export class AgentLoop {
         if (JSON.stringify(patches).length > 262_144) {
           throw new Error('file_patch payload is too large; use smaller, precise patch batches.');
         }
-        return JSON.stringify({ ok: true, ...await this.tools.patchFile({
-          path: args.path,
-          expectedSha256: args.expectedSha256,
-          patches,
-        }) });
+        return JSON.stringify({
+          ok: true,
+          ...await this.gateway.workspace.applyPatch(
+            args.path,
+            args.expectedSha256,
+            patches,
+          ),
+        });
       }
       default:
         throw new Error(`Unsupported terminal tool: ${call.name}`);

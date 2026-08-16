@@ -300,6 +300,17 @@ class FakeTerminals {
     return () => { this.sensitiveSubmissionListener = undefined; };
   }
   state() { return { transport: 'ssh', shellKind: 'posix', status: 'connected' }; }
+  descriptor() {
+    return {
+      id: 'terminal',
+      title: 'Test',
+      profileId: 'ssh:host',
+      shellKind: 'posix' as const,
+      transport: 'ssh' as const,
+      hostId: 'host',
+      sessionId: '11111111-1111-1111-1111-111111111111',
+    };
+  }
   currentExecution() { return this.current ? { ...this.current } : undefined; }
   acquireAgentControl() {
     if (this.controlLease) throw new Error('already leased');
