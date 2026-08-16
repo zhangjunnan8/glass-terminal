@@ -35,7 +35,7 @@ import type {
 } from './app-server-turn-runner';
 
 const NATIVE_AGENT_READY_REASON = 'Codex App Server 已就绪；内建 Shell/File 在独立的 Codex 工作区内运行。';
-const TERMINAL_CONTEXT_ENABLED_REASON = '已允许 Codex 以只读方式获取当前可见终端的近期内容。';
+const TERMINAL_CONTEXT_ENABLED_REASON = '已允许 Codex 以只读方式获取当前可见终端的状态和近期内容。';
 const PROBE_TIMEOUT_MS = 5_000;
 
 interface StoredAppServerConfig {
@@ -682,19 +682,19 @@ export class CodexAppServerService {
     };
     if (!request.enabled) {
       // Revocation is immediate: an in-flight turn may have already received
-      // terminal_read in its dynamic tool set, so interrupt it before writing.
+      // terminal_state/terminal_read in its dynamic tool set, so interrupt it.
       this.config = nextConfig;
       this.update({ error: undefined });
       void this.turnRunner.interrupt().catch((error) => {
         this.update({
-          error: `终端内容读取权限已撤销，但中断当前 App Server Turn 失败：${this.actionError(error)}`,
+          error: `终端上下文读取权限已撤销，但中断当前 App Server Turn 失败：${this.actionError(error)}`,
         });
       });
       try {
         this.writeConfig(nextConfig);
       } catch (error) {
         this.update({
-          error: `终端内容读取权限已在当前进程撤销，但配置写入失败：${this.actionError(error)}`,
+          error: `终端上下文读取权限已在当前进程撤销，但配置写入失败：${this.actionError(error)}`,
         });
       }
       return this.getState();
@@ -1151,12 +1151,12 @@ export class CodexAppServerService {
       ? agentReason
       : terminalContextEnabled
         ? TERMINAL_CONTEXT_ENABLED_REASON
-        : 'Codex 使用独立工作区，当前不能读取可见终端内容。';
+        : '每轮仍会提供非敏感终端身份；当前未开放状态刷新和近期内容读取。';
     const terminalContextAccess = {
       available: agentAvailable,
       enabled: terminalContextEnabled,
       acceptedClientTools: terminalContextEnabled
-        ? ['terminal_read' as const]
+        ? ['terminal_state' as const, 'terminal_read' as const]
         : [],
       reason: terminalContextReason,
     };

@@ -22,6 +22,14 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
+function turnInputText(params: unknown): string {
+  const input = asRecord(params).input;
+  if (!Array.isArray(input) || !input.length) throw new Error('Missing turn input.');
+  const text = asRecord(input[0]).text;
+  if (typeof text !== 'string') throw new Error('Missing turn input text.');
+  return text;
+}
+
 class FakeConnection implements AppServerConnection {
   readonly requests: RecordedRequest[] = [];
   responder?: (method: string, params: unknown) => unknown | Promise<unknown>;
@@ -90,6 +98,19 @@ class FakeConnection implements AppServerConnection {
 function createTools(): CodexAppServerTurnTools {
   return {
     readTerminal: vi.fn(async ({ maxChars }) => `last ${maxChars} chars`),
+    getTerminalState: vi.fn(async () => ({
+      transport: 'ssh' as const,
+      target: {
+        label: 'Ubuntu VM',
+        hostname: '192.168.31.93',
+        port: 22,
+        username: 'zjn',
+      },
+      cwd: '/home/zjn/project',
+      effectiveUser: 'zjn',
+      shellKind: 'posix' as const,
+      connectionState: 'connected' as const,
+    })),
   };
 }
 
@@ -133,7 +154,7 @@ function completeTurn(
 }
 
 describe('CodexAppServerTurnRunner native mode', () => {
-  it('uses the native workspace permission profile and exposes only terminal_read when allowed', async () => {
+  it('binds an SSH terminal to every turn and exposes only read-only terminal context tools', async () => {
     const workspaceRoot = resolve('app-server-agent-workspace');
     const connection = new FakeConnection();
     const runner = new CodexAppServerTurnRunner(workspaceRoot);
@@ -167,6 +188,13 @@ describe('CodexAppServerTurnRunner native mode', () => {
     });
     expect(asRecord(turnStart.params)).not.toHaveProperty('sandboxPolicy');
     expect(JSON.stringify(turnStart.params)).not.toContain('readOnlyAccess');
+    const turnText = turnInputText(turnStart.params);
+    expect(turnText).toContain('ai_terminal_binding');
+    expect(turnText).toContain('192.168.31.93');
+    expect(turnText).toContain('/home/zjn/project');
+    expect(turnText).toContain('local ');
+    expect(turnText).toContain('App Server process');
+    expect(turnText).toContain('must never be described as having run on the SSH target');
 
     const read = asRecord(await connection.invoke('item/tool/call', {
       threadId: 'thread-new', turnId: 'turn-1', callId: 'read-1',
@@ -175,12 +203,19 @@ describe('CodexAppServerTurnRunner native mode', () => {
     expect(read.success).toBe(true);
     expect(tools.readTerminal).toHaveBeenCalledWith({ maxChars: 500 });
 
-    for (const tool of ['terminal_state', 'terminal_execute']) {
-      const rejected = asRecord(await connection.invoke('item/tool/call', {
-        threadId: 'thread-new', turnId: 'turn-1', callId: `${tool}-1`, tool, arguments: {},
-      }));
-      expect(rejected.success).toBe(false);
-    }
+    const state = asRecord(await connection.invoke('item/tool/call', {
+      threadId: 'thread-new', turnId: 'turn-1', callId: 'terminal_state-1',
+      tool: 'terminal_state', arguments: {},
+    }));
+    expect(state.success).toBe(true);
+    expect(JSON.stringify(state)).toContain('192.168.31.93');
+    expect(tools.getTerminalState).toHaveBeenCalledTimes(2);
+
+    const rejected = asRecord(await connection.invoke('item/tool/call', {
+      threadId: 'thread-new', turnId: 'turn-1', callId: 'terminal_execute-1',
+      tool: 'terminal_execute', arguments: {},
+    }));
+    expect(rejected.success).toBe(false);
 
     completeTurn(connection);
     await expect(resultPromise).resolves.toMatchObject({
@@ -188,21 +223,91 @@ describe('CodexAppServerTurnRunner native mode', () => {
     });
   });
 
-  it('registers no terminal tools when terminal context access is disabled', async () => {
+  it('always injects terminal identity but registers no tools when terminal read is disabled', async () => {
     const connection = new FakeConnection();
     const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));
     runner.attach(connection);
     const resultPromise = runner.run(createInput({ terminalContextAccess: false }));
     const threadStart = await waitForRequest(connection, 'thread/start');
     expect(asRecord(threadStart.params).dynamicTools).toEqual([]);
-    await waitForRequest(connection, 'turn/start');
-    const rejected = asRecord(await connection.invoke('item/tool/call', {
-      threadId: 'thread-new', turnId: 'turn-1', callId: 'read-disabled',
-      tool: 'terminal_read', arguments: {},
-    }));
-    expect(rejected.success).toBe(false);
+    const turnStart = await waitForRequest(connection, 'turn/start');
+    expect(turnInputText(turnStart.params)).toContain('192.168.31.93');
+    expect(turnInputText(turnStart.params)).toContain('"terminalHistory": "disabled"');
+    for (const tool of ['terminal_read', 'terminal_state']) {
+      const rejected = asRecord(await connection.invoke('item/tool/call', {
+        threadId: 'thread-new', turnId: 'turn-1', callId: `${tool}-disabled`,
+        tool, arguments: {},
+      }));
+      expect(rejected.success).toBe(false);
+    }
     completeTurn(connection);
     await expect(resultPromise).resolves.toMatchObject({ status: 'completed' });
+  });
+
+  it('injects local terminal metadata without leaking extra sensitive fields', async () => {
+    const connection = new FakeConnection();
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));
+    const tools = createTools();
+    vi.mocked(tools.getTerminalState).mockResolvedValue({
+      transport: 'local',
+      target: { label: 'PowerShell', password: 'nested-secret' },
+      cwd: 'C:\\Users\\tester\\project',
+      effectiveUser: 'tester',
+      shellKind: 'powershell',
+      connectionState: 'connected',
+      hostId: 'must-not-leak',
+      password: 'super-secret',
+    } as never);
+    runner.attach(connection);
+
+    const resultPromise = runner.run(createInput({ tools, terminalContextAccess: false }));
+    const turnStart = await waitForRequest(connection, 'turn/start');
+    const serialized = turnInputText(turnStart.params);
+    expect(serialized).toContain('PowerShell');
+    expect(serialized).toContain('C:\\\\Users\\\\tester\\\\project');
+    expect(serialized).toContain('independent local workspace');
+    expect(serialized).not.toContain('must-not-leak');
+    expect(serialized).not.toContain('super-secret');
+    expect(serialized).not.toContain('nested-secret');
+    completeTurn(connection);
+    await expect(resultPromise).resolves.toMatchObject({ status: 'completed' });
+  });
+
+  it('refreshes the terminal cwd for every resumed turn', async () => {
+    const connection = new FakeConnection();
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));
+    const tools = createTools();
+    const getTerminalState = vi.mocked(tools.getTerminalState);
+    runner.attach(connection);
+
+    const first = runner.run(createInput({ tools, threadId: 'thread-existing' }));
+    await vi.waitFor(() => {
+      expect(connection.requests.filter(({ method }) => method === 'turn/start')).toHaveLength(1);
+    });
+    const firstTurn = connection.requests.filter(({ method }) => method === 'turn/start')[0];
+    expect(turnInputText(firstTurn.params)).toContain('/home/zjn/project');
+    completeTurn(connection, 'thread-existing');
+    await expect(first).resolves.toMatchObject({ status: 'completed' });
+
+    getTerminalState.mockResolvedValue({
+      transport: 'ssh',
+      target: {
+        label: 'Ubuntu VM', hostname: '192.168.31.93', port: 22, username: 'zjn',
+      },
+      cwd: '/srv/updated',
+      effectiveUser: 'root',
+      shellKind: 'posix',
+      connectionState: 'connected',
+    });
+    const second = runner.run(createInput({ tools, threadId: 'thread-existing' }));
+    await vi.waitFor(() => {
+      expect(connection.requests.filter(({ method }) => method === 'turn/start')).toHaveLength(2);
+    });
+    const secondTurn = connection.requests.filter(({ method }) => method === 'turn/start')[1];
+    expect(turnInputText(secondTurn.params)).toContain('/srv/updated');
+    expect(turnInputText(secondTurn.params)).toContain('root');
+    completeTurn(connection, 'thread-existing');
+    await expect(second).resolves.toMatchObject({ status: 'completed' });
   });
 
   it('accepts native command/file approvals without visible-terminal lockout', async () => {

@@ -74,8 +74,27 @@ export interface CodexAgentIsolationState {
 export interface CodexTerminalContextAccessState {
   available: boolean;
   enabled: boolean;
-  acceptedClientTools: Array<'terminal_read'>;
+  acceptedClientTools: Array<'terminal_state' | 'terminal_read'>;
   reason: string;
+}
+
+/**
+ * Non-secret identity and shell metadata for the user's currently selected
+ * visible terminal. This is deliberately separate from the local workspace in
+ * which Codex App Server runs its built-in Shell/File tools.
+ */
+export interface CodexVisibleTerminalContext {
+  transport: 'local' | 'ssh';
+  target: {
+    label: string;
+    hostname?: string;
+    port?: number;
+    username?: string;
+  };
+  cwd?: string;
+  effectiveUser?: string;
+  shellKind: 'powershell' | 'cmd' | 'wsl' | 'git-bash' | 'posix';
+  connectionState: 'connected' | 'disconnected';
 }
 
 export type CodexPendingLogin =

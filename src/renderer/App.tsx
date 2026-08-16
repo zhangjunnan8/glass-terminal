@@ -738,8 +738,8 @@ export function App() {
     await runCodexAction(
       () => window.aiTerminal.codexAppServer.setTerminalContextAccess({ enabled }),
       enabled
-        ? '已允许 Codex 以只读方式获取当前可见终端的近期内容。'
-        : '已关闭 Codex 对当前终端内容的读取权限。',
+        ? '已允许 Codex 只读刷新当前终端状态并读取近期内容。'
+        : '已关闭终端状态刷新与内容读取；每轮仍会提供非敏感的终端身份。',
     );
   }
 
@@ -2229,9 +2229,9 @@ export function App() {
             >
               <strong>Codex App Server · 原生模式</strong>
               <p>{codexAgentAvailable
-                ? `Codex 的内建 Shell/File 在应用独立工作区内执行，不与当前 SSH/本地 Shell 共用。${codexTerminalContextAccess?.enabled
-                  ? '已允许它只读获取当前终端的近期内容。'
-                  : '当前未允许它读取终端内容。'}当前终端始终由你控制。`
+                ? `Codex 的内建 Shell/File 在应用独立工作区内执行，不与当前 SSH/本地 Shell 共用。每轮都会告诉它当前终端的类型、目标、目录和用户。${codexTerminalContextAccess?.enabled
+                  ? '已额外允许它只读刷新状态并获取近期内容。'
+                  : '当前未允许它刷新状态或读取终端内容。'}当前终端始终由你控制。`
                 : selectedAgentBackendStatus}</p>
               <button data-action="open-codex-agent-settings" onClick={openAgentBackendSettings}>
                 打开 App Server 设置
@@ -2243,7 +2243,7 @@ export function App() {
               <div className="agent-glyph">✦</div>
               <strong>理解终端上下文的 AI 助手</strong>
               <p>{codexBackendSelected
-                ? 'Codex 使用应用独立工作区完成任务；只有开启读取权限后，它才能获取当前终端的近期文本。'
+                ? 'Codex 使用应用独立工作区完成任务；它会知道当前终端的身份，开启读取权限后还能获取近期文本。'
                 : '智能体会读取当前会话，并在向这个可见终端发送每条命令前请求你的批准。'}</p>
               <div className="guardrail"><span>✓</span> {codexBackendSelected
                 ? '当前终端始终由你控制'
@@ -3118,8 +3118,9 @@ export function App() {
                     </p>
                     <ul>
                       <li>当前终端始终由你控制；Codex 原生模式不提供任何终端控制功能。</li>
-                      <li>开启这个开关只会提供 <code>terminal_read</code>，让 Codex 读取当前可见终端的近期文本；它不能向终端写入或执行命令。</li>
-                      <li>关闭读取权限后，Codex 仍可以在自己的独立工作区中工作。</li>
+                      <li>AI Terminal 每轮都会提供当前终端的类型、目标、目录、有效用户和 Shell；不包含密码或凭据引用。</li>
+                      <li>开启这个开关会额外提供 <code>terminal_state</code> 和 <code>terminal_read</code>，用于只读刷新状态和读取近期文本；不能向终端写入或执行命令。</li>
+                      <li>关闭后，Codex 仍知道每轮开始时绑定的终端身份，并可在自己的独立工作区中工作。</li>
                     </ul>
                   </div>
 

@@ -372,7 +372,7 @@ describe('CodexAppServerService', () => {
       agentAvailable: true,
       terminalContextAccess: {
         enabled: true,
-        acceptedClientTools: ['terminal_read'],
+        acceptedClientTools: ['terminal_state', 'terminal_read'],
       },
       agentIsolation: {
         enforcement: 'codex-native-workspace-write',

@@ -81,10 +81,10 @@ function codexSnapshot(contextEnabled = false, revision = 1): CodexAppServerSnap
     terminalContextAccess: {
       available: true,
       enabled: contextEnabled,
-      acceptedClientTools: contextEnabled ? ['terminal_read'] : [],
+      acceptedClientTools: contextEnabled ? ['terminal_state', 'terminal_read'] : [],
       reason: contextEnabled
-        ? '已允许 Codex 以只读方式获取当前可见终端的近期内容。'
-        : 'Codex 使用独立工作区，当前不能读取可见终端内容。',
+        ? '已允许 Codex 以只读方式获取当前可见终端的状态和近期内容。'
+        : 'Codex 使用独立工作区；仍有每轮终端身份，但不能刷新状态或读取内容。',
     },
     // Deliberately false/unavailable: renderer readiness must use the native fields above.
     terminalAgentEnabled: false,

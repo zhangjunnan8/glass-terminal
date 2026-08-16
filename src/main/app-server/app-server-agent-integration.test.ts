@@ -173,10 +173,13 @@ class FakeSessions {
     hostId: 'host',
     shellProfileId: 'ssh:host',
     shellKind: 'posix',
-    targetSnapshot: { label: 'Test', username: 'tester' },
+    targetSnapshot: {
+      label: 'Test', hostname: '192.168.31.93', port: 22, username: 'tester',
+    },
     connectionState: 'connected',
     status: 'active',
     runtimeTerminalId: TERMINAL_ID,
+    cwd: '/home/tester/project',
     effectiveUser: 'tester',
     pinned: false,
     preludeTruncated: false,
@@ -189,6 +192,10 @@ class FakeSessions {
   };
 
   upgrade(): SessionRecord {
+    return this.session;
+  }
+
+  sessionForTerminal(): SessionRecord {
     return this.session;
   }
 
@@ -696,6 +703,19 @@ describe('Codex App Server Agent integration', () => {
     }));
     expect(read.success).toBe(true);
     expect(JSON.stringify(read)).toContain('visible-history-canary');
+
+    const state = asRecord(await connection.invoke('item/tool/call', {
+      threadId: PROVIDER_THREAD_ID,
+      turnId,
+      callId: 'read-visible-state',
+      tool: 'terminal_state',
+      arguments: {},
+    }));
+    expect(state.success).toBe(true);
+    expect(JSON.stringify(state)).toContain('192.168.31.93');
+    expect(JSON.stringify(state)).toContain('/home/tester/project');
+    expect(JSON.stringify(state)).toContain('local ');
+    expect(JSON.stringify(state)).toContain('App Server process');
 
     const execute = asRecord(await connection.invoke('item/tool/call', {
       threadId: PROVIDER_THREAD_ID,

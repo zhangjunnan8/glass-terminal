@@ -82,10 +82,13 @@ class FakeSessions {
     hostId: 'host',
     shellProfileId: 'ssh:host',
     shellKind: 'posix',
-    targetSnapshot: { label: 'Test', username: 'tester' },
+    targetSnapshot: {
+      label: 'Test', hostname: '192.168.31.93', port: 22, username: 'tester',
+    },
     connectionState: 'connected',
     status: 'active',
     runtimeTerminalId: 'terminal',
+    cwd: '/home/tester/project',
     effectiveUser: 'tester',
     pinned: false,
     preludeTruncated: false,
@@ -152,7 +155,7 @@ class FakeCodexAppServer {
       terminalContextAccess: {
         available: true,
         enabled: true,
-        acceptedClientTools: ['terminal_read'],
+        acceptedClientTools: ['terminal_state', 'terminal_read'],
         reason: 'allowed',
       },
       terminalAgentEnabled: true,
@@ -194,7 +197,7 @@ class DeferredStreamingCodexAppServer {
       terminalContextAccess: {
         available: true,
         enabled: true,
-        acceptedClientTools: ['terminal_read'],
+        acceptedClientTools: ['terminal_state', 'terminal_read'],
         reason: 'allowed',
       },
       terminalAgentEnabled: true,
@@ -613,6 +616,51 @@ describe('AgentService shared-terminal controls', () => {
     codex.finish('done');
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
     expect(terminals.controlModes).toEqual([]);
+  });
+
+  it('reads fresh non-secret Session metadata for native Codex terminal state', async () => {
+    const codex = new DeferredStreamingCodexAppServer();
+    const sessions = new FakeSessions();
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      () => { throw new Error('Generic Provider must not be used.'); },
+      codex as unknown as CodexAppServerService,
+    );
+
+    service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Inspect the current SSH terminal.',
+      backend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      },
+    });
+    await waitFor(() => Boolean(codex.input));
+
+    sessions.session = {
+      ...sessions.session,
+      cwd: '/srv/latest',
+      effectiveUser: 'root',
+      connectionState: 'disconnected',
+    };
+    const state = await codex.input!.tools.getTerminalState();
+    expect(state).toEqual({
+      transport: 'ssh',
+      target: {
+        label: 'Test', hostname: '192.168.31.93', port: 22, username: 'tester',
+      },
+      cwd: '/srv/latest',
+      effectiveUser: 'root',
+      shellKind: 'posix',
+      connectionState: 'disconnected',
+    });
+    expect(state).not.toHaveProperty('hostId');
+
+    codex.finish('state read');
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
   });
 
   it('publishes partial Generic Provider output and finalizes one persisted chat item', async () => {

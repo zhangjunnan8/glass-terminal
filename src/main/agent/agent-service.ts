@@ -26,7 +26,8 @@ import type {
   TerminalInputMode,
 } from '../../shared/agent';
 import type { ProviderProfile } from '../../shared/provider';
-import type { SessionAuditEvent } from '../../shared/session';
+import type { CodexVisibleTerminalContext } from '../../shared/codex-app-server';
+import type { SessionAuditEvent, SessionRecord } from '../../shared/session';
 import type { ProviderStore } from '../providers/provider-store';
 import type { SessionManager } from '../sessions/session-manager';
 import type { TerminalService } from '../terminal/terminal-service';
@@ -146,6 +147,28 @@ function codexPromptWithLocalHistory(
     '当前用户消息：',
     prompt,
   ].join('\n');
+}
+
+function codexVisibleTerminalContext(session: SessionRecord): CodexVisibleTerminalContext {
+  return {
+    transport: session.transport,
+    target: {
+      label: session.targetSnapshot.label,
+      ...(session.targetSnapshot.hostname
+        ? { hostname: session.targetSnapshot.hostname }
+        : {}),
+      ...(session.targetSnapshot.port !== undefined
+        ? { port: session.targetSnapshot.port }
+        : {}),
+      ...(session.targetSnapshot.username
+        ? { username: session.targetSnapshot.username }
+        : {}),
+    },
+    ...(session.cwd ? { cwd: session.cwd } : {}),
+    ...(session.effectiveUser ? { effectiveUser: session.effectiveUser } : {}),
+    shellKind: session.shellKind,
+    connectionState: session.connectionState,
+  };
 }
 
 function safeChatItem(value: unknown): AgentChatItem | undefined {
@@ -952,6 +975,12 @@ export class AgentService {
 
     let streamedMessage: AgentChatItem | undefined;
     try {
+      const boundSession = this.sessions.sessionForTerminal(
+        runtime.owner,
+        runtime.terminalId,
+      );
+      if (!boundSession) throw new Error('当前终端没有可用的持久会话上下文。');
+      let lastKnownTerminalContext = codexVisibleTerminalContext(boundSession);
       const upstreamPrompt = codexPromptWithLocalHistory(
         runtime.messages,
         prompt,
@@ -968,6 +997,25 @@ export class AgentService {
           readTerminal: async ({ maxChars }) => (
             this.sessions.readTerminalHistory(runtime.sessionId).slice(-maxChars)
           ),
+          getTerminalState: async () => {
+            try {
+              const latestSession = this.sessions.sessionForTerminal(
+                runtime.owner,
+                runtime.terminalId,
+              );
+              if (latestSession) {
+                lastKnownTerminalContext = codexVisibleTerminalContext(latestSession);
+                return lastKnownTerminalContext;
+              }
+            } catch {
+              // A terminal may close between the user message and a state read.
+            }
+            return {
+              ...lastKnownTerminalContext,
+              target: { ...lastKnownTerminalContext.target },
+              connectionState: 'disconnected',
+            };
+          },
         },
         onThreadBound: (threadId) => {
           if (!this.isCurrentTurn(runtime, token)) {
