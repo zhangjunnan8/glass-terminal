@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { ToolGateway } from '../../shared/tools';
 import type {
@@ -76,6 +78,30 @@ class SequencedProvider implements AgentProviderRuntime {
 }
 
 describe('GenericHarnessBackend', () => {
+  it('keeps shell, filesystem, SSH, and SFTP dependencies behind the injected gateway', () => {
+    const source = readFileSync(
+      resolve(process.cwd(), 'src/main/agent/generic-harness-backend.ts'),
+      'utf8',
+    );
+    const moduleSpecifiers = [...new Set([
+      ...source.matchAll(/\bfrom\s+['"]([^'"]+)['"]/gu),
+      ...source.matchAll(/\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/gu),
+      ...source.matchAll(/\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)/gu),
+    ].map((match) => match[1]))].sort();
+
+    expect(moduleSpecifiers).toEqual([
+      '../../shared/tools',
+      './agent-backend',
+      './agent-loop',
+    ]);
+    expect(source).not.toMatch(
+      /\b(?:TerminalService|LocalFilesystemBackend|RemoteFilesystemProvider|SftpRemoteFilesystem|SFTPWrapper)\b/u,
+    );
+    expect(source).not.toMatch(
+      /\bprocess\.env\.(?:COMSPEC|ComSpec|SHELL)\b|\bcmd\.exe\b|\bpowershell(?:\.exe)?\b|\/bin\/sh/u,
+    );
+  });
+
   it('creates a thread and uses only the ToolGateway explicitly injected for that turn', async () => {
     const provider = new SequencedProvider([
       { message: { role: 'assistant', content: null, toolCalls: [{

@@ -23,6 +23,18 @@ function posixQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
+function escapeTerminalControls(value: string): string {
+  return value.replace(
+    /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/gu,
+    (character) => {
+      const codePoint = character.charCodeAt(0);
+      const width = codePoint <= 0xff ? 2 : 4;
+      const prefix = codePoint <= 0xff ? 'x' : 'u';
+      return `\\${prefix}${codePoint.toString(16).padStart(width, '0').toUpperCase()}`;
+    },
+  );
+}
+
 export function buildCommandEnvelope(
   shellKind: ShellProfile['kind'],
   command: string,
@@ -31,15 +43,21 @@ export function buildCommandEnvelope(
   const [first, second] = splitNonce(nonce);
   if (shellKind === 'powershell') {
     const encodedCommand = Buffer.from(command, 'utf16le').toString('base64');
+    const encodedDisplay = Buffer
+      .from(`$ ${escapeTerminalControls(command)}`, 'utf16le')
+      .toString('base64');
     const startMarker = `\x1eAI:${nonce}:START\x1f`;
     const endPrefix = `\x1eAI:${nonce}:END:`;
     const input = [
       `$__ait_a='${first}'`,
       `$__ait_b='${second}'`,
+      `$__ait_cmd=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedCommand}'))`,
+      `$__ait_display=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedDisplay}'))`,
+      '[Console]::WriteLine($__ait_display)',
       "[Console]::WriteLine(([char]30)+'AI:'+$__ait_a+$__ait_b+':START'+[char]31)",
       '$global:LASTEXITCODE=0',
       '$__ait_ok=$true',
-      `try { . ([ScriptBlock]::Create([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedCommand}')))); $__ait_ok=$? } catch { Write-Error $_; $__ait_ok=$false }`,
+      'try { . ([ScriptBlock]::Create($__ait_cmd)); $__ait_ok=$? } catch { Write-Error $_; $__ait_ok=$false }',
       '$__ait_ec=if($__ait_ok){[int]$LASTEXITCODE}elseif($LASTEXITCODE -ne 0){[int]$LASTEXITCODE}else{1}',
       "[Console]::WriteLine(([char]30)+'AI:'+$__ait_a+$__ait_b+':END:'+$__ait_ec+[char]31)",
     ].join(';');

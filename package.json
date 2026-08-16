@@ -12,6 +12,7 @@
     "test": "vitest run",
     "test:ssh": "vitest run src/main/terminal/ssh-integration.test.ts",
     "test:sftp": "vitest run src/main/sftp/sftp-integration.test.ts",
+    "test:agent:ssh": "vitest run src/main/agent/agent-workspace-ssh.integration.test.ts",
     "build:renderer": "vite build",
     "build:electron": "tsup",
     "build": "npm run typecheck && npm test && npm run build:renderer && npm run build:electron",
