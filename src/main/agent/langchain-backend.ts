@@ -41,7 +41,7 @@ import type { ProviderStore } from '../providers/provider-store';
 
 const MAX_BACKEND_THREAD_ID_CHARS = 256;
 const MAX_HARNESS_ROUNDS = 64;
-const DEFAULT_MAX_ROUNDS = 12;
+const DEFAULT_MAX_ROUNDS = 40;
 
 interface LangChainThreadRecord {
   handle: AgentBackendThread;
@@ -373,6 +373,11 @@ export class LangChainBackend implements AgentBackend {
       }
 
       throwIfCancelled(controller.signal);
+      if (rounds >= this.maxRounds) {
+        throw new Error(
+          `Agent 超出 ${this.maxRounds} 轮安全上限。请拆分任务、减少单次修改的文件数，或分多轮继续。`,
+        );
+      }
       record.priorMessages = cloneMessages(
         transcript.filter((message) => message.role !== 'system'),
       );
