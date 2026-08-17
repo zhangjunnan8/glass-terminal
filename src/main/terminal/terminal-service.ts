@@ -177,9 +177,11 @@ export class TerminalService {
       let observedFingerprint = '';
       let settled = false;
       let exitCode = 0;
+      let authTimeout: ReturnType<typeof setTimeout> | undefined;
       const banners: string[] = [];
 
       const fail = (error: Error) => {
+        if (authTimeout) clearTimeout(authTimeout);
         if (settled) {
           this.emitData(terminalId, `\r\n\x1b[31m[SSH error: ${error.message}]\x1b[0m\r\n`);
           this.emitExit(terminalId, 255);
@@ -211,6 +213,7 @@ export class TerminalService {
       });
       client.on('error', fail);
       client.once('ready', () => {
+        if (authTimeout) clearTimeout(authTimeout);
         const terminalOptions: PseudoTtyOptions = {
           term: 'xterm-256color',
           cols: Math.max(2, request.cols ?? 80),
@@ -257,6 +260,12 @@ export class TerminalService {
         });
       });
 
+      authTimeout = setTimeout(() => {
+        fail(new Error(
+          'SSH 认证超时：服务器未在 25 秒内完成认证。'
+          + '若该主机仅允许私钥连接，请将认证方式改为“私钥”并选择私钥文件。',
+        ));
+      }, 25_000);
       try {
         client.connect(this.sshConfig(host, request, (key) => {
           const digest = createHash('sha256').update(key).digest('base64').replace(/=+$/, '');
