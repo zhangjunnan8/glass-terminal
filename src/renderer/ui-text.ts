@@ -128,3 +128,21 @@ export const executionStatusLabel = (status: CommandExecutionStatus) => executio
 export const transferStatusLabel = (status: TransferStatus) => transferStatusLabels[status];
 export const authMethodLabel = (method: SshAuthMethod) => authMethodLabels[method];
 export const roleLabel = (role: AgentChatItem['role']) => roleLabels[role];
+
+/** Locale-independent wall-clock time, e.g. "14:02:31". */
+export function formatClock(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  const pad = (value: number) => String(value).padStart(2, '0');
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+
+/** Compact duration label for a single turn or command, e.g. "12.4 秒". */
+export function formatDuration(milliseconds: number): string {
+  if (!Number.isFinite(milliseconds) || milliseconds < 0) return '';
+  if (milliseconds < 1000) return `${Math.round(milliseconds)} 毫秒`;
+  if (milliseconds < 60_000) return `${(milliseconds / 1000).toFixed(1)} 秒`;
+  const minutes = Math.floor(milliseconds / 60_000);
+  const seconds = Math.round((milliseconds % 60_000) / 1000);
+  return `${minutes} 分 ${seconds} 秒`;
+}

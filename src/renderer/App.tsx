@@ -64,6 +64,8 @@ import {
   codexPlanTypeLabel,
   codexReasoningEffortLabel,
   executionStatusLabel,
+  formatClock,
+  formatDuration,
   providerStatusLabel,
   roleLabel,
   sessionStatusLabel,
@@ -247,6 +249,7 @@ export function App() {
   const [agentBackendChoices, setAgentBackendChoices] = useState<Record<string, AgentBackendKind>>({});
   const [agentUpdatesBelow, setAgentUpdatesBelow] = useState(false);
   const [agentPanelVisible, setAgentPanelVisible] = useState(true);
+  const [agentControlsExpanded, setAgentControlsExpanded] = useState(true);
   const [agentPanelWidth, setAgentPanelWidth] = useState(390);
   const [agentPrompt, setAgentPrompt] = useState('');
   const [editingAgentMessageId, setEditingAgentMessageId] = useState<string | null>(null);
@@ -2293,39 +2296,51 @@ export function App() {
           <div className="agent-heading">
             <div className="agent-heading-title-row">
               <strong>AI 智能体</strong>
-              <button
-                type="button"
-                title="隐藏 AI 栏"
-                aria-label="隐藏 AI 栏"
-                data-action="hide-agent-panel"
-                onClick={() => setAgentPanelVisible(false)}
-              >×</button>
+              <span className="agent-heading-actions">
+                <button
+                  type="button"
+                  title={agentControlsExpanded ? '收起智能体设置' : '展开智能体设置'}
+                  aria-label={agentControlsExpanded ? '收起智能体设置' : '展开智能体设置'}
+                  aria-expanded={agentControlsExpanded}
+                  data-action="toggle-agent-controls"
+                  onClick={() => setAgentControlsExpanded((current) => !current)}
+                >⚙</button>
+                <button
+                  type="button"
+                  title="隐藏 AI 栏"
+                  aria-label="隐藏 AI 栏"
+                  data-action="hide-agent-panel"
+                  onClick={() => setAgentPanelVisible(false)}
+                >×</button>
+              </span>
             </div>
-            <label className="agent-backend-picker">
-              <span>当前智能体后端</span>
-              <select
-                aria-describedby="agent-backend-status"
-                data-testid="agent-backend-select"
-                data-backend-kind={selectedAgentBackendKind}
-                value={selectedAgentBackendKind}
-                disabled={!activeTab || composerBlocked || activeAgent?.fullTakeover}
-                onChange={(event) => {
-                  if (!activeTab) return;
-                  const kind = event.target.value as AgentBackendKind;
-                  setAgentBackendChoices((current) => ({
-                    ...current,
-                    [activeTab.id]: kind,
-                  }));
-                }}
-              >
-                <option value="generic-provider">
-                  默认 Provider{defaultProvider ? ` · ${defaultProvider.name}` : '（未配置）'}
-                </option>
-                <option value={CODEX_APP_SERVER_AGENT_BACKEND}>
-                  Codex App Server · 原生模式
-                </option>
-              </select>
-            </label>
+            {agentControlsExpanded && (
+              <label className="agent-backend-picker">
+                <span>当前智能体后端</span>
+                <select
+                  aria-describedby="agent-backend-status"
+                  data-testid="agent-backend-select"
+                  data-backend-kind={selectedAgentBackendKind}
+                  value={selectedAgentBackendKind}
+                  disabled={!activeTab || composerBlocked || activeAgent?.fullTakeover}
+                  onChange={(event) => {
+                    if (!activeTab) return;
+                    const kind = event.target.value as AgentBackendKind;
+                    setAgentBackendChoices((current) => ({
+                      ...current,
+                      [activeTab.id]: kind,
+                    }));
+                  }}
+                >
+                  <option value="generic-provider">
+                    默认 Provider{defaultProvider ? ` · ${defaultProvider.name}` : '（未配置）'}
+                  </option>
+                  <option value={CODEX_APP_SERVER_AGENT_BACKEND}>
+                    Codex App Server · 原生模式
+                  </option>
+                </select>
+              </label>
+            )}
             <span
               id="agent-backend-status"
               className={`agent-backend-status ${selectedAgentBackendReady ? 'ready' : 'unavailable'}`}
@@ -2333,7 +2348,7 @@ export function App() {
               role="status"
             >{selectedAgentBackendStatus}</span>
           </div>
-          {!codexBackendSelected && (
+          {agentControlsExpanded && !codexBackendSelected && (
             <div className="agent-controls">
               <label
                 className="agent-file-access-picker"
@@ -2505,7 +2520,7 @@ export function App() {
               )}
             </div>
           )}
-          {activeAgent?.messages.map((message) => {
+          {activeAgent?.messages.map((message, index) => {
             const latestUser = message.role === 'user' && message.id === latestUserMessage?.id;
             const latestUserRunning = latestUser && (
               agentTurnBusy(activeAgent.state)
@@ -2514,9 +2529,20 @@ export function App() {
             );
             const interruptAlreadyRequested = foregroundRunning
               && Boolean(activeAgent.activeExecution?.interruptRequestedAt);
+            const previousMessage = activeAgent.messages[index - 1];
+            const turnDurationMs = message.role === 'assistant'
+              && previousMessage?.role === 'user'
+              ? new Date(message.createdAt).getTime() - new Date(previousMessage.createdAt).getTime()
+              : undefined;
             return (
             <article className={`agent-message ${message.role}`} key={message.id}>
-              <span>{roleLabel(message.role)}</span>
+              <span className="agent-message-role">
+                {roleLabel(message.role)}
+                <time className="agent-message-time">{formatClock(message.createdAt)}</time>
+                {turnDurationMs !== undefined && turnDurationMs >= 0 && (
+                  <small className="agent-message-duration">{formatDuration(turnDurationMs)}</small>
+                )}
+              </span>
               <Suspense fallback={<p className="agent-plain-message">{message.content}</p>}>
                 <AgentMessageContent
                   role={message.role}
