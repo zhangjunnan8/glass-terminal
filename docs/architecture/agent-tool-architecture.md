@@ -119,6 +119,27 @@ reset, clean, stash, apply, hooks, or configuration changes—continues to run a
 a visible terminal command through the normal approval path. Until such a
 read-only facade exists, Git commands use the terminal.
 
+## LangChain harness (implemented)
+
+`src/main/agent/langchain-backend.ts` is the concrete `AgentBackend` used for the
+Generic Provider path (`index.ts` wires it through `LangChainProviderModelFactory`).
+It replaces the in-house `AgentLoop` while keeping every boundary below it intact.
+
+- The model transport is `ChatOpenAICompletions` (any OpenAI-compatible endpoint;
+  DeepSeek, GLM, MiniMax, OpenAI all use the same `baseURL` mechanism). The model
+  is built lazily from the app's `ProviderStore` so the API key stays in the
+  secret store and the recipient revision is fenced, matching `GenericOpenAiProvider`.
+- Tool schemas are derived only from the per-turn `ToolGateway`. LangChain's own
+  Shell/LocalShell/ApplyPatch tools are never imported; `terminal_execute` and
+  `workspace_*` are the only tools the model can call. Workspace tool exposure is
+  gated by `fileAccessMode` (off / read-only / read-write) with `PolicyWorkspaceTool`
+  remaining the authoritative per-call enforcement.
+- Responses stream over SSE (`assistant_delta` → `assistant_text`), preserving the
+  renderer streaming contract and the smoke tests. Tool calls are aggregated from
+  streamed chunks via `collapseToolCallChunks`.
+- The harness owns no PTY, SSH, SFTP, or filesystem client; those remain under
+  `TerminalService` and `AgentFileService`, reachable only through `ToolGateway`.
+
 ## Known large-workspace limits
 
 Search and glob have bounded depth, visited-file count, bytes read, result count,

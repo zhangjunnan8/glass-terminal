@@ -147,6 +147,11 @@ React renderer + xterm.js
   - `ensureRuntime()`：Terminal/Session/AI thread/backend 绑定与恢复。
 - `src/main/agent/agent-loop.ts`：tool schema、最多 12 rounds、结果路由和历史压缩。
 - `src/main/agent/generic-provider.ts`：OpenAI-compatible `/chat/completions` + SSE 解析与容量门禁。
+- `src/main/agent/langchain-backend.ts`：**生产默认的 Generic Harness**（`index.ts` 经
+  `LangChainProviderModelFactory` 接线），用 LangChain.js 的 `ChatOpenAICompletions` 跑调用循环；
+  工具仍全部来自 `ToolGateway`，LangChain 自带 shell/file 工具从不注册。SSE 流式、模型懒加载
+  （API key 留在 secret store、recipient revision 栅栏）。`agent-loop.ts`/`generic-provider.ts`
+  保留为兼容/测试路径。
 - `src/main/providers/provider-store.ts`：Provider CRUD、HTTPS/URL 校验、`/models`、Ready 状态。
 - `src/shared/provider-templates.ts`：内置 API 模板。
 
