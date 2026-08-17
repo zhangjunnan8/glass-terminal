@@ -9,6 +9,8 @@ import {
   codexAppServerPhaseLabel,
   codexPlanTypeLabel,
   codexReasoningEffortLabel,
+  formatClock,
+  formatDuration,
   roleLabel,
   sessionStatusLabel,
   transferStatusLabel,
@@ -32,5 +34,14 @@ describe('Chinese UI labels', () => {
     expect(transferStatusLabel('running')).toBe('传输中');
     expect(authMethodLabel('private-key')).toBe('私钥');
     expect(roleLabel('user')).toBe('用户');
+  });
+
+  it('formats wall-clock time and turn durations', () => {
+    expect(formatClock('2026-08-15T14:02:31.000Z')).toMatch(/^\d{2}:\d{2}:\d{2}$/);
+    expect(formatClock('not-a-date')).toBe('');
+    expect(formatDuration(250)).toBe('250 毫秒');
+    expect(formatDuration(12_400)).toBe('12.4 秒');
+    expect(formatDuration(75_000)).toBe('1 分 15 秒');
+    expect(formatDuration(-1)).toBe('');
   });
 });
