@@ -252,6 +252,19 @@ handleTrusted(HOST_CHANNELS.remove, (_event, hostId: string) => (
 handleTrusted(HOST_CHANNELS.forgetCredential, (_event, hostId: string) => (
   requireHostService().forgetCredential(hostId)
 ));
+handleTrusted(HOST_CHANNELS.choosePrivateKeyPath, async (event) => {
+  const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!ownerWindow) throw new Error('无法打开私钥文件选择窗口。');
+  const selection = await dialog.showOpenDialog(ownerWindow, {
+    title: '选择 SSH 私钥文件',
+    properties: ['openFile'],
+    filters: [
+      { name: 'SSH 私钥', extensions: ['pem', 'key', 'ppk', '*'] },
+    ],
+  });
+  if (selection.canceled || !selection.filePaths[0]) return null;
+  return selection.filePaths[0];
+});
 handleTrusted(HOST_CHANNELS.listFolders, () => requireHostService().listFolders());
 handleTrusted(
   HOST_CHANNELS.createFolder,

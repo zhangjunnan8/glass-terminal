@@ -185,6 +185,7 @@ export const HOST_CHANNELS = {
   remove: 'host:remove',
   forgetCredential: 'host:forget-credential',
   connect: 'terminal:connect-ssh',
+  choosePrivateKeyPath: 'host:choose-private-key',
   listFolders: 'host-folder:list',
   createFolder: 'host-folder:create',
   renameFolder: 'host-folder:rename',

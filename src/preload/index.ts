@@ -55,6 +55,7 @@ const hostBridge: DesktopBridge['hosts'] = {
   save: (input) => ipcRenderer.invoke(HOST_CHANNELS.save, input),
   remove: (hostId) => ipcRenderer.invoke(HOST_CHANNELS.remove, hostId),
   forgetCredential: (hostId) => ipcRenderer.invoke(HOST_CHANNELS.forgetCredential, hostId),
+  choosePrivateKeyPath: () => ipcRenderer.invoke(HOST_CHANNELS.choosePrivateKeyPath),
   listFolders: () => ipcRenderer.invoke(HOST_CHANNELS.listFolders),
   createFolder: (request) => ipcRenderer.invoke(HOST_CHANNELS.createFolder, request),
   renameFolder: (request) => ipcRenderer.invoke(HOST_CHANNELS.renameFolder, request),

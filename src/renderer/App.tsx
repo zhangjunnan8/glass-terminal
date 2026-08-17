@@ -12,6 +12,7 @@ import {
   type HostInput,
   type HostProfile,
   type HostProtocol,
+  type SshAuthMethod,
 } from '../shared/host';
 import type { RuntimeInfo } from '../shared/ipc';
 import { PRODUCT_NAME } from '../shared/product';
@@ -254,6 +255,8 @@ export function App() {
   const [editedApprovalCommand, setEditedApprovalCommand] = useState('');
   const [editingHost, setEditingHost] = useState<HostProfile | null | undefined>(undefined);
   const [editingHostProtocol, setEditingHostProtocol] = useState<HostProtocol>('ssh');
+  const [hostFormAuthMethod, setHostFormAuthMethod] = useState<SshAuthMethod>('password');
+  const [hostFormPrivateKeyPath, setHostFormPrivateKeyPath] = useState('');
   const [connectingHost, setConnectingHost] = useState<HostProfile | null>(null);
   const [reconnectingSessionId, setReconnectingSessionId] = useState<string | null>(null);
   const [renamingSession, setRenamingSession] = useState<SessionRecord | null>(null);
@@ -1354,7 +1357,18 @@ export function App() {
   function openHostEditor(host: HostProfile | null) {
     setConnectionError(null);
     setEditingHostProtocol('ssh');
+    setHostFormAuthMethod(host?.authMethod ?? 'password');
+    setHostFormPrivateKeyPath(host?.privateKeyPath ?? '');
     setEditingHost(host);
+  }
+
+  async function choosePrivateKeyFile() {
+    try {
+      const path = await window.aiTerminal.hosts.choosePrivateKeyPath();
+      if (path) setHostFormPrivateKeyPath(path);
+    } catch (error) {
+      setConnectionError(errorMessage(error));
+    }
   }
 
   function openHostFolderDialog(mode: HostFolderDialog['mode'], folder?: HostFolder) {
@@ -1505,8 +1519,10 @@ export function App() {
       hostname: String(data.get('hostname') ?? ''),
       port: Number(data.get('port') ?? 22),
       username: String(data.get('username') ?? ''),
-      authMethod: String(data.get('authMethod') ?? 'password') as HostInput['authMethod'],
-      privateKeyPath: String(data.get('privateKeyPath') ?? ''),
+      authMethod: hostFormAuthMethod,
+      privateKeyPath: hostFormAuthMethod === 'private-key'
+        ? hostFormPrivateKeyPath
+        : undefined,
       folderId: String(data.get('folderId') ?? '') || null,
       favorite: data.get('favorite') === 'on',
     };
@@ -2834,14 +2850,31 @@ export function App() {
                 <label>端口<input name="port" type="number" min="1" max="65535" required defaultValue={editingHost?.port ?? 22} /></label>
                 <label>用户名<input name="username" required defaultValue={editingHost?.username ?? ''} /></label>
                 <label className="span-2">认证方式
-                  <select name="authMethod" defaultValue={editingHost?.authMethod ?? 'password'}>
+                  <select
+                    name="authMethod"
+                    value={hostFormAuthMethod}
+                    onChange={(event) => setHostFormAuthMethod(event.target.value as SshAuthMethod)}
+                  >
                     <option value="password">用户名和密码</option>
                     <option value="keyboard-interactive">键盘交互认证</option>
                     <option value="private-key">私钥</option>
                     <option value="agent">Windows OpenSSH / Pageant 代理</option>
                   </select>
                 </label>
-                <label className="span-2">私钥路径（使用私钥时）<input name="privateKeyPath" defaultValue={editingHost?.privateKeyPath ?? ''} /></label>
+                {hostFormAuthMethod === 'private-key' && (
+                  <div className="span-2">
+                    <label>私钥文件</label>
+                    <div className="host-key-path-row">
+                      <input
+                        name="privateKeyPath"
+                        readOnly
+                        value={hostFormPrivateKeyPath}
+                        placeholder="未选择私钥文件"
+                      />
+                      <button type="button" onClick={() => void choosePrivateKeyFile()}>选择文件…</button>
+                    </div>
+                  </div>
+                )}
                 <label>文件夹
                   <select name="folderId" defaultValue={editingHost?.folderId ?? ''}>
                     <option value="">未分组</option>

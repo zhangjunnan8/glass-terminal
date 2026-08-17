@@ -115,6 +115,7 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       save: vi.fn(),
       remove: vi.fn(),
       forgetCredential: vi.fn(),
+      choosePrivateKeyPath: vi.fn().mockResolvedValue(null),
       listFolders: vi.fn().mockResolvedValue([]),
       createFolder: vi.fn(),
       renameFolder: vi.fn(),

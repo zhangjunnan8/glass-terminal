@@ -718,6 +718,20 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .modal p { color: #9aa8ba; font-size: 14px; line-height: 1.55; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 11px; }
 .form-grid .span-2 { grid-column: span 2; }
+.host-key-path-row { display: flex; gap: 6px; }
+.host-key-path-row input { flex: 1; }
+.host-key-path-row button {
+  height: 38px;
+  padding: 0 12px;
+  color: #b2bfce;
+  border: 1px solid #2d3a4c;
+  border-radius: 4px;
+  background: #182230;
+  cursor: pointer;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.host-key-path-row button:hover { border-color: #4aa48c; }
 .modal label { display: flex; flex-direction: column; gap: 6px; color: #9aa7b8; font-size: 13px; font-weight: 600; letter-spacing: 0; }
 .modal input, .modal select {
   width: 100%;

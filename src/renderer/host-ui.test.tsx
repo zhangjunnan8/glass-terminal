@@ -97,6 +97,7 @@ function hostBridge() {
       save: vi.fn(),
       remove: vi.fn(),
       forgetCredential: vi.fn(),
+      choosePrivateKeyPath: vi.fn().mockResolvedValue(null),
       createFolder: vi.fn().mockResolvedValue({ ...folder, id: 'folder-2', name: '测试环境' }),
       renameFolder: vi.fn().mockResolvedValue(folder),
       removeFolder: vi.fn().mockResolvedValue(undefined),

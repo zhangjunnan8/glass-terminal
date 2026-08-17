@@ -86,6 +86,7 @@ export interface DesktopBridge {
     save(input: HostInput): Promise<HostProfile>;
     remove(hostId: string): Promise<void>;
     forgetCredential(hostId: string): Promise<void>;
+    choosePrivateKeyPath(): Promise<string | null>;
     listFolders(): Promise<HostFolder[]>;
     createFolder(request: CreateHostFolderRequest): Promise<HostFolder>;
     renameFolder(request: RenameHostFolderRequest): Promise<HostFolder>;
