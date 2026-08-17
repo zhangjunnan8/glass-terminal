@@ -81,6 +81,13 @@ interface AgentRuntimeRecord extends AgentSessionView {
   resolveAuthHandoff?: () => void;
   resolveApproval?: (resolution: ApprovalResolution) => void;
   streamEmitTimer?: ReturnType<typeof setTimeout>;
+  /**
+   * Character offset into the terminal journal where the previous turn ended.
+   * The next turn's ambient context is only the terminal text produced after
+   * this offset (human input + background output), not the AI's own command
+   * echo that is already carried by structured tool results.
+   */
+  terminalContextOffset?: number;
 }
 
 type GenericBackendFactory = (providerId: string) => AgentBackend;
@@ -96,6 +103,8 @@ const BUSY_STATES = new Set<AgentRuntimeState>([
 ]);
 
 const MAX_FILE_ACCESS_PATHS = 16;
+/** Upper bound on the ambient terminal context injected per turn. */
+const MAX_TURN_TERMINAL_CONTEXT_CHARS = 12_000;
 
 function disabledFileAccessPolicy(): AgentFileAccessPolicy {
   return {
@@ -1381,7 +1390,10 @@ export class AgentService {
       }
       if (!this.isCurrentTurn(runtime, token)) return;
 
-      const terminalContext = this.sessions.readTerminalHistory(runtime.sessionId).slice(-12_000);
+      const fullTerminalHistory = this.sessions.readTerminalHistory(runtime.sessionId);
+      const terminalContext = fullTerminalHistory
+        .slice(runtime.terminalContextOffset ?? 0)
+        .slice(-MAX_TURN_TERMINAL_CONTEXT_CHARS);
       const result = await backend.sendMessage({
         thread,
         prompt,
@@ -1433,6 +1445,10 @@ export class AgentService {
       this.emit(runtime);
     } finally {
       await closeTurnTools();
+      // Advance the ambient-context watermark past this turn's terminal output so
+      // the next turn only carries new human input and background output.
+      runtime.terminalContextOffset = this.sessions
+        .readTerminalHistory(runtime.sessionId).length;
     }
   }
 
