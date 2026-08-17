@@ -289,4 +289,23 @@ describe('Agent tool activity reducer', () => {
       expect(running[0]?.status).toBe('running');
     },
   );
+
+  it('attaches and preserves the turn id across start and completion', () => {
+    const toolCall = call('turn-1', 'workspace_read_file', { path: 'src/a.ts' });
+    const running = reduceAgentToolActivities(
+      [],
+      event('tool_started', toolCall),
+      START,
+      'turn-42',
+    );
+    expect(running[0]).toMatchObject({ id: 'turn-1', turnId: 'turn-42' });
+
+    const completed = reduceAgentToolActivities(
+      running,
+      event('tool_completed', toolCall, { ok: true, sha256: 'a'.repeat(64) }),
+      FINISH,
+      'turn-42',
+    );
+    expect(completed[0]).toMatchObject({ turnId: 'turn-42', status: 'succeeded', finishedAt: FINISH });
+  });
 });

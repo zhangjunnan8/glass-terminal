@@ -434,6 +434,7 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .agent-activity-card .interrupt:active:not(:disabled) { transform: scale(.96); }
 .agent-activity-card .interrupt:disabled { cursor: default; opacity: .55; }
 .tool-activity-list { margin: 10px; overflow: hidden; border: 1px solid #28374a; border-radius: 5px; background: #0c131d; }
+.tool-activity-list.compact { margin: 6px 0 0; border-radius: 4px; }
 .tool-activity-list.collapsed ol { display: none; }
 .tool-activity-toggle { display: flex; width: 100%; align-items: center; gap: 8px; padding: 9px 10px; color: #bdc9d8; border: 0; background: transparent; cursor: pointer; font-size: 12px; text-align: left; }
 .tool-activity-toggle:hover { background: #101a26; }

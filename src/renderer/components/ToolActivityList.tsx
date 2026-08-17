@@ -13,15 +13,21 @@ const STATUS_LABELS: Record<AgentToolActivity['status'], string> = {
 
 interface ToolActivityListProps {
   activities: readonly AgentToolActivity[];
+  /** Distinct test id when rendered inline alongside a message. */
+  testId?: string;
+  /** Tighter spacing for inline (inside a message) rendering. */
+  compact?: boolean;
 }
 
 /**
- * Bounded, collapsed-by-default summary of recent tool use. The full list stays
- * in the DOM (visually hidden) so it remains accessible to tests and screen
- * readers, while the default view keeps the last assistant message adjacent to
- * the composer instead of being pushed away by an always-expanded activity list.
+ * Bounded, collapsed-by-default summary of tool use. The full list stays in the
+ * DOM (visually hidden) so it remains accessible to tests and screen readers.
  */
-export function ToolActivityList({ activities }: ToolActivityListProps) {
+export function ToolActivityList({
+  activities,
+  testId = 'tool-activity-list',
+  compact = false,
+}: ToolActivityListProps) {
   const [expanded, setExpanded] = useState(false);
   const recentActivities = activities.slice(-MAX_VISIBLE_ACTIVITIES);
   if (!recentActivities.length) return null;
@@ -35,8 +41,8 @@ export function ToolActivityList({ activities }: ToolActivityListProps) {
 
   return (
     <section
-      className={`tool-activity-list ${expanded ? 'expanded' : 'collapsed'}`}
-      data-testid="tool-activity-list"
+      className={`tool-activity-list ${expanded ? 'expanded' : 'collapsed'}${compact ? ' compact' : ''}`}
+      data-testid={testId}
       data-expanded={expanded ? 'true' : 'false'}
       aria-label="工具活动"
     >

@@ -98,6 +98,12 @@ export interface AgentToolActivity {
   startedAt: string;
   finishedAt?: string;
   summary?: string;
+  /**
+   * Identifies the assistant message this activity belongs to. Absent for
+   * activities persisted before the turn-grouping field existed; those remain
+   * ungrouped in the renderer.
+   */
+  turnId?: string;
 }
 
 export interface AgentSessionView {

@@ -486,6 +486,12 @@ export function App() {
       ? '正在处理界面操作'
       : null;
   const activeAgent = activeTab ? agentStates[activeTab.id] : undefined;
+  const activeMessages = activeAgent?.messages ?? [];
+  const activeActivities = activeAgent?.activities ?? [];
+  const activeMessageIds = new Set(activeMessages.map((message) => message.id));
+  const unmatchedActivities = activeActivities.filter((activity) => (
+    !activity.turnId || !activeMessageIds.has(activity.turnId)
+  ));
   const latestUserMessage = activeAgent
     ? [...activeAgent.messages].reverse().find((message) => message.role === 'user')
     : undefined;
@@ -2534,6 +2540,9 @@ export function App() {
               && previousMessage?.role === 'user'
               ? new Date(message.createdAt).getTime() - new Date(previousMessage.createdAt).getTime()
               : undefined;
+            const turnActivities = message.role === 'assistant'
+              ? activeActivities.filter((activity) => activity.turnId === message.id)
+              : [];
             return (
             <article className={`agent-message ${message.role}`} key={message.id}>
               <span className="agent-message-role">
@@ -2550,6 +2559,13 @@ export function App() {
                   streaming={activeAgent.streamingMessageId === message.id}
                 />
               </Suspense>
+              {turnActivities.length > 0 && (
+                <ToolActivityList
+                  activities={turnActivities}
+                  testId={`tool-activity-list-${message.id}`}
+                  compact
+                />
+              )}
               {latestUser && (
                 latestUserRunning ? (
                   <AgentActivityCard
@@ -2599,7 +2615,7 @@ export function App() {
             </article>
             );
           })}
-          <ToolActivityList activities={activeAgent?.activities ?? []} />
+          <ToolActivityList activities={unmatchedActivities} />
           {activeAgent?.pendingApproval?.status === 'waiting'
             && activeAgent.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND && (
             <section className="approval-card">

@@ -196,7 +196,7 @@ function completedSummary(
   return summary || undefined;
 }
 
-function startedActivity(call: AgentToolCall, timestamp: string): AgentToolActivity {
+function startedActivity(call: AgentToolCall, timestamp: string, turnId?: string): AgentToolActivity {
   const toolName = safeToolName(call);
   return {
     id: safeIdentifier(call),
@@ -205,6 +205,7 @@ function startedActivity(call: AgentToolCall, timestamp: string): AgentToolActiv
     label: activityLabel(call, toolName),
     status: 'running',
     startedAt: timestamp,
+    ...(turnId ? { turnId } : {}),
   };
 }
 
@@ -222,6 +223,7 @@ export function reduceAgentToolActivities(
   activities: readonly AgentToolActivity[],
   event: AgentBackendEvent,
   timestamp: string,
+  turnId?: string,
 ): AgentToolActivity[] {
   if (
     (event.type !== 'tool_started' && event.type !== 'tool_completed')
@@ -232,12 +234,12 @@ export function reduceAgentToolActivities(
   if (event.type === 'tool_started') {
     return limitAgentToolActivities([
       ...activities.filter((activity) => activity.id !== id),
-      startedActivity(event.toolCall, timestamp),
+      startedActivity(event.toolCall, timestamp, turnId),
     ]);
   }
 
   const existing = activities.find((activity) => activity.id === id)
-    ?? startedActivity(event.toolCall, timestamp);
+    ?? startedActivity(event.toolCall, timestamp, turnId);
   const result = parseBoundedRecord(event.result);
   const status = completedStatus(event.result, result);
   const summary = completedSummary(existing.toolName, existing.kind, result, status);

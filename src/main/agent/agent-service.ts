@@ -1203,6 +1203,9 @@ export class AgentService {
     }
     if (!controlLeaseId) throw new Error('Generic Agent control lease is missing.');
     const signal = runtime.abortController!.signal;
+    // One stable id per turn ties the assistant message and all of its tool
+    // activities together so the renderer can group them inline.
+    const assistantTurnId = randomUUID();
     let streamedMessage: AgentChatItem | undefined;
     let acceptBackendEvents = true;
     let turnToolsLive = true;
@@ -1219,13 +1222,14 @@ export class AgentService {
           runtime.activities,
           event,
           new Date().toISOString(),
+          assistantTurnId,
         );
         this.emit(runtime);
       }
       if (event.type === 'assistant_delta' && event.text) {
         if (!streamedMessage) {
           streamedMessage = {
-            id: randomUUID(),
+            id: assistantTurnId,
             role: 'assistant',
             content: '',
             createdAt: new Date().toISOString(),
@@ -1243,7 +1247,7 @@ export class AgentService {
           streamedMessage = undefined;
           this.cancelStreamEmit(runtime);
         } else {
-          this.addChat(runtime, 'assistant', event.text);
+          this.addChat(runtime, 'assistant', event.text, assistantTurnId);
         }
         this.emit(runtime);
       }
@@ -2296,9 +2300,10 @@ export class AgentService {
     runtime: AgentRuntimeRecord,
     role: AgentChatItem['role'],
     content: string,
+    id?: string,
   ): void {
     const item: AgentChatItem = {
-      id: randomUUID(),
+      id: id ?? randomUUID(),
       role,
       content,
       createdAt: new Date().toISOString(),
