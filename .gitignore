@@ -3,6 +3,8 @@ dist/
 dist-electron/
 release/
 coverage/
+.npm-cache/
+.npm-logs/
 .vite/
 .electron-cache/
 .smoke-data/
