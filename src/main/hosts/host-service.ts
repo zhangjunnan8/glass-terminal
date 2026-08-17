@@ -137,6 +137,7 @@ export class HostService {
       throw error;
     }
 
+    let terminal = result.descriptor;
     try {
       if (this.hosts.revision(host.id) !== expectedRevision) {
         throw new Error('SSH 连接期间主机配置已更改，请重新连接。');
@@ -146,7 +147,8 @@ export class HostService {
         expectedRevision = this.hosts.revision(host.id);
       }
       if (request.sessionId) {
-        this.sessions.reconnect(owner, result.descriptor, request.sessionId);
+        const session = this.sessions.reconnect(owner, result.descriptor, request.sessionId);
+        terminal = { ...result.descriptor, sessionId: session.id };
       }
     } catch (error) {
       this.closeCreatedTerminal(owner, result.descriptor.id);
@@ -165,7 +167,7 @@ export class HostService {
     }
     return {
       status: 'connected',
-      terminal: result.descriptor,
+      terminal,
       ...(credentialWarning ? { credentialWarning } : {}),
     };
   }

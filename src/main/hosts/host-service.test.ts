@@ -88,7 +88,7 @@ function fixture(input: Partial<HostInput> = {}) {
   });
   const reconnect = vi.fn(() => {
     order.push('session-bound');
-    return undefined;
+    return { id: 'session-1' };
   });
   const close = vi.fn();
   const service = new HostService(
@@ -166,7 +166,10 @@ describe('HostService SSH credentials', () => {
       saveCredential: true,
     });
 
-    expect(result).toMatchObject({ status: 'connected', terminal: { id: 'terminal-1' } });
+    expect(result).toMatchObject({
+      status: 'connected',
+      terminal: { id: 'terminal-1', sessionId: 'session-1' },
+    });
     expect(result).not.toHaveProperty('credentialWarning');
     expect(current.order).toEqual(['terminal-ready', 'session-bound', 'credential-set']);
     expect(current.hosts.get(current.host.id).credentialConfigured).toBe(true);
