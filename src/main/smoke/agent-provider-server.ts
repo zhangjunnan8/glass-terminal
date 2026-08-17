@@ -36,6 +36,41 @@ function textResponse(content: string): string {
   return JSON.stringify({ choices: [{ finish_reason: 'stop', message: { role: 'assistant', content } }] });
 }
 
+function sendToolResponse(
+  response: ServerResponse,
+  id: string,
+  command: string,
+  reason: string,
+  stream: boolean,
+): void {
+  if (!stream) {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(toolResponse(id, command, reason));
+    return;
+  }
+  const toolCall = {
+    index: 0,
+    id,
+    type: 'function',
+    function: { name: 'terminal_execute', arguments: JSON.stringify({ command, reason }) },
+  };
+  response.writeHead(200, {
+    'content-type': 'text/event-stream; charset=utf-8',
+    'cache-control': 'no-cache',
+  });
+  response.write(`data: ${JSON.stringify({
+    choices: [{
+      index: 0,
+      delta: { role: 'assistant', content: null, tool_calls: [toolCall] },
+      finish_reason: null,
+    }],
+  })}\n\n`);
+  response.write(`data: ${JSON.stringify({
+    choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+  })}\n\n`);
+  response.end('data: [DONE]\n\n');
+}
+
 function sendTextResponse(response: ServerResponse, content: string, stream: boolean): void {
   if (!stream) {
     response.writeHead(200, { 'content-type': 'application/json' });
@@ -110,12 +145,13 @@ export async function startAgentSmokeProvider(remotePosix = false): Promise<Agen
           .filter((message) => message.role === 'tool').length;
         if (prompt.includes('Full Takeover marker')) {
           if (toolResultCount < 2) {
-            response.writeHead(200, { 'content-type': 'application/json' });
-            response.end(toolResponse(
+            sendToolResponse(
+              response,
               `full-takeover-${toolResultCount + 1}`,
               takeoverCommands[toolResultCount],
               'verify consecutive Full Takeover commands',
-            ));
+              parsed.stream === true,
+            );
           } else {
             sendTextResponse(response, 'Full Takeover smoke complete.', parsed.stream === true);
           }
@@ -123,29 +159,36 @@ export async function startAgentSmokeProvider(remotePosix = false): Promise<Agen
         }
         if (prompt.includes('secure authentication smoke')) {
           if (toolResultCount === 0) {
-            response.writeHead(200, { 'content-type': 'application/json' });
-            response.end(toolResponse(
-              'auth-smoke-call', authCommand, 'verify secure input handoff',
-            ));
+            sendToolResponse(
+              response,
+              'auth-smoke-call',
+              authCommand,
+              'verify secure input handoff',
+              parsed.stream === true,
+            );
           } else {
             sendTextResponse(response, 'Authentication smoke complete.', parsed.stream === true);
           }
           return;
         }
         if (prompt.includes('manual takeover smoke')) {
-          response.writeHead(200, { 'content-type': 'application/json' });
-          response.end(toolResponse(
+          sendToolResponse(
+            response,
             'manual-takeover-call',
             longCommand,
             'verify manual takeover and Ctrl+C',
-          ));
+            parsed.stream === true,
+          );
           return;
         }
         if (toolResultCount === 0) {
-          response.writeHead(200, { 'content-type': 'application/json' });
-          response.end(toolResponse(
-            'agent-smoke-call', approvedCommand, 'verify shared visible terminal',
-          ));
+          sendToolResponse(
+            response,
+            'agent-smoke-call',
+            approvedCommand,
+            'verify shared visible terminal',
+            parsed.stream === true,
+          );
         } else {
           sendTextResponse(
             response,

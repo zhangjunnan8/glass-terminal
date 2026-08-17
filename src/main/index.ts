@@ -56,6 +56,7 @@ import { ProviderStore } from './providers/provider-store';
 import { MemorySecretStore, WindowsCredentialStore } from './providers/secret-store';
 import { AgentService } from './agent/agent-service';
 import { AgentFileService } from './agent/agent-file-service';
+import { LangChainBackend, LangChainProviderModelFactory } from './agent/langchain-backend';
 import { startAgentSmokeProvider } from './smoke/agent-provider-server';
 import type { AgentSmokeProvider } from './smoke/agent-provider-server';
 import { registerSmokeRunner, smokeModeFromEnvironment } from './smoke/smoke-runner';
@@ -599,6 +600,15 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
     undefined,
     codexAppServerService,
     new AgentFileService(terminalService, sessionManager, remoteFilesystemProvider),
+    // The Generic Provider backend now runs through the LangChain harness.
+    // The shared visible terminal remains the only shell: LangChain's own
+    // shell/file tools are never registered (see langchain-backend.ts).
+    (providerId) => new LangChainBackend({
+      modelFactory: () => new LangChainProviderModelFactory(
+        providerId,
+        requireProviderStore(),
+      ).build(),
+    }),
   );
   createMainWindow();
   void codexAppServerService.startIfBound();
