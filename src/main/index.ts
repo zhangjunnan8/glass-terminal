@@ -53,7 +53,8 @@ import { SessionStore } from './sessions/session-store';
 import { SftpService } from './sftp/sftp-service';
 import { TransferQueue } from './sftp/transfer-queue';
 import { ProviderStore } from './providers/provider-store';
-import { MemorySecretStore, WindowsCredentialStore } from './providers/secret-store';
+import { MemorySecretStore } from './providers/secret-store';
+import { FileSecretStore } from './providers/file-secret-store';
 import { AgentService } from './agent/agent-service';
 import { AgentFileService } from './agent/agent-file-service';
 import { LangChainBackend, LangChainProviderModelFactory } from './agent/langchain-backend';
@@ -555,7 +556,9 @@ handleTrusted(
 
 if (ownsSingleInstance) void app.whenReady().then(async () => {
   hostStore = new HostStore(join(app.getPath('userData'), 'config', 'hosts.json'));
-  const secretStore = isSmokeTest ? new MemorySecretStore() : new WindowsCredentialStore();
+  const secretStore = isSmokeTest
+    ? new MemorySecretStore()
+    : new FileSecretStore(join(app.getPath('userData'), 'config', 'secrets.json'));
   if (smokeMode === 'agent' || smokeMode === 'agent-ssh') {
     agentSmokeProvider = await startAgentSmokeProvider(smokeMode === 'agent-ssh');
   }

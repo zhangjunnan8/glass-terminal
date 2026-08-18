@@ -1,10 +1,17 @@
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 
+export interface SecretEntry {
+  reference: string;
+  secret: string;
+}
+
 export interface SecretStore {
   get(reference: string): Promise<string | undefined>;
   set(reference: string, secret: string): Promise<void>;
   remove(reference: string): Promise<void>;
+  /** Optional: enumerate every stored entry for portable export/import. */
+  entries?(): Promise<SecretEntry[]>;
 }
 
 export class MemorySecretStore implements SecretStore {
@@ -20,6 +27,10 @@ export class MemorySecretStore implements SecretStore {
 
   async remove(reference: string): Promise<void> {
     this.secrets.delete(reference);
+  }
+
+  async entries(): Promise<SecretEntry[]> {
+    return [...this.secrets.entries()].map(([reference, secret]) => ({ reference, secret }));
   }
 }
 
