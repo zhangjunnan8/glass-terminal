@@ -31,7 +31,7 @@ UI-ZH-CN — Alpha 中文界面与大字号可读性。
 - `npm test`：13 个测试文件通过、2 个跳过；61 项测试通过、2 项跳过。
 - `npm run smoke`：`SMOKE_LOCAL_TERMINAL_READY=true`，同时验证 `zh-CN` 界面标记、12px 分区标题和 14px 搜索框。
 - `npm run smoke:agent`：`SMOKE_AGENT_TERMINAL_READY=true`。
-- Ubuntu `192.168.31.93`：`npm run smoke:ssh` 与 `npm run smoke:agent:ssh` 均通过。
+- Ubuntu `192.0.2.10`：`npm run smoke:ssh` 与 `npm run smoke:agent:ssh` 均通过。
 
 ## Build result
 

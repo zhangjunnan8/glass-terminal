@@ -555,7 +555,7 @@ class FakeSessions {
     shellProfileId: 'ssh:host',
     shellKind: 'posix',
     targetSnapshot: {
-      label: 'Test', hostname: '192.168.31.93', port: 22, username: 'tester',
+      label: 'Test', hostname: '192.0.2.10', port: 22, username: 'tester',
     },
     connectionState: 'connected',
     status: 'active',
@@ -2992,7 +2992,7 @@ describe('AgentService shared-terminal controls', () => {
     expect(state).toEqual({
       transport: 'ssh',
       target: {
-        label: 'Test', hostname: '192.168.31.93', port: 22, username: 'tester',
+        label: 'Test', hostname: '192.0.2.10', port: 22, username: 'tester',
       },
       cwd: '/srv/latest',
       effectiveUser: 'root',

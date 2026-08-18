@@ -16,7 +16,7 @@ function sshSession(overrides: Partial<SessionRecord> = {}): SessionRecord {
     hostId: 'host',
     shellProfileId: 'ssh:host',
     shellKind: 'posix',
-    targetSnapshot: { label: 'Ubuntu', username: 'zjn' },
+    targetSnapshot: { label: 'Ubuntu', username: 'tester' },
     connectionState: 'disconnected',
     status: 'disconnected',
     runtimeTerminalId: 'old-terminal',
@@ -44,16 +44,16 @@ describe('Session shell context', () => {
 
   it('tracks a prompt split across terminal output chunks', () => {
     const tracker = new ShellContextTracker('posix');
-    expect(tracker.push('build finished\r\nzjn@ubu')).toBeUndefined();
+    expect(tracker.push('build finished\r\ntester@ubu')).toBeUndefined();
     expect(tracker.push('ntu:~/workspace$ ')).toEqual({
-      effectiveUser: 'zjn',
+      effectiveUser: 'tester',
       cwd: '~/workspace',
     });
   });
 
   it('extracts PowerShell and Command Prompt directories without guessing normal output', () => {
-    expect(inferShellContext('PS C:\\Users\\zjn\\repo> ', 'powershell')).toEqual({
-      cwd: 'C:\\Users\\zjn\\repo',
+    expect(inferShellContext('PS C:\\Users\\tester\\repo> ', 'powershell')).toEqual({
+      cwd: 'C:\\Users\\tester\\repo',
     });
     expect(inferShellContext('C:\\work\\repo> ', 'cmd')).toEqual({ cwd: 'C:\\work\\repo' });
     expect(inferShellContext('documentation says user@host:/tmp$ then continues', 'posix'))
@@ -67,7 +67,7 @@ describe('Session shell context', () => {
   });
 
   it('restores a login-user home-relative cwd without sudo', () => {
-    expect(buildSshRestoreInput(sshSession({ effectiveUser: 'zjn', cwd: '~/repo' })))
+    expect(buildSshRestoreInput(sshSession({ effectiveUser: 'tester', cwd: '~/repo' })))
       .toBe('cd -- "$HOME"/\'repo\'\r');
   });
 

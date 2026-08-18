@@ -1,22 +1,58 @@
+# dependencies / build output
 node_modules/
 dist/
 dist-electron/
 release/
 coverage/
+
+# package-manager caches
 .npm-cache/
 .npm-logs/
 .vite/
 .electron-cache/
+.parcel-cache/
+.eslintcache/
+.cache/
+
+# runtime data (smoke tests write userData here)
 .smoke-data/
-*.log
-*.tsbuildinfo
-.DS_Store
-Thumbs.db
+app-data/
+
+# local secret store — never commit (production data lives in %APPDATA%)
+secrets.json
+secrets.json.key
+hosts.json
+providers.json
+app-settings.json
+codex-app-server.json
+*.credential
+*.secret
+
+# environment / secrets
 .env
 .env.*
 !.env.example
-app-data/
 *.pem
 *.key
 *.pfx
 *.p12
+
+# logs / diagnostics
+*.log
+pnpm-debug.log
+yarn-debug.log
+yarn-error.log
+*.tsbuildinfo
+
+# editor / OS noise
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+*.swp
+*~
+*.tmp
+*.bak
+*.orig
+*.rej

@@ -29,7 +29,7 @@
 - `npm test`：16 个测试文件通过、2 个跳过；86 项测试通过、2 项跳过。
 - `npm run smoke`：`SMOKE_LOCAL_TERMINAL_READY=true`，包含 App Server 中文 UI 与 14px 正文字号断言。
 - `npm run smoke:agent`：`SMOKE_AGENT_TERMINAL_READY=true`。
-- Ubuntu `192.168.31.93`：`npm run smoke:ssh` 与 `npm run smoke:agent:ssh` 均通过。
+- Ubuntu `192.0.2.10`：`npm run smoke:ssh` 与 `npm run smoke:agent:ssh` 均通过。
 
 ## Build result
 

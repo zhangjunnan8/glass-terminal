@@ -60,7 +60,7 @@
 ## Manual verification
 
 - Local Windows PowerShell/ConPTY Electron smoke: passed.
-- Ubuntu `192.168.31.93` SSH PTY Electron smoke: passed.
+- Ubuntu `192.0.2.10` SSH PTY Electron smoke: passed.
 
 ## Known issues
 

@@ -174,7 +174,7 @@ class FakeSessions {
     shellProfileId: 'ssh:host',
     shellKind: 'posix',
     targetSnapshot: {
-      label: 'Test', hostname: '192.168.31.93', port: 22, username: 'tester',
+      label: 'Test', hostname: '192.0.2.10', port: 22, username: 'tester',
     },
     connectionState: 'connected',
     status: 'active',
@@ -711,7 +711,7 @@ describe('Codex App Server Agent integration', () => {
       arguments: {},
     }));
     expect(state.success).toBe(true);
-    expect(JSON.stringify(state)).toContain('192.168.31.93');
+    expect(JSON.stringify(state)).toContain('192.0.2.10');
     expect(JSON.stringify(state)).toContain('/home/tester/project');
     expect(JSON.stringify(state)).toContain('local ');
     expect(JSON.stringify(state)).toContain('App Server process');

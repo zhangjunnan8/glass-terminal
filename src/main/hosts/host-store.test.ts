@@ -27,7 +27,7 @@ function sshHost(name: string, suffix = name): HostInput {
     name,
     hostname: `192.0.2.${suffix.length}`,
     port: 22,
-    username: 'zjn',
+    username: 'tester',
     authMethod: 'password',
   };
 }
@@ -43,14 +43,14 @@ describe('HostStore', () => {
     const { store, filePath } = createStore();
     const host = store.save({
       name: 'Ubuntu Lab',
-      hostname: '192.168.31.93',
+      hostname: '192.0.2.10',
       port: 22,
-      username: 'zjn',
+      username: 'tester',
       authMethod: 'password',
     });
     expect(store.get(host.id)).toMatchObject({
       protocol: 'ssh',
-      hostname: '192.168.31.93',
+      hostname: '192.0.2.10',
       sortOrder: 0,
       credentialConfigured: false,
     });
@@ -99,9 +99,9 @@ describe('HostStore', () => {
     const legacy = [{
       id: 'legacy-host',
       name: 'Ubuntu Lab',
-      hostname: '192.168.31.93',
+      hostname: '192.0.2.10',
       port: 22,
-      username: 'zjn',
+      username: 'tester',
       authMethod: 'password',
       group: 'Production',
       favorite: false,

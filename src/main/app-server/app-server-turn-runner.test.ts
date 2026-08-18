@@ -102,12 +102,12 @@ function createTools(): CodexAppServerTurnTools {
       transport: 'ssh' as const,
       target: {
         label: 'Ubuntu VM',
-        hostname: '192.168.31.93',
+        hostname: '192.0.2.10',
         port: 22,
-        username: 'zjn',
+        username: 'tester',
       },
-      cwd: '/home/zjn/project',
-      effectiveUser: 'zjn',
+      cwd: '/home/tester/project',
+      effectiveUser: 'tester',
       shellKind: 'posix' as const,
       connectionState: 'connected' as const,
     })),
@@ -190,8 +190,8 @@ describe('CodexAppServerTurnRunner native mode', () => {
     expect(JSON.stringify(turnStart.params)).not.toContain('readOnlyAccess');
     const turnText = turnInputText(turnStart.params);
     expect(turnText).toContain('ai_terminal_binding');
-    expect(turnText).toContain('192.168.31.93');
-    expect(turnText).toContain('/home/zjn/project');
+    expect(turnText).toContain('192.0.2.10');
+    expect(turnText).toContain('/home/tester/project');
     expect(turnText).toContain('local ');
     expect(turnText).toContain('App Server process');
     expect(turnText).toContain('must never be described as having run on the SSH target');
@@ -208,7 +208,7 @@ describe('CodexAppServerTurnRunner native mode', () => {
       tool: 'terminal_state', arguments: {},
     }));
     expect(state.success).toBe(true);
-    expect(JSON.stringify(state)).toContain('192.168.31.93');
+    expect(JSON.stringify(state)).toContain('192.0.2.10');
     expect(tools.getTerminalState).toHaveBeenCalledTimes(2);
 
     const rejected = asRecord(await connection.invoke('item/tool/call', {
@@ -231,7 +231,7 @@ describe('CodexAppServerTurnRunner native mode', () => {
     const threadStart = await waitForRequest(connection, 'thread/start');
     expect(asRecord(threadStart.params).dynamicTools).toEqual([]);
     const turnStart = await waitForRequest(connection, 'turn/start');
-    expect(turnInputText(turnStart.params)).toContain('192.168.31.93');
+    expect(turnInputText(turnStart.params)).toContain('192.0.2.10');
     expect(turnInputText(turnStart.params)).toContain('"terminalHistory": "disabled"');
     for (const tool of ['terminal_read', 'terminal_state']) {
       const rejected = asRecord(await connection.invoke('item/tool/call', {
@@ -285,14 +285,14 @@ describe('CodexAppServerTurnRunner native mode', () => {
       expect(connection.requests.filter(({ method }) => method === 'turn/start')).toHaveLength(1);
     });
     const firstTurn = connection.requests.filter(({ method }) => method === 'turn/start')[0];
-    expect(turnInputText(firstTurn.params)).toContain('/home/zjn/project');
+    expect(turnInputText(firstTurn.params)).toContain('/home/tester/project');
     completeTurn(connection, 'thread-existing');
     await expect(first).resolves.toMatchObject({ status: 'completed' });
 
     getTerminalState.mockResolvedValue({
       transport: 'ssh',
       target: {
-        label: 'Ubuntu VM', hostname: '192.168.31.93', port: 22, username: 'zjn',
+        label: 'Ubuntu VM', hostname: '192.0.2.10', port: 22, username: 'tester',
       },
       cwd: '/srv/updated',
       effectiveUser: 'root',

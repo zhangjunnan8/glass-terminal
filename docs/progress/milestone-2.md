@@ -42,7 +42,7 @@
 
 ## Manual verification
 
-The designated target `192.168.31.93` accepted the test login and executed only
+The designated target `192.0.2.10` accepted the test login and executed only
 the non-mutating marker command plus `exit`. No remote project files were
 created or changed.
 

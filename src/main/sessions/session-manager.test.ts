@@ -183,7 +183,7 @@ describe('SessionManager reconnect restoration', () => {
         name: 'Ubuntu',
         hostname: '192.0.2.10',
         port: 22,
-        username: 'zjn',
+        username: 'tester',
       })) } as unknown as HostStore,
     );
     const session = manager.upgrade(owner(), 'audit-terminal');
@@ -224,14 +224,14 @@ describe('SessionManager reconnect restoration', () => {
     const terminals = new FakeTerminals();
     terminals.snapshots.set(
       'old-terminal',
-      snapshot('old-terminal', 'zjn@ubuntu:~$ sudo -i\r\nroot@ubuntu:/srv/project# '),
+      snapshot('old-terminal', 'tester@ubuntu:~$ sudo -i\r\nroot@ubuntu:/srv/project# '),
     );
     let currentHost = {
         id: 'host',
         name: 'Ubuntu',
         hostname: '192.0.2.10',
         port: 22,
-        username: 'zjn',
+        username: 'tester',
       };
     const hosts = {
       get: vi.fn(() => currentHost),
@@ -253,7 +253,7 @@ describe('SessionManager reconnect restoration', () => {
     });
     terminals.emitExit('old-terminal');
 
-    terminals.snapshots.set('new-terminal', snapshot('new-terminal', 'zjn@ubuntu:~$ '));
+    terminals.snapshots.set('new-terminal', snapshot('new-terminal', 'tester@ubuntu:~$ '));
     const reconnected = manager.reconnect(browser, descriptor('new-terminal'), session.id);
 
     expect(reconnected.runtimeTerminalId).toBe('new-terminal');
@@ -262,7 +262,7 @@ describe('SessionManager reconnect restoration', () => {
     expect(terminals.writes[0]).toContain('/opt/new-project');
     expect(manager.sessionForTerminal(browser, 'new-terminal')?.id).toBe(session.id);
 
-    terminals.snapshots.set('duplicate-terminal', snapshot('duplicate-terminal', 'zjn@ubuntu:~$ '));
+    terminals.snapshots.set('duplicate-terminal', snapshot('duplicate-terminal', 'tester@ubuntu:~$ '));
     expect(() => manager.reconnect(
       browser,
       descriptor('duplicate-terminal'),
@@ -272,7 +272,7 @@ describe('SessionManager reconnect restoration', () => {
 
     terminals.emitExit('new-terminal');
     currentHost = { ...currentHost, hostname: '192.0.2.99' };
-    terminals.snapshots.set('changed-target-terminal', snapshot('changed-target-terminal', 'zjn@ubuntu:~$ '));
+    terminals.snapshots.set('changed-target-terminal', snapshot('changed-target-terminal', 'tester@ubuntu:~$ '));
     expect(() => manager.reconnect(
       browser,
       descriptor('changed-target-terminal'),
@@ -288,7 +288,7 @@ describe('SessionManager reconnect restoration', () => {
     const terminals = new FakeTerminals();
     terminals.snapshots.set('history-terminal', snapshot(
       'history-terminal',
-      '\u001b[32mzjn@ubuntu:~$\u001b[0m echo history\r\nhistory\r\n',
+      '\u001b[32mtester@ubuntu:~$\u001b[0m echo history\r\nhistory\r\n',
     ));
     const hosts = {
       get: vi.fn(() => ({
@@ -296,7 +296,7 @@ describe('SessionManager reconnect restoration', () => {
         name: 'Ubuntu',
         hostname: '192.0.2.10',
         port: 22,
-        username: 'zjn',
+        username: 'tester',
       })),
     } as unknown as HostStore;
     const store = new SessionStore(join(root, 'sessions'));
@@ -470,7 +470,7 @@ describe('SessionManager workspace binding', () => {
     const root = mkdtempSync(join(tmpdir(), 'ai-terminal-manager-ssh-workspace-test-'));
     roots.push(root);
     const terminals = new FakeTerminals();
-    terminals.snapshots.set('ssh-terminal', snapshot('ssh-terminal', 'zjn@ubuntu:~$ '));
+    terminals.snapshots.set('ssh-terminal', snapshot('ssh-terminal', 'tester@ubuntu:~$ '));
     const remote = new FakeRemoteProvider();
     const manager = new SessionManager(
       new SessionStore(join(root, 'sessions')),
@@ -480,7 +480,7 @@ describe('SessionManager workspace binding', () => {
         name: 'Ubuntu',
         hostname: '192.0.2.10',
         port: 22,
-        username: 'zjn',
+        username: 'tester',
       })) } as unknown as HostStore,
       remote as unknown as RemoteFilesystemProvider,
     );
@@ -510,7 +510,7 @@ describe('SessionManager workspace binding', () => {
     const root = mkdtempSync(join(tmpdir(), 'ai-terminal-manager-invalid-workspace-test-'));
     roots.push(root);
     const terminals = new FakeTerminals();
-    terminals.snapshots.set('ssh-terminal', snapshot('ssh-terminal', 'zjn@ubuntu:~$ '));
+    terminals.snapshots.set('ssh-terminal', snapshot('ssh-terminal', 'tester@ubuntu:~$ '));
     const remote = new FakeRemoteProvider();
     const manager = new SessionManager(
       new SessionStore(join(root, 'sessions')),
@@ -520,7 +520,7 @@ describe('SessionManager workspace binding', () => {
         name: 'Ubuntu',
         hostname: '192.0.2.10',
         port: 22,
-        username: 'zjn',
+        username: 'tester',
       })) } as unknown as HostStore,
       remote as unknown as RemoteFilesystemProvider,
     );

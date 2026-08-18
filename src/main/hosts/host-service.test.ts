@@ -61,9 +61,9 @@ function fixture(input: Partial<HostInput> = {}) {
   const hosts = new HostStore(filePath);
   const host = hosts.save({
     name: 'Ubuntu Lab',
-    hostname: '192.168.31.93',
+    hostname: '192.0.2.10',
     port: 22,
-    username: 'zjn',
+    username: 'tester',
     authMethod: 'password',
     ...input,
   });

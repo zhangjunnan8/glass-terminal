@@ -100,9 +100,9 @@ describe('structured command sentinel', () => {
     filter.push(`${envelope.input}\r\n${envelope.startMarker}`);
     const end = `${envelope.endPrefix}0${envelope.endSuffix}`;
 
-    const display = filter.push(`alice\r\n${end}\r\nzjn@host:~$ `);
+    const display = filter.push(`alice\r\n${end}\r\ntester@host:~$ `);
     expect(display).toContain('alice');
-    expect(display).toContain('zjn@host:~$');
+    expect(display).toContain('tester@host:~$');
     expect(display).not.toContain(envelope.endPrefix);
     expect(display).not.toContain(envelope.startMarker);
 
