@@ -223,6 +223,13 @@ button { border: 0; }
 .session-history-row small { margin-top: 2px; color: #77879a; font-size: 12px; }
 .selected-host-card .session-history-actions { display: flex; flex-shrink: 0; gap: 3px; }
 .selected-host-card .session-history-actions button { min-height: 30px; padding: 4px 6px; font-size: 12px; }
+.session-history-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #b9c7d8; font-size: 13px; }
+.host-card-actions { align-items: center; }
+.icon-btn { display: inline-flex; width: 26px; height: 26px; align-items: center; justify-content: center; padding: 0; color: #8b9ab0; border: 1px solid transparent; border-radius: 4px; background: transparent; cursor: pointer; font-size: 13px; line-height: 1; }
+.icon-btn:hover { color: #d5e0ee; background: #1b2735; border-color: #2a384b; }
+.icon-btn.danger:hover { color: #ffb4bb; background: #351820; border-color: #5a2a33; }
+.icon-btn:disabled { opacity: .5; cursor: default; }
+.selected-host-card button.icon-btn { min-height: 26px; }
 .open-terminal-list { padding-bottom: 12px; }
 .history-sidebar-list { display: flex; flex-direction: column; gap: 7px; padding: 0 8px 12px; }
 .history-sidebar-row { padding: 9px; border: 1px solid #253346; border-radius: 5px; background: #0d141e; }

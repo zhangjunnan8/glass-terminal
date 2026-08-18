@@ -264,7 +264,7 @@ describe('主机分组与协议界面', () => {
     await act(async () => item.querySelector<HTMLButtonElement>('.host-row')!.click());
 
     await act(async () => {
-      item.querySelector<HTMLButtonElement>('.selected-host-card .danger-text')!.click();
+      item.querySelector<HTMLButtonElement>('.selected-host-card .icon-btn.danger')!.click();
     });
 
     expect(bridge.hosts.remove).toHaveBeenCalledWith(groupedHost.id);
@@ -283,7 +283,7 @@ describe('主机分组与协议界面', () => {
     const item = container.querySelector<HTMLElement>('[data-host-id="host-1"]')!;
     await act(async () => item.querySelector<HTMLButtonElement>('.host-row')!.click());
     await act(async () => {
-      item.querySelector<HTMLButtonElement>('.selected-host-card .danger-text')!.click();
+      item.querySelector<HTMLButtonElement>('.selected-host-card .icon-btn.danger')!.click();
     });
     await settle();
 

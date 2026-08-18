@@ -248,7 +248,7 @@ describe('renderer host and session dialogs', () => {
     await settle();
 
     expect(rename).toHaveBeenCalledWith({ sessionId: session.id, name: 'Renamed session' });
-    expect(container.querySelector('.session-history-row strong')?.textContent).toBe('Renamed session');
+    expect(container.querySelector('.session-history-name')?.textContent).toBe('Renamed session');
     expect(container.querySelector('.tab-title')?.textContent).toBe('Renamed session');
     expect(container.querySelector('[data-testid="rename-session-dialog"]')).toBeNull();
     expect(bridge.sessions.list).toHaveBeenCalledTimes(2);
@@ -528,7 +528,7 @@ describe('renderer host and session dialogs', () => {
     const open = container.querySelector<HTMLButtonElement>(
       `[data-action="reconnect-session"][data-session-id="${session.id}"]`,
     );
-    expect(open?.textContent).toBe('打开');
+    expect(open?.textContent).toBe('↗');
     await act(async () => open!.click());
 
     expect(bridge.terminal.connectSsh).not.toHaveBeenCalled();

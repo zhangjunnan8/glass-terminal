@@ -1759,25 +1759,40 @@ export function App() {
             <div className="selected-host-card">
               <strong>{host.name}</strong>
               <span>{authMethodLabel(host.authMethod)} · {host.hostKeyFingerprint ? '已信任' : '未验证'}</span>
-              <div>
+              <div className="host-card-actions">
                 <button
                   data-action="connect-host"
                   disabled={sshConnectionPending}
                   onClick={() => openSshConnection(host)}
                 >{sshConnectionPending ? '正在连接…' : '连接'}</button>
-                <button onClick={() => openHostEditor(host)}>编辑</button>
-                <button className="danger-text" onClick={() => void removeHost(host)}>删除</button>
+                <button
+                  className="icon-btn"
+                  title="编辑主机"
+                  aria-label="编辑主机"
+                  onClick={() => openHostEditor(host)}
+                >✎</button>
+                <button
+                  className="icon-btn danger"
+                  title="删除主机"
+                  aria-label="删除主机"
+                  onClick={() => void removeHost(host)}
+                >🗑</button>
               </div>
               {host.authMethod !== 'agent' && (
                 <div className="host-credential-row">
-                  <small>Windows 凭据：{host.credentialConfigured ? '已保存' : '未保存'}</small>
+                  <small title="凭据保存在当前 Windows 用户的凭据管理器中">
+                    {host.credentialConfigured ? '凭据已保存' : '凭据未保存'}
+                  </small>
                   {host.credentialConfigured && (
                     <button
+                      className="icon-btn"
                       type="button"
+                      title="删除已保存凭据"
+                      aria-label="删除已保存凭据"
                       data-action="forget-host-credential"
                       disabled={credentialActionPending}
                       onClick={() => void forgetHostCredential(host)}
-                    >{credentialActionPending ? '正在删除…' : '删除凭据'}</button>
+                    >{credentialActionPending ? '…' : '🗝'}</button>
                   )}
                 </div>
               )}
@@ -1795,26 +1810,36 @@ export function App() {
                     && (tab.sessionId === session.id || tab.id === session.runtimeTerminalId)
                   ));
                   return (
-                    <div className="session-history-row" key={session.id}>
-                      <span>
-                        <strong>{session.name}</strong>
-                        <small>{sessionStatusLabel(session.status)} · {new Date(session.updatedAt).toLocaleString('zh-CN')}</small>
-                      </span>
+                    <div
+                      className="session-history-row"
+                      key={session.id}
+                      title={`${sessionStatusLabel(session.status)} · ${new Date(session.updatedAt).toLocaleString('zh-CN')}`}
+                    >
+                      <span className="session-history-name" title={session.name}>{session.name}</span>
                       <span className="session-history-actions">
                         <button
+                          className="icon-btn"
                           type="button"
+                          title="查看历史"
+                          aria-label="查看历史"
                           data-action="view-session-history"
                           data-session-id={session.id}
                           onClick={() => openSessionHistory(session)}
-                        >查看</button>
+                        >▤</button>
                         <button
+                          className="icon-btn"
                           type="button"
                           title="重命名会话"
+                          aria-label="重命名会话"
                           data-action="rename-session"
                           data-session-id={session.id}
                           onClick={() => openSessionRename(session)}
-                        >重命名</button>
+                        >✎</button>
                         <button
+                          className="icon-btn"
+                          type="button"
+                          title={liveTab ? '打开' : '重连'}
+                          aria-label={liveTab ? '打开' : '重连'}
                           data-action="reconnect-session"
                           data-session-id={session.id}
                           disabled={sshConnectionPending}
@@ -1822,7 +1847,7 @@ export function App() {
                             if (liveTab) setActiveId(liveTab.id);
                             else openSshConnection(host, session.id);
                           }}
-                        >{liveTab ? '打开' : '重连'}</button>
+                        >{liveTab ? '↗' : '↻'}</button>
                       </span>
                     </div>
                   );
