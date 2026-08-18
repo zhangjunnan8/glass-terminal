@@ -151,3 +151,37 @@
   font-size: 12px;
   color: #7d8ca0;
 }
+
+.settings-shell[data-theme="light"] {
+  color: #172033;
+  background: #f5f7fa;
+}
+.settings-shell[data-theme="light"] :is(.settings-header, .settings-nav) {
+  border-color: #d4dae3;
+}
+.settings-shell[data-theme="light"] :is(.settings-header h1, .settings-card h2, .settings-nav .settings-nav-active) {
+  color: #172033;
+}
+.settings-shell[data-theme="light"] :is(.settings-version, .settings-hint) {
+  color: #667286;
+}
+.settings-shell[data-theme="light"] .settings-nav button {
+  color: #5d6b80;
+}
+.settings-shell[data-theme="light"] .settings-nav button:hover {
+  color: #172033;
+}
+.settings-shell[data-theme="light"] :is(.settings-description, .settings-field > span, .settings-check) {
+  color: #536176;
+}
+.settings-shell[data-theme="light"] .settings-field select,
+.settings-shell[data-theme="light"] .settings-field input {
+  border-color: #cbd3de;
+  background: #ffffff;
+  color: #202c40;
+}
+.settings-shell[data-theme="light"] .settings-actions button {
+  border-color: #cbd3de;
+  background: #eef1f5;
+  color: #253146;
+}

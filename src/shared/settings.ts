@@ -21,6 +21,7 @@ export type AppSettingsPatch = Partial<
 export const SETTINGS_CHANNELS = {
   get: 'settings:get',
   update: 'settings:update',
+  changed: 'settings:changed',
 } as const;
 
 export const SETTINGS_WINDOW_CHANNELS = {

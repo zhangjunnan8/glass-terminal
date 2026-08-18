@@ -186,6 +186,13 @@ const agentBridge: DesktopBridge['agent'] = {
 const settingsBridge: DesktopBridge['settings'] = {
   get: () => ipcRenderer.invoke(SETTINGS_CHANNELS.get),
   update: (patch) => ipcRenderer.invoke(SETTINGS_CHANNELS.update, patch),
+  onChanged: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, settings: import('../shared/settings').AppSettings) => {
+      listener(settings);
+    };
+    ipcRenderer.on(SETTINGS_CHANNELS.changed, handler);
+    return () => ipcRenderer.removeListener(SETTINGS_CHANNELS.changed, handler);
+  },
 };
 
 const backupBridge: DesktopBridge['backup'] = {

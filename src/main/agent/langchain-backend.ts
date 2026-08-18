@@ -1,17 +1,9 @@
-import {
+import type {
   AIMessage,
-  AIMessageChunk,
-  collapseToolCallChunks,
-  HumanMessage,
-  SystemMessage,
-  ToolMessage,
+  BaseMessage,
 } from '@langchain/core/messages';
-import type { BaseMessage } from '@langchain/core/messages';
-import { tool } from '@langchain/core/tools';
 import type { StructuredToolInterface } from '@langchain/core/tools';
-import { ChatOpenAICompletions } from '@langchain/openai';
-import { concat } from '@langchain/core/utils/stream';
-import { z } from 'zod';
+import type { ChatOpenAICompletions } from '@langchain/openai';
 import type {
   AgentBackend,
   AgentBackendResult,
@@ -25,18 +17,13 @@ import type { AgentFileAccessMode } from '../../shared/agent';
 import type { ProviderStore } from '../providers/provider-store';
 
 /**
- * Spike: a LangChain-based Harness that satisfies the project's existing
- * `AgentBackend` boundary.
+ * LangChain-backed harness. It satisfies the project's `AgentBackend` boundary
+ * without owning any shell, SSH connection, PTY, or filesystem: the model only
+ * ever reaches those through the per-turn `ToolGateway` injected by AgentService.
  *
- * Design invariants enforced here:
- *  - The Harness owns NO shell, SSH connection, PTY, or filesystem. It only
- *    ever reaches them through the per-turn `ToolGateway` injected by
- *    `AgentService`.
- *  - LangChain's own Shell/LocalShell/ApplyPatch tools are never imported or
- *    registered. The only tools the model sees are derived from `ToolGateway`.
- *  - The model transport is an OpenAI-compatible `ChatOpenAICompletions`
- *    configured by the caller (DeepSeek base URL, or a test stub). No provider
- *    coupling lives in this file.
+ * LangChain (and zod) are loaded lazily via dynamic `import()` so the Electron
+ * main process does not pay their parse cost on startup — only the first turn
+ * that actually constructs a backend does.
  */
 
 const MAX_BACKEND_THREAD_ID_CHARS = 256;
@@ -50,6 +37,46 @@ interface LangChainThreadRecord {
 
 interface ActiveTurn {
   controller: AbortController;
+}
+
+/** Runtime LangChain symbols, loaded once on first use. */
+interface LangChainRuntime {
+  AIMessage: any;
+  AIMessageChunk: any;
+  collapseToolCallChunks: any;
+  HumanMessage: any;
+  SystemMessage: any;
+  ToolMessage: any;
+  tool: any;
+  ChatOpenAICompletions: any;
+  concat: any;
+  z: any;
+}
+
+let langChainRuntimePromise: Promise<LangChainRuntime> | undefined;
+
+function loadLangChainRuntime(): Promise<LangChainRuntime> {
+  if (!langChainRuntimePromise) {
+    langChainRuntimePromise = Promise.all([
+      import('@langchain/core/messages'),
+      import('@langchain/core/tools'),
+      import('@langchain/openai'),
+      import('@langchain/core/utils/stream'),
+      import('zod'),
+    ]).then(([messages, tools, openai, stream, zod]) => ({
+      AIMessage: messages.AIMessage,
+      AIMessageChunk: messages.AIMessageChunk,
+      collapseToolCallChunks: messages.collapseToolCallChunks,
+      HumanMessage: messages.HumanMessage,
+      SystemMessage: messages.SystemMessage,
+      ToolMessage: messages.ToolMessage,
+      tool: tools.tool,
+      ChatOpenAICompletions: openai.ChatOpenAICompletions,
+      concat: stream.concat,
+      z: zod.z,
+    }));
+  }
+  return langChainRuntimePromise;
 }
 
 export interface LangChainBackendOptions {
@@ -66,8 +93,7 @@ export interface LangChainBackendOptions {
  * Builds a `ChatOpenAICompletions` (DeepSeek or any OpenAI-compatible endpoint)
  * from the app's `ProviderStore`, fencing on the provider recipient revision so
  * a changed endpoint/model/credential can never receive prior conversation
- * history, so a changed endpoint/model/credential can never receive prior
- * conversation history.
+ * history.
  */
 export class LangChainProviderModelFactory {
   private readonly expectedRecipientRevision: string;
@@ -84,13 +110,14 @@ export class LangChainProviderModelFactory {
       this.providerId,
       this.expectedRecipientRevision,
     );
-    return new ChatOpenAICompletions({
+    const runtime = await loadLangChainRuntime();
+    return new runtime.ChatOpenAICompletions({
       model: profile.modelId,
       apiKey,
       maxRetries: 1,
       timeout: 120_000,
       configuration: { baseURL: profile.baseUrl },
-    });
+    }) as ChatOpenAICompletions;
   }
 }
 
@@ -142,14 +169,14 @@ function parseToolArguments(argumentsText: string): Record<string, unknown> {
   }
 }
 
-function toLangChainMessage(message: AgentMessage): BaseMessage {
+function toLangChainMessage(message: AgentMessage, runtime: LangChainRuntime): BaseMessage {
   switch (message.role) {
     case 'system':
-      return new SystemMessage(message.content);
+      return new runtime.SystemMessage(message.content);
     case 'user':
-      return new HumanMessage(message.content);
+      return new runtime.HumanMessage(message.content);
     case 'assistant':
-      return new AIMessage({
+      return new runtime.AIMessage({
         content: message.content ?? '',
         ...(message.toolCalls?.length
           ? {
@@ -162,7 +189,7 @@ function toLangChainMessage(message: AgentMessage): BaseMessage {
           : {}),
       });
     case 'tool':
-      return new ToolMessage({
+      return new runtime.ToolMessage({
         content: message.content,
         tool_call_id: message.toolCallId,
       });
@@ -177,7 +204,7 @@ function toAgentMessage(message: BaseMessage): AgentMessage {
     return { role: type === 'system' ? 'system' : 'user', content: String(message.content ?? '') };
   }
   if (type === 'ai') {
-    const ai = message as AIMessage;
+    const ai = message as unknown as AIMessage;
     return {
       role: 'assistant',
       content: typeof ai.content === 'string' ? ai.content : JSON.stringify(ai.content ?? ''),
@@ -193,7 +220,10 @@ function toAgentMessage(message: BaseMessage): AgentMessage {
     };
   }
   if (type === 'tool') {
-    const toolMessage = message as ToolMessage;
+    const toolMessage = message as unknown as {
+      content: string | unknown[];
+      tool_call_id: string;
+    };
     return {
       role: 'tool',
       content: String(toolMessage.content ?? ''),
@@ -280,13 +310,14 @@ export class LangChainBackend implements AgentBackend {
     this.activeTurns.set(record.handle.id, { controller });
 
     try {
+      const runtime = await loadLangChainRuntime();
       const modelWithTools = (await this.resolveModel()).bindTools(
-        this.buildTools(input.gateway, input.fileAccessMode),
+        this.buildTools(input.gateway, input.fileAccessMode, runtime),
       );
       const messages: BaseMessage[] = [
-        new SystemMessage(input.systemPrompt),
-        ...record.priorMessages.map(toLangChainMessage),
-        new HumanMessage(
+        new runtime.SystemMessage(input.systemPrompt),
+        ...record.priorMessages.map((message) => toLangChainMessage(message, runtime)),
+        new runtime.HumanMessage(
           `${input.prompt}\n\nRecent visible terminal context:\n${input.terminalContext}`,
         ),
       ];
@@ -305,25 +336,28 @@ export class LangChainBackend implements AgentBackend {
       while (rounds < this.maxRounds) {
         throwIfCancelled(controller.signal);
         const stream = await modelWithTools.stream(messages, { signal: controller.signal });
-        let full: AIMessageChunk | undefined;
+        let full: unknown;
         for await (const chunk of stream) {
           throwIfCancelled(controller.signal);
           if (chunk.content) {
             const text = typeof chunk.content === 'string' ? chunk.content : '';
             if (text) input.onEvent?.({ type: 'assistant_delta', text });
           }
-          full = full === undefined ? chunk : concat(full, chunk);
+          full = full === undefined ? chunk : runtime.concat(full, chunk);
         }
         throwIfCancelled(controller.signal);
         const toolCalls = full
-          ? collapseToolCallChunks(full.tool_call_chunks ?? []).tool_calls
+          ? runtime.collapseToolCallChunks((full as { tool_call_chunks?: unknown[] }).tool_call_chunks ?? [])
+            .tool_calls
           : [];
         const content = full
-          ? (typeof full.content === 'string'
-            ? full.content
-            : (full.content ? JSON.stringify(full.content) : ''))
+          ? (typeof (full as { content?: unknown }).content === 'string'
+            ? String((full as { content: string }).content)
+            : ((full as { content?: unknown }).content
+              ? JSON.stringify((full as { content: unknown }).content)
+              : ''))
           : '';
-        const response = new AIMessage({
+        const response = new runtime.AIMessage({
           content,
           ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
         });
@@ -366,7 +400,7 @@ export class LangChainBackend implements AgentBackend {
           }
           throwIfCancelled(controller.signal);
 
-          messages.push(new ToolMessage({ content: result, tool_call_id: call.id ?? '' }));
+          messages.push(new runtime.ToolMessage({ content: result, tool_call_id: call.id ?? '' }));
           transcript.push({ role: 'tool', content: result, toolCallId: call.id ?? '' });
           input.onEvent?.({ type: 'tool_completed', toolCall, result });
         }
@@ -419,33 +453,34 @@ export class LangChainBackend implements AgentBackend {
   private buildTools(
     gateway: ToolGateway,
     fileAccessMode: AgentFileAccessMode,
+    runtime: LangChainRuntime,
   ): StructuredToolInterface[] {
     const run = (name: string) => (
       (args: Record<string, unknown>) => this.executeTool(gateway, fileAccessMode, name, args)
     );
 
     const tools: StructuredToolInterface[] = [
-      tool(run('terminal_execute'), {
+      runtime.tool(run('terminal_execute'), {
         name: 'terminal_execute',
         description:
           'Request execution of one command in the same visible terminal. '
           + 'User approval is required unless Full Takeover is explicitly active.',
-        schema: z.object({
-          command: z.string().min(1).describe('The single shell command to execute.'),
-          reason: z.string().optional().describe('Optional one-line justification.'),
+        schema: runtime.z.object({
+          command: runtime.z.string().min(1).describe('The single shell command to execute.'),
+          reason: runtime.z.string().optional().describe('Optional one-line justification.'),
         }),
       }),
-      tool(run('terminal_read'), {
+      runtime.tool(run('terminal_read'), {
         name: 'terminal_read',
         description: 'Read a bounded recent portion of the exact visible terminal history.',
-        schema: z.object({
-          maxChars: z.number().int().min(100).max(30_000).optional(),
+        schema: runtime.z.object({
+          maxChars: runtime.z.number().int().min(100).max(30_000).optional(),
         }),
       }),
-      tool(run('terminal_state'), {
+      runtime.tool(run('terminal_state'), {
         name: 'terminal_state',
         description: 'Get the current terminal transport, shell, cwd/user, and control state.',
-        schema: z.object({}),
+        schema: runtime.z.object({}),
       }),
     ];
 
@@ -457,45 +492,45 @@ export class LangChainBackend implements AgentBackend {
 
     if (permissions.read) {
       tools.push(
-        tool(run('workspace_list'), {
+        runtime.tool(run('workspace_list'), {
           name: 'workspace_list',
           description: 'List one bounded directory inside the explicit Workspace Root without running a shell command.',
-          schema: z.object({
-            path: z.string().max(4_096).optional().describe('Directory path relative to the Workspace Root.'),
+          schema: runtime.z.object({
+            path: runtime.z.string().max(4_096).optional().describe('Directory path relative to the Workspace Root.'),
           }),
         }),
-        tool(run('workspace_read_file'), {
+        runtime.tool(run('workspace_read_file'), {
           name: 'workspace_read_file',
           description:
             'Read one needed, bounded UTF-8 text file inside the Workspace Root and return its SHA-256. '
             + 'Prefer small, targeted reads; never use cat in the terminal for this.',
-          schema: z.object({
-            path: z.string().min(1).max(4_096).describe('File path relative to the Workspace Root.'),
+          schema: runtime.z.object({
+            path: runtime.z.string().min(1).max(4_096).describe('File path relative to the Workspace Root.'),
           }),
         }),
-        tool(run('workspace_stat'), {
+        runtime.tool(run('workspace_stat'), {
           name: 'workspace_stat',
           description: 'Inspect one file, directory, or symbolic link inside the Workspace Root without reading its contents.',
-          schema: z.object({
-            path: z.string().min(1).max(4_096),
+          schema: runtime.z.object({
+            path: runtime.z.string().min(1).max(4_096),
           }),
         }),
-        tool(run('workspace_search'), {
+        runtime.tool(run('workspace_search'), {
           name: 'workspace_search',
           description: 'Search bounded UTF-8 workspace files for literal text and return structured line/column previews. Use this instead of grep in the terminal.',
-          schema: z.object({
-            query: z.string().min(1).max(4_096),
-            path: z.string().max(4_096).optional(),
-            maxResults: z.number().int().min(1).max(200).optional(),
+          schema: runtime.z.object({
+            query: runtime.z.string().min(1).max(4_096),
+            path: runtime.z.string().max(4_096).optional(),
+            maxResults: runtime.z.number().int().min(1).max(200).optional(),
           }),
         }),
-        tool(run('workspace_glob'), {
+        runtime.tool(run('workspace_glob'), {
           name: 'workspace_glob',
           description: 'Find bounded workspace paths matching a glob pattern without running find, dir, or another shell command.',
-          schema: z.object({
-            pattern: z.string().min(1).max(4_096),
-            path: z.string().max(4_096).optional(),
-            maxResults: z.number().int().min(1).max(500).optional(),
+          schema: runtime.z.object({
+            pattern: runtime.z.string().min(1).max(4_096),
+            path: runtime.z.string().max(4_096).optional(),
+            maxResults: runtime.z.number().int().min(1).max(500).optional(),
           }),
         }),
       );
@@ -503,51 +538,51 @@ export class LangChainBackend implements AgentBackend {
 
     if (modeCanWrite) {
       tools.push(
-        tool(run('workspace_apply_patch'), {
+        runtime.tool(run('workspace_apply_patch'), {
           name: 'workspace_apply_patch',
           description:
             'Preferred way to modify an existing file. Atomically apply exact, unique text replacements and return a diff. '
             + 'expectedSha256 must come from the latest workspace_read_file; re-read after a conflict.',
-          schema: z.object({
-            path: z.string().min(1).max(4_096),
-            expectedSha256: z.string().regex(/^[a-fA-F0-9]{64}$/),
-            patches: z.array(z.object({
-              search: z.string().min(1).max(131_072),
-              replace: z.string().max(131_072),
+          schema: runtime.z.object({
+            path: runtime.z.string().min(1).max(4_096),
+            expectedSha256: runtime.z.string().regex(/^[a-fA-F0-9]{64}$/),
+            patches: runtime.z.array(runtime.z.object({
+              search: runtime.z.string().min(1).max(131_072),
+              replace: runtime.z.string().max(131_072),
             })).min(1).max(64),
           }),
         }),
-        tool(run('workspace_write_file'), {
+        runtime.tool(run('workspace_write_file'), {
           name: 'workspace_write_file',
           description:
             'Atomically create one bounded UTF-8 text file. For an existing file prefer workspace_apply_patch; pass null only when the path must not exist.',
-          schema: z.object({
-            path: z.string().min(1).max(4_096),
-            content: z.string().max(131_072),
-            expectedSha256: z.string().regex(/^[a-fA-F0-9]{64}$/).nullable(),
+          schema: runtime.z.object({
+            path: runtime.z.string().min(1).max(4_096),
+            content: runtime.z.string().max(131_072),
+            expectedSha256: runtime.z.string().regex(/^[a-fA-F0-9]{64}$/).nullable(),
           }),
         }),
-        tool(run('workspace_mkdir'), {
+        runtime.tool(run('workspace_mkdir'), {
           name: 'workspace_mkdir',
           description: 'Create one directory inside the Workspace Root without running a shell command.',
-          schema: z.object({
-            path: z.string().min(1).max(4_096),
+          schema: runtime.z.object({
+            path: runtime.z.string().min(1).max(4_096),
           }),
         }),
-        tool(run('workspace_rename'), {
+        runtime.tool(run('workspace_rename'), {
           name: 'workspace_rename',
           description: 'Rename or move one workspace path to another path inside the same Workspace Root.',
-          schema: z.object({
-            source: z.string().min(1).max(4_096),
-            destination: z.string().min(1).max(4_096),
+          schema: runtime.z.object({
+            source: runtime.z.string().min(1).max(4_096),
+            destination: runtime.z.string().min(1).max(4_096),
           }),
         }),
-        tool(run('workspace_delete'), {
+        runtime.tool(run('workspace_delete'), {
           name: 'workspace_delete',
           description: 'Delete one workspace path. Recursive directory deletion must be explicitly requested.',
-          schema: z.object({
-            path: z.string().min(1).max(4_096),
-            recursive: z.boolean().optional(),
+          schema: runtime.z.object({
+            path: runtime.z.string().min(1).max(4_096),
+            recursive: runtime.z.boolean().optional(),
           }),
         }),
       );

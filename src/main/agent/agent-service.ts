@@ -34,7 +34,6 @@ import type { TerminalCommandResult, WorkspaceBinding } from '../../shared/tools
 import type { ProviderStore } from '../providers/provider-store';
 import type { SessionManager } from '../sessions/session-manager';
 import type { TerminalService } from '../terminal/terminal-service';
-import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import type {
   AgentBackend,
   AgentBackendEvent,
@@ -46,7 +45,6 @@ import {
   reduceAgentToolActivities,
   settleRunningToolActivities,
 } from './agent-tool-activity';
-import { LangChainProviderModelFactory } from './langchain-backend';
 import type { CodexAppServerService } from '../app-server/app-server-service';
 import { SharedTerminalTool } from '../tools/shared-terminal-tool';
 import { SessionToolGateway } from '../tools/tool-gateway';
@@ -90,7 +88,7 @@ interface AgentRuntimeRecord extends AgentSessionView {
   terminalContextOffset?: number;
 }
 
-type GenericBackendFactory = (providerId: string) => AgentBackend;
+type GenericBackendFactory = (providerId: string) => AgentBackend | Promise<AgentBackend>;
 
 const BUSY_STATES = new Set<AgentRuntimeState>([
   'THINKING',
@@ -1381,7 +1379,7 @@ export class AgentService {
 
       let backend = runtime.harnessBackend;
       if (!backend) {
-        backend = this.genericBackendFactory(runtime.providerId);
+        backend = await this.genericBackendFactory(runtime.providerId);
         runtime.harnessBackend = backend;
       }
       let thread = runtime.harnessThread;
@@ -2397,6 +2395,8 @@ export class AgentService {
     prompt: string,
   ): Promise<string | undefined> {
     try {
+      const { LangChainProviderModelFactory } = await import('./langchain-backend');
+      const { HumanMessage, SystemMessage } = await import('@langchain/core/messages');
       const model = await new LangChainProviderModelFactory(providerId, this.providers).build();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15_000);

@@ -68,7 +68,6 @@ import { BackupService } from './backup/backup-service';
 import { HostBackupService } from './backup/host-backup-service';
 import { AgentService } from './agent/agent-service';
 import { AgentFileService } from './agent/agent-file-service';
-import { LangChainBackend, LangChainProviderModelFactory } from './agent/langchain-backend';
 import { startAgentSmokeProvider } from './smoke/agent-provider-server';
 import type { AgentSmokeProvider } from './smoke/agent-provider-server';
 import { registerSmokeRunner, smokeModeFromEnvironment } from './smoke/smoke-runner';
@@ -291,9 +290,19 @@ handleTrusted('runtime:get-info', () => ({
 }));
 
 handleTrusted(SETTINGS_CHANNELS.get, () => requireAppSettingsStore().get());
-handleTrusted(SETTINGS_CHANNELS.update, (_event, patch: AppSettingsPatch) => (
-  requireAppSettingsStore().update(patch)
-));
+handleTrusted(SETTINGS_CHANNELS.update, (_event, patch: AppSettingsPatch) => {
+  const updated = requireAppSettingsStore().update(patch);
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.webContents.isDestroyed()) {
+      try {
+        window.webContents.send(SETTINGS_CHANNELS.changed, updated);
+      } catch {
+        // A concurrently closing window must not starve other windows of updates.
+      }
+    }
+  }
+  return updated;
+});
 handleTrusted(SETTINGS_WINDOW_CHANNELS.open, () => {
   showSettingsWindow();
 });
@@ -774,15 +783,21 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
     providerStore,
     codexAppServerService,
     new AgentFileService(terminalService, sessionManager, remoteFilesystemProvider),
-    // The Generic Provider backend now runs through the LangChain harness.
+    // The Generic Provider backend runs through the LangChain harness, loaded
+    // lazily so its ESM-only dependencies do not delay application startup.
     // The shared visible terminal remains the only shell: LangChain's own
     // shell/file tools are never registered (see langchain-backend.ts).
-    (providerId) => new LangChainBackend({
-      modelFactory: () => new LangChainProviderModelFactory(
-        providerId,
-        requireProviderStore(),
-      ).build(),
-    }),
+    async (providerId) => {
+      const { LangChainBackend, LangChainProviderModelFactory } = await import(
+        './agent/langchain-backend'
+      );
+      return new LangChainBackend({
+        modelFactory: () => new LangChainProviderModelFactory(
+          providerId,
+          requireProviderStore(),
+        ).build(),
+      });
+    },
   );
   createMainWindow();
   void codexAppServerService.startIfBound();

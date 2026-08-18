@@ -16,6 +16,7 @@ import {
 } from '../shared/host';
 import type { RuntimeInfo } from '../shared/ipc';
 import { PRODUCT_NAME } from '../shared/product';
+import type { AppSettings } from '../shared/settings';
 import type { SessionRecord } from '../shared/session';
 import type { ProviderProfile } from '../shared/provider';
 import {
@@ -40,7 +41,7 @@ import {
   scrollAgentOutputToBottom,
 } from './agent-scroll';
 import { clampAgentPanelWidth, shouldSubmitAgentComposer } from './agent-ui';
-import { readUiTheme, storeUiTheme } from './theme';
+import { readUiTheme, resolveUiTheme } from './theme';
 import type { UiTheme } from './theme';
 import {
   agentStateLabel,
@@ -160,6 +161,7 @@ function mergeCodexAppServerState(
 const MAX_COMPOSER_HEIGHT_PX = 240;
 
 export function App() {
+  const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [uiTheme, setUiTheme] = useState<UiTheme>(() => readUiTheme());
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
   const [shells, setShells] = useState<ShellProfile[]>([]);
@@ -221,8 +223,18 @@ export function App() {
   const [credentialActionPending, setCredentialActionPending] = useState(false);
 
   useEffect(() => {
-    storeUiTheme(uiTheme);
-  }, [uiTheme]);
+    const settingsBridge = window.aiTerminal.settings;
+    if (!settingsBridge) return undefined;
+    void settingsBridge.get().then((settings) => {
+      setAppSettings(settings);
+      setUiTheme(resolveUiTheme(settings.theme));
+    }).catch(() => undefined);
+    const removeSettingsListener = settingsBridge.onChanged((settings) => {
+      setAppSettings(settings);
+      setUiTheme(resolveUiTheme(settings.theme));
+    });
+    return removeSettingsListener;
+  }, []);
 
   useEffect(() => window.aiTerminal.sessions.onRenamed((session) => {
     setSessions((current) => [
@@ -1507,7 +1519,7 @@ export function App() {
   return (
     <div
       className={`app-shell ${agentPanelVisible ? '' : 'agent-panel-hidden'}`}
-      data-locale="zh-CN"
+      data-locale={appSettings?.language ?? 'zh-CN'}
       data-theme={uiTheme}
       data-agent-panel-visible={agentPanelVisible ? 'true' : 'false'}
       style={{ '--agent-panel-width': `${agentPanelWidth}px` } as CSSProperties}
@@ -1526,19 +1538,17 @@ export function App() {
           aria-label={uiTheme === 'dark' ? '切换到白色主题' : '切换到深色主题'}
           aria-pressed={uiTheme === 'light'}
           title={uiTheme === 'dark' ? '切换到白色主题' : '切换到深色主题'}
-          onClick={() => setUiTheme((current) => current === 'dark' ? 'light' : 'dark')}
+          onClick={() => {
+            const next = uiTheme === 'dark' ? 'light' : 'dark';
+            setUiTheme(next);
+            void Promise.resolve(window.aiTerminal.settings?.update({ theme: next }))
+              .catch(() => undefined);
+          }}
         >{uiTheme === 'dark' ? '☀ 白色' : '☾ 深色'}</button>
         <div className="runtime-pill">
           <span className="status-dot" />
           {runtime ? `${runtime.platform} · ${runtime.arch}` : '正在启动…'}
         </div>
-        <button
-          type="button"
-          className="titlebar-settings"
-          data-action="open-settings-window"
-          title="设置"
-          onClick={() => void window.aiTerminal.settingsWindow.open()}
-        >⚙ 设置</button>
       </header>
 
       {workspaceActionError && (

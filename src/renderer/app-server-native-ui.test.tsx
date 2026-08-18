@@ -237,6 +237,7 @@ function bridgeForCodex(snapshot: CodexAppServerSnapshot): DesktopBridge {
         updatedAt: new Date(0).toISOString(),
       }),
       update: vi.fn(),
+      onChanged: vi.fn(() => () => undefined),
     },
     backup: {
       export: vi.fn().mockResolvedValue(null),
@@ -340,7 +341,7 @@ describe('native Codex App Server renderer mode', () => {
     expect(shell.dataset.theme).toBe('dark');
     await act(async () => toggle.click());
     expect(shell.dataset.theme).toBe('light');
-    expect(window.localStorage.getItem('ai-terminal:ui-theme')).toBe('light');
+    expect(bridge.settings.update).toHaveBeenCalledWith({ theme: 'light' });
     expect(toggle.getAttribute('aria-pressed')).toBe('true');
   });
 

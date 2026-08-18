@@ -168,6 +168,7 @@ export interface DesktopBridge {
   settings: {
     get(): Promise<AppSettings>;
     update(patch: AppSettingsPatch): Promise<AppSettings>;
+    onChanged(listener: (settings: AppSettings) => void): () => void;
   };
   backup: {
     export(request: BackupExportRequest): Promise<BackupExportResult | null>;

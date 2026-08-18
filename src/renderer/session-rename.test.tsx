@@ -185,6 +185,7 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
         updatedAt: new Date(0).toISOString(),
       }),
       update: vi.fn(),
+      onChanged: vi.fn(() => () => undefined),
     },
     backup: {
       export: vi.fn().mockResolvedValue(null),

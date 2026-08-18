@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { AppSettings } from '../shared/settings';
 import { AiServiceSettings } from './AiServiceSettings';
+import { resolveUiTheme } from './theme';
 
 type SettingsSection = 'general' | 'ai' | 'data';
 
@@ -24,6 +25,11 @@ export function SettingsWindow() {
       setDraft(next);
     }).catch((error) => setSettingsMessage(errorMessage(error)));
     void window.aiTerminal.runtime.getInfo().then((info) => setVersion(info.version));
+    const removeSettingsListener = window.aiTerminal.settings.onChanged((next) => {
+      setSettings(next);
+      setDraft(next);
+    });
+    return removeSettingsListener;
   }, []);
 
   const patchDraft = useCallback((patch: Partial<AppSettings>) => {
@@ -90,7 +96,10 @@ export function SettingsWindow() {
   );
 
   return (
-    <div className="settings-shell">
+    <div
+      className="settings-shell app-shell"
+      data-theme={resolveUiTheme(draft?.theme ?? 'dark')}
+    >
       <header className="settings-header">
         <h1>设置</h1>
         <span className="settings-version">AI Terminal{version ? ` · v${version}` : ''}</span>
