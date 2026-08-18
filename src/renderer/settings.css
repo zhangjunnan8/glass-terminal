@@ -65,6 +65,10 @@
   gap: 14px;
 }
 
+.settings-card-wide {
+  max-width: 820px;
+}
+
 .settings-card h2 {
   margin: 0 0 4px;
   font-size: 15px;

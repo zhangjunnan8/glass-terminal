@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { AppSettings } from '../shared/settings';
+import { AiServiceSettings } from './AiServiceSettings';
 
-type SettingsSection = 'general' | 'data';
+type SettingsSection = 'general' | 'ai' | 'data';
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -104,6 +105,13 @@ export function SettingsWindow() {
         </button>
         <button
           type="button"
+          className={section === 'ai' ? 'settings-nav-active' : ''}
+          onClick={() => setSection('ai')}
+        >
+          AI 服务
+        </button>
+        <button
+          type="button"
           className={section === 'data' ? 'settings-nav-active' : ''}
           onClick={() => setSection('data')}
         >
@@ -112,6 +120,13 @@ export function SettingsWindow() {
       </nav>
 
       <main className="settings-body">
+        {section === 'ai' && (
+          <section className="settings-card settings-card-wide">
+            <h2>AI 服务</h2>
+            <AiServiceSettings />
+          </section>
+        )}
+
         {section === 'general' && draft && (
           <section className="settings-card">
             <h2>通用偏好</h2>
