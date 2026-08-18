@@ -40,7 +40,6 @@ import {
   scrollAgentOutputToBottom,
 } from './agent-scroll';
 import { clampAgentPanelWidth, shouldSubmitAgentComposer } from './agent-ui';
-import { AiServiceSettings } from './AiServiceSettings';
 import { readUiTheme, storeUiTheme } from './theme';
 import type { UiTheme } from './theme';
 import {
@@ -183,9 +182,7 @@ export function App() {
   const [sidebarSearch, setSidebarSearch] = useState('');
   const [newTerminalOpen, setNewTerminalOpen] = useState(false);
   const [sftpOpen, setSftpOpen] = useState(false);
-  const [providerModalOpen, setProviderModalOpen] = useState(false);
   const [codexAppServer, setCodexAppServer] = useState<CodexAppServerSnapshot | null>(null);
-  const providerModalRef = useRef<HTMLDivElement>(null);
   const agentBodyRef = useRef<HTMLDivElement>(null);
   const agentComposerRef = useRef<HTMLTextAreaElement>(null);
   const agentStickToBottomRef = useRef(true);
@@ -293,21 +290,6 @@ export function App() {
       removeCodexAppServerListener();
     };
   }, []);
-
-  useEffect(() => {
-    if (!providerModalOpen) return undefined;
-    const previouslyFocused = document.activeElement;
-    providerModalRef.current?.focus();
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape') return;
-      setProviderModalOpen(false);
-    };
-    document.addEventListener('keydown', handleKeyDown);
-    return () => {
-      document.removeEventListener('keydown', handleKeyDown);
-      if (previouslyFocused instanceof HTMLElement) previouslyFocused.focus();
-    };
-  }, [providerModalOpen]);
 
   useEffect(() => {
     const handleOpenedTerminal = (event: Event) => {
@@ -670,7 +652,7 @@ export function App() {
   }
 
   function openAgentBackendSettings() {
-    setProviderModalOpen(true);
+    void window.aiTerminal.settingsWindow.open();
   }
 
   async function sendAgentPrompt(event: FormEvent<HTMLFormElement>) {
@@ -1609,7 +1591,7 @@ export function App() {
         >◷</button>
         <div className="activity-spacer" />
         <button className="activity" title="AI 服务设置" data-action="open-provider-settings" onClick={() => {
-          setProviderModalOpen(true);
+          void window.aiTerminal.settingsWindow.open();
         }}>⚙</button>
       </aside>
 
@@ -2757,28 +2739,6 @@ export function App() {
               </button>
             </div>
           </form>
-        </div>
-      )}
-
-      {providerModalOpen && (
-        <div className="modal-backdrop">
-          <div
-            ref={providerModalRef}
-            className="modal provider-modal"
-            data-testid="provider-settings-modal"
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="provider-settings-title"
-            tabIndex={-1}
-          >
-            <div className="modal-header">
-              <strong id="provider-settings-title">AI 服务设置</strong>
-              <button type="button" aria-label="关闭 AI 服务设置" onClick={() => {
-                setProviderModalOpen(false);
-              }}>×</button>
-            </div>
-            <AiServiceSettings />
-          </div>
         </div>
       )}
 

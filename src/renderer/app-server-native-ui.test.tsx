@@ -8,6 +8,7 @@ import type { DesktopBridge } from '../shared/ipc';
 import type { ProviderProfile } from '../shared/provider';
 import type { SessionRecord } from '../shared/session';
 import { App } from './App';
+import { AiServiceSettings } from './AiServiceSettings';
 
 vi.mock('./components/TerminalPane', () => ({
   TerminalPane: () => <div data-testid="terminal-pane" />,
@@ -310,14 +311,8 @@ describe('native Codex App Server renderer mode', () => {
   it('toggles only read access to current terminal through the native context API', async () => {
     const bridge = bridgeForCodex(codexSnapshot());
     Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
-    await act(async () => root.render(<App />));
+    await act(async () => root.render(<AiServiceSettings />));
     await settle();
-
-    const backendSelect = container.querySelector<HTMLSelectElement>('[data-testid="agent-backend-select"]')!;
-    await act(async () => setSelectValue(backendSelect, CODEX_APP_SERVER_AGENT_BACKEND));
-    await act(async () => {
-      container.querySelector<HTMLButtonElement>('[data-action="open-codex-agent-settings"]')!.click();
-    });
 
     const toggle = container.querySelector<HTMLInputElement>('[data-testid="codex-terminal-context-toggle"]')!;
     expect(toggle.checked).toBe(false);

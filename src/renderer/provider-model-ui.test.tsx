@@ -2,7 +2,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DesktopBridge } from '../shared/ipc';
-import { App } from './App';
+import { AiServiceSettings } from './AiServiceSettings';
 
 vi.mock('./components/TerminalPane', () => ({
   TerminalPane: () => <div data-testid="terminal-pane" />,
@@ -110,12 +110,9 @@ describe('compatible API model picker', () => {
       value: providerBridge(discoverModels),
     });
 
-    await act(async () => root.render(<App />));
+    await act(async () => root.render(<AiServiceSettings />));
     await settle();
 
-    await act(async () => {
-      container.querySelector<HTMLButtonElement>('[data-action="open-provider-settings"]')!.click();
-    });
     await act(async () => {
       container.querySelector<HTMLButtonElement>('[data-testid="provider-kind-generic"]')!.click();
     });
