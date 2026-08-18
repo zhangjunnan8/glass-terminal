@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { buildCommandEnvelope, SentinelCapture } from './structured-command';
+import {
+  buildCommandEnvelope,
+  CommandDisplayFilter,
+  SentinelCapture,
+} from './structured-command';
 
 function decodedPowerShellPayloads(input: string): string[] {
   return [...input.matchAll(/\[Convert\]::FromBase64String\('([A-Za-z0-9+/=]+)'\)/gu)]
@@ -78,5 +82,31 @@ describe('structured command sentinel', () => {
     expect(displayPayload).not.toMatch(
       /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/u,
     );
+  });
+
+  it('strips the envelope echo and start sentinel, re-presenting the clean command', () => {
+    const envelope = buildCommandEnvelope('posix', 'whoami', 'abcdef0123456789');
+    const filter = new CommandDisplayFilter(envelope, 'whoami', 'posix');
+
+    const display = filter.push(`${envelope.input}\r\n${envelope.startMarker}`);
+    expect(display).toBe('$ whoami\r\n');
+    expect(display).not.toContain(envelope.startMarker);
+    expect(display).not.toContain('__ait_a');
+  });
+
+  it('hides the end sentinel and keeps command output and the following prompt', () => {
+    const envelope = buildCommandEnvelope('posix', 'whoami', 'abcdef0123456789');
+    const filter = new CommandDisplayFilter(envelope, 'whoami', 'posix');
+    filter.push(`${envelope.input}\r\n${envelope.startMarker}`);
+    const end = `${envelope.endPrefix}0${envelope.endSuffix}`;
+
+    const display = filter.push(`alice\r\n${end}\r\nzjn@host:~$ `);
+    expect(display).toContain('alice');
+    expect(display).toContain('zjn@host:~$');
+    expect(display).not.toContain(envelope.endPrefix);
+    expect(display).not.toContain(envelope.startMarker);
+
+    // Once complete, subsequent stream data passes through unchanged.
+    expect(filter.push('next prompt echo')).toBe('next prompt echo');
   });
 });

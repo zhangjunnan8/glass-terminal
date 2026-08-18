@@ -17,7 +17,7 @@ import type {
 } from '../../shared/terminal';
 import { TERMINAL_CHANNELS } from '../../shared/terminal';
 import { discoverShells } from './shell-discovery';
-import { buildCommandEnvelope, SentinelCapture } from './structured-command';
+import { buildCommandEnvelope, CommandDisplayFilter, SentinelCapture } from './structured-command';
 import { TerminalInteractionDetector } from './interaction-detector';
 
 interface TerminalBackend {
@@ -59,6 +59,7 @@ interface TerminalRecord {
 interface ActiveExecution {
   execution: CommandExecution;
   capture: SentinelCapture;
+  displayFilter: CommandDisplayFilter;
   interactionDetector: TerminalInteractionDetector;
   outputBytes: number;
   hooks: StructuredExecutionHooks;
@@ -471,6 +472,11 @@ export class TerminalService {
       record.activeExecution = {
         execution,
         capture: new SentinelCapture(envelope),
+        displayFilter: new CommandDisplayFilter(
+          envelope,
+          normalizedCommand,
+          record.descriptor.shellKind,
+        ),
         interactionDetector: new TerminalInteractionDetector(),
         outputBytes: 0,
         hooks,
@@ -742,16 +748,19 @@ export class TerminalService {
         data,
       });
     }
+    // The journal keeps the raw stream; only the renderer-visible copy strips
+    // the structured-command envelope and sentinels.
+    const displayData = executionAtChunkStart?.displayFilter?.push(data) ?? data;
     if (!record.attached) {
-      record.pendingOutput.push(data);
-      record.pendingOutputLength += data.length;
+      record.pendingOutput.push(displayData);
+      record.pendingOutputLength += displayData.length;
       while (record.pendingOutputLength > MAX_PENDING_OUTPUT && record.pendingOutput.length > 1) {
         record.pendingOutputLength -= record.pendingOutput.shift()!.length;
       }
       return;
     }
     if (!record.owner.isDestroyed()) {
-      record.owner.send(TERMINAL_CHANNELS.data, { terminalId, data });
+      record.owner.send(TERMINAL_CHANNELS.data, { terminalId, data: displayData });
     }
   }
 

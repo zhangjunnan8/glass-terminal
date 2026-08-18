@@ -150,3 +150,80 @@ export class SentinelCapture {
     return { output, observed, completed: false };
   }
 }
+
+function displayPrompt(shellKind: ShellProfile['kind']): string {
+  if (shellKind === 'powershell') return 'PS ';
+  if (shellKind === 'cmd') return '> ';
+  return '$ ';
+}
+
+/**
+ * Produces the human-visible stream for a structured command execution: the
+ * envelope echo and START/END sentinels are stripped, the clean command is
+ * re-presented with a shell prompt, and everything after the END sentinel
+ * (the next shell prompt) is passed through unchanged.
+ *
+ * This only affects what is rendered to the user; the SentinelCapture still
+ * consumes the raw stream for exit-code detection, and the journal still
+ * records the raw bytes for audit/replay.
+ */
+export class CommandDisplayFilter {
+  private readonly prompt: string;
+  private readonly displayCommand: string;
+  private buffer = '';
+  private started = false;
+  private completed = false;
+
+  constructor(
+    private readonly envelope: CommandEnvelope,
+    displayCommand: string,
+    shellKind: ShellProfile['kind'],
+  ) {
+    this.prompt = displayPrompt(shellKind);
+    this.displayCommand = displayCommand;
+  }
+
+  push(data: string): string {
+    if (this.completed) return data;
+    this.buffer += data;
+
+    if (!this.started) {
+      const startIndex = this.buffer.indexOf(this.envelope.startMarker);
+      if (startIndex < 0) {
+        const reserve = Math.max(0, this.envelope.startMarker.length - 1);
+        if (this.buffer.length > reserve) this.buffer = this.buffer.slice(-reserve);
+        return '';
+      }
+      this.started = true;
+      this.buffer = this.buffer.slice(startIndex + this.envelope.startMarker.length);
+      return `${this.prompt}${this.displayCommand}\r\n${this.consumeUntilEnd()}`;
+    }
+
+    return this.consumeUntilEnd();
+  }
+
+  private consumeUntilEnd(): string {
+    const endIndex = this.buffer.indexOf(this.envelope.endPrefix);
+    if (endIndex >= 0) {
+      const codeStart = endIndex + this.envelope.endPrefix.length;
+      const suffixIndex = this.buffer.indexOf(this.envelope.endSuffix, codeStart);
+      if (suffixIndex >= 0) {
+        const before = this.buffer.slice(0, endIndex);
+        const after = this.buffer.slice(suffixIndex + this.envelope.endSuffix.length);
+        this.completed = true;
+        this.buffer = '';
+        return before + after;
+      }
+      const before = this.buffer.slice(0, endIndex);
+      this.buffer = this.buffer.slice(endIndex);
+      return before;
+    }
+    const reserve = Math.max(0, this.envelope.endPrefix.length - 1);
+    if (this.buffer.length > reserve) {
+      const out = this.buffer.slice(0, this.buffer.length - reserve);
+      this.buffer = this.buffer.slice(this.buffer.length - reserve);
+      return out;
+    }
+    return '';
+  }
+}
