@@ -41,7 +41,7 @@ import {
   scrollAgentOutputToBottom,
 } from './agent-scroll';
 import { clampAgentPanelWidth, shouldSubmitAgentComposer } from './agent-ui';
-import { readUiTheme, resolveUiTheme } from './theme';
+import { readUiTheme, resolveUiTheme, useSystemTheme } from './theme';
 import type { UiTheme } from './theme';
 import {
   agentStateLabel,
@@ -163,6 +163,7 @@ const MAX_COMPOSER_HEIGHT_PX = 240;
 export function App() {
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [uiTheme, setUiTheme] = useState<UiTheme>(() => readUiTheme());
+  const systemTheme = useSystemTheme();
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
   const [shells, setShells] = useState<ShellProfile[]>([]);
   const [hosts, setHosts] = useState<HostProfile[]>([]);
@@ -235,6 +236,10 @@ export function App() {
     });
     return removeSettingsListener;
   }, []);
+
+  useEffect(() => {
+    if (appSettings?.theme === 'system') setUiTheme(systemTheme);
+  }, [systemTheme, appSettings?.theme]);
 
   useEffect(() => window.aiTerminal.sessions.onRenamed((session) => {
     setSessions((current) => [
@@ -1535,16 +1540,16 @@ export function App() {
           type="button"
           className="theme-toggle"
           data-action="toggle-theme"
-          aria-label={uiTheme === 'dark' ? '切换到白色主题' : '切换到深色主题'}
+          aria-label={uiTheme === 'dark' ? '切换到亮色主题' : '切换到深色主题'}
           aria-pressed={uiTheme === 'light'}
-          title={uiTheme === 'dark' ? '切换到白色主题' : '切换到深色主题'}
+          title={uiTheme === 'dark' ? '切换到亮色主题' : '切换到深色主题'}
           onClick={() => {
             const next = uiTheme === 'dark' ? 'light' : 'dark';
             setUiTheme(next);
             void Promise.resolve(window.aiTerminal.settings?.update({ theme: next }))
               .catch(() => undefined);
           }}
-        >{uiTheme === 'dark' ? '☀ 白色' : '☾ 深色'}</button>
+        >{uiTheme === 'dark' ? '☀ 亮色' : '☾ 深色'}</button>
         <div className="runtime-pill">
           <span className="status-dot" />
           {runtime ? `${runtime.platform} · ${runtime.arch}` : '正在启动…'}

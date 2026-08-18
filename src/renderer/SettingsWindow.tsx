@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { AppSettings } from '../shared/settings';
 import { AiServiceSettings } from './AiServiceSettings';
-import { resolveUiTheme } from './theme';
+import { useSystemTheme } from './theme';
 
 type SettingsSection = 'general' | 'ai' | 'data';
 
@@ -18,6 +18,7 @@ export function SettingsWindow() {
   const [backupPending, setBackupPending] = useState(false);
   const [includeLogs, setIncludeLogs] = useState(false);
   const [version, setVersion] = useState('');
+  const systemTheme = useSystemTheme();
 
   useEffect(() => {
     void window.aiTerminal.settings.get().then((next) => {
@@ -42,7 +43,6 @@ export function SettingsWindow() {
     try {
       const saved = await window.aiTerminal.settings.update({
         theme: draft.theme,
-        language: draft.language,
         logRetentionDays: draft.logRetentionDays,
         defaultMaxRounds: draft.defaultMaxRounds,
       });
@@ -94,11 +94,12 @@ export function SettingsWindow() {
   const dirty = Boolean(
     draft && settings && JSON.stringify(draft) !== JSON.stringify(settings),
   );
+  const resolvedTheme = draft?.theme === 'system' ? systemTheme : (draft?.theme ?? 'dark');
 
   return (
     <div
       className="settings-shell app-shell"
-      data-theme={resolveUiTheme(draft?.theme ?? 'dark')}
+      data-theme={resolvedTheme}
     >
       <header className="settings-header">
         <h1>设置</h1>
@@ -150,21 +151,8 @@ export function SettingsWindow() {
                 })}
               >
                 <option value="dark">深色</option>
-                <option value="light">浅色</option>
+                <option value="light">亮色</option>
                 <option value="system">跟随系统</option>
-              </select>
-            </label>
-
-            <label className="settings-field">
-              <span>语言</span>
-              <select
-                value={draft.language}
-                onChange={(event) => patchDraft({
-                  language: event.target.value as AppSettings['language'],
-                })}
-              >
-                <option value="zh-CN">简体中文</option>
-                <option value="en">English</option>
               </select>
             </label>
 
