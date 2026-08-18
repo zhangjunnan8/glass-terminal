@@ -57,6 +57,7 @@ import type {
   SetCodexTerminalContextAccessRequest,
   SetCodexTerminalAgentEnabledRequest,
 } from './codex-app-server';
+import type { AppSettings, AppSettingsPatch } from './settings';
 
 export interface RuntimeInfo {
   platform: NodeJS.Platform;
@@ -158,5 +159,9 @@ export interface DesktopBridge {
     resolveTakeover(request: ResolveTakeoverRequest): Promise<AgentSessionView>;
     confirmShellReady(request: ConfirmShellReadyRequest): Promise<AgentSessionView>;
     onStateChanged(listener: (state: AgentSessionView) => void): () => void;
+  };
+  settings: {
+    get(): Promise<AppSettings>;
+    update(patch: AppSettingsPatch): Promise<AppSettings>;
   };
 }

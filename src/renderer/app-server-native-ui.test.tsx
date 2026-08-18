@@ -225,6 +225,18 @@ function bridgeForCodex(snapshot: CodexAppServerSnapshot): DesktopBridge {
       onStateChanged: vi.fn(() => () => undefined),
     },
     sftp: {} as DesktopBridge['sftp'],
+    settings: {
+      get: vi.fn().mockResolvedValue({
+        schemaVersion: 1,
+        theme: 'dark',
+        language: 'zh-CN',
+        logRetentionDays: 90,
+        defaultMaxRounds: 40,
+        createdAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      }),
+      update: vi.fn(),
+    },
   };
 }
 

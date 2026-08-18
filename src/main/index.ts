@@ -27,6 +27,8 @@ import { SFTP_CHANNELS } from '../shared/sftp';
 import type { DownloadSelectionRequest, UploadSelectionRequest } from '../shared/sftp';
 import { PROVIDER_CHANNELS } from '../shared/provider';
 import type { ProviderInput, ProviderModelDiscoveryInput } from '../shared/provider';
+import { SETTINGS_CHANNELS } from '../shared/settings';
+import type { AppSettingsPatch } from '../shared/settings';
 import { AGENT_CHANNELS } from '../shared/agent';
 import type {
   ConfirmShellReadyRequest,
@@ -55,6 +57,7 @@ import { TransferQueue } from './sftp/transfer-queue';
 import { ProviderStore } from './providers/provider-store';
 import { MemorySecretStore } from './providers/secret-store';
 import { FileSecretStore } from './providers/file-secret-store';
+import { AppSettingsStore } from './settings/app-settings-store';
 import { AgentService } from './agent/agent-service';
 import { AgentFileService } from './agent/agent-file-service';
 import { LangChainBackend, LangChainProviderModelFactory } from './agent/langchain-backend';
@@ -91,6 +94,7 @@ let providerStore: ProviderStore | undefined;
 let agentService: AgentService | undefined;
 let codexAppServerService: CodexAppServerService | undefined;
 let agentSmokeProvider: AgentSmokeProvider | undefined;
+let appSettingsStore: AppSettingsStore | undefined;
 const trustedRendererContents = new Set<number>();
 const ownsSingleInstance = acquireSingleInstance(
   app,
@@ -129,6 +133,11 @@ function requireCodexAppServerService(): CodexAppServerService {
 function requireAgentService(): AgentService {
   if (!agentService) throw new Error('Agent service is not ready.');
   return agentService;
+}
+
+function requireAppSettingsStore(): AppSettingsStore {
+  if (!appSettingsStore) throw new Error('App settings store is not ready.');
+  return appSettingsStore;
 }
 
 function assertTrustedSender(event: IpcMainInvokeEvent): void {
@@ -202,6 +211,11 @@ handleTrusted('runtime:get-info', () => ({
   arch: process.arch,
   version: app.getVersion(),
 }));
+
+handleTrusted(SETTINGS_CHANNELS.get, () => requireAppSettingsStore().get());
+handleTrusted(SETTINGS_CHANNELS.update, (_event, patch: AppSettingsPatch) => (
+  requireAppSettingsStore().update(patch)
+));
 
 handleTrusted(TERMINAL_CHANNELS.listShells, () => terminalService.listShells());
 handleTrusted(
@@ -559,6 +573,9 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
   const secretStore = isSmokeTest
     ? new MemorySecretStore()
     : new FileSecretStore(join(app.getPath('userData'), 'config', 'secrets.json'));
+  appSettingsStore = new AppSettingsStore(
+    join(app.getPath('userData'), 'config', 'app-settings.json'),
+  );
   if (smokeMode === 'agent' || smokeMode === 'agent-ssh') {
     agentSmokeProvider = await startAgentSmokeProvider(smokeMode === 'agent-ssh');
   }
