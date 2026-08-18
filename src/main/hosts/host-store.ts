@@ -153,6 +153,7 @@ function parseHost(
     sortOrder: safeOrder(candidate.sortOrder, fallbackOrder),
     credentialConfigured: candidate.credentialConfigured === true && Boolean(credentialReference),
     credentialReference,
+    fullTakeover: candidate.fullTakeover === true,
     revision: Number.isSafeInteger(candidate.revision) && Number(candidate.revision) > 0
       ? Number(candidate.revision)
       : 1,
@@ -257,6 +258,18 @@ export class HostStore {
     return this.getStored(hostId).revision;
   }
 
+  setFullTakeover(hostId: string, enabled: boolean): HostProfile {
+    const existing = this.getStored(hostId);
+    const updated: StoredHostProfile = {
+      ...existing,
+      fullTakeover: enabled,
+      revision: existing.revision + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    this.replace(updated);
+    return publicHost(updated, this.folders);
+  }
+
   connectionIdentityChanged(input: HostInput): boolean {
     const normalized = normalizeInput(input);
     const existing = input.id
@@ -294,6 +307,7 @@ export class HostStore {
         : this.nextHostOrder(folderSelection.folderId),
       credentialConfigured: connectionChanged ? false : existing?.credentialConfigured ?? false,
       credentialReference: connectionChanged ? undefined : existing?.credentialReference,
+      fullTakeover: existing?.fullTakeover ?? false,
       revision: (existing?.revision ?? 0) + 1,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,

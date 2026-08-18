@@ -65,6 +65,7 @@ describe.runIf(enabled)('real SFTP over the visible SSH connection', () => {
       authMethod: 'password',
       sortOrder: 0,
       favorite: false,
+      fullTakeover: false,
       credentialConfigured: false,
       createdAt: new Date(0).toISOString(),
       updatedAt: new Date(0).toISOString(),

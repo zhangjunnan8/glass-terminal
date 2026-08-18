@@ -33,6 +33,7 @@ const groupedHost: HostProfile = {
   folderId: folder.id,
   sortOrder: 0,
   favorite: false,
+  fullTakeover: false,
   credentialConfigured: false,
   createdAt: now,
   updatedAt: now,

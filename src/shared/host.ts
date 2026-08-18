@@ -137,6 +137,11 @@ export interface HostProfile {
   group?: string;
   favorite: boolean;
   credentialConfigured: boolean;
+  /**
+   * Persistent per-host approval preference. When true, every future terminal
+   * of this host defaults to Full Takeover instead of per-command approval.
+   */
+  fullTakeover: boolean;
   createdAt: string;
   updatedAt: string;
 }
@@ -158,6 +163,7 @@ export interface HostInput {
   /** @deprecated Use folderId. A matching folder is created when necessary. */
   group?: string;
   favorite?: boolean;
+  fullTakeover?: boolean;
 }
 
 export interface SshConnectRequest {

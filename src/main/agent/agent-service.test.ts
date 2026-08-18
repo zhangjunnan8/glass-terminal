@@ -236,6 +236,7 @@ class FakeSessions {
   readonly failAuditTypes = new Set<string>();
   failThreadEvents = false;
   persistedThreadId?: string;
+  fullTakeover = false;
   session: SessionRecord = {
     schemaVersion: 1,
     id: '11111111-1111-1111-1111-111111111111',
@@ -307,6 +308,8 @@ class FakeSessions {
     this.threadEvents.push(event);
     this.persistedThreadEvents.push(event);
   }
+  hostFullTakeover(_hostId: string) { return this.fullTakeover; }
+  setHostFullTakeover(_hostId: string, enabled: boolean) { this.fullTakeover = enabled; }
   readTerminalHistory() { return 'tester@host:~$ '; }
   appendAudit(
     _sessionId: string,

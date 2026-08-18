@@ -54,6 +54,7 @@ describe.runIf(enabled)('real SSH shared terminal', () => {
       authMethod: 'password',
       sortOrder: 0,
       favorite: false,
+      fullTakeover: false,
       credentialConfigured: false,
       createdAt: new Date(0).toISOString(),
       updatedAt: new Date(0).toISOString(),

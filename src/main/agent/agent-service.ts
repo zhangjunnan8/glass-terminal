@@ -994,6 +994,7 @@ export class AgentService {
           approvalId: approval.id,
         });
         runtime.fullTakeover = true;
+        this.syncHostFullTakeover(runtime);
       }
       try {
         return this.resolveApproval(owner, {
@@ -1004,6 +1005,7 @@ export class AgentService {
         });
       } catch (error) {
         runtime.fullTakeover = false;
+        this.syncHostFullTakeover(runtime);
         this.appendControlAudit(runtime, 'full_takeover_changed', 'system', {
           enabled: false,
           reason: 'approval_resolution_failed',
@@ -1048,6 +1050,7 @@ export class AgentService {
         enabled: false,
       });
     }
+    this.syncHostFullTakeover(runtime);
     this.emit(runtime);
     return this.cloneRuntime(runtime);
   }
@@ -1970,7 +1973,9 @@ export class AgentService {
         : CODEX_APP_SERVER_AGENT_BACKEND,
       state: 'USER_CONTROL',
       terminalInputMode: 'human',
-      fullTakeover: false,
+      fullTakeover: backend.kind === 'generic-provider' && session.hostId
+        ? this.sessions.hostFullTakeover(session.hostId)
+        : false,
       fileAccessMode: 'off',
       fileAccessPolicy: disabledFileAccessPolicy(),
       fileAccessGeneration: 0,
@@ -2304,6 +2309,19 @@ export class AgentService {
       });
     } catch (error) {
       console.error('Unable to persist Full Takeover shutdown:', error);
+    }
+  }
+
+  /** Persist the runtime's Full Takeover preference to its bound Host. */
+  private syncHostFullTakeover(runtime: AgentRuntimeRecord): void {
+    if (runtime.backend.kind !== 'generic-provider') return;
+    try {
+      const session = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
+      if (session?.hostId) {
+        this.sessions.setHostFullTakeover(session.hostId, runtime.fullTakeover);
+      }
+    } catch {
+      // Full Takeover persistence is best-effort; the in-memory state remains authoritative.
     }
   }
 

@@ -232,6 +232,14 @@ export class SessionManager {
     return this.store.rename(request.sessionId, request.name, request.source ?? 'manual');
   }
 
+  hostFullTakeover(hostId: string): boolean {
+    return this.hosts.get(hostId).fullTakeover;
+  }
+
+  setHostFullTakeover(hostId: string, enabled: boolean): void {
+    this.hosts.setFullTakeover(hostId, enabled);
+  }
+
   readTerminalHistory(sessionId: string): string {
     return this.store.readTerminalHistory(sessionId);
   }

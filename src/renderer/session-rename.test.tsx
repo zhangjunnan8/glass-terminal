@@ -49,6 +49,7 @@ const host: HostProfile = {
   authMethod: 'password',
   credentialConfigured: false,
   favorite: false,
+  fullTakeover: false,
   sortOrder: 0,
   createdAt: now,
   updatedAt: now,
