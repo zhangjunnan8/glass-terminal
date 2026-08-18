@@ -1,0 +1,18 @@
+appId: com.ai-terminal.app
+productName: AI Terminal
+directories:
+  output: release
+files:
+  - dist/**
+  - dist-electron/**
+  - package.json
+# Keep the app unpacked: @langchain/* and zod are loaded via dynamic import()
+# (ESM), and node-pty is a native module. An unpacked directory avoids asar's
+# ESM/native-module resolution pitfalls and is simpler to 7z afterwards.
+asar: false
+win:
+  target:
+    - target: dir
+      arch:
+        - x64
+npmRebuild: true
