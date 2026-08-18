@@ -22,3 +22,7 @@ export const SETTINGS_CHANNELS = {
   get: 'settings:get',
   update: 'settings:update',
 } as const;
+
+export const SETTINGS_WINDOW_CHANNELS = {
+  open: 'settings-window:open',
+} as const;

@@ -27,7 +27,7 @@ import { SFTP_CHANNELS } from '../shared/sftp';
 import type { DownloadSelectionRequest, UploadSelectionRequest } from '../shared/sftp';
 import { PROVIDER_CHANNELS } from '../shared/provider';
 import type { ProviderInput, ProviderModelDiscoveryInput } from '../shared/provider';
-import { SETTINGS_CHANNELS } from '../shared/settings';
+import { SETTINGS_CHANNELS, SETTINGS_WINDOW_CHANNELS } from '../shared/settings';
 import type { AppSettingsPatch } from '../shared/settings';
 import { BACKUP_CHANNELS } from '../shared/backup';
 import type {
@@ -88,6 +88,9 @@ const isDevelopment = Boolean(developmentRendererUrl);
 const rendererEntryUrl = developmentRendererUrl?.href ?? pathToFileURL(
   join(__dirname, '..', 'dist', 'index.html'),
 ).toString();
+const settingsEntryUrl = developmentRendererUrl
+  ? new URL('settings.html', developmentRendererUrl).href
+  : pathToFileURL(join(__dirname, '..', 'dist', 'settings.html')).toString();
 const smokeMode = smokeModeFromEnvironment();
 const isSmokeTest = smokeMode !== null;
 const terminalService = new TerminalService();
@@ -103,6 +106,7 @@ let codexAppServerService: CodexAppServerService | undefined;
 let agentSmokeProvider: AgentSmokeProvider | undefined;
 let appSettingsStore: AppSettingsStore | undefined;
 let backupService: BackupService | undefined;
+let settingsWindow: BrowserWindow | null = null;
 const trustedRendererContents = new Set<number>();
 const ownsSingleInstance = acquireSingleInstance(
   app,
@@ -153,12 +157,17 @@ function requireBackupService(): BackupService {
   return backupService;
 }
 
+function isTrustedEntryUrl(url: string): boolean {
+  return isTrustedRendererUrl(url, rendererEntryUrl, isDevelopment)
+    || isTrustedRendererUrl(url, settingsEntryUrl, isDevelopment);
+}
+
 function assertTrustedSender(event: IpcMainInvokeEvent): void {
   if (
     !trustedRendererContents.has(event.sender.id)
     || event.sender.isDestroyed()
     || event.senderFrame !== event.sender.mainFrame
-    || !isTrustedRendererUrl(event.senderFrame.url, rendererEntryUrl, isDevelopment)
+    || !isTrustedEntryUrl(event.senderFrame.url)
   ) throw new Error('拒绝来自非受信页面的应用请求。');
 }
 
@@ -202,7 +211,7 @@ function createMainWindow(): BrowserWindow {
   });
 
   window.webContents.on('will-navigate', (event, url) => {
-    if (!isTrustedRendererUrl(url, rendererEntryUrl, isDevelopment)) event.preventDefault();
+    if (!isTrustedEntryUrl(url)) event.preventDefault();
   });
 
   const contents = window.webContents;
@@ -219,6 +228,55 @@ function createMainWindow(): BrowserWindow {
   return window;
 }
 
+function showSettingsWindow(): void {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    if (settingsWindow.isMinimized()) settingsWindow.restore();
+    settingsWindow.focus();
+    return;
+  }
+  settingsWindow = new BrowserWindow({
+    width: 860,
+    height: 640,
+    minWidth: 640,
+    minHeight: 480,
+    show: false,
+    backgroundColor: '#0b1018',
+    title: `${PRODUCT_NAME} — 设置`,
+    parent: BrowserWindow.getAllWindows()[0],
+    webPreferences: {
+      preload: join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  settingsWindow.once('ready-to-show', () => {
+    if (!isSmokeTest) settingsWindow?.show();
+  });
+  settingsWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.startsWith('https://')) void shell.openExternal(url);
+    return { action: 'deny' };
+  });
+  settingsWindow.webContents.on('will-navigate', (event, url) => {
+    if (!isTrustedEntryUrl(url)) event.preventDefault();
+  });
+
+  const contents = settingsWindow.webContents;
+  const contentsId = contents.id;
+  trustedRendererContents.add(contentsId);
+  contents.once('destroyed', () => {
+    trustedRendererContents.delete(contentsId);
+    agentService?.closeOwnedBy(contentsId);
+    terminalService.closeOwnedBy(contentsId);
+  });
+  settingsWindow.once('closed', () => {
+    settingsWindow = null;
+  });
+
+  void settingsWindow.loadURL(settingsEntryUrl);
+}
+
 handleTrusted('runtime:get-info', () => ({
   platform: process.platform,
   arch: process.arch,
@@ -229,6 +287,9 @@ handleTrusted(SETTINGS_CHANNELS.get, () => requireAppSettingsStore().get());
 handleTrusted(SETTINGS_CHANNELS.update, (_event, patch: AppSettingsPatch) => (
   requireAppSettingsStore().update(patch)
 ));
+handleTrusted(SETTINGS_WINDOW_CHANNELS.open, () => {
+  showSettingsWindow();
+});
 handleTrusted(BACKUP_CHANNELS.export, async (event, request: BackupExportRequest) => {
   void request;
   const ownerWindow = BrowserWindow.fromWebContents(event.sender);

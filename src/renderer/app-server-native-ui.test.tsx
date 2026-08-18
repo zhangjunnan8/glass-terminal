@@ -241,6 +241,9 @@ function bridgeForCodex(snapshot: CodexAppServerSnapshot): DesktopBridge {
       export: vi.fn().mockResolvedValue(null),
       import: vi.fn().mockResolvedValue(null),
     },
+    settingsWindow: {
+      open: vi.fn().mockResolvedValue(undefined),
+    },
   };
 }
 

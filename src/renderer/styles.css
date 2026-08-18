@@ -877,6 +877,26 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .theme-toggle:hover { border-color: #4b8d7d; background: #1b2b35; }
 .theme-toggle:active { transform: scale(.96); }
 
+.titlebar-settings {
+  min-height: 32px;
+  margin-right: 10px;
+  padding: 5px 12px;
+  color: #aab8ca;
+  border: 1px solid #2c394c;
+  border-radius: 15px;
+  background: #151f2b;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+  transition: border-color 140ms ease, background-color 140ms ease;
+}
+.titlebar-settings:hover { border-color: #4a90d9; background: #1a2434; }
+.app-shell[data-theme="light"] .titlebar-settings {
+  color: #3c4a5c;
+  border-color: #d4dae3;
+  background: #eef1f5;
+}
+
 /* The light palette is scoped to this app only; it never changes the Windows theme. */
 .app-shell[data-theme="light"] {
   color: #172033;

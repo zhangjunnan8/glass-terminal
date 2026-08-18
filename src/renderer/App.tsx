@@ -1882,6 +1882,13 @@ export function App() {
           <span className="status-dot" />
           {runtime ? `${runtime.platform} · ${runtime.arch}` : '正在启动…'}
         </div>
+        <button
+          type="button"
+          className="titlebar-settings"
+          data-action="open-settings-window"
+          title="设置"
+          onClick={() => void window.aiTerminal.settingsWindow.open()}
+        >⚙ 设置</button>
       </header>
 
       {workspaceActionError && (
