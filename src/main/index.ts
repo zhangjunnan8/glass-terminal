@@ -610,7 +610,6 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
     terminalService,
     sessionManager,
     providerStore,
-    undefined,
     codexAppServerService,
     new AgentFileService(terminalService, sessionManager, remoteFilesystemProvider),
     // The Generic Provider backend now runs through the LangChain harness.

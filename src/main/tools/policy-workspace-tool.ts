@@ -124,7 +124,7 @@ function clonePermissions(permissions: WorkspaceToolPermissions): WorkspaceToolP
  *
  * The backend remains responsible for canonical/realpath and symlink checks.
  * This layer performs the independent lexical policy check before any delegate
- * method is reached, including calls not advertised to a model by AgentLoop.
+ * method is reached, including calls not advertised to a model by the harness.
  */
 export class PolicyWorkspaceTool implements WorkspaceTool {
   private readonly permissions: WorkspaceToolPermissions;

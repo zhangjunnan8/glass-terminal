@@ -1,5 +1,5 @@
 import type { WebContents } from 'electron';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import {
   CODEX_APP_SERVER_AGENT_BACKEND,
@@ -7,6 +7,7 @@ import {
 } from '../../shared/agent';
 import type {
   AgentBackendRef,
+  AgentFileAccessMode,
   AgentSessionView,
   CommandActor,
   CommandExecution,
@@ -14,6 +15,7 @@ import type {
 } from '../../shared/agent';
 import type { ProviderProfile } from '../../shared/provider';
 import type { SessionRecord } from '../../shared/session';
+import type { ToolGateway } from '../../shared/tools';
 import type { ProviderStore } from '../providers/provider-store';
 import type { CodexAppServerService } from '../app-server/app-server-service';
 import type { RunCodexTurnInput } from '../app-server/app-server-turn-runner';
@@ -24,19 +26,14 @@ import type {
 } from '../terminal/terminal-service';
 import type {
   AgentBackend,
+  AgentBackendEvent,
+  AgentBackendResult,
   AgentBackendThread,
+  AgentMessage,
+  AgentToolCall,
   InterruptAgentBackendInput,
   SendAgentBackendMessageInput,
 } from './agent-backend';
-import type {
-  AgentCompletion,
-  AgentCompletionRequest,
-  AgentLoopEvent,
-  AgentLoopResult,
-  AgentMessage,
-  AgentProviderRuntime,
-  AgentToolCall,
-} from './agent-loop';
 import type { AgentFileService } from './agent-file-service';
 import { AgentService } from './agent-service';
 
@@ -48,12 +45,323 @@ async function waitFor(predicate: () => boolean, timeout = 2_000): Promise<void>
   }
 }
 
-class FakeProvider implements AgentProviderRuntime {
-  readonly requests: AgentCompletionRequest[] = [];
+interface ScriptedCompletion {
+  message: {
+    role: 'assistant';
+    content: string | null;
+    toolCalls?: AgentToolCall[];
+  };
+}
 
-  constructor(private readonly responses: AgentCompletion[]) {}
+interface ScriptedCompletionRequest {
+  messages: AgentMessage[];
+  signal: AbortSignal;
+  onTextDelta?(delta: string): void;
+}
 
-  async complete(request: AgentCompletionRequest): Promise<AgentCompletion> {
+interface ScriptedProvider {
+  complete(request: ScriptedCompletionRequest): Promise<ScriptedCompletion>;
+}
+
+function parseScriptedToolArguments(call: AgentToolCall): Record<string, unknown> {
+  try {
+    const parsed: unknown = JSON.parse(call.arguments || '{}');
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('Tool arguments must be an object.');
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(`Invalid arguments for ${call.name}: ${(error as Error).message}`);
+  }
+}
+
+function throwIfScriptedTurnCancelled(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const error = new Error('Agent turn cancelled.');
+  error.name = 'AbortError';
+  throw error;
+}
+
+/**
+ * Test-only scripted harness. It implements the `AgentBackend` boundary with a
+ * deterministic, caller-driven completion sequence so AgentService orchestration
+ * tests can exercise the real per-turn ToolGateway without a network or model.
+ */
+class ScriptedLoopBackend implements AgentBackend {
+  private readonly threads = new Map<string, {
+    handle: AgentBackendThread;
+    priorMessages: AgentMessage[];
+  }>();
+  private readonly activeTurns = new Map<string, { controller: AbortController }>();
+
+  constructor(private readonly provider: ScriptedProvider) {}
+
+  async createThread(input: { id: string; signal?: AbortSignal }): Promise<AgentBackendThread> {
+    if (input.signal) throwIfScriptedTurnCancelled(input.signal);
+    if (this.threads.has(input.id)) throw new Error(`Agent backend thread ${input.id} already exists.`);
+    const handle = Object.freeze({ id: input.id });
+    this.threads.set(input.id, { handle, priorMessages: [] });
+    return handle;
+  }
+
+  async resume(input: {
+    id: string;
+    priorMessages: readonly AgentMessage[];
+    signal?: AbortSignal;
+  }): Promise<AgentBackendThread> {
+    if (input.signal) throwIfScriptedTurnCancelled(input.signal);
+    const handle = Object.freeze({ id: input.id });
+    this.threads.set(input.id, {
+      handle,
+      priorMessages: input.priorMessages.map((message) => ({ ...message })),
+    });
+    return handle;
+  }
+
+  async sendMessage(input: SendAgentBackendMessageInput): Promise<AgentBackendResult> {
+    const record = this.threads.get(input.thread.id);
+    if (!record || record.handle !== input.thread) {
+      throw new Error('Agent backend thread handle is missing or stale.');
+    }
+    if (this.activeTurns.has(input.thread.id)) {
+      throw new Error(`Agent backend thread ${input.thread.id} already has an active turn.`);
+    }
+
+    const controller = new AbortController();
+    const abortFromCaller = () => controller.abort(input.signal.reason);
+    if (input.signal.aborted) abortFromCaller();
+    else input.signal.addEventListener('abort', abortFromCaller, { once: true });
+    this.activeTurns.set(input.thread.id, { controller });
+
+    try {
+      const messages: AgentMessage[] = [
+        { role: 'system', content: input.systemPrompt },
+        ...record.priorMessages.map((message) => ({ ...message })),
+        {
+          role: 'user',
+          content: `${input.prompt}\n\nRecent visible terminal context:\n${input.terminalContext}`,
+        },
+      ];
+      let finalText = '';
+
+      for (let round = 0; round < 64; round += 1) {
+        throwIfScriptedTurnCancelled(controller.signal);
+        const completion = await this.provider.complete({
+          messages,
+          signal: controller.signal,
+          onTextDelta: (delta) => {
+            if (delta && !controller.signal.aborted) {
+              input.onEvent?.({ type: 'assistant_delta', text: delta });
+            }
+          },
+        });
+        throwIfScriptedTurnCancelled(controller.signal);
+        const assistant = completion.message;
+        messages.push(assistant);
+        if (assistant.content) {
+          finalText = assistant.content;
+          input.onEvent?.({ type: 'assistant_text', text: assistant.content });
+        }
+        if (!assistant.toolCalls?.length) {
+          throwIfScriptedTurnCancelled(controller.signal);
+          record.priorMessages = messages
+            .filter((message) => message.role !== 'system')
+            .map((message) => ({ ...message }));
+          return {
+            id: randomUUID(),
+            messages: messages.map((message) => ({ ...message })),
+            finalText,
+            rounds: round + 1,
+          };
+        }
+
+        for (const call of assistant.toolCalls) {
+          throwIfScriptedTurnCancelled(controller.signal);
+          input.onEvent?.({ type: 'tool_started', toolCall: call });
+          throwIfScriptedTurnCancelled(controller.signal);
+          let result: string;
+          try {
+            result = await this.executeTool(input.gateway, call, input.fileAccessMode);
+          } catch (error) {
+            throwIfScriptedTurnCancelled(controller.signal);
+            result = JSON.stringify({ ok: false, error: (error as Error).message });
+          }
+          throwIfScriptedTurnCancelled(controller.signal);
+          messages.push({ role: 'tool', toolCallId: call.id, content: result });
+          input.onEvent?.({ type: 'tool_completed', toolCall: call, result });
+          throwIfScriptedTurnCancelled(controller.signal);
+        }
+      }
+      throw new Error('Scripted backend exceeded the round limit.');
+    } finally {
+      input.signal.removeEventListener('abort', abortFromCaller);
+      const active = this.activeTurns.get(input.thread.id);
+      if (active?.controller === controller) this.activeTurns.delete(input.thread.id);
+    }
+  }
+
+  async interrupt(input: InterruptAgentBackendInput): Promise<void> {
+    this.activeTurns.get(input.threadId)?.controller.abort(
+      new Error(`Agent turn interrupted: ${input.reason}.`),
+    );
+  }
+
+  private async executeTool(
+    gateway: ToolGateway,
+    call: AgentToolCall,
+    fileAccessMode: AgentFileAccessMode,
+  ): Promise<string> {
+    const args = parseScriptedToolArguments(call);
+    switch (call.name) {
+      case 'terminal_read': {
+        const requested = typeof args.maxChars === 'number' ? args.maxChars : 8_000;
+        const maxChars = Math.min(30_000, Math.max(100, Math.floor(requested)));
+        return JSON.stringify({
+          ok: true,
+          output: await gateway.terminal.readVisible({ maxChars }),
+        });
+      }
+      case 'terminal_state':
+        return JSON.stringify({ ok: true, state: await gateway.terminal.getState() });
+      case 'terminal_execute': {
+        if (typeof args.command !== 'string' || !args.command.trim()) {
+          throw new Error('terminal_execute requires a non-empty command.');
+        }
+        const result = await gateway.terminal.execute(
+          args.command,
+          typeof args.reason === 'string' ? args.reason : undefined,
+        );
+        return JSON.stringify({ ok: result.status === 'completed', ...result });
+      }
+      case 'workspace_list': {
+        const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
+        const path = typeof args.path === 'string' ? args.path : '.';
+        return JSON.stringify({ ok: true, ...await workspace.listDirectory(path) });
+      }
+      case 'workspace_read_file': {
+        const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
+        return JSON.stringify({
+          ok: true,
+          ...await workspace.readFile(this.requiredPath(args, call.name)),
+        });
+      }
+      case 'workspace_stat': {
+        const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
+        return JSON.stringify({
+          ok: true,
+          ...await workspace.stat(this.requiredPath(args, call.name)),
+        });
+      }
+      case 'workspace_search': {
+        const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
+        if (typeof args.query !== 'string' || !args.query) {
+          throw new Error('workspace_search requires a valid query.');
+        }
+        return JSON.stringify({
+          ok: true,
+          ...await workspace.search(args.query, {
+            ...(typeof args.path === 'string' ? { path: args.path } : {}),
+            ...(typeof args.maxResults === 'number' ? { maxResults: args.maxResults } : {}),
+          }),
+        });
+      }
+      case 'workspace_glob': {
+        const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
+        if (typeof args.pattern !== 'string' || !args.pattern) {
+          throw new Error('workspace_glob requires a valid pattern.');
+        }
+        return JSON.stringify({
+          ok: true,
+          ...await workspace.glob(args.pattern, {
+            ...(typeof args.path === 'string' ? { path: args.path } : {}),
+            ...(typeof args.maxResults === 'number' ? { maxResults: args.maxResults } : {}),
+          }),
+        });
+      }
+      case 'workspace_apply_patch': {
+        const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
+        return JSON.stringify({
+          ok: true,
+          ...await workspace.applyPatch(
+            this.requiredPath(args, call.name),
+            this.requiredString(args, 'expectedSha256', call.name),
+            args.patches as never,
+          ),
+        });
+      }
+      case 'workspace_write_file': {
+        const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
+        return JSON.stringify({
+          ok: true,
+          ...await workspace.writeFile(
+            this.requiredPath(args, call.name),
+            this.requiredString(args, 'content', call.name),
+            (args.expectedSha256 as string | null) ?? null,
+          ),
+        });
+      }
+      case 'workspace_mkdir': {
+        const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
+        const path = this.requiredPath(args, call.name);
+        await workspace.mkdir(path);
+        return JSON.stringify({ ok: true, path });
+      }
+      case 'workspace_rename': {
+        const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
+        const source = this.requiredPath(args, call.name, 'source');
+        const destination = this.requiredPath(args, call.name, 'destination');
+        await workspace.rename(source, destination);
+        return JSON.stringify({ ok: true, source, destination });
+      }
+      case 'workspace_delete': {
+        const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
+        const path = this.requiredPath(args, call.name);
+        const recursive = args.recursive === true;
+        await workspace.delete(path, { recursive });
+        return JSON.stringify({ ok: true, path, recursive });
+      }
+      default:
+        throw new Error(`Unsupported tool: ${call.name}`);
+    }
+  }
+
+  private requireWorkspace(
+    gateway: ToolGateway,
+    fileAccessMode: AgentFileAccessMode,
+    toolName: string,
+  ): NonNullable<ToolGateway['workspace']> {
+    const permissions = gateway.context.permissions.workspace;
+    if (
+      fileAccessMode === 'off'
+      || !permissions.enabled
+      || !permissions.read
+      || !gateway.workspace
+    ) throw new Error(`${toolName} is disabled.`);
+    return gateway.workspace;
+  }
+
+  private requiredPath(args: Record<string, unknown>, toolName: string, field = 'path'): string {
+    const value = args[field];
+    if (typeof value !== 'string' || !value || value.length > 4_096) {
+      throw new Error(`${toolName} requires a valid ${field}.`);
+    }
+    return value;
+  }
+
+  private requiredString(args: Record<string, unknown>, field: string, toolName: string): string {
+    const value = args[field];
+    if (typeof value !== 'string') throw new Error(`${toolName} requires a valid ${field}.`);
+    return value;
+  }
+}
+
+class FakeProvider implements ScriptedProvider {
+  readonly requests: ScriptedCompletionRequest[] = [];
+
+  constructor(private readonly responses: ScriptedCompletion[]) {}
+
+  async complete(request: ScriptedCompletionRequest): Promise<ScriptedCompletion> {
     this.requests.push(request);
     const response = this.responses.shift();
     if (!response) throw new Error('No fake response remains.');
@@ -61,11 +369,11 @@ class FakeProvider implements AgentProviderRuntime {
   }
 }
 
-class DeferredStreamingProvider implements AgentProviderRuntime {
-  request?: AgentCompletionRequest;
-  private resolveCompletion?: (value: AgentCompletion) => void;
+class DeferredStreamingProvider implements ScriptedProvider {
+  request?: ScriptedCompletionRequest;
+  private resolveCompletion?: (value: ScriptedCompletion) => void;
 
-  complete(request: AgentCompletionRequest): Promise<AgentCompletion> {
+  complete(request: ScriptedCompletionRequest): Promise<ScriptedCompletion> {
     this.request = request;
     return new Promise((resolve) => {
       this.resolveCompletion = resolve;
@@ -107,7 +415,7 @@ class RecordingBackend implements AgentBackend {
     return { id: input.id };
   }
 
-  async sendMessage(input: SendAgentBackendMessageInput): Promise<AgentLoopResult> {
+  async sendMessage(input: SendAgentBackendMessageInput): Promise<AgentBackendResult> {
     this.sendInputs.push(input);
     const priorMessages = this.histories.get(input.thread.id) ?? [];
     this.priorMessagesAtSend.push(priorMessages.map((message) => ({ ...message })));
@@ -118,7 +426,7 @@ class RecordingBackend implements AgentBackend {
     this.interrupts.push(input);
   }
 
-  protected complete(input: SendAgentBackendMessageInput): AgentLoopResult {
+  protected complete(input: SendAgentBackendMessageInput): AgentBackendResult {
     const finalText = `reply:${input.prompt}`;
     const messages: AgentMessage[] = [
       ...(this.histories.get(input.thread.id) ?? []),
@@ -139,10 +447,10 @@ class RecordingBackend implements AgentBackend {
 class DeferredRecordingBackend extends RecordingBackend {
   private pending?: {
     input: SendAgentBackendMessageInput;
-    resolve(result: AgentLoopResult): void;
+    resolve(result: AgentBackendResult): void;
   };
 
-  override sendMessage(input: SendAgentBackendMessageInput): Promise<AgentLoopResult> {
+  override sendMessage(input: SendAgentBackendMessageInput): Promise<AgentBackendResult> {
     this.sendInputs.push(input);
     this.priorMessagesAtSend.push([]);
     return new Promise((resolve) => {
@@ -161,11 +469,11 @@ class DeferredRecordingBackend extends RecordingBackend {
 class DeferredActivityBackend extends RecordingBackend {
   private pending?: {
     input: SendAgentBackendMessageInput;
-    resolve(result: AgentLoopResult): void;
+    resolve(result: AgentBackendResult): void;
     reject(error: unknown): void;
   };
 
-  override sendMessage(input: SendAgentBackendMessageInput): Promise<AgentLoopResult> {
+  override sendMessage(input: SendAgentBackendMessageInput): Promise<AgentBackendResult> {
     this.sendInputs.push(input);
     this.priorMessagesAtSend.push([]);
     return new Promise((resolve, reject) => {
@@ -173,7 +481,7 @@ class DeferredActivityBackend extends RecordingBackend {
     });
   }
 
-  emit(event: AgentLoopEvent): void {
+  emit(event: AgentBackendEvent): void {
     if (!this.pending) throw new Error('Backend message has not started.');
     this.pending.input.onEvent?.(event);
   }
@@ -653,7 +961,7 @@ function browserOwner(): WebContents {
   } as unknown as WebContents;
 }
 
-function toolCall(id: string, command: string): AgentCompletion {
+function toolCall(id: string, command: string): ScriptedCompletion {
   return {
     message: {
       role: 'assistant',
@@ -692,7 +1000,6 @@ async function startActivityHarness(prompt = 'Inspect the workspace.') {
     providerStore(),
     undefined,
     undefined,
-    undefined,
     () => backend,
   );
   const initial = service.sendPrompt(owner, { terminalId: 'terminal', prompt });
@@ -716,7 +1023,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       undefined,
       backendFactory,
@@ -767,7 +1073,6 @@ describe('AgentService shared-terminal controls', () => {
       providerStore(),
       undefined,
       undefined,
-      undefined,
       backendFactory,
     );
 
@@ -813,7 +1118,6 @@ describe('AgentService shared-terminal controls', () => {
         terminals as unknown as TerminalService,
         new FakeSessions() as unknown as SessionManager,
         providerStore(),
-        undefined,
         undefined,
         undefined,
         () => backend,
@@ -1163,7 +1467,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      () => { throw new Error('Legacy Provider factory must stay behind the backend adapter.'); },
       undefined,
       undefined,
       backendFactory,
@@ -1225,7 +1528,6 @@ describe('AgentService shared-terminal controls', () => {
       providerStore(),
       undefined,
       undefined,
-      undefined,
       backendFactory,
     );
 
@@ -1253,7 +1555,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       undefined,
       backendFactory,
@@ -1293,7 +1594,6 @@ describe('AgentService shared-terminal controls', () => {
         new FakeTerminals() as unknown as TerminalService,
         new FakeSessions() as unknown as SessionManager,
         providerStore(),
-        undefined,
         undefined,
         undefined,
         () => backend,
@@ -1336,16 +1636,12 @@ describe('AgentService shared-terminal controls', () => {
     const genericBackendFactory = vi.fn((_providerId: string): AgentBackend => {
       throw new Error('Generic backend must not be constructed.');
     });
-    const providerFactory = vi.fn((_providerId: string): AgentProviderRuntime => {
-      throw new Error('Generic Provider must not be constructed.');
-    });
     const codex = new FakeCodexAppServer();
     const owner = browserOwner();
     const service = new AgentService(
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      providerFactory,
       codex as unknown as CodexAppServerService,
       undefined,
       genericBackendFactory,
@@ -1362,7 +1658,6 @@ describe('AgentService shared-terminal controls', () => {
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
 
     expect(genericBackendFactory).not.toHaveBeenCalled();
-    expect(providerFactory).not.toHaveBeenCalled();
   });
 
   it('allows Workspace changes without a runtime and enforces runtime ownership', async () => {
@@ -1397,7 +1692,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       fileService,
     );
     const owner = browserOwner();
@@ -1426,7 +1720,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       fileService,
     );
@@ -1509,7 +1802,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       fileService,
     );
 
@@ -1558,7 +1850,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       fileService,
     );
     const owner = browserOwner();
@@ -1591,7 +1882,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       {
         bindWorkspaceRoot: vi.fn().mockRejectedValue(new Error('请先设置 Workspace Root。')),
       } as unknown as AgentFileService,
@@ -1617,7 +1907,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       { bindWorkspaceRoot, canonicalizeAccessRoot } as unknown as AgentFileService,
     );
@@ -1677,7 +1966,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       { bindWorkspaceRoot } as unknown as AgentFileService,
     );
     const owner = browserOwner();
@@ -1718,7 +2006,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       { bindWorkspaceRoot } as unknown as AgentFileService,
     );
@@ -1769,7 +2056,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providers,
       undefined,
-      undefined,
       { bindWorkspaceRoot } as unknown as AgentFileService,
       () => backendAdapter,
     );
@@ -1810,7 +2096,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       { bindWorkspaceRoot } as unknown as AgentFileService,
     );
     const owner = browserOwner();
@@ -1830,7 +2115,6 @@ describe('AgentService shared-terminal controls', () => {
       }) as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       { bindWorkspaceRoot } as unknown as AgentFileService,
     );
     await expect(sessionOnlyService.setFileAccess(owner, {
@@ -1849,7 +2133,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       {
         bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
@@ -1891,7 +2174,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       {
         bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
         canonicalizeAccessRoot: vi.fn(async (
@@ -1925,7 +2207,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       {
         bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
@@ -1973,7 +2254,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providers,
-      undefined,
       undefined,
       {
         bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
@@ -2046,7 +2326,6 @@ describe('AgentService shared-terminal controls', () => {
       providers,
       undefined,
       undefined,
-      undefined,
       () => backendAdapter,
     );
 
@@ -2079,7 +2358,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providers,
-      undefined,
       undefined,
       {
         bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
@@ -2143,7 +2421,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providers,
       undefined,
-      undefined,
       {
         bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
         canonicalizeAccessRoot: vi.fn(async (
@@ -2189,7 +2466,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       fileService,
       () => backendAdapter,
@@ -2258,7 +2534,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       fileService,
       () => backendAdapter,
     );
@@ -2313,7 +2588,6 @@ describe('AgentService shared-terminal controls', () => {
         options.terminals as unknown as TerminalService,
         sessions as unknown as SessionManager,
         options.providers,
-        undefined,
         undefined,
         fileService,
         () => options.backend,
@@ -2396,7 +2670,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       fileService,
     );
     await terminalExitService.setFileAccess(owner, {
@@ -2419,7 +2692,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       replacementSessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       new FakeCodexAppServer() as unknown as CodexAppServerService,
       fileService,
     );
@@ -2452,7 +2724,9 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
     const owner = browserOwner();
 
@@ -2475,7 +2749,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      () => { throw new Error('Generic Provider must not be used.'); },
       codex as unknown as CodexAppServerService,
     );
     const owner = browserOwner();
@@ -2526,9 +2799,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
       undefined,
       fileService,
+      () => new ScriptedLoopBackend(provider),
     );
     const owner = browserOwner();
 
@@ -2618,7 +2891,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => { throw new Error('Generic Provider must not be used.'); },
       codex as unknown as CodexAppServerService,
     );
 
@@ -2664,7 +2936,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      () => { throw new Error('Generic Provider must not be used.'); },
       codex as unknown as CodexAppServerService,
     );
     const request = {
@@ -2698,7 +2969,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => { throw new Error('Generic Provider must not be used.'); },
       codex as unknown as CodexAppServerService,
     );
 
@@ -2745,7 +3015,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Stream Markdown.' });
@@ -2785,7 +3057,9 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Stream then pause.' });
@@ -2819,7 +3093,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => { throw new Error('Generic Provider must not be used.'); },
       codex as unknown as CodexAppServerService,
     );
 
@@ -2857,7 +3130,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => new FakeProvider([]),
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(new FakeProvider([])),
     );
     const owner = browserOwner();
 
@@ -2883,7 +3158,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Who am I?' });
@@ -2920,7 +3197,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Inspect OS' });
@@ -2952,7 +3231,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
 
     const enabled = service.setFullTakeover(owner, {
@@ -2989,7 +3270,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Run both.' });
@@ -3029,7 +3312,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Try it.' });
@@ -3071,7 +3356,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Try it.' });
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
@@ -3122,7 +3409,9 @@ describe('AgentService shared-terminal controls', () => {
       normalTerminals as unknown as TerminalService,
       normalSessions as unknown as SessionManager,
       providerStore(),
-      () => normalProvider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(normalProvider),
     );
     normalService.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Confirm.' });
     await waitFor(() => normalService.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
@@ -3157,7 +3446,9 @@ describe('AgentService shared-terminal controls', () => {
       takeoverTerminals as unknown as TerminalService,
       takeoverSessions as unknown as SessionManager,
       providerStore(),
-      () => takeoverProvider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(takeoverProvider),
     );
     takeoverService.setFullTakeover(owner, { terminalId: 'terminal', enabled: true });
     takeoverService.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Confirm.' });
@@ -3181,7 +3472,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Start it.' });
@@ -3245,7 +3538,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Start it.' });
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
@@ -3297,7 +3592,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Run sudo.' });
@@ -3359,7 +3656,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
 
     service.setFullTakeover(owner, { terminalId: 'terminal', enabled: true });
@@ -3383,7 +3682,9 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
 
     const running = service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Long task.' });
@@ -3421,7 +3722,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     );
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'First prompt.' });
@@ -3471,7 +3774,9 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      () => provider,
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
     ).getState(owner, 'terminal');
     expect(restored?.messages.map((item) => item.content)).toEqual([
       'First prompt.',
@@ -3488,7 +3793,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      () => { throw new Error('Generic Provider must not be used.'); },
       codex as unknown as CodexAppServerService,
     );
     const running = service.sendPrompt(owner, {
@@ -3523,7 +3827,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      () => { throw new Error('Generic Provider must not be used.'); },
       codex as unknown as CodexAppServerService,
     );
     const running = service.sendPrompt(owner, {
@@ -3592,7 +3895,9 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       store,
-      (providerId) => providerId === firstProfile.id ? firstProvider : secondProvider,
+      undefined,
+      undefined,
+      (providerId) => new ScriptedLoopBackend(providerId === firstProfile.id ? firstProvider : secondProvider),
     );
     const owner = browserOwner();
 

@@ -12,7 +12,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ProviderStore } from './provider-store';
 import { MemorySecretStore } from './secret-store';
 import { PROVIDER_TEMPLATES, providerTemplateForBaseUrl } from '../../shared/provider-templates';
-import { GenericOpenAiProvider } from '../agent/generic-provider';
 
 const roots: string[] = [];
 
@@ -191,14 +190,6 @@ describe('ProviderStore', () => {
       original.id,
       pending.recipientRevision,
     )).rejects.toThrow('transitioning');
-    const fetchMock = vi.fn<typeof fetch>();
-    const runtime = new GenericOpenAiProvider(original.id, restarted, fetchMock);
-    await expect(runtime.complete({
-      messages: [{ role: 'user', content: 'must not leave this process' }],
-      tools: [],
-      signal: new AbortController().signal,
-    })).rejects.toThrow('transitioning');
-    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('rejects a runtime snapshot when recipient config changes during secret retrieval', async () => {

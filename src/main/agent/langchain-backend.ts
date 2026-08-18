@@ -66,7 +66,8 @@ export interface LangChainBackendOptions {
  * Builds a `ChatOpenAICompletions` (DeepSeek or any OpenAI-compatible endpoint)
  * from the app's `ProviderStore`, fencing on the provider recipient revision so
  * a changed endpoint/model/credential can never receive prior conversation
- * history. Mirrors the identity discipline of `GenericOpenAiProvider`.
+ * history, so a changed endpoint/model/credential can never receive prior
+ * conversation history.
  */
 export class LangChainProviderModelFactory {
   private readonly expectedRecipientRevision: string;

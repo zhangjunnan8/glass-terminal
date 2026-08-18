@@ -416,7 +416,6 @@ async function harness() {
     terminals as unknown as TerminalService,
     sessions as unknown as SessionManager,
     {} as ProviderStore,
-    () => { throw new Error('Generic Provider must not be used.'); },
     appServer,
   );
   disposers.push(() => {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AgentToolActivity } from '../../shared/agent';
-import type { AgentLoopEvent, AgentToolCall } from './agent-loop';
+import type { AgentBackendEvent, AgentToolCall } from './agent-backend';
 import {
   limitAgentToolActivities,
   MAX_AGENT_TOOL_ACTIVITIES,
@@ -25,7 +25,7 @@ function event(
   type: 'tool_started' | 'tool_completed',
   toolCall: AgentToolCall,
   result?: Record<string, unknown> | string,
-): AgentLoopEvent {
+): AgentBackendEvent {
   return {
     type,
     toolCall,

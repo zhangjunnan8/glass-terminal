@@ -34,20 +34,19 @@ import type { TerminalCommandResult, WorkspaceBinding } from '../../shared/tools
 import type { ProviderStore } from '../providers/provider-store';
 import type { SessionManager } from '../sessions/session-manager';
 import type { TerminalService } from '../terminal/terminal-service';
+import { HumanMessage, SystemMessage } from '@langchain/core/messages';
 import type {
   AgentBackend,
   AgentBackendEvent,
   AgentBackendThread,
   AgentMessage,
 } from './agent-backend';
-import type { AgentProviderRuntime } from './agent-loop';
 import { AgentFileService } from './agent-file-service';
 import {
   reduceAgentToolActivities,
   settleRunningToolActivities,
 } from './agent-tool-activity';
-import { GenericHarnessBackend } from './generic-harness-backend';
-import { GenericOpenAiProvider } from './generic-provider';
+import { LangChainProviderModelFactory } from './langchain-backend';
 import type { CodexAppServerService } from '../app-server/app-server-service';
 import { SharedTerminalTool } from '../tools/shared-terminal-tool';
 import { SessionToolGateway } from '../tools/tool-gateway';
@@ -480,16 +479,15 @@ export class AgentService {
     private readonly terminals: TerminalService,
     private readonly sessions: SessionManager,
     private readonly providers: ProviderStore,
-    private readonly providerFactory: (providerId: string) => AgentProviderRuntime = (
-      providerId,
-    ) => new GenericOpenAiProvider(providerId, providers),
     private readonly codexAppServer?: CodexAppServerService,
     fileService?: AgentFileService,
     genericBackendFactory?: GenericBackendFactory,
   ) {
     this.fileService = fileService ?? new AgentFileService(terminals, sessions);
     this.genericBackendFactory = genericBackendFactory
-      ?? ((providerId) => new GenericHarnessBackend(this.providerFactory(providerId)));
+      ?? (() => {
+        throw new Error('No Generic Provider harness is configured for this Agent Service.');
+      });
     this.removeExitListener = terminals.onExit((terminalId, ownerId) => {
       this.handleTerminalExit(terminalId, ownerId);
     });
@@ -2399,19 +2397,18 @@ export class AgentService {
     prompt: string,
   ): Promise<string | undefined> {
     try {
-      const provider = this.providerFactory(providerId);
+      const model = await new LangChainProviderModelFactory(providerId, this.providers).build();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 15_000);
       try {
-        const completion = await provider.complete({
-          messages: [
-            { role: 'system', content: SESSION_TITLE_SYSTEM_PROMPT },
-            { role: 'user', content: prompt.slice(0, 4_000) },
+        const response = await model.invoke(
+          [
+            new SystemMessage(SESSION_TITLE_SYSTEM_PROMPT),
+            new HumanMessage(prompt.slice(0, 4_000)),
           ],
-          tools: [],
-          signal: controller.signal,
-        });
-        const title = completion.message.content?.trim();
+          { signal: controller.signal },
+        );
+        const title = typeof response.content === 'string' ? response.content.trim() : '';
         if (!title) return undefined;
         return title.length > 24 ? title.slice(0, 24) : title;
       } finally {
