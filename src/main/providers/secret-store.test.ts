@@ -1,6 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { FileSecretStore } from './file-secret-store';
 import { isAllowedCredentialReference } from './secret-store';
@@ -78,11 +78,26 @@ describe('FileSecretStore', () => {
     ]));
   });
 
-  it('stores secrets as portable plaintext JSON (documented portability tradeoff)', async () => {
+  it('encrypts secrets at rest and never writes plaintext', async () => {
     const path = fixture();
     const store = new FileSecretStore(path);
     await store.set('AI Terminal/ssh/00000000-0000-4000-8000-000000000005', 'top-secret-value');
     const persisted = readFileSync(path, 'utf8');
-    expect(persisted).toContain('top-secret-value');
+    expect(persisted).toContain('v1:');
+    expect(persisted).not.toContain('top-secret-value');
+  });
+
+  it('migrates a legacy plaintext store to encryption on load', async () => {
+    const path = fixture();
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      'AI Terminal/ssh/00000000-0000-4000-8000-000000000006': 'legacy-secret',
+    }), 'utf8');
+
+    const store = new FileSecretStore(path);
+    expect(await store.get('AI Terminal/ssh/00000000-0000-4000-8000-000000000006'))
+      .toBe('legacy-secret');
+    const persisted = readFileSync(path, 'utf8');
+    expect(persisted).not.toContain('legacy-secret');
   });
 });

@@ -17,6 +17,7 @@
     "build:electron": "tsup",
     "build": "npm run typecheck && npm test && npm run build:renderer && npm run build:electron",
     "package": "electron-builder --dir",
+    "postpackage": "npm rebuild node-pty",
     "package:win": "electron-builder --dir --win",
     "smoke": "cross-env AI_TERMINAL_SMOKE_TEST=1 electron .",
     "smoke:ssh": "cross-env AI_TERMINAL_SSH_SMOKE_TEST=1 electron .",

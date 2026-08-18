@@ -1,20 +1,29 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { SecretEntry, SecretStore } from './secret-store';
+import { loadOrCreateSecretKey, SecretCipher } from './secret-cipher';
+
+const ENCRYPTED_PREFIX = 'v1:';
 
 /**
- * App-owned, file-backed secret store. It keeps Provider API keys and SSH
- * host credentials in a single JSON file so the whole credential set can be
- * exported/imported with the rest of the configuration.
+ * App-owned, file-backed secret store. Provider API keys and SSH host
+ * credentials are persisted to a single JSON file encrypted with AES-256-GCM;
+ * the 32-byte key lives in a sibling key file so the store remains portable
+ * (copy both files) without ever writing secrets in plaintext.
  *
- * Security note: this trades the OS credential vault's protection for
- * portability. The file is written atomically and never logs its contents,
- * but callers are responsible for the secrecy of the directory that hosts it.
+ * The whole file is encrypted, so export/import keeps working unchanged: the
+ * store decrypts into memory, and the backup service serializes those in-memory
+ * entries into the portable bundle.
  */
 export class FileSecretStore implements SecretStore {
   private readonly values = new Map<string, string>();
+  private readonly cipher: SecretCipher;
 
-  constructor(private readonly path: string) {
+  constructor(
+    private readonly path: string,
+    keyPath = `${path}.key`,
+  ) {
+    this.cipher = new SecretCipher(loadOrCreateSecretKey(keyPath));
     this.load();
   }
 
@@ -26,13 +35,22 @@ export class FileSecretStore implements SecretStore {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
       throw error;
     }
-    const parsed: unknown = JSON.parse(raw);
+    let parsed: unknown;
+    let migratedFromPlaintext = false;
+    if (raw.startsWith(ENCRYPTED_PREFIX)) {
+      parsed = JSON.parse(this.cipher.decrypt(raw)) as unknown;
+    } else {
+      // Migrate a plaintext store written by an earlier version.
+      parsed = JSON.parse(raw) as unknown;
+      migratedFromPlaintext = true;
+    }
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       throw new Error('Secret store file is malformed.');
     }
     for (const [reference, secret] of Object.entries(parsed as Record<string, unknown>)) {
       if (typeof secret === 'string' && secret) this.values.set(reference, secret);
     }
+    if (migratedFromPlaintext) this.persist();
   }
 
   async get(reference: string): Promise<string | undefined> {
@@ -57,11 +75,8 @@ export class FileSecretStore implements SecretStore {
   private persist(): void {
     mkdirSync(dirname(this.path), { recursive: true });
     const temporary = `${this.path}.tmp`;
-    writeFileSync(
-      temporary,
-      `${JSON.stringify(Object.fromEntries(this.values), null, 2)}\n`,
-      'utf8',
-    );
+    const encrypted = this.cipher.encrypt(JSON.stringify(Object.fromEntries(this.values)));
+    writeFileSync(temporary, encrypted, 'utf8');
     renameSync(temporary, this.path);
   }
 }
