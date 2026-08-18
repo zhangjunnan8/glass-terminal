@@ -25,7 +25,7 @@ interface ResolvedConnectionRequest {
   revision: number;
 }
 
-const CREDENTIAL_SAVE_WARNING = 'SSH 已连接，但无法将凭据保存到 Windows 凭据管理器。下次重连可能仍需输入。';
+const CREDENTIAL_SAVE_WARNING = 'SSH 已连接，但无法将凭据保存到本机密钥库。下次重连可能仍需输入。';
 
 export class HostService {
   private readonly hostOperationTails = new Map<string, Promise<void>>();

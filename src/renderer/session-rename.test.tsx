@@ -596,7 +596,7 @@ describe('renderer host and session dialogs', () => {
     expect(bridge.hosts.list).toHaveBeenCalledTimes(2);
     expect(container.querySelector('.host-credential-row')?.textContent).toContain('未保存');
     expect(container.querySelector('.host-credential-message[role="status"]')?.textContent)
-      .toContain('已从 Windows 凭据管理器删除');
+      .toContain('已从本机密钥库删除');
   });
 
 });

@@ -1637,7 +1637,7 @@ export function App() {
       setHostCredentialMessage({
         hostId: host.id,
         tone: 'success',
-        text: '已从 Windows 凭据管理器删除 SSH 凭据。',
+        text: '已从本机密钥库删除 SSH 凭据。',
       });
     } catch (error) {
       const message = errorMessage(error);
@@ -1687,7 +1687,7 @@ export function App() {
         setHostCredentialMessage({
           hostId: host.id,
           tone: 'success',
-          text: 'SSH 凭据已安全保存到当前用户的 Windows 凭据管理器。',
+          text: 'SSH 凭据已保存到本机密钥库。',
         });
       } else if (secret.saveCredential && !updatedHost?.credentialConfigured) {
         setHostCredentialMessage({
@@ -1802,7 +1802,7 @@ export function App() {
               </div>
               {host.authMethod !== 'agent' && (
                 <div className="host-credential-row">
-                  <small title="凭据保存在当前 Windows 用户的凭据管理器中">
+                  <small title="凭据保存在本机密钥库中">
                     {host.credentialConfigured ? '凭据已保存' : '凭据未保存'}
                   </small>
                   {host.credentialConfigured && (
@@ -3097,8 +3097,8 @@ export function App() {
                 </label>
                 <p className="secure-note">
                   {connectingHost.credentialConfigured
-                    ? '已保存的凭据只由主进程从当前用户的 Windows 凭据管理器读取；密码框可留空。'
-                    : '勾选后仅保存到当前用户的 Windows 凭据管理器，不写入主机、会话、终端或审计日志。'}
+                    ? '已保存的凭据只由主进程从本机密钥库读取；密码框可留空。'
+                    : '勾选后仅保存到本机密钥库，不写入主机、会话、终端或审计日志。'}
                 </p>
                 {connectingHost.credentialConfigured && (
                   <button
@@ -3636,7 +3636,7 @@ export function App() {
                         type="password"
                         required={!editingProvider?.apiKeyConfigured}
                         autoComplete="new-password"
-                        placeholder={editingProvider?.apiKeyConfigured ? '已保存到 Windows 凭据管理器' : '必填'}
+                        placeholder={editingProvider?.apiKeyConfigured ? '已保存到本机密钥库' : '必填'}
                         onInput={() => scheduleProviderModelDiscovery()}
                       />
                     </label>
@@ -3644,7 +3644,7 @@ export function App() {
                       <input name="makeDefault" type="checkbox" defaultChecked={editingProvider?.isDefault ?? providers.length === 0} />
                       设为默认 Provider
                     </label>
-                    <p className="secure-note">API Key 作为 Windows 通用凭据保存；Provider JSON 只保存凭据引用。</p>
+                    <p className="secure-note">API Key 保存到本机密钥库；Provider JSON 只保存凭据引用。</p>
                     {providerDiscoveryMessage && (
                       <div
                         className={`provider-discovery-message ${providerDiscoveryMessage.tone}`}
