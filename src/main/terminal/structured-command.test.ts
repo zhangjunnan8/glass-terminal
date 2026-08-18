@@ -55,7 +55,7 @@ describe('structured command sentinel', () => {
     const envelope = buildCommandEnvelope('powershell', command, '0011223344556677');
     const [executionPayload, displayPayload] = decodedPowerShellPayloads(envelope.input);
     const displayIndex = envelope.input.indexOf('[Console]::WriteLine($__ait_display)');
-    const startIndex = envelope.input.indexOf("':START'+[char]31");
+    const startIndex = envelope.input.indexOf("'_START__')");
 
     expect(executionPayload).toBe(command);
     expect(displayPayload).toBe(`$ ${command}`);

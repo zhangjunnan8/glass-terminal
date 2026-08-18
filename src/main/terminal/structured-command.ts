@@ -46,22 +46,25 @@ export function buildCommandEnvelope(
     const encodedDisplay = Buffer
       .from(`$ ${escapeTerminalControls(command)}`, 'utf16le')
       .toString('base64');
-    const startMarker = `\x1eAI:${nonce}:START\x1f`;
-    const endPrefix = `\x1eAI:${nonce}:END:`;
+    // Plain-text sentinels (like cmd): Windows OpenSSH's conhost PTY strips the
+    // C0 control characters \x1e/\x1f that the POSIX envelope relies on, so the
+    // START/END markers must be printable ASCII to survive the round trip.
+    const startMarker = `__AI_TERMINAL_${nonce}_START__`;
+    const endPrefix = `__AI_TERMINAL_${nonce}_END_`;
     const input = [
       `$__ait_a='${first}'`,
       `$__ait_b='${second}'`,
       `$__ait_cmd=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedCommand}'))`,
       `$__ait_display=[Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${encodedDisplay}'))`,
       '[Console]::WriteLine($__ait_display)',
-      "[Console]::WriteLine(([char]30)+'AI:'+$__ait_a+$__ait_b+':START'+[char]31)",
+      "[Console]::WriteLine('__AI_TERMINAL_'+$__ait_a+$__ait_b+'_START__')",
       '$global:LASTEXITCODE=0',
       '$__ait_ok=$true',
       'try { . ([ScriptBlock]::Create($__ait_cmd)); $__ait_ok=$? } catch { Write-Error $_; $__ait_ok=$false }',
       '$__ait_ec=if($__ait_ok){[int]$LASTEXITCODE}elseif($LASTEXITCODE -ne 0){[int]$LASTEXITCODE}else{1}',
-      "[Console]::WriteLine(([char]30)+'AI:'+$__ait_a+$__ait_b+':END:'+$__ait_ec+[char]31)",
+      "[Console]::WriteLine('__AI_TERMINAL_'+$__ait_a+$__ait_b+'_END_'+$__ait_ec+'__')",
     ].join(';');
-    return { input: `${input}\r`, startMarker, endPrefix, endSuffix: '\x1f' };
+    return { input: `${input}\r`, startMarker, endPrefix, endSuffix: '__' };
   }
 
   if (shellKind === 'cmd') {
