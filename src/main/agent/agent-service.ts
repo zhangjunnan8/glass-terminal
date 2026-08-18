@@ -106,6 +106,19 @@ const MAX_FILE_ACCESS_PATHS = 16;
 /** Upper bound on the ambient terminal context injected per turn. */
 const MAX_TURN_TERMINAL_CONTEXT_CHARS = 12_000;
 
+/**
+ * Removes ANSI escape sequences (CSI/OSC/DCS and two-char escapes) from
+ * terminal output before it enters model context. Color and cursor codes carry
+ * no meaning to the model and only waste tokens.
+ */
+function stripAnsiSequences(value: string): string {
+  return value
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/gu, '')   // OSC ... BEL / ST
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/gu, '')             // CSI
+    .replace(/\u001b[PX^_][^\u001b]*\u001b\\/gu, '')          // DCS / SOS / PM / APC
+    .replace(/\u001b[@-Z\\-_]/gu, '');                        // two-char escapes
+}
+
 function disabledFileAccessPolicy(): AgentFileAccessPolicy {
   return {
     read: false,
@@ -1391,9 +1404,11 @@ export class AgentService {
       if (!this.isCurrentTurn(runtime, token)) return;
 
       const fullTerminalHistory = this.sessions.readTerminalHistory(runtime.sessionId);
-      const terminalContext = fullTerminalHistory
-        .slice(runtime.terminalContextOffset ?? 0)
-        .slice(-MAX_TURN_TERMINAL_CONTEXT_CHARS);
+      const terminalContext = stripAnsiSequences(
+        fullTerminalHistory
+          .slice(runtime.terminalContextOffset ?? 0)
+          .slice(-MAX_TURN_TERMINAL_CONTEXT_CHARS),
+      );
       const result = await backend.sendMessage({
         thread,
         prompt,

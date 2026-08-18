@@ -526,6 +526,29 @@ export class LangChainBackend implements AgentBackend {
             expectedSha256: z.string().regex(/^[a-fA-F0-9]{64}$/).nullable(),
           }),
         }),
+        tool(run('workspace_mkdir'), {
+          name: 'workspace_mkdir',
+          description: 'Create one directory inside the Workspace Root without running a shell command.',
+          schema: z.object({
+            path: z.string().min(1).max(4_096),
+          }),
+        }),
+        tool(run('workspace_rename'), {
+          name: 'workspace_rename',
+          description: 'Rename or move one workspace path to another path inside the same Workspace Root.',
+          schema: z.object({
+            source: z.string().min(1).max(4_096),
+            destination: z.string().min(1).max(4_096),
+          }),
+        }),
+        tool(run('workspace_delete'), {
+          name: 'workspace_delete',
+          description: 'Delete one workspace path. Recursive directory deletion must be explicitly requested.',
+          schema: z.object({
+            path: z.string().min(1).max(4_096),
+            recursive: z.boolean().optional(),
+          }),
+        }),
       );
     }
 
@@ -565,7 +588,10 @@ export class LangChainBackend implements AgentBackend {
       case 'workspace_search':
       case 'workspace_glob':
       case 'workspace_apply_patch':
-      case 'workspace_write_file': {
+      case 'workspace_write_file':
+      case 'workspace_mkdir':
+      case 'workspace_rename':
+      case 'workspace_delete': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, name);
         switch (name) {
           case 'workspace_list': {
@@ -613,6 +639,20 @@ export class LangChainBackend implements AgentBackend {
                 (args.expectedSha256 as string | null) ?? null,
               ),
             });
+          case 'workspace_mkdir':
+            await workspace.mkdir(requirePath(args, name));
+            return JSON.stringify({ ok: true, path: requirePath(args, name) });
+          case 'workspace_rename': {
+            const source = requirePath(args, name, 'source');
+            const destination = requirePath(args, name, 'destination');
+            await workspace.rename(source, destination);
+            return JSON.stringify({ ok: true, source, destination });
+          }
+          case 'workspace_delete': {
+            const recursive = args.recursive === true;
+            await workspace.delete(requirePath(args, name), { recursive });
+            return JSON.stringify({ ok: true, path: requirePath(args, name), recursive });
+          }
           default:
             throw new Error(`Unsupported tool: ${name}`);
         }

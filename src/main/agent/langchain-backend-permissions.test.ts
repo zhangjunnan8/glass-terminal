@@ -156,6 +156,9 @@ describe('LangChainBackend workspace tool gating', () => {
     expect(tools).toContain('workspace_glob');
     expect(tools).not.toContain('workspace_apply_patch');
     expect(tools).not.toContain('workspace_write_file');
+    expect(tools).not.toContain('workspace_mkdir');
+    expect(tools).not.toContain('workspace_rename');
+    expect(tools).not.toContain('workspace_delete');
   });
 
   it('advertises read and write tools in read-write mode', async () => {
@@ -163,5 +166,8 @@ describe('LangChainBackend workspace tool gating', () => {
     expect(tools).toContain('workspace_read_file');
     expect(tools).toContain('workspace_apply_patch');
     expect(tools).toContain('workspace_write_file');
+    expect(tools).toContain('workspace_mkdir');
+    expect(tools).toContain('workspace_rename');
+    expect(tools).toContain('workspace_delete');
   });
 });
