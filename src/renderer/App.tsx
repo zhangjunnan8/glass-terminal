@@ -160,6 +160,26 @@ function mergeCodexAppServerState(
 /** Max composer height in pixels before the textarea stops growing and scrolls. */
 const MAX_COMPOSER_HEIGHT_PX = 240;
 
+const THEME_ORDER: AppSettings['theme'][] = ['dark', 'light', 'system'];
+
+function nextThemeSetting(theme: AppSettings['theme']): AppSettings['theme'] {
+  const index = THEME_ORDER.indexOf(theme);
+  return THEME_ORDER[(index + 1) % THEME_ORDER.length] ?? 'dark';
+}
+
+function themeLabel(theme: AppSettings['theme']): string {
+  if (theme === 'light') return '☀ 亮色';
+  if (theme === 'system') return '◐ 跟随系统';
+  return '☾ 深色';
+}
+
+function themeActionLabel(theme: AppSettings['theme']): string {
+  const next = nextThemeSetting(theme);
+  if (next === 'light') return '切换到亮色';
+  if (next === 'system') return '切换到跟随系统';
+  return '切换到深色';
+}
+
 export function App() {
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [uiTheme, setUiTheme] = useState<UiTheme>(() => readUiTheme());
@@ -1540,16 +1560,18 @@ export function App() {
           type="button"
           className="theme-toggle"
           data-action="toggle-theme"
-          aria-label={uiTheme === 'dark' ? '切换到亮色主题' : '切换到深色主题'}
-          aria-pressed={uiTheme === 'light'}
-          title={uiTheme === 'dark' ? '切换到亮色主题' : '切换到深色主题'}
+          data-theme-setting={appSettings?.theme ?? 'dark'}
+          aria-label={themeActionLabel(appSettings?.theme ?? 'dark')}
+          title={themeActionLabel(appSettings?.theme ?? 'dark')}
           onClick={() => {
-            const next = uiTheme === 'dark' ? 'light' : 'dark';
-            setUiTheme(next);
+            const current = appSettings?.theme ?? 'dark';
+            const next = nextThemeSetting(current);
+            setUiTheme(resolveUiTheme(next));
+            setAppSettings((prev) => (prev ? { ...prev, theme: next } : prev));
             void Promise.resolve(window.aiTerminal.settings?.update({ theme: next }))
               .catch(() => undefined);
           }}
-        >{uiTheme === 'dark' ? '☀ 亮色' : '☾ 深色'}</button>
+        >{themeLabel(appSettings?.theme ?? 'dark')}</button>
         <div className="runtime-pill">
           <span className="status-dot" />
           {runtime ? `${runtime.platform} · ${runtime.arch}` : '正在启动…'}

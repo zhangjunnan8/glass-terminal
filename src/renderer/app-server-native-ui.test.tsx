@@ -330,7 +330,7 @@ describe('native Codex App Server renderer mode', () => {
     expect(container.textContent).not.toContain('启用实验模式');
   });
 
-  it('persists a white application theme without changing system settings', async () => {
+  it('cycles theme through dark, light, and system', async () => {
     const bridge = bridgeForCodex(codexSnapshot());
     Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
     await act(async () => root.render(<App />));
@@ -339,10 +339,20 @@ describe('native Codex App Server renderer mode', () => {
     const shell = container.querySelector<HTMLElement>('.app-shell')!;
     const toggle = container.querySelector<HTMLButtonElement>('[data-action="toggle-theme"]')!;
     expect(shell.dataset.theme).toBe('dark');
+    expect(toggle.textContent).toContain('深色');
+
     await act(async () => toggle.click());
     expect(shell.dataset.theme).toBe('light');
+    expect(toggle.textContent).toContain('亮色');
     expect(bridge.settings.update).toHaveBeenCalledWith({ theme: 'light' });
-    expect(toggle.getAttribute('aria-pressed')).toBe('true');
+
+    await act(async () => toggle.click());
+    expect(toggle.textContent).toContain('跟随系统');
+    expect(bridge.settings.update).toHaveBeenCalledWith({ theme: 'system' });
+
+    await act(async () => toggle.click());
+    expect(toggle.textContent).toContain('深色');
+    expect(bridge.settings.update).toHaveBeenCalledWith({ theme: 'dark' });
   });
 
   it('requires an explicit in-app confirmation before Generic Provider gains file write access', async () => {
