@@ -10,6 +10,7 @@ import type {
   MoveHostRequest,
   RenameHostFolderRequest,
   SshAuthMethod,
+  SshShellKind,
 } from '../../shared/host';
 
 const HOST_STORE_VERSION = 2;
@@ -23,6 +24,7 @@ const AUTH_METHODS = new Set<SshAuthMethod>([
   'agent',
   'keyboard-interactive',
 ]);
+const SHELL_KINDS = new Set<SshShellKind>(['posix', 'powershell', 'cmd']);
 
 interface NormalizedHostInput {
   protocol: 'ssh';
@@ -33,6 +35,7 @@ interface NormalizedHostInput {
   authMethod: SshAuthMethod;
   privateKeyPath?: string;
   favorite: boolean;
+  shellKind: SshShellKind;
 }
 
 interface StoredHostProfile extends Omit<HostProfile, 'group'> {
@@ -95,6 +98,9 @@ function normalizeInput(input: HostInput): NormalizedHostInput {
   if (input.authMethod === 'private-key' && !privateKeyPath) {
     throw new Error('A private key path is required.');
   }
+  const shellKind: SshShellKind = input.shellKind && SHELL_KINDS.has(input.shellKind)
+    ? input.shellKind
+    : 'posix';
   return {
     protocol: 'ssh',
     name: requiredText(input.name, 'Host name', MAX_HOST_NAME_LENGTH),
@@ -104,6 +110,7 @@ function normalizeInput(input: HostInput): NormalizedHostInput {
     authMethod: input.authMethod,
     privateKeyPath,
     favorite: Boolean(input.favorite),
+    shellKind,
   };
 }
 
@@ -140,6 +147,7 @@ function parseHost(
     authMethod: candidate.authMethod as SshAuthMethod,
     privateKeyPath: candidate.privateKeyPath,
     favorite: candidate.favorite,
+    shellKind: candidate.shellKind,
   });
   const expectedReference = `AI Terminal/ssh/${id}`;
   const credentialReference = candidate.credentialReference === expectedReference

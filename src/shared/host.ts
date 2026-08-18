@@ -4,6 +4,18 @@ export type SshAuthMethod =
   | 'agent'
   | 'keyboard-interactive';
 
+/** Shell spoken by a remote SSH host. Used to build the correct command envelope. */
+export type SshShellKind = 'posix' | 'powershell' | 'cmd';
+
+export const SSH_SHELL_KIND_OPTIONS: readonly {
+  kind: SshShellKind;
+  label: string;
+}[] = [
+  { kind: 'posix', label: 'Linux / POSIX (bash, sh, zsh…)' },
+  { kind: 'powershell', label: 'PowerShell' },
+  { kind: 'cmd', label: '命令提示符 (cmd)' },
+];
+
 /**
  * Connection protocols shown by the new-Host dialog. Only SSH is implemented today;
  * the remaining variants are intentionally UI contracts, not connect capabilities.
@@ -142,6 +154,8 @@ export interface HostProfile {
    * of this host defaults to Full Takeover instead of per-command approval.
    */
   fullTakeover: boolean;
+  /** Remote shell kind; defaults to POSIX for hosts created before this field. */
+  shellKind?: SshShellKind;
   createdAt: string;
   updatedAt: string;
 }
@@ -164,6 +178,7 @@ export interface HostInput {
   group?: string;
   favorite?: boolean;
   fullTakeover?: boolean;
+  shellKind?: SshShellKind;
 }
 
 export interface SshConnectRequest {

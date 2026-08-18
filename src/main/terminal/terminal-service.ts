@@ -235,7 +235,7 @@ export class TerminalService {
             id: terminalId,
             title: host.name,
             profileId: `ssh:${host.id}`,
-            shellKind: 'posix',
+            shellKind: host.shellKind ?? 'posix',
             transport: 'ssh',
             hostId: host.id,
           };

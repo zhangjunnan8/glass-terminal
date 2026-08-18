@@ -8,11 +8,13 @@ import type {
 } from 'react';
 import {
   HOST_PROTOCOL_OPTIONS,
+  SSH_SHELL_KIND_OPTIONS,
   type HostFolder,
   type HostInput,
   type HostProfile,
   type HostProtocol,
   type SshAuthMethod,
+  type SshShellKind,
 } from '../shared/host';
 import type { RuntimeInfo } from '../shared/ipc';
 import { PRODUCT_NAME } from '../shared/product';
@@ -226,6 +228,7 @@ export function App() {
   const [editingHostProtocol, setEditingHostProtocol] = useState<HostProtocol>('ssh');
   const [hostFormAuthMethod, setHostFormAuthMethod] = useState<SshAuthMethod>('password');
   const [hostFormPrivateKeyPath, setHostFormPrivateKeyPath] = useState('');
+  const [hostFormShellKind, setHostFormShellKind] = useState<SshShellKind>('posix');
   const [connectingHost, setConnectingHost] = useState<HostProfile | null>(null);
   const [reconnectingSessionId, setReconnectingSessionId] = useState<string | null>(null);
   const [renamingSession, setRenamingSession] = useState<SessionRecord | null>(null);
@@ -1059,6 +1062,7 @@ export function App() {
     setEditingHostProtocol('ssh');
     setHostFormAuthMethod(host?.authMethod ?? 'password');
     setHostFormPrivateKeyPath(host?.privateKeyPath ?? '');
+    setHostFormShellKind(host?.shellKind ?? 'posix');
     setEditingHost(host);
   }
 
@@ -1223,6 +1227,7 @@ export function App() {
       privateKeyPath: hostFormAuthMethod === 'private-key'
         ? hostFormPrivateKeyPath
         : undefined,
+      shellKind: hostFormShellKind,
       folderId: String(data.get('folderId') ?? '') || null,
       favorite: data.get('favorite') === 'on',
     };
@@ -2612,6 +2617,17 @@ export function App() {
                 <label className="span-2">主机名或 IP 地址<input name="hostname" required defaultValue={editingHost?.hostname ?? ''} /></label>
                 <label>端口<input name="port" type="number" min="1" max="65535" required defaultValue={editingHost?.port ?? 22} /></label>
                 <label>用户名<input name="username" required defaultValue={editingHost?.username ?? ''} /></label>
+                <label className="span-2">远程 Shell
+                  <select
+                    name="shellKind"
+                    value={hostFormShellKind}
+                    onChange={(event) => setHostFormShellKind(event.target.value as SshShellKind)}
+                  >
+                    {SSH_SHELL_KIND_OPTIONS.map((option) => (
+                      <option value={option.kind} key={option.kind}>{option.label}</option>
+                    ))}
+                  </select>
+                </label>
                 <label className="span-2">认证方式
                   <select
                     name="authMethod"
