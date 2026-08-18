@@ -194,6 +194,9 @@ function preferredCodexReasoningEffort(
   return efforts[0]?.reasoningEffort ?? '';
 }
 
+/** Max composer height in pixels before the textarea stops growing and scrolls. */
+const MAX_COMPOSER_HEIGHT_PX = 240;
+
 export function App() {
   const [uiTheme, setUiTheme] = useState<UiTheme>(() => readUiTheme());
   const [runtime, setRuntime] = useState<RuntimeInfo | null>(null);
@@ -559,6 +562,14 @@ export function App() {
     setEditingAgentTerminalId(null);
     setAgentPrompt('');
   }, [activeId]);
+
+  // Grow the composer with its content up to a threshold; beyond that it scrolls.
+  useLayoutEffect(() => {
+    const composer = agentComposerRef.current;
+    if (!composer) return;
+    composer.style.height = 'auto';
+    composer.style.height = `${Math.min(composer.scrollHeight, MAX_COMPOSER_HEIGHT_PX)}px`;
+  }, [agentPrompt]);
 
   useLayoutEffect(() => {
     const element = agentBodyRef.current;

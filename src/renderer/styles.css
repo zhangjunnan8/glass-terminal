@@ -676,7 +676,7 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .provider-actions .primary { margin-left: auto; color: #07130f; border-color: #5bc9a7; background: #5bc9a7; font-weight: 700; }
 .provider-actions .danger-text { color: #e9828a; }
 .composer { margin: 10px; padding: 10px; border: 1px solid #273345; border-radius: 6px; background: #0b1119; }
-.composer textarea { width: 100%; height: 72px; resize: none; border: 0; outline: 0; background: transparent; font-size: 14px; line-height: 1.5; }
+.composer textarea { width: 100%; min-height: 72px; max-height: 240px; resize: none; overflow-y: auto; border: 0; outline: 0; background: transparent; font-size: 14px; line-height: 1.5; }
 .composer div { display: flex; align-items: center; justify-content: space-between; gap: 8px; color: #8f9db0; font-size: 14px; line-height: 1.45; }
 .composer div > span { min-width: 0; flex: 1; }
 .composer button { width: 36px; height: 36px; flex-shrink: 0; color: #07130f; border-radius: 4px; background: #61d4af; cursor: pointer; font-size: 18px; font-weight: 800; box-shadow: 0 3px 10px #0005; transition: color 150ms ease, background-color 150ms ease, box-shadow 150ms ease, transform 100ms ease; }
