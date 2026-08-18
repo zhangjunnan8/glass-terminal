@@ -58,6 +58,11 @@ import type {
   SetCodexTerminalAgentEnabledRequest,
 } from './codex-app-server';
 import type { AppSettings, AppSettingsPatch } from './settings';
+import type {
+  BackupExportRequest,
+  BackupExportResult,
+  BackupImportResult,
+} from './backup';
 
 export interface RuntimeInfo {
   platform: NodeJS.Platform;
@@ -163,5 +168,9 @@ export interface DesktopBridge {
   settings: {
     get(): Promise<AppSettings>;
     update(patch: AppSettingsPatch): Promise<AppSettings>;
+  };
+  backup: {
+    export(request: BackupExportRequest): Promise<BackupExportResult | null>;
+    import(): Promise<BackupImportResult | null>;
   };
 }

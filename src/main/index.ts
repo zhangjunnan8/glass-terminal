@@ -29,6 +29,12 @@ import { PROVIDER_CHANNELS } from '../shared/provider';
 import type { ProviderInput, ProviderModelDiscoveryInput } from '../shared/provider';
 import { SETTINGS_CHANNELS } from '../shared/settings';
 import type { AppSettingsPatch } from '../shared/settings';
+import { BACKUP_CHANNELS } from '../shared/backup';
+import type {
+  BackupExportRequest,
+  BackupExportResult,
+  BackupImportResult,
+} from '../shared/backup';
 import { AGENT_CHANNELS } from '../shared/agent';
 import type {
   ConfirmShellReadyRequest,
@@ -58,6 +64,7 @@ import { ProviderStore } from './providers/provider-store';
 import { MemorySecretStore } from './providers/secret-store';
 import { FileSecretStore } from './providers/file-secret-store';
 import { AppSettingsStore } from './settings/app-settings-store';
+import { BackupService } from './backup/backup-service';
 import { AgentService } from './agent/agent-service';
 import { AgentFileService } from './agent/agent-file-service';
 import { LangChainBackend, LangChainProviderModelFactory } from './agent/langchain-backend';
@@ -95,6 +102,7 @@ let agentService: AgentService | undefined;
 let codexAppServerService: CodexAppServerService | undefined;
 let agentSmokeProvider: AgentSmokeProvider | undefined;
 let appSettingsStore: AppSettingsStore | undefined;
+let backupService: BackupService | undefined;
 const trustedRendererContents = new Set<number>();
 const ownsSingleInstance = acquireSingleInstance(
   app,
@@ -138,6 +146,11 @@ function requireAgentService(): AgentService {
 function requireAppSettingsStore(): AppSettingsStore {
   if (!appSettingsStore) throw new Error('App settings store is not ready.');
   return appSettingsStore;
+}
+
+function requireBackupService(): BackupService {
+  if (!backupService) throw new Error('Backup service is not ready.');
+  return backupService;
 }
 
 function assertTrustedSender(event: IpcMainInvokeEvent): void {
@@ -216,6 +229,30 @@ handleTrusted(SETTINGS_CHANNELS.get, () => requireAppSettingsStore().get());
 handleTrusted(SETTINGS_CHANNELS.update, (_event, patch: AppSettingsPatch) => (
   requireAppSettingsStore().update(patch)
 ));
+handleTrusted(BACKUP_CHANNELS.export, async (event, request: BackupExportRequest) => {
+  void request;
+  const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!ownerWindow) throw new Error('无法打开导出窗口。');
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const selection = await dialog.showSaveDialog(ownerWindow, {
+    title: '导出 AI Terminal 配置',
+    defaultPath: join(app.getPath('documents'), `ai-terminal-backup-${stamp}.aitbak`),
+    filters: [{ name: 'AI Terminal 备份', extensions: ['aitbak', 'json'] }],
+  });
+  if (selection.canceled || !selection.filePath) return null;
+  return requireBackupService().exportToFile(selection.filePath);
+});
+handleTrusted(BACKUP_CHANNELS.import, async (event) => {
+  const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!ownerWindow) throw new Error('无法打开导入窗口。');
+  const selection = await dialog.showOpenDialog(ownerWindow, {
+    title: '导入 AI Terminal 配置',
+    properties: ['openFile'],
+    filters: [{ name: 'AI Terminal 备份', extensions: ['aitbak', 'json'] }],
+  });
+  if (selection.canceled || !selection.filePaths[0]) return null;
+  return requireBackupService().importFromFile(selection.filePaths[0]);
+});
 
 handleTrusted(TERMINAL_CHANNELS.listShells, () => terminalService.listShells());
 handleTrusted(
@@ -575,6 +612,15 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
     : new FileSecretStore(join(app.getPath('userData'), 'config', 'secrets.json'));
   appSettingsStore = new AppSettingsStore(
     join(app.getPath('userData'), 'config', 'app-settings.json'),
+  );
+  backupService = new BackupService(
+    {
+      settings: join(app.getPath('userData'), 'config', 'app-settings.json'),
+      providers: join(app.getPath('userData'), 'config', 'providers.json'),
+      codexAppServer: join(app.getPath('userData'), 'config', 'codex-app-server.json'),
+    },
+    secretStore,
+    app.getVersion(),
   );
   if (smokeMode === 'agent' || smokeMode === 'agent-ssh') {
     agentSmokeProvider = await startAgentSmokeProvider(smokeMode === 'agent-ssh');

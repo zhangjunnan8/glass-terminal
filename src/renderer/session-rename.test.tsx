@@ -186,6 +186,10 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       }),
       update: vi.fn(),
     },
+    backup: {
+      export: vi.fn().mockResolvedValue(null),
+      import: vi.fn().mockResolvedValue(null),
+    },
   };
 }
 

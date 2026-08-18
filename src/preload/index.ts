@@ -13,6 +13,7 @@ import type { AgentSessionView } from '../shared/agent';
 import { CODEX_APP_SERVER_CHANNELS } from '../shared/codex-app-server';
 import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import { SETTINGS_CHANNELS } from '../shared/settings';
+import { BACKUP_CHANNELS } from '../shared/backup';
 
 const terminalBridge: DesktopBridge['terminal'] = {
   listShells: () => ipcRenderer.invoke(TERMINAL_CHANNELS.listShells),
@@ -187,6 +188,11 @@ const settingsBridge: DesktopBridge['settings'] = {
   update: (patch) => ipcRenderer.invoke(SETTINGS_CHANNELS.update, patch),
 };
 
+const backupBridge: DesktopBridge['backup'] = {
+  export: (request) => ipcRenderer.invoke(BACKUP_CHANNELS.export, request),
+  import: () => ipcRenderer.invoke(BACKUP_CHANNELS.import),
+};
+
 const bridge: DesktopBridge = Object.freeze({
   runtime: Object.freeze({
     getInfo: () => ipcRenderer.invoke('runtime:get-info'),
@@ -199,6 +205,7 @@ const bridge: DesktopBridge = Object.freeze({
   codexAppServer: Object.freeze(codexAppServerBridge),
   agent: Object.freeze(agentBridge),
   settings: Object.freeze(settingsBridge),
+  backup: Object.freeze(backupBridge),
 });
 
 contextBridge.exposeInMainWorld('aiTerminal', bridge);
