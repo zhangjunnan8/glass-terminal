@@ -173,6 +173,10 @@ export interface DesktopBridge {
     export(request: BackupExportRequest): Promise<BackupExportResult | null>;
     import(): Promise<BackupImportResult | null>;
   };
+  hostBackup: {
+    export(): Promise<BackupExportResult | null>;
+    import(): Promise<BackupImportResult | null>;
+  };
   settingsWindow: {
     open(): Promise<void>;
   };

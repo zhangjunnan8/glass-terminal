@@ -897,6 +897,14 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
   background: #eef1f5;
 }
 
+.host-backup-notice {
+  margin: 0;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: #9fb0c3;
+  border-bottom: 1px solid #1d2733;
+}
+
 /* The light palette is scoped to this app only; it never changes the Windows theme. */
 .app-shell[data-theme="light"] {
   color: #172033;

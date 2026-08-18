@@ -190,6 +190,10 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       export: vi.fn().mockResolvedValue(null),
       import: vi.fn().mockResolvedValue(null),
     },
+    hostBackup: {
+      export: vi.fn().mockResolvedValue(null),
+      import: vi.fn().mockResolvedValue(null),
+    },
     settingsWindow: {
       open: vi.fn().mockResolvedValue(undefined),
     },

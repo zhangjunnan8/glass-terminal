@@ -209,6 +209,7 @@ export function App() {
   const [hostFolderError, setHostFolderError] = useState<string | null>(null);
   const [hostFolderActionPending, setHostFolderActionPending] = useState(false);
   const [hostTreeDrag, setHostTreeDrag] = useState<HostTreeDrag | null>(null);
+  const [hostBackupNotice, setHostBackupNotice] = useState<string | null>(null);
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [providers, setProviders] = useState<ProviderProfile[]>([]);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
@@ -756,6 +757,34 @@ export function App() {
     const next = await window.aiTerminal.hosts.listFolders();
     setHostFolders(next);
     return next;
+  }
+
+  async function exportHosts() {
+    setHostBackupNotice(null);
+    try {
+      const result = await window.aiTerminal.hostBackup.export();
+      if (result) setHostBackupNotice(`已导出 ${result.sections.length} 个分区。`);
+    } catch (error) {
+      setHostBackupNotice(errorMessage(error));
+    }
+  }
+
+  async function importHosts() {
+    setHostBackupNotice(null);
+    try {
+      const result = await window.aiTerminal.hostBackup.import();
+      if (result) {
+        await refreshHosts();
+        await refreshHostFolders();
+        setHostBackupNotice(
+          result.needsRestart
+            ? `已导入 ${result.sectionsImported.length} 个分区，重启后生效。`
+            : `已导入 ${result.sectionsImported.length} 个分区。`,
+        );
+      }
+    } catch (error) {
+      setHostBackupNotice(errorMessage(error));
+    }
   }
 
   async function refreshSessions() {
@@ -1955,9 +1984,16 @@ export function App() {
             ? '终端'
             : sidebarView === 'hosts' ? '主机' : '会话历史'}</span>
           {sidebarView === 'hosts' && (
-            <button title="添加主机" onClick={() => openHostEditor(null)}>＋</button>
+            <>
+              <button title="导出主机配置" onClick={() => void exportHosts()}>⇩</button>
+              <button title="导入主机配置" onClick={() => void importHosts()}>⇧</button>
+              <button title="添加主机" onClick={() => openHostEditor(null)}>＋</button>
+            </>
           )}
         </div>
+        {sidebarView === 'hosts' && hostBackupNotice && (
+          <div className="host-backup-notice" role="status">{hostBackupNotice}</div>
+        )}
         <label className="search-box">
           <span>⌕</span>
           <input

@@ -43,3 +43,8 @@ export const BACKUP_CHANNELS = {
   export: 'backup:export',
   import: 'backup:import',
 } as const;
+
+export const HOST_BACKUP_CHANNELS = {
+  export: 'host-backup:export',
+  import: 'host-backup:import',
+} as const;

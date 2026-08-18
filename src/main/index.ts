@@ -29,7 +29,7 @@ import { PROVIDER_CHANNELS } from '../shared/provider';
 import type { ProviderInput, ProviderModelDiscoveryInput } from '../shared/provider';
 import { SETTINGS_CHANNELS, SETTINGS_WINDOW_CHANNELS } from '../shared/settings';
 import type { AppSettingsPatch } from '../shared/settings';
-import { BACKUP_CHANNELS } from '../shared/backup';
+import { BACKUP_CHANNELS, HOST_BACKUP_CHANNELS } from '../shared/backup';
 import type {
   BackupExportRequest,
   BackupExportResult,
@@ -65,6 +65,7 @@ import { MemorySecretStore } from './providers/secret-store';
 import { FileSecretStore } from './providers/file-secret-store';
 import { AppSettingsStore } from './settings/app-settings-store';
 import { BackupService } from './backup/backup-service';
+import { HostBackupService } from './backup/host-backup-service';
 import { AgentService } from './agent/agent-service';
 import { AgentFileService } from './agent/agent-file-service';
 import { LangChainBackend, LangChainProviderModelFactory } from './agent/langchain-backend';
@@ -106,6 +107,7 @@ let codexAppServerService: CodexAppServerService | undefined;
 let agentSmokeProvider: AgentSmokeProvider | undefined;
 let appSettingsStore: AppSettingsStore | undefined;
 let backupService: BackupService | undefined;
+let hostBackupService: HostBackupService | undefined;
 let settingsWindow: BrowserWindow | null = null;
 const trustedRendererContents = new Set<number>();
 const ownsSingleInstance = acquireSingleInstance(
@@ -155,6 +157,11 @@ function requireAppSettingsStore(): AppSettingsStore {
 function requireBackupService(): BackupService {
   if (!backupService) throw new Error('Backup service is not ready.');
   return backupService;
+}
+
+function requireHostBackupService(): HostBackupService {
+  if (!hostBackupService) throw new Error('Host backup service is not ready.');
+  return hostBackupService;
 }
 
 function isTrustedEntryUrl(url: string): boolean {
@@ -313,6 +320,29 @@ handleTrusted(BACKUP_CHANNELS.import, async (event) => {
   });
   if (selection.canceled || !selection.filePaths[0]) return null;
   return requireBackupService().importFromFile(selection.filePaths[0]);
+});
+handleTrusted(HOST_BACKUP_CHANNELS.export, async (event) => {
+  const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!ownerWindow) throw new Error('无法打开主机导出窗口。');
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const selection = await dialog.showSaveDialog(ownerWindow, {
+    title: '导出 SSH 主机配置',
+    defaultPath: join(app.getPath('documents'), `ai-terminal-hosts-${stamp}.aithosts`),
+    filters: [{ name: 'AI Terminal 主机备份', extensions: ['aithosts', 'json'] }],
+  });
+  if (selection.canceled || !selection.filePath) return null;
+  return requireHostBackupService().exportToFile(selection.filePath);
+});
+handleTrusted(HOST_BACKUP_CHANNELS.import, async (event) => {
+  const ownerWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!ownerWindow) throw new Error('无法打开主机导入窗口。');
+  const selection = await dialog.showOpenDialog(ownerWindow, {
+    title: '导入 SSH 主机配置',
+    properties: ['openFile'],
+    filters: [{ name: 'AI Terminal 主机备份', extensions: ['aithosts', 'json'] }],
+  });
+  if (selection.canceled || !selection.filePaths[0]) return null;
+  return requireHostBackupService().importFromFile(selection.filePaths[0]);
 });
 
 handleTrusted(TERMINAL_CHANNELS.listShells, () => terminalService.listShells());
@@ -680,6 +710,11 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
       providers: join(app.getPath('userData'), 'config', 'providers.json'),
       codexAppServer: join(app.getPath('userData'), 'config', 'codex-app-server.json'),
     },
+    secretStore,
+    app.getVersion(),
+  );
+  hostBackupService = new HostBackupService(
+    join(app.getPath('userData'), 'config', 'hosts.json'),
     secretStore,
     app.getVersion(),
   );

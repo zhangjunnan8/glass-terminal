@@ -13,7 +13,7 @@ import type { AgentSessionView } from '../shared/agent';
 import { CODEX_APP_SERVER_CHANNELS } from '../shared/codex-app-server';
 import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import { SETTINGS_CHANNELS, SETTINGS_WINDOW_CHANNELS } from '../shared/settings';
-import { BACKUP_CHANNELS } from '../shared/backup';
+import { BACKUP_CHANNELS, HOST_BACKUP_CHANNELS } from '../shared/backup';
 
 const terminalBridge: DesktopBridge['terminal'] = {
   listShells: () => ipcRenderer.invoke(TERMINAL_CHANNELS.listShells),
@@ -193,6 +193,11 @@ const backupBridge: DesktopBridge['backup'] = {
   import: () => ipcRenderer.invoke(BACKUP_CHANNELS.import),
 };
 
+const hostBackupBridge: DesktopBridge['hostBackup'] = {
+  export: () => ipcRenderer.invoke(HOST_BACKUP_CHANNELS.export),
+  import: () => ipcRenderer.invoke(HOST_BACKUP_CHANNELS.import),
+};
+
 const settingsWindowBridge: DesktopBridge['settingsWindow'] = {
   open: () => ipcRenderer.invoke(SETTINGS_WINDOW_CHANNELS.open),
 };
@@ -210,6 +215,7 @@ const bridge: DesktopBridge = Object.freeze({
   agent: Object.freeze(agentBridge),
   settings: Object.freeze(settingsBridge),
   backup: Object.freeze(backupBridge),
+  hostBackup: Object.freeze(hostBackupBridge),
   settingsWindow: Object.freeze(settingsWindowBridge),
 });
 
