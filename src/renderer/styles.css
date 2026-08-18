@@ -410,7 +410,6 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .agent-empty p { max-width: 300px; color: #8291a5; font-size: 14px; line-height: 1.55; }
 .guardrail { margin-top: 10px; padding: 8px 10px; color: #91b6aa; border: 1px solid #243c38; border-radius: 4px; background: #101e1c; font-size: 14px; }
 .guardrail span { margin-right: 4px; color: #61d4af; }
-.activate-session { min-height: 38px; margin-top: 14px; padding: 8px 13px; color: #071410; border: 0; border-radius: 4px; background: #61d4af; cursor: pointer; font-size: 14px; font-weight: 700; }
 .provider-configure { min-height: 38px; margin-top: 8px; padding: 8px 10px; color: #a8b8cc; border: 1px solid #2a3b50; border-radius: 4px; background: #131d29; cursor: pointer; font-size: 14px; }
 .agent-backend-notice { margin: 10px; padding: 11px; color: #bcc9d8; border: 1px solid #38546a; border-radius: 5px; background: #0d1a25; }
 .agent-backend-notice.enabled, .agent-backend-notice.ready { border-color: #2f6657; background: #0e211c; }

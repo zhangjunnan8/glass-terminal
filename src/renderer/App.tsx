@@ -1264,20 +1264,6 @@ export function App() {
     }
   }
 
-  async function activateAiSession() {
-    if (!activeTab) return;
-    setWorkspaceActionError(null);
-    try {
-      const session = await window.aiTerminal.sessions.upgrade({ terminalId: activeTab.id });
-      setTabs((current) => current.map((tab) => (
-        tab.id === activeTab.id ? { ...tab, sessionId: session.id } : tab
-      )));
-      await refreshSessions();
-    } catch (error) {
-      setWorkspaceActionError(errorMessage(error));
-    }
-  }
-
   async function chooseLocalWorkspace() {
     if (!activeTab || activeTab.transport !== 'local' || workspaceChangeDisabledReason) return;
     setWorkspaceActionError(null);
@@ -2562,11 +2548,6 @@ export function App() {
               >
                 管理智能体后端
               </button>
-              {activeTab && !activeTab.sessionId && (
-                <button className="activate-session" onClick={() => void activateAiSession()}>
-                  启用 AI 会话
-                </button>
-              )}
             </div>
           )}
           {activeAgent?.messages.map((message, index) => {
