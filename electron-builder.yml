@@ -6,10 +6,16 @@ files:
   - dist/**
   - dist-electron/**
   - package.json
+  - "!**/*.map"
 # Keep the app unpacked: @langchain/* and zod are loaded via dynamic import()
 # (ESM), and node-pty is a native module. An unpacked directory avoids asar's
 # ESM/native-module resolution pitfalls and is simpler to 7z afterwards.
 asar: false
+afterPack: build/after-pack.cjs
+# Ship only the locale packs the app actually needs (zh-CN UI + en-US fallback).
+electronLanguages:
+  - en-US
+  - zh-CN
 win:
   target:
     - target: dir
