@@ -4,6 +4,7 @@ import { HOST_CHANNELS } from '../shared/host';
 import { TERMINAL_CHANNELS } from '../shared/terminal';
 import type { TerminalDataEvent, TerminalExitEvent } from '../shared/terminal';
 import { SESSION_CHANNELS } from '../shared/session';
+import type { SessionRecord } from '../shared/session';
 import { SFTP_CHANNELS } from '../shared/sftp';
 import type { TransferJobSnapshot } from '../shared/sftp';
 import { PROVIDER_CHANNELS } from '../shared/provider';
@@ -74,6 +75,13 @@ const sessionBridge: DesktopBridge['sessions'] = {
     request,
   ),
   rename: (request) => ipcRenderer.invoke(SESSION_CHANNELS.rename, request),
+  onRenamed: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, session: SessionRecord) => {
+      listener(session);
+    };
+    ipcRenderer.on(SESSION_CHANNELS.renamed, handler);
+    return () => ipcRenderer.removeListener(SESSION_CHANNELS.renamed, handler);
+  },
   readTerminalHistory: (sessionId) => ipcRenderer.invoke(
     SESSION_CHANNELS.readTerminalHistory,
     sessionId,

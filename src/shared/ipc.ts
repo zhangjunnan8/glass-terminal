@@ -101,6 +101,7 @@ export interface DesktopBridge {
     clearWorkspace(request: ClearWorkspaceRequest): Promise<SessionRecord>;
     chooseLocalWorkspace(request: UpgradeSessionRequest): Promise<SessionRecord | null>;
     rename(request: RenameSessionRequest): Promise<SessionRecord>;
+    onRenamed(listener: (session: SessionRecord) => void): () => void;
     readTerminalHistory(sessionId: string): Promise<string>;
     readHistoryDetail(request: ReadSessionHistoryDetailRequest): Promise<SessionHistoryDetail>;
     remove(request: DeleteSessionRequest): Promise<void>;

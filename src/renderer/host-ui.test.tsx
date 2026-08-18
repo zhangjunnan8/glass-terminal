@@ -106,6 +106,7 @@ function hostBridge() {
     },
     sessions: {
       list: vi.fn().mockResolvedValue([session]),
+      onRenamed: vi.fn(() => () => undefined),
     },
     providers: {
       list: vi.fn().mockResolvedValue([]),

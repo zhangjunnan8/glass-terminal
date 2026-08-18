@@ -42,6 +42,7 @@ function providerBridge(discoverModels: DesktopBridge['providers']['discoverMode
     },
     sessions: {
       list: vi.fn().mockResolvedValue([]),
+      onRenamed: vi.fn(() => () => undefined),
     },
     providers: {
       list: vi.fn().mockResolvedValue([]),

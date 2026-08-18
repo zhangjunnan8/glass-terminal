@@ -182,6 +182,7 @@ function bridgeForCodex(snapshot: CodexAppServerSnapshot): DesktopBridge {
       clearWorkspace: vi.fn(),
       chooseLocalWorkspace: vi.fn(),
       rename: vi.fn(),
+      onRenamed: vi.fn().mockReturnValue(() => undefined),
       readTerminalHistory: vi.fn(),
       readHistoryDetail: vi.fn(),
       remove: vi.fn(),

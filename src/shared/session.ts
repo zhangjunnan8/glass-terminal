@@ -149,6 +149,7 @@ export const SESSION_CHANNELS = {
   clearWorkspace: 'session:clear-workspace',
   chooseLocalWorkspace: 'session:choose-local-workspace',
   rename: 'session:rename',
+  renamed: 'session:renamed',
   readTerminalHistory: 'session:read-terminal-history',
   readHistoryDetail: 'session:read-history-detail',
   remove: 'session:remove',

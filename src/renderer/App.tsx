@@ -284,6 +284,13 @@ export function App() {
     storeUiTheme(uiTheme);
   }, [uiTheme]);
 
+  useEffect(() => window.aiTerminal.sessions.onRenamed((session) => {
+    setSessions((current) => [
+      session,
+      ...current.filter((candidate) => candidate.id !== session.id),
+    ]);
+  }), []);
+
   useEffect(() => {
     void window.aiTerminal.runtime.getInfo().then(setRuntime);
     void window.aiTerminal.hosts.list().then(setHosts).catch((error) => {

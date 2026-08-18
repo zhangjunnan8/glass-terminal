@@ -29,6 +29,7 @@ import type {
 import type { ProviderProfile } from '../../shared/provider';
 import type { CodexVisibleTerminalContext } from '../../shared/codex-app-server';
 import type { SessionAuditEvent, SessionRecord } from '../../shared/session';
+import { SESSION_CHANNELS } from '../../shared/session';
 import type { TerminalCommandResult, WorkspaceBinding } from '../../shared/tools';
 import type { ProviderStore } from '../providers/provider-store';
 import type { SessionManager } from '../sessions/session-manager';
@@ -303,6 +304,8 @@ Every command must use terminal_execute so it appears in the visible terminal. W
 Do not ask the user to send passwords, API keys, passphrases, OTPs, or other credentials through chat. Authentication is entered by the user directly in the visible terminal.
 Commands require explicit user approval unless the UI reports that Full Takeover is active.`;
 
+const SESSION_TITLE_SYSTEM_PROMPT = '你是会话命名助手。根据用户的第一个请求，生成一个简短的中文会话标题（不超过 12 个字符）。只输出标题本身，不要引号、标点、前缀或解释。';
+
 function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
   return {
     revision: runtime.revision,
@@ -519,12 +522,16 @@ export class AgentService {
       throw new Error('A foreground process retained by Takeover is still running.');
     }
 
+    const sessionBefore = this.sessions.sessionForTerminal(owner, request.terminalId);
     const runtime = this.ensureRuntime(owner, request.terminalId, backend);
     if (this.revokeChangedProviderAuthority(runtime)) {
       this.emit(runtime);
       throw new Error('Provider 配置已变化；旧对话未发送，请重新提交本轮请求。');
     }
     this.addChat(runtime, 'user', prompt);
+    if (!sessionBefore && runtime.backend.kind === 'generic-provider') {
+      void this.autoNameSession(runtime, prompt);
+    }
     return this.startPersistedPrompt(runtime, prompt);
   }
 
@@ -2341,6 +2348,60 @@ export class AgentService {
     };
     this.persistChatItem(runtime, item);
     runtime.messages.push(item);
+  }
+
+  /** Best-effort: name a freshly created session from the user's first prompt. */
+  private async autoNameSession(
+    runtime: AgentRuntimeRecord,
+    prompt: string,
+  ): Promise<void> {
+    try {
+      const providerId = runtime.backend.kind === 'generic-provider'
+        ? runtime.backend.providerId
+        : undefined;
+      if (!providerId) return;
+      const name = await this.summarizeSessionName(providerId, prompt);
+      if (!name) return;
+      const updated = this.sessions.rename({
+        sessionId: runtime.sessionId,
+        name,
+        source: 'automatic',
+      });
+      if (updated.name !== name) return;
+      if (!runtime.owner.isDestroyed()) {
+        runtime.owner.send(SESSION_CHANNELS.renamed, updated);
+      }
+    } catch {
+      // Naming is cosmetic; a failure must never affect the turn.
+    }
+  }
+
+  private async summarizeSessionName(
+    providerId: string,
+    prompt: string,
+  ): Promise<string | undefined> {
+    try {
+      const provider = this.providerFactory(providerId);
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15_000);
+      try {
+        const completion = await provider.complete({
+          messages: [
+            { role: 'system', content: SESSION_TITLE_SYSTEM_PROMPT },
+            { role: 'user', content: prompt.slice(0, 4_000) },
+          ],
+          tools: [],
+          signal: controller.signal,
+        });
+        const title = completion.message.content?.trim();
+        if (!title) return undefined;
+        return title.length > 24 ? title.slice(0, 24) : title;
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch {
+      return undefined;
+    }
   }
 
   private persistChatItem(runtime: AgentRuntimeRecord, item: AgentChatItem): void {

@@ -130,6 +130,7 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       clearWorkspace: vi.fn().mockResolvedValue(session),
       chooseLocalWorkspace: vi.fn().mockResolvedValue(null),
       rename,
+      onRenamed: vi.fn().mockReturnValue(() => undefined),
       readTerminalHistory: vi.fn(),
       readHistoryDetail: vi.fn(),
       remove: vi.fn(),
