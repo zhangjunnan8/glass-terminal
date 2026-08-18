@@ -6,7 +6,10 @@ export const HOST_SECRET_PREFIX = 'AI Terminal/ssh/';
 
 export interface BackupSectionEnvelope {
   schemaVersion: number;
-  data: unknown;
+  /** Inline data for small sections (JSON backups). */
+  data?: unknown;
+  /** Entry path inside a ZIP archive for large sections (session logs). */
+  file?: string;
 }
 
 export interface BackupManifest {

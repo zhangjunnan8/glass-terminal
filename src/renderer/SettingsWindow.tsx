@@ -15,6 +15,7 @@ export function SettingsWindow() {
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
   const [backupMessage, setBackupMessage] = useState<string | null>(null);
   const [backupPending, setBackupPending] = useState(false);
+  const [includeLogs, setIncludeLogs] = useState(false);
   const [version, setVersion] = useState('');
 
   useEffect(() => {
@@ -51,7 +52,7 @@ export function SettingsWindow() {
     setBackupPending(true);
     setBackupMessage(null);
     try {
-      const result = await window.aiTerminal.backup.export({ includeLogs: false });
+      const result = await window.aiTerminal.backup.export({ includeLogs });
       if (result) {
         setBackupMessage(`已导出 ${result.sections.length} 个分区（${result.bytes} 字节）。`);
       }
@@ -60,7 +61,7 @@ export function SettingsWindow() {
     } finally {
       setBackupPending(false);
     }
-  }, []);
+  }, [includeLogs]);
 
   const importBackup = useCallback(async () => {
     setBackupPending(true);
@@ -204,6 +205,17 @@ export function SettingsWindow() {
               导出将生成一个可移植的备份文件，包含通用偏好、Provider 配置与 Provider
               API Key。SSH 主机配置独立管理，不包含在通用备份中。导入后需要重启应用生效。
             </p>
+
+            <div className="settings-actions">
+              <label className="settings-check">
+                <input
+                  type="checkbox"
+                  checked={includeLogs}
+                  onChange={(event) => setIncludeLogs(event.target.checked)}
+                />
+                <span>包含会话日志</span>
+              </label>
+            </div>
 
             <div className="settings-actions">
               <button

@@ -298,17 +298,16 @@ handleTrusted(SETTINGS_WINDOW_CHANNELS.open, () => {
   showSettingsWindow();
 });
 handleTrusted(BACKUP_CHANNELS.export, async (event, request: BackupExportRequest) => {
-  void request;
   const ownerWindow = BrowserWindow.fromWebContents(event.sender);
   if (!ownerWindow) throw new Error('无法打开导出窗口。');
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const selection = await dialog.showSaveDialog(ownerWindow, {
     title: '导出 AI Terminal 配置',
     defaultPath: join(app.getPath('documents'), `ai-terminal-backup-${stamp}.aitbak`),
-    filters: [{ name: 'AI Terminal 备份', extensions: ['aitbak', 'json'] }],
+    filters: [{ name: 'AI Terminal 备份', extensions: ['aitbak'] }],
   });
   if (selection.canceled || !selection.filePath) return null;
-  return requireBackupService().exportToFile(selection.filePath);
+  return requireBackupService().exportToFile(selection.filePath, request.includeLogs === true);
 });
 handleTrusted(BACKUP_CHANNELS.import, async (event) => {
   const ownerWindow = BrowserWindow.fromWebContents(event.sender);
@@ -316,7 +315,7 @@ handleTrusted(BACKUP_CHANNELS.import, async (event) => {
   const selection = await dialog.showOpenDialog(ownerWindow, {
     title: '导入 AI Terminal 配置',
     properties: ['openFile'],
-    filters: [{ name: 'AI Terminal 备份', extensions: ['aitbak', 'json'] }],
+    filters: [{ name: 'AI Terminal 备份', extensions: ['aitbak'] }],
   });
   if (selection.canceled || !selection.filePaths[0]) return null;
   return requireBackupService().importFromFile(selection.filePaths[0]);
@@ -709,6 +708,7 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
       settings: join(app.getPath('userData'), 'config', 'app-settings.json'),
       providers: join(app.getPath('userData'), 'config', 'providers.json'),
       codexAppServer: join(app.getPath('userData'), 'config', 'codex-app-server.json'),
+      sessions: join(app.getPath('userData'), 'sessions'),
     },
     secretStore,
     app.getVersion(),

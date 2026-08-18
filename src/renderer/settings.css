@@ -113,6 +113,14 @@
   margin-top: 6px;
 }
 
+.settings-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: #c4cfdb;
+}
+
 .settings-actions button {
   padding: 7px 16px;
   border: 1px solid #263442;

@@ -1,7 +1,9 @@
+// @vitest-environment node
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import AdmZip from 'adm-zip';
 import { MemorySecretStore } from '../providers/secret-store';
 import { BackupService } from './backup-service';
 
@@ -18,6 +20,7 @@ function paths(root: string) {
     settings: join(root, 'config', 'app-settings.json'),
     providers: join(root, 'config', 'providers.json'),
     codexAppServer: join(root, 'config', 'codex-app-server.json'),
+    sessions: join(root, 'sessions'),
   };
 }
 
@@ -27,6 +30,16 @@ function seedConfig(root: string) {
   writeFileSync(p.settings, JSON.stringify({ schemaVersion: 1, theme: 'light' }), 'utf8');
   writeFileSync(p.providers, JSON.stringify([{ id: 'provider-1' }]), 'utf8');
   writeFileSync(p.codexAppServer, JSON.stringify({ bound: true }), 'utf8');
+}
+
+function readManifest(bundlePath: string) {
+  const zip = new AdmZip(bundlePath);
+  const entry = zip.getEntry('manifest.json');
+  expect(entry).toBeTruthy();
+  return JSON.parse(entry!.getData().toString('utf8')) as {
+    formatVersion: number;
+    sections: Record<string, { schemaVersion: number; data?: unknown; file?: string }>;
+  };
 }
 
 afterEach(() => {
@@ -53,20 +66,17 @@ describe('BackupService', () => {
       'codexAppServer',
       'providerSecrets',
     ]);
-    const bundle = JSON.parse(readFileSync(bundlePath, 'utf8')) as {
-      sections: Record<string, { schemaVersion: number; data: unknown }>;
-    };
-    expect(bundle.sections.providerSecrets.data).toEqual({
+    const manifest = readManifest(bundlePath);
+    expect(manifest.sections.providerSecrets.file).toBe('sections/provider-secrets.json');
+    const secretsEntry = new AdmZip(bundlePath).getEntry('sections/provider-secrets.json')!;
+    expect(JSON.parse(secretsEntry.getData().toString('utf8'))).toEqual({
       'AI Terminal/provider/00000000-0000-4000-8000-000000000001': 'api-key',
     });
 
     const target = fixture();
     const targetSecrets = new MemorySecretStore();
-    const imported = await new BackupService(
-      paths(target),
-      targetSecrets,
-      '1.0.0',
-    ).importFromFile(bundlePath);
+    const imported = await new BackupService(paths(target), targetSecrets, '1.0.0')
+      .importFromFile(bundlePath);
 
     expect(imported.sectionsImported).toEqual([
       'settings',
@@ -109,18 +119,53 @@ describe('BackupService', () => {
     )).toBe('host-pass');
   });
 
+  it('bundles and restores session logs only when requested', async () => {
+    const source = fixture();
+    seedConfig(source);
+    mkdirSync(join(paths(source).sessions, 'sess-1', 'terminal'), { recursive: true });
+    writeFileSync(join(paths(source).sessions, 'sess-1', 'audit.jsonl'), '{"type":"x"}\n', 'utf8');
+    writeFileSync(
+      join(paths(source).sessions, 'sess-1', 'terminal', 'output.jsonl.gz'),
+      Buffer.from([0x1f, 0x8b, 0x08, 0x00]),
+    );
+
+    const bundlePath = join(source, 'backup.aitbak');
+    const exported = await new BackupService(
+      paths(source),
+      new MemorySecretStore(),
+      '1.0.0',
+    ).exportToFile(bundlePath, true);
+    expect(exported.sections).toContain('sessions');
+
+    const target = fixture();
+    const imported = await new BackupService(
+      paths(target),
+      new MemorySecretStore(),
+      '1.0.0',
+    ).importFromFile(bundlePath);
+    expect(imported.sectionsImported).toContain('sessions');
+    expect(readFileSync(join(paths(target).sessions, 'sess-1', 'audit.jsonl'), 'utf8'))
+      .toBe('{"type":"x"}\n');
+    expect(readFileSync(join(paths(target).sessions, 'sess-1', 'terminal', 'output.jsonl.gz')))
+      .toEqual(Buffer.from([0x1f, 0x8b, 0x08, 0x00]));
+  });
+
   it('skips unknown and unsupported sections instead of failing', async () => {
-    const bundlePath = join(fixture(), 'backup.aitbak');
-    writeFileSync(bundlePath, JSON.stringify({
+    const zip = new AdmZip();
+    zip.addFile('manifest.json', Buffer.from(JSON.stringify({
       formatVersion: 1,
       appVersion: '1.0.0',
       exportedAt: new Date(0).toISOString(),
       sections: {
-        settings: { schemaVersion: 1, data: { theme: 'dark' } },
-        futureSection: { schemaVersion: 9, data: { keep: true } },
-        providers: { schemaVersion: 2, data: [] },
+        settings: { schemaVersion: 1, file: 'sections/settings.json' },
+        futureSection: { schemaVersion: 9, file: 'sections/future.json' },
+        providers: { schemaVersion: 2, file: 'sections/providers.json' },
       },
-    }), 'utf8');
+    }), 'utf8'));
+    zip.addFile('sections/settings.json', Buffer.from(JSON.stringify({ theme: 'dark' }), 'utf8'));
+    zip.addFile('sections/providers.json', Buffer.from('[]', 'utf8'));
+    const bundlePath = join(fixture(), 'backup.aitbak');
+    zip.writeZip(bundlePath);
 
     const target = fixture();
     const imported = await new BackupService(
@@ -139,8 +184,10 @@ describe('BackupService', () => {
   });
 
   it('rejects an unsupported format version', async () => {
+    const zip = new AdmZip();
+    zip.addFile('manifest.json', Buffer.from(JSON.stringify({ formatVersion: 99, sections: {} }), 'utf8'));
     const bundlePath = join(fixture(), 'backup.aitbak');
-    writeFileSync(bundlePath, JSON.stringify({ formatVersion: 99, sections: {} }), 'utf8');
+    zip.writeZip(bundlePath);
     await expect(new BackupService(
       paths(fixture()),
       new MemorySecretStore(),
