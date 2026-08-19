@@ -17,7 +17,13 @@ import type {
 } from '../../shared/terminal';
 import { TERMINAL_CHANNELS } from '../../shared/terminal';
 import { discoverShells } from './shell-discovery';
-import { buildCommandEnvelope, CommandDisplayFilter, SentinelCapture } from './structured-command';
+import {
+  buildCommandEnvelope,
+  CommandDisplayFilter,
+  envelopeInputLines,
+  SentinelCapture,
+  stripEnvelopeEcho,
+} from './structured-command';
 import { TerminalInteractionDetector } from './interaction-detector';
 
 interface TerminalBackend {
@@ -127,6 +133,12 @@ export class TerminalService {
   private readonly journalListeners = new Set<JournalListener>();
   private readonly exitListeners = new Set<ExitListener>();
   private readonly sensitiveSubmissionListeners = new Set<SensitiveSubmissionListener>();
+  /**
+   * ANSI-stripped input lines of the most recent command envelopes per
+   * terminal, used to hide envelope echoes resurfaced by later full-screen
+   * redraws (window resize / panel drag) after the execution filter is gone.
+   */
+  private readonly recentEnvelopeEchos = new Map<string, Set<string>[]>();
 
   listShells(): ShellProfile[] {
     return discoverShells();
@@ -441,6 +453,10 @@ export class TerminalService {
     };
     const nonce = randomUUID().replaceAll('-', '');
     const envelope = buildCommandEnvelope(record.descriptor.shellKind, normalizedCommand, nonce);
+    const recent = this.recentEnvelopeEchos.get(terminalId) ?? [];
+    recent.push(envelopeInputLines(envelope.input));
+    if (recent.length > 4) recent.shift();
+    this.recentEnvelopeEchos.set(terminalId, recent);
     return new Promise((resolve) => {
       const timeout = setTimeout(() => {
         const active = record.activeExecution;
@@ -750,7 +766,11 @@ export class TerminalService {
     }
     // The journal keeps the raw stream; only the renderer-visible copy strips
     // the structured-command envelope and sentinels.
-    const displayData = executionAtChunkStart?.displayFilter?.push(data) ?? data;
+    const filtered = executionAtChunkStart?.displayFilter?.push(data) ?? data;
+    const displayData = stripEnvelopeEcho(
+      filtered,
+      this.recentEnvelopeEchos.get(terminalId) ?? [],
+    );
     if (!record.attached) {
       record.pendingOutput.push(displayData);
       record.pendingOutputLength += displayData.length;

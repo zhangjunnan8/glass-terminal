@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   buildCommandEnvelope,
   CommandDisplayFilter,
+  envelopeInputLines,
   SentinelCapture,
+  stripEnvelopeEcho,
 } from './structured-command';
 
 function decodedPowerShellPayloads(input: string): string[] {
@@ -108,5 +110,40 @@ describe('structured command sentinel', () => {
 
     // Once complete, subsequent stream data passes through unchanged.
     expect(filter.push('next prompt echo')).toBe('next prompt echo');
+  });
+});
+
+describe('envelope echo redraw filtering', () => {
+  it('hides envelope input lines resurfaced by a later full-screen redraw', () => {
+    const envelope = buildCommandEnvelope('powershell', 'Get-Date', 'abcdef0123456789');
+    const recent = [envelopeInputLines(envelope.input)];
+    const redraw = [
+      '\x1b[H(base) PS C:\\Users\\tester> \r\n',
+      `\x1b[92m${envelope.input}\x1b[m\r\n`,
+      '(base) PS C:\\Users\\tester> ^C\r\n',
+      '(base) PS C:\\Users\\tester> ',
+    ].join('');
+
+    const output = stripEnvelopeEcho(redraw, recent);
+    expect(output).toContain('(base) PS C:\\Users\\tester>');
+    expect(output).toContain('^C');
+    expect(output).not.toContain('__ait_a');
+    expect(output).not.toContain('__ait_cmd');
+    expect(output).not.toContain('Get-Date');
+  });
+
+  it('keeps ordinary terminal lines untouched when nothing matches', () => {
+    const recent = [envelopeInputLines(buildCommandEnvelope('cmd', 'dir', '1122334455667788').input)];
+    const data = 'C:\\work> echo hello\r\nhello\r\nC:\\work> ';
+    expect(stripEnvelopeEcho(data, recent)).toBe(data);
+  });
+
+  it('collects every envelope input line including cmd multi-line envelopes', () => {
+    const envelope = buildCommandEnvelope('cmd', 'echo hi', '9988776655443322');
+    const lines = envelopeInputLines(envelope.input);
+    expect(lines.size).toBeGreaterThanOrEqual(4);
+    for (const line of lines) {
+      expect(line).not.toMatch(/[\r\n]/u);
+    }
   });
 });

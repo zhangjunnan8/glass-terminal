@@ -230,3 +230,45 @@ export class CommandDisplayFilter {
     return '';
   }
 }
+
+const ANSI_PATTERN = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g;
+
+function stripAnsi(value: string): string {
+  return value.replace(ANSI_PATTERN, '');
+}
+
+/**
+ * Lines of one command envelope input, ANSI-stripped, used to recognise the
+ * echo of that envelope when a terminal redraws its full screen buffer later
+ * (e.g. after a window resize). Remote conhost keeps the raw injected input in
+ * its scroll buffer, so the redraw can resurface lines that the per-execution
+ * CommandDisplayFilter already consumed and dropped.
+ */
+export function envelopeInputLines(input: string): Set<string> {
+  const lines = new Set<string>();
+  for (const raw of input.split(/\r\n|\r|\n/)) {
+    const stripped = stripAnsi(raw);
+    if (stripped) lines.add(stripped);
+  }
+  return lines;
+}
+
+/**
+ * Line-level fallback filter: drops whole lines whose ANSI-stripped content
+ * exactly matches a line we injected as part of a recent command envelope.
+ * Applied to the renderer-visible stream regardless of whether an execution is
+ * still live, so post-execution terminal redraws cannot leak the envelope echo.
+ */
+export function stripEnvelopeEcho(
+  data: string,
+  recentEnvelopes: ReadonlyArray<ReadonlySet<string>>,
+): string {
+  if (!data || recentEnvelopes.length === 0) return data;
+  return data.replace(/[^\n]*\n|[^\n]*$/g, (line) => {
+    const stripped = stripAnsi(line.replace(/\r?\n$/, '')).replace(/\r+$/, '');
+    for (const envelope of recentEnvelopes) {
+      if (envelope.has(stripped)) return '';
+    }
+    return line;
+  });
+}
