@@ -1415,10 +1415,24 @@ export class AgentService {
           .slice(runtime.terminalContextOffset ?? 0)
           .slice(-MAX_TURN_TERMINAL_CONTEXT_CHARS),
       );
+      const fileAccessModeLabel = runtime.fileAccessMode === 'read-only'
+        ? '只读'
+        : runtime.fileAccessMode === 'read-write'
+          ? '读写'
+          : '完全访问';
+      const systemPrompt = workspace && runtime.fileAccessMode !== 'off'
+        ? `${SYSTEM_PROMPT}\n\n当前会话工作区（每轮注入）：\n`
+          + `- Workspace Root: ${workspace.root}\n`
+          + `- 文件访问模式: ${fileAccessModeLabel}\n`
+          + 'workspace_* 工具的 path 参数是相对该根的相对路径；'
+          + (runtime.fileAccessMode === 'full-access'
+            ? '完全访问模式也允许使用绝对路径读取根外文件。'
+            : '只有该根内的文件才能用文件工具读写，根外的内容只能经终端命令（仍需审批）。')
+        : SYSTEM_PROMPT;
       const result = await backend.sendMessage({
         thread,
         prompt,
-        systemPrompt: SYSTEM_PROMPT,
+        systemPrompt,
         terminalContext,
         fileAccessMode: runtime.fileAccessMode,
         gateway,
