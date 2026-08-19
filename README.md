@@ -96,6 +96,25 @@ npm run package
 
 ---
 
+## 🔗 开源致谢
+
+Glass Terminal 建立在以下出色的开源项目之上，向它们的作者和维护者致敬：
+
+| 组件 | 作用 | 许可证 |
+|---|---|---|
+| [xterm.js](https://github.com/xtermjs/xterm.js) | 终端模拟与渲染（VS Code 终端同款核心） | MIT |
+| [node-pty](https://github.com/microsoft/node-pty) | 本地 PTY 会话（基于 Windows ConPTY） | MIT |
+| [ssh2](https://github.com/mscdex/ssh2) | SSH / SFTP 远程连接 | MIT |
+| [Electron](https://github.com/electron/electron) | 跨平台桌面应用壳 | MIT |
+| [React](https://github.com/facebook/react) | UI 框架 | MIT |
+| [LangChain](https://github.com/langchain-ai/langchainjs) | Agent 工具编排 | MIT |
+| [zod](https://github.com/colinhacks/zod) | 运行时模式校验 | MIT |
+| [Vite](https://github.com/vitejs/vite) · [tsup](https://github.com/egoist/tsup) · [Vitest](https://github.com/vitest-dev/vitest) · [electron-builder](https://github.com/electron-userland/electron-builder) | 构建与测试工具链 | MIT |
+
+终端底层基于微软开源的 **Windows ConPTY 控制台基础设施**（[OpenConsole / conpty](https://github.com/microsoft/terminal)）。
+
+---
+
 ## 📁 目录结构
 
 ```text
