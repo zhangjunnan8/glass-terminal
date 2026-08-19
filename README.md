@@ -77,7 +77,7 @@ npm run package
 | `AI_TERMINAL_DEEPSEEK_API_KEY` | DeepSeek API Key（Generic Provider 默认模型） |
 | `AI_TERMINAL_SSH_TEST_HOST` 等 `AI_TERMINAL_SSH_TEST_*` | SSH 集成测试环境变量 |
 
-> 用户数据（主机、Provider、加密密钥库、会话）保存在 `%APPDATA%\ai-terminal\`，与应用本体分离。
+> 用户数据（主机、Provider、加密密钥库、会话）保存在 `%APPDATA%\glass-terminal\`，与应用本体分离。
 
 ---
 

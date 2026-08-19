@@ -117,9 +117,9 @@ const ownsSingleInstance = acquireSingleInstance(
 if (isSmokeTest) {
   app.setPath('userData', join(process.cwd(), '.smoke-data', smokeMode!));
 } else {
-  // Keep the user-data directory stable across product renames so existing
-  // hosts, providers, secrets and sessions are not orphaned.
-  app.setPath('userData', join(app.getPath('appData'), 'ai-terminal'));
+  // The product's canonical user-data directory. Kept explicit and stable so
+  // installs from any name variant share the same hosts/providers/sessions.
+  app.setPath('userData', join(app.getPath('appData'), 'glass-terminal'));
 }
 
 function requireHostStore(): HostStore {
