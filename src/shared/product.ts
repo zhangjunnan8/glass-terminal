@@ -1,1 +1,1 @@
-export const PRODUCT_NAME = 'AI Terminal' as const;
+export const PRODUCT_NAME = 'Glass Terminal' as const;

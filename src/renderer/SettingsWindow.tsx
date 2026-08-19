@@ -103,7 +103,7 @@ export function SettingsWindow() {
     >
       <header className="settings-header">
         <h1>设置</h1>
-        <span className="settings-version">AI Terminal{version ? ` · v${version}` : ''}</span>
+        <span className="settings-version">Glass Terminal{version ? ` · v${version}` : ''}</span>
       </header>
 
       <nav className="settings-nav">

@@ -1,6 +1,6 @@
 # Codex App Server 使用与接入说明
 
-> 当前状态：AI Terminal Alpha 已接入 Codex App Server 的完整 UI 控制面和原生
+> 当前状态：Glass Terminal Alpha 已接入 Codex App Server 的完整 UI 控制面和原生
 > Agent 链路，包括 CLI 检测与启动、ChatGPT 登录、账号、模型、推理强度、
 > Thread/Turn、流式输出、内建 Shell/File 项目以及可选的当前终端只读上下文。
 > 用户无需运行 PowerShell、输入 JSON 或复制 token。
@@ -40,7 +40,7 @@
 ## 安全与凭据
 
 - `codex app-server` 只由 Electron main 进程以 stdio 启动；renderer 不能访问子进程或任意 JSON-RPC。
-- OAuth token 由 Codex/App Server 自己保存与刷新；AI Terminal 不会读取、拷贝或导出 token。
+- OAuth token 由 Codex/App Server 自己保存与刷新；Glass Terminal 不会读取、拷贝或导出 token。
 - 浏览器授权地址仅在 main 进程持有并限制为 HTTPS；renderer 只收到显示所需状态。
 - 原生 Turn 优先使用 App Server 的内建 `:workspace` 权限配置，将写入限制在当前工作区。只有旧版 App Server 不支持权限配置发现时，才降级为关闭网络的 `workspaceWrite` 沙箱。内建命令/文件项由 Codex 内部连续运行，不会触发可见终端的审批或输入锁。
 - 终端读权限会持久化为布尔配置，不保存终端文本；关闭后新 Turn 仍有每轮身份元数据，但不再得到 `terminal_state`/`terminal_read` 动态工具。

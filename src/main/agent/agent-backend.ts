@@ -30,7 +30,7 @@ export interface AgentBackendResult {
   rounds: number;
 }
 
-/** Opaque, backend-owned handle for one AI Terminal conversation thread. */
+/** Opaque, backend-owned handle for one Glass Terminal conversation thread. */
 export interface AgentBackendThread {
   readonly id: string;
 }

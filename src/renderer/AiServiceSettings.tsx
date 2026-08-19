@@ -521,7 +521,7 @@ export function AiServiceSettings() {
           <section className="codex-setup-section">
             <div className="codex-section-heading">
               <span>2</span>
-              <div><strong>ChatGPT 账号</strong><small>登录和 token 刷新由 App Server 管理；AI Terminal 不读取或保存 token。</small></div>
+              <div><strong>ChatGPT 账号</strong><small>登录和 token 刷新由 App Server 管理；Glass Terminal 不读取或保存 token。</small></div>
             </div>
             {codexAppServer?.phase !== 'ready' && (
               <p className="codex-empty-state">启动服务后即可在这里完成登录。</p>
@@ -735,12 +735,12 @@ export function AiServiceSettings() {
             >
               <strong>Codex 原生模式与当前终端相互独立</strong>
               <p>
-                Codex 的内建 <code>Shell</code>/<code>File</code> 工具在 AI Terminal
+                Codex 的内建 <code>Shell</code>/<code>File</code> 工具在 Glass Terminal
                 为它分配的应用独立工作区内执行，不会进入当前 SSH 或本地 Shell。
               </p>
               <ul>
                 <li>当前终端始终由你控制；Codex 原生模式不提供任何终端控制功能。</li>
-                <li>AI Terminal 每轮都会提供当前终端的类型、目标、目录、有效用户和 Shell；不包含密码或凭据引用。</li>
+                <li>Glass Terminal 每轮都会提供当前终端的类型、目标、目录、有效用户和 Shell；不包含密码或凭据引用。</li>
                 <li>开启这个开关会额外提供 <code>terminal_state</code> 和 <code>terminal_read</code>，用于只读刷新状态和读取近期文本；不能向终端写入或执行命令。</li>
                 <li>关闭后，Codex 仍知道每轮开始时绑定的终端身份，并可在自己的独立工作区中工作。</li>
               </ul>

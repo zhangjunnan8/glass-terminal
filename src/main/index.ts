@@ -116,6 +116,10 @@ const ownsSingleInstance = acquireSingleInstance(
 
 if (isSmokeTest) {
   app.setPath('userData', join(process.cwd(), '.smoke-data', smokeMode!));
+} else {
+  // Keep the user-data directory stable across product renames so existing
+  // hosts, providers, secrets and sessions are not orphaned.
+  app.setPath('userData', join(app.getPath('appData'), 'ai-terminal'));
 }
 
 function requireHostStore(): HostStore {
@@ -311,9 +315,9 @@ handleTrusted(BACKUP_CHANNELS.export, async (event, request: BackupExportRequest
   if (!ownerWindow) throw new Error('无法打开导出窗口。');
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const selection = await dialog.showSaveDialog(ownerWindow, {
-    title: '导出 AI Terminal 配置',
-    defaultPath: join(app.getPath('documents'), `ai-terminal-backup-${stamp}.aitbak`),
-    filters: [{ name: 'AI Terminal 备份', extensions: ['aitbak'] }],
+    title: '导出 Glass Terminal 配置',
+    defaultPath: join(app.getPath('documents'), `glass-terminal-backup-${stamp}.aitbak`),
+    filters: [{ name: 'Glass Terminal 备份', extensions: ['aitbak'] }],
   });
   if (selection.canceled || !selection.filePath) return null;
   return requireBackupService().exportToFile(selection.filePath, request.includeLogs === true);
@@ -322,9 +326,9 @@ handleTrusted(BACKUP_CHANNELS.import, async (event) => {
   const ownerWindow = BrowserWindow.fromWebContents(event.sender);
   if (!ownerWindow) throw new Error('无法打开导入窗口。');
   const selection = await dialog.showOpenDialog(ownerWindow, {
-    title: '导入 AI Terminal 配置',
+    title: '导入 Glass Terminal 配置',
     properties: ['openFile'],
-    filters: [{ name: 'AI Terminal 备份', extensions: ['aitbak'] }],
+    filters: [{ name: 'Glass Terminal 备份', extensions: ['aitbak'] }],
   });
   if (selection.canceled || !selection.filePaths[0]) return null;
   return requireBackupService().importFromFile(selection.filePaths[0]);
@@ -335,8 +339,8 @@ handleTrusted(HOST_BACKUP_CHANNELS.export, async (event) => {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const selection = await dialog.showSaveDialog(ownerWindow, {
     title: '导出 SSH 主机配置',
-    defaultPath: join(app.getPath('documents'), `ai-terminal-hosts-${stamp}.aithosts`),
-    filters: [{ name: 'AI Terminal 主机备份', extensions: ['aithosts', 'json'] }],
+    defaultPath: join(app.getPath('documents'), `glass-terminal-hosts-${stamp}.aithosts`),
+    filters: [{ name: 'Glass Terminal 主机备份', extensions: ['aithosts', 'json'] }],
   });
   if (selection.canceled || !selection.filePath) return null;
   return requireHostBackupService().exportToFile(selection.filePath);
@@ -347,7 +351,7 @@ handleTrusted(HOST_BACKUP_CHANNELS.import, async (event) => {
   const selection = await dialog.showOpenDialog(ownerWindow, {
     title: '导入 SSH 主机配置',
     properties: ['openFile'],
-    filters: [{ name: 'AI Terminal 主机备份', extensions: ['aithosts', 'json'] }],
+    filters: [{ name: 'Glass Terminal 主机备份', extensions: ['aithosts', 'json'] }],
   });
   if (selection.canceled || !selection.filePaths[0]) return null;
   return requireHostBackupService().importFromFile(selection.filePaths[0]);

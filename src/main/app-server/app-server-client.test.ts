@@ -72,7 +72,7 @@ describe('CodexAppServerClient', () => {
     expect(messages.map((message) => message.method)).toEqual(['initialize', 'initialized']);
     expect(messages[0]).toMatchObject({
       params: {
-        clientInfo: { name: 'ai_terminal', title: 'AI Terminal', version: '0.1.0' },
+        clientInfo: { name: 'glass_terminal', title: 'Glass Terminal', version: '0.1.0' },
         capabilities: { experimentalApi: true },
       },
     });

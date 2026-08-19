@@ -1,5 +1,5 @@
-appId: com.ai-terminal.app
-productName: AI Terminal
+appId: com.glass-terminal.app
+productName: Glass Terminal
 directories:
   output: release
 files:

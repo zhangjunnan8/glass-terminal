@@ -278,7 +278,7 @@ export class CodexAppServerClient implements AppServerConnection {
         id: request.id,
         error: {
           code: -32601,
-          message: 'AI Terminal 当前未启用 App Server 工具请求。',
+          message: 'Glass Terminal 当前未启用 App Server 工具请求。',
         },
       });
       return;
@@ -358,8 +358,8 @@ export async function launchCodexAppServer(
   try {
     await client.request('initialize', {
       clientInfo: {
-        name: 'ai_terminal',
-        title: 'AI Terminal',
+        name: 'glass_terminal',
+        title: 'Glass Terminal',
         version: clientVersion,
       },
       capabilities: {

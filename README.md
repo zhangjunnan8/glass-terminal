@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🖥️ AI Terminal
+# 🖥️ Glass Terminal
 
 ### 人与 AI 共享同一终端会话的 Windows 桌面应用
 
@@ -63,7 +63,7 @@ npm run build       # 编译 renderer + Electron main/preload
 
 ```bash
 npm run package
-# 产物：release/win-unpacked/AI Terminal.exe
+# 产物：release/win-unpacked/Glass Terminal.exe
 ```
 
 ---
@@ -129,10 +129,10 @@ docs/
 
 ## 🔒 隐私
 
-AI Terminal **不包含任何分析或遥测**。Provider 请求必须由你主动发起，且仅携带完成该请求所需的终端上下文。请勿提交 `.env`、密码、API Key、私钥或会话数据到仓库。
+Glass Terminal **不包含任何分析或遥测**。Provider 请求必须由你主动发起，且仅携带完成该请求所需的终端上下文。请勿提交 `.env`、密码、API Key、私钥或会话数据到仓库。
 
 ---
 
 ## 📄 许可证
 
-[MIT](LICENSE) © 2026 AI Terminal contributors
+[MIT](LICENSE) © 2026 Glass Terminal contributors

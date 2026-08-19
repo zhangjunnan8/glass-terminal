@@ -1,4 +1,4 @@
-# AI Terminal — AI 项目交接指南
+# Glass Terminal — AI 项目交接指南
 
 > 用途：把这份文档作为新 AI 窗口的第一个上下文。它记录当前产品边界、
 > 核心调用链、代码地图、数据布局、安全不变量和已知限制。
@@ -31,7 +31,7 @@ Codex App Server 边界。不要启动或刷新我正在使用的 Electron 窗�
 
 ## 2. 产品是什么
 
-AI Terminal 是 Windows-first Electron 桌面终端，把本地 PTY/ConPTY、SSH、Session 持久化、
+Glass Terminal 是 Windows-first Electron 桌面终端，把本地 PTY/ConPTY、SSH、Session 持久化、
 SFTP 和两类 AI 后端整合在同一个中文 UI 中。
 
 两类 Agent 必须严格区分：
@@ -236,9 +236,9 @@ command/file 审批自动返回 `acceptForSession`，额外权限请求始终拒
 9. Codex native 与可见终端不共享 Shell；只有独立本机 workspace，可选 state/history read-only，没有 terminal execute/lock/Full Takeover。
 10. Codex 同一 App Server 连接同时最多一个 active Turn；必须 exact threadId/turnId/callId，
     无法证明旧 Turn 终止时必须阻止新 Turn 或 quarantine 连接。
-11. 已保存的 SSH/API secret 不进 AI Terminal 配置 JSON，renderer 也取不到其明文；首次输入仍会
+11. 已保存的 SSH/API secret 不进 Glass Terminal 配置 JSON，renderer 也取不到其明文；首次输入仍会
     短暂存在受控输入框并经 IPC 交给 main。OAuth 凭据由隔离的 Codex home 自行保存/刷新，
-    AI Terminal 不读取、复制或导出。Credential Manager 只用 UUID-scoped reference；Host 的
+    Glass Terminal 不读取、复制或导出。Credential Manager 只用 UUID-scoped reference；Host 的
     hostname/port/username/auth method/private-key path 变化会退役旧凭据，只有 hostname/port
     变化才清除 server fingerprint。
 12. Agent 文件权限默认 off、不跨重启；根在授权时规范化冻结，拒绝 traversal/root replacement/symlink overwrite。
@@ -288,7 +288,7 @@ Generic Provider 本地门禁在 `src/main/agent/generic-provider.ts`：
 | 单个 tool arguments | 1,048,576 个 JavaScript 字符 |
 | 所有 tool arguments 合计 | 2,097,152 个 JavaScript 字符 |
 
-这个错误可能是 AI Terminal 为防止截断工具调用/内存膨胀主动拒绝，也可能是上游
+这个错误可能是 Glass Terminal 为防止截断工具调用/内存膨胀主动拒绝，也可能是上游
 Provider 的限制。不要第一反应就继续放大上限。
 
 大型代码任务的正确路线：

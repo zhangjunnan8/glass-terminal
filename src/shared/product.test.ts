@@ -3,6 +3,6 @@ import { PRODUCT_NAME } from './product';
 
 describe('product metadata', () => {
   it('uses the stable desktop product name', () => {
-    expect(PRODUCT_NAME).toBe('AI Terminal');
+    expect(PRODUCT_NAME).toBe('Glass Terminal');
   });
 });
