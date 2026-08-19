@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import * as iconv from 'iconv-lite';
 import {
   link,
   rename,
@@ -216,18 +217,31 @@ function sha256(content: Buffer | string): string {
   return createHash('sha256').update(content).digest('hex');
 }
 
-function assertUtf8Text(buffer: Buffer, label: string): string {
-  if (buffer.includes(0)) throw new Error(`${label} 不是受支持的 UTF-8 文本文件。`);
+/**
+ * Detected text encoding of a workspace file. Windows 中文环境的文本文件大量为
+ * ANSI/GBK 编码；读取时回退解码、写回时保持原编码，避免把 GBK 文件悄悄转成
+ * UTF-8（那会让依赖代码页的解释器读乱码）。
+ */
+type TextFileEncoding = 'utf-8' | 'gb18030';
+
+function decodeFileText(buffer: Buffer, label: string): { text: string; encoding: TextFileEncoding } {
+  if (buffer.includes(0)) throw new Error(`${label} 不是受支持的文本文件。`);
   try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(buffer);
+    return { text: new TextDecoder('utf-8', { fatal: true }).decode(buffer), encoding: 'utf-8' };
   } catch {
-    throw new Error(`${label} 不是有效的 UTF-8 文本文件。`);
+    try {
+      return { text: iconv.decode(buffer, 'gb18030'), encoding: 'gb18030' };
+    } catch {
+      throw new Error(`${label} 不是受支持的 UTF-8/GBK 文本文件。`);
+    }
   }
 }
 
-function boundedContent(content: string): Buffer {
-  if (content.includes('\0')) throw new Error('文件内容不能包含 NUL 字节。');
-  const bytes = Buffer.from(content, 'utf8');
+function encodeFileText(text: string, encoding: TextFileEncoding): Buffer {
+  if (text.includes('\0')) throw new Error('文件内容不能包含 NUL 字节。');
+  const bytes = encoding === 'gb18030'
+    ? iconv.encode(text, 'gb18030')
+    : Buffer.from(text, 'utf8');
   if (bytes.length > MAX_AGENT_FILE_BYTES) {
     throw new Error(
       `单次文件写入为 ${bytes.length} 字节，超过 ${MAX_AGENT_FILE_BYTES} 字节限制；`
@@ -235,6 +249,10 @@ function boundedContent(content: string): Buffer {
     );
   }
   return bytes;
+}
+
+function boundedContent(content: string): Buffer {
+  return encodeFileText(content, 'utf-8');
 }
 
 function assertBoundedPath(requestedPath: string): void {
@@ -493,7 +511,8 @@ export class AgentFileService {
       if (buffer.length > MAX_AGENT_FILE_BYTES) {
         throw new Error(`文件读取结果为 ${buffer.length} 字节，超过 ${MAX_AGENT_FILE_BYTES} 字节限制。`);
       }
-      return { path, content: assertUtf8Text(buffer, path), bytes: buffer.length, sha256: sha256(buffer) };
+      const decoded = decodeFileText(buffer, path);
+      return { path, content: decoded.text, bytes: buffer.length, sha256: sha256(buffer) };
     }
     return this.withRemoteFilesystem(owner, terminalId, target, async (filesystem) => {
       const { root } = await this.prepareAccessRoots(filesystem, target);
@@ -508,7 +527,8 @@ export class AgentFileService {
       if (buffer.length > MAX_AGENT_FILE_BYTES) {
         throw new Error(`文件读取结果为 ${buffer.length} 字节，超过 ${MAX_AGENT_FILE_BYTES} 字节限制。`);
       }
-      return { path, content: assertUtf8Text(buffer, path), bytes: buffer.length, sha256: sha256(buffer) };
+      const decoded = decodeFileText(buffer, path);
+      return { path, content: decoded.text, bytes: buffer.length, sha256: sha256(buffer) };
     });
   }
 
@@ -731,7 +751,6 @@ export class AgentFileService {
       target.requestedPath,
       target.sessionId,
     );
-    const bytes = boundedContent(content);
     if (target.transport === 'local') {
       let prepared = await this.prepareMutationTarget(this.localFilesystem, target);
       if (prepared.stat) {
@@ -745,7 +764,11 @@ export class AgentFileService {
       // turning create-only authority into implicit overwrite/read authority.
       const current = prepared.stat ? await this.optionalLocalFile(path) : undefined;
       this.assertExpectedHash(path, current?.content, expectedSha256);
-      const before = current ? assertUtf8Text(current.content, path) : undefined;
+      const currentDecoded = current ? decodeFileText(current.content, path) : undefined;
+      const before = currentDecoded?.text;
+      const bytes = currentDecoded
+        ? encodeFileText(content, currentDecoded.encoding)
+        : boundedContent(content);
       const diff = createWorkspaceDiff(this.safeDiffLabel(target, path), before, content);
       if (!tracker) throw new Error('Workspace write is missing its audit tracker.');
       tracker.intent = {
@@ -816,7 +839,7 @@ export class AgentFileService {
     }
     if (!tracker) throw new Error('Workspace write is missing its audit tracker.');
     return this.withRemoteFilesystem(owner, terminalId, target, (filesystem) => (
-      this.writeRemoteText(filesystem, target, content, bytes, expectedSha256, tracker)
+      this.writeRemoteText(filesystem, target, content, expectedSha256, tracker)
     ));
   }
 
@@ -934,7 +957,6 @@ export class AgentFileService {
         filesystem,
         target,
         next,
-        boundedContent(next),
         expectedSha256,
         tracker!,
       );
@@ -1343,7 +1365,7 @@ export class AgentFileService {
     const buffer = await filesystem.readFile(path, MAX_AGENT_FILE_BYTES);
     return {
       path,
-      content: assertUtf8Text(buffer, path),
+      content: decodeFileText(buffer, path).text,
       bytes: buffer.length,
       sha256: sha256(buffer),
     };
@@ -1353,7 +1375,6 @@ export class AgentFileService {
     filesystem: RemoteFilesystem,
     initialTarget: Extract<ResolvedTarget, { transport: 'ssh' }>,
     content: string,
-    bytes: Buffer,
     expectedSha256: string | null,
     tracker: OperationAuditTracker,
   ): Promise<AgentFileWriteResult> {
@@ -1373,7 +1394,11 @@ export class AgentFileService {
       ? await filesystem.readFile(prepared.path, MAX_AGENT_FILE_BYTES)
       : undefined;
     this.assertExpectedHash(prepared.path, current, expectedSha256);
-    const before = current ? assertUtf8Text(current, prepared.path) : undefined;
+    const currentDecoded = current ? decodeFileText(current, prepared.path) : undefined;
+    const before = currentDecoded?.text;
+    const bytes = currentDecoded
+      ? encodeFileText(content, currentDecoded.encoding)
+      : boundedContent(content);
     const diff = createWorkspaceDiff(this.safeDiffLabel(target, prepared.path), before, content);
     tracker.intent = {
       ...tracker.intent,

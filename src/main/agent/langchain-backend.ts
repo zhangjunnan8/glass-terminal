@@ -502,8 +502,9 @@ export class LangChainBackend implements AgentBackend {
         runtime.tool(run('workspace_read_file'), {
           name: 'workspace_read_file',
           description:
-            'Read one needed, bounded UTF-8 text file inside the Workspace Root and return its SHA-256. '
-            + 'Prefer small, targeted reads; never use cat in the terminal for this.',
+            'Read one needed, bounded text file inside the Workspace Root and return its SHA-256. '
+            + 'Supports UTF-8 and Windows GBK (ANSI) encodings; edits keep the file\'s original encoding. '
+            + 'Prefer small, targeted reads; never use cat/Get-Content/type in the terminal for this.',
           schema: runtime.z.object({
             path: runtime.z.string().min(1).max(4_096).describe('File path relative to the Workspace Root.'),
           }),
@@ -542,6 +543,7 @@ export class LangChainBackend implements AgentBackend {
           name: 'workspace_apply_patch',
           description:
             'Preferred way to modify an existing file. Atomically apply exact, unique text replacements and return a diff. '
+            + 'Works on UTF-8 and Windows GBK (ANSI) text; the file keeps its original encoding on write-back. '
             + 'expectedSha256 must come from the latest workspace_read_file; re-read after a conflict.',
           schema: runtime.z.object({
             path: runtime.z.string().min(1).max(4_096),

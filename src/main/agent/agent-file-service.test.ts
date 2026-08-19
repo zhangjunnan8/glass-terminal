@@ -14,6 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join, parse, resolve } from 'node:path';
 import { createHash } from 'node:crypto';
+import * as iconv from 'iconv-lite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { WebContents } from 'electron';
 import type {
@@ -216,6 +217,35 @@ describe('AgentFileService local workspace boundary', () => {
     const created = await service.writeText(owner, 'terminal', 'new.ts', 'export {};\n', null);
     expect(created.created).toBe(true);
     expect(readFileSync(join(root, 'new.ts'), 'utf8')).toBe('export {};\n');
+  });
+
+  it('reads and patches GBK-encoded Chinese files, preserving the original encoding', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-gbk-'));
+    roots.push(root);
+    const original = '策略文件：单价 = 11.05\n';
+    const path = join(root, 'script.ps1');
+    writeFileSync(path, iconv.encode(original, 'gb18030'));
+    const service = createService(root);
+    const owner = { id: 1 } as WebContents;
+
+    const initial = await service.readText(owner, 'terminal', 'script.ps1');
+    expect(initial.content).toBe(original);
+
+    const patched = await service.applyPatch(
+      owner,
+      'terminal',
+      'script.ps1',
+      initial.sha256,
+      [{ search: '11.05', replace: '12.30' }],
+    );
+    expect(patched.created).toBe(false);
+
+    // 写回必须保持 GBK 编码：磁盘字节与 gb18030 编码一致，而不是被转成 UTF-8。
+    const onDisk = readFileSync(path);
+    expect(onDisk.equals(iconv.encode('策略文件：单价 = 12.30\n', 'gb18030'))).toBe(true);
+    expect(onDisk.toString('utf8')).not.toContain('策略文件');
+    const after = await service.readText(owner, 'terminal', 'script.ps1');
+    expect(after.content).toBe('策略文件：单价 = 12.30\n');
   });
 
   it('emits exactly one intent and outcome for each top-level Workspace operation', async () => {

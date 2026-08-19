@@ -33,6 +33,7 @@
     "@langchain/core": "^1.2.8",
     "@langchain/openai": "^1.5.8",
     "adm-zip": "^0.5.18",
+    "iconv-lite": "^0.7.3",
     "node-pty": "^1.1.0",
     "ssh2": "^1.17.0",
     "zod": "^4.4.3"
