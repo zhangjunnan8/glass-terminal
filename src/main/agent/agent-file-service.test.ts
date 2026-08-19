@@ -248,6 +248,48 @@ describe('AgentFileService local workspace boundary', () => {
     expect(after.content).toBe('策略文件：单价 = 12.30\n');
   });
 
+  it('strips and restores a UTF-8 BOM across reads and patches', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-utf8bom-'));
+    roots.push(root);
+    const path = join(root, 'bom.txt');
+    const body = '配置：alpha\n';
+    writeFileSync(path, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(body, 'utf8')]));
+    const service = createService(root);
+    const owner = { id: 1 } as WebContents;
+
+    const initial = await service.readText(owner, 'terminal', 'bom.txt');
+    expect(initial.content).toBe(body);
+
+    const patched = await service.applyPatch(owner, 'terminal', 'bom.txt', initial.sha256, [
+      { search: 'alpha', replace: 'beta' },
+    ]);
+    expect(patched.created).toBe(false);
+    const onDisk = readFileSync(path);
+    expect(onDisk.subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf]))).toBe(true);
+    expect(onDisk.subarray(3).toString('utf8')).toBe('配置：beta\n');
+  });
+
+  it('reads and patches UTF-16LE files, preserving BOM and byte order', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-utf16-'));
+    roots.push(root);
+    const path = join(root, 'unicode.txt');
+    const body = 'Hello 世界\n';
+    writeFileSync(path, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(body, 'utf16le')]));
+    const service = createService(root);
+    const owner = { id: 1 } as WebContents;
+
+    const initial = await service.readText(owner, 'terminal', 'unicode.txt');
+    expect(initial.content).toBe(body);
+
+    const patched = await service.applyPatch(owner, 'terminal', 'unicode.txt', initial.sha256, [
+      { search: '世界', replace: 'world' },
+    ]);
+    expect(patched.created).toBe(false);
+    const onDisk = readFileSync(path);
+    expect(onDisk.subarray(0, 2).equals(Buffer.from([0xff, 0xfe]))).toBe(true);
+    expect(onDisk.subarray(2).toString('utf16le')).toBe('Hello world\n');
+  });
+
   it('emits exactly one intent and outcome for each top-level Workspace operation', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-audit-pairs-'));
     roots.push(root);

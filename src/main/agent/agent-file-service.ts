@@ -217,14 +217,37 @@ function sha256(content: Buffer | string): string {
   return createHash('sha256').update(content).digest('hex');
 }
 
+const UTF8_BOM = Buffer.from([0xef, 0xbb, 0xbf]);
+const UTF16LE_BOM = Buffer.from([0xff, 0xfe]);
+const UTF16BE_BOM = Buffer.from([0xfe, 0xff]);
+
 /**
  * Detected text encoding of a workspace file. Windows 中文环境的文本文件大量为
  * ANSI/GBK 编码；读取时回退解码、写回时保持原编码，避免把 GBK 文件悄悄转成
- * UTF-8（那会让依赖代码页的解释器读乱码）。
+ * UTF-8（那会让依赖代码页的解释器读乱码）。带 BOM 的文件按 BOM 判定，写回时
+ * 还原 BOM，保证字节序和可识别性不被破坏。
  */
-type TextFileEncoding = 'utf-8' | 'gb18030';
+type TextFileEncoding = 'utf-8' | 'utf-8-bom' | 'utf-16le' | 'gb18030';
 
 function decodeFileText(buffer: Buffer, label: string): { text: string; encoding: TextFileEncoding } {
+  // BOM 是文件自带的编码证据，必须先于任何内容校验判定：UTF-16 文本天然
+  // 包含大量 NUL 字节，不能套用 UTF-8 文本的 NUL 拒绝规则。
+  if (buffer.length >= 3 && buffer.subarray(0, 3).equals(UTF8_BOM)) {
+    return { text: buffer.subarray(3).toString('utf8'), encoding: 'utf-8-bom' };
+  }
+  if (buffer.length >= 2 && buffer.subarray(0, 2).equals(UTF16LE_BOM)) {
+    return { text: buffer.subarray(2).toString('utf16le'), encoding: 'utf-16le' };
+  }
+  if (buffer.length >= 2 && buffer.subarray(0, 2).equals(UTF16BE_BOM)) {
+    // Node 没有直接的 utf16be 转换；交换字节序后按 utf16le 解码。UTF-16BE 文件
+    // 极少见，写回时统一落为带 BOM 的 UTF-16LE（内容保持一致）。
+    const swapped = Buffer.allocUnsafe(buffer.length - 2);
+    for (let index = 2; index < buffer.length; index += 2) {
+      swapped[index - 2] = buffer[index + 1];
+      swapped[index - 1] = buffer[index];
+    }
+    return { text: swapped.toString('utf16le'), encoding: 'utf-16le' };
+  }
   if (buffer.includes(0)) throw new Error(`${label} 不是受支持的文本文件。`);
   try {
     return { text: new TextDecoder('utf-8', { fatal: true }).decode(buffer), encoding: 'utf-8' };
@@ -238,10 +261,16 @@ function decodeFileText(buffer: Buffer, label: string): { text: string; encoding
 }
 
 function encodeFileText(text: string, encoding: TextFileEncoding): Buffer {
-  if (text.includes('\0')) throw new Error('文件内容不能包含 NUL 字节。');
-  const bytes = encoding === 'gb18030'
-    ? iconv.encode(text, 'gb18030')
-    : Buffer.from(text, 'utf8');
+  if (text.includes('\0')) throw new Error('文件内容不能包含 NUL 字符。');
+  let bytes: Buffer;
+  if (encoding === 'gb18030') {
+    bytes = iconv.encode(text, 'gb18030');
+  } else if (encoding === 'utf-16le') {
+    bytes = Buffer.concat([UTF16LE_BOM, Buffer.from(text, 'utf16le')]);
+  } else {
+    const body = Buffer.from(text, 'utf8');
+    bytes = encoding === 'utf-8-bom' ? Buffer.concat([UTF8_BOM, body]) : body;
+  }
   if (bytes.length > MAX_AGENT_FILE_BYTES) {
     throw new Error(
       `单次文件写入为 ${bytes.length} 字节，超过 ${MAX_AGENT_FILE_BYTES} 字节限制；`
