@@ -9,6 +9,8 @@ export type AgentMessage =
     toolCalls?: AgentToolCall[];
     /** Generated context checkpoint; never rendered as a user-visible chat item. */
     contextSummary?: boolean;
+    /** Tool results have not yet been included in a successful Provider request. */
+    toolResultsPending?: boolean;
   }
   | { role: 'tool'; content: string; toolCallId: string };
 
@@ -37,6 +39,8 @@ export interface AgentBackendResult {
     mode: 'delta' | 'checkpoint';
     messages: AgentMessage[];
   };
+  /** Turn stopped locally after preserving protocol-complete partial history. */
+  haltedError?: string;
 }
 
 /** Opaque, backend-owned handle for one Glass Terminal conversation thread. */

@@ -144,6 +144,54 @@ describe('bounded Workspace traversal', () => {
     )).rejects.toThrow('通配符数量');
   });
 
+  it('continues bounded search and glob results from a deterministic traversal offset', async () => {
+    const stats = new Map<string, RemoteFileStat>([
+      ['/work', stat('directory')],
+      ['/work/a.txt', stat('file', 6)],
+      ['/work/b.txt', stat('file', 6)],
+      ['/work/c.txt', stat('file', 6)],
+    ]);
+    const filesystem = memoryFilesystem(stats, new Map([
+      ['/work/a.txt', Buffer.from('needle')],
+      ['/work/b.txt', Buffer.from('needle')],
+      ['/work/c.txt', Buffer.from('needle')],
+    ]));
+
+    const firstSearch = await searchWorkspace(
+      filesystem, 'ssh', '/work', '/work', 'needle', { maxResults: 1 },
+    );
+    const secondSearch = await searchWorkspace(
+      filesystem,
+      'ssh',
+      '/work',
+      '/work',
+      'needle',
+      { maxResults: 1, resultOffset: firstSearch.nextOffset },
+    );
+    expect(firstSearch).toMatchObject({
+      matches: [{ path: '/work/a.txt' }], truncated: true, nextOffset: 1,
+    });
+    expect(secondSearch).toMatchObject({
+      matches: [{ path: '/work/b.txt' }], truncated: true, nextOffset: 2,
+    });
+
+    const firstGlob = await globWorkspace(
+      filesystem, 'ssh', '/work', '/work', '*.txt', { maxResults: 2 },
+    );
+    const secondGlob = await globWorkspace(
+      filesystem,
+      'ssh',
+      '/work',
+      '/work',
+      '*.txt',
+      { maxResults: 2, resultOffset: firstGlob.nextOffset },
+    );
+    expect(firstGlob).toMatchObject({
+      paths: ['/work/a.txt', '/work/b.txt'], truncated: true, nextOffset: 2,
+    });
+    expect(secondGlob).toMatchObject({ paths: ['/work/c.txt'], truncated: false });
+  });
+
   it('does not follow a directory changed into a symlink before listing', async () => {
     const stats = new Map<string, RemoteFileStat>([
       ['/work', stat('directory')],

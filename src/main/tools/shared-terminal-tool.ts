@@ -7,6 +7,7 @@ import type {
   TerminalTool,
   TerminalToolState,
 } from '../../shared/tools';
+import type { TerminalHistoryCursor } from '../sessions/session-store';
 import type { SessionManager } from '../sessions/session-manager';
 import type { TerminalService } from '../terminal/terminal-service';
 
@@ -14,6 +15,7 @@ const DEFAULT_VISIBLE_CHARACTERS = 8_000;
 const MAX_VISIBLE_CHARACTERS = 30_000;
 const DEFAULT_HISTORY_CHARACTERS = 120_000;
 const MAX_HISTORY_CHARACTERS = 120_000;
+const TERMINAL_PAGE_CURSOR_PATTERN = /^v1:(\d+)$/u;
 
 export interface SharedTerminalToolOptions {
   context: SessionToolContext;
@@ -105,6 +107,36 @@ export class SharedTerminalTool implements TerminalTool {
     return this.options.sessions
       .readTerminalHistorySince(session.id, undefined, maxChars)
       .content;
+  }
+
+  async readVisiblePage(options: { maxChars?: number; cursor?: string } = {}) {
+    this.assertLive();
+    const { session } = this.assertCurrentBinding();
+    this.assertPermission('read');
+    const maxChars = boundedCharacterLimit(
+      options.maxChars,
+      DEFAULT_VISIBLE_CHARACTERS,
+      MAX_VISIBLE_CHARACTERS,
+    );
+    let cursor: TerminalHistoryCursor | undefined;
+    if (options.cursor !== undefined) {
+      const match = TERMINAL_PAGE_CURSOR_PATTERN.exec(options.cursor);
+      const position = match ? Number(match[1]) : Number.NaN;
+      if (!Number.isSafeInteger(position) || position < 0) {
+        throw new Error('Invalid terminal_read continuation cursor.');
+      }
+      cursor = { version: 1, position };
+    }
+    const page = this.options.sessions.readTerminalHistoryBefore(
+      session.id,
+      cursor,
+      maxChars,
+    );
+    return {
+      output: page.content,
+      truncated: page.truncated,
+      ...(page.truncated ? { nextCursor: `v1:${page.nextCursor.position}` } : {}),
+    };
   }
 
   async getState(): Promise<TerminalToolState> {

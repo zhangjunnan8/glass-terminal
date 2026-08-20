@@ -103,6 +103,7 @@ export interface AgentFilePatch {
 export interface AgentFileSearchOptions {
   path?: string;
   maxResults?: number;
+  resultOffset?: number;
 }
 
 export interface AgentFileDeleteOptions {
@@ -1053,7 +1054,7 @@ export class AgentFileService {
         prepared.root,
         prepared.path,
         query,
-        { maxResults: options.maxResults },
+        { maxResults: options.maxResults, resultOffset: options.resultOffset },
       );
     });
   }
@@ -1120,7 +1121,7 @@ export class AgentFileService {
         prepared.root,
         prepared.path,
         pattern,
-        { maxResults: options.maxResults },
+        { maxResults: options.maxResults, resultOffset: options.resultOffset },
       );
     });
   }

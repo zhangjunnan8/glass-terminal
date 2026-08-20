@@ -70,12 +70,21 @@ export interface TerminalToolState {
   [key: string]: unknown;
 }
 
+export interface TerminalReadPage {
+  output: string;
+  /** Opaque cursor for the next older page. */
+  nextCursor?: string;
+  truncated: boolean;
+}
+
 export interface TerminalTool {
   execute(command: string, reason?: string): Promise<TerminalCommandResult>;
   sendInput(input: string): Promise<void>;
   interrupt(commandId?: string): Promise<void>;
   readVisible(options?: { maxChars?: number }): Promise<string>;
   readHistory(options?: { maxChars?: number }): Promise<string>;
+  /** Optional paged form used by budget-aware Generic Agent runtimes. */
+  readVisiblePage?(options?: { maxChars?: number; cursor?: string }): Promise<TerminalReadPage>;
   getState(): Promise<TerminalToolState>;
 }
 
@@ -134,12 +143,16 @@ export interface WorkspaceSearchResult {
   matches: WorkspaceSearchMatch[];
   filesScanned: number;
   truncated: boolean;
+  /** Internal deterministic traversal offset; model-facing code wraps it in an opaque cursor. */
+  nextOffset?: number;
 }
 
 export interface WorkspaceGlobResult {
   pattern: string;
   paths: string[];
   truncated: boolean;
+  /** Internal deterministic traversal offset; model-facing code wraps it in an opaque cursor. */
+  nextOffset?: number;
 }
 
 export interface WorkspaceTool {
@@ -159,8 +172,16 @@ export interface WorkspaceTool {
     expectedSha256: string,
     patches: WorkspacePatchOperation[],
   ): Promise<WorkspaceFileWriteResult>;
-  search(query: string, options?: { path?: string; maxResults?: number }): Promise<WorkspaceSearchResult>;
-  glob(pattern: string, options?: { path?: string; maxResults?: number }): Promise<WorkspaceGlobResult>;
+  search(query: string, options?: {
+    path?: string;
+    maxResults?: number;
+    resultOffset?: number;
+  }): Promise<WorkspaceSearchResult>;
+  glob(pattern: string, options?: {
+    path?: string;
+    maxResults?: number;
+    resultOffset?: number;
+  }): Promise<WorkspaceGlobResult>;
   stat(path: string): Promise<WorkspaceStatResult>;
   mkdir(path: string): Promise<void>;
   rename(source: string, destination: string): Promise<void>;

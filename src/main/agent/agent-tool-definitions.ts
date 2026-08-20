@@ -57,8 +57,11 @@ const TERMINAL_TOOLS: readonly AgentFunctionToolDefinition[] = [
   ),
   tool(
     'terminal_read',
-    'Read a bounded recent portion of the exact visible terminal history.',
-    object({ maxChars: integer({ minimum: 100, maximum: 30_000 }) }),
+    'Read a budget-bounded page of exact visible terminal history. The first call returns the newest page; pass nextCursor to read the next older page.',
+    object({
+      maxChars: integer({ minimum: 100, maximum: 30_000 }),
+      cursor: string({ minLength: 1, maxLength: 512 }),
+    }),
   ),
   tool(
     'terminal_state',
@@ -79,9 +82,13 @@ const WORKSPACE_READ_TOOLS: readonly AgentFunctionToolDefinition[] = [
     'workspace_read_file',
     'Read one needed, bounded text file inside the Workspace Root and return its SHA-256. '
       + 'Supports UTF-8 and Windows GBK (ANSI) encodings; edits keep the file\'s original encoding. '
-      + 'Prefer small, targeted reads; never use cat/Get-Content/type in the terminal for this.',
+      + 'Use startLine/endLine for a targeted range and pass nextCursor to continue a truncated page. '
+      + 'Prefer small reads; never use cat/Get-Content/type in the terminal for this.',
     object({
       path: { ...path, description: 'File path relative to the Workspace Root.' },
+      startLine: integer({ minimum: 1, maximum: 10_000_000 }),
+      endLine: integer({ minimum: 1, maximum: 10_000_000 }),
+      cursor: string({ minLength: 1, maxLength: 2_048 }),
     }, ['path']),
   ),
   tool(
@@ -91,20 +98,22 @@ const WORKSPACE_READ_TOOLS: readonly AgentFunctionToolDefinition[] = [
   ),
   tool(
     'workspace_search',
-    'Search bounded UTF-8 workspace files for literal text and return structured line/column previews. Use this instead of grep in the terminal.',
+    'Search bounded UTF-8 workspace files for literal text and return structured line/column previews. Pass nextCursor to continue a truncated result page. Use this instead of grep in the terminal.',
     object({
       query: string({ minLength: 1, maxLength: 4_096 }),
       path: optionalPath,
       maxResults: integer({ minimum: 1, maximum: 200 }),
+      cursor: string({ minLength: 1, maxLength: 2_048 }),
     }, ['query']),
   ),
   tool(
     'workspace_glob',
-    'Find bounded workspace paths matching a glob pattern without running find, dir, or another shell command.',
+    'Find bounded workspace paths matching a glob pattern; pass nextCursor to continue a truncated result page. Do not run find, dir, or another shell command.',
     object({
       pattern: string({ minLength: 1, maxLength: 4_096 }),
       path: optionalPath,
       maxResults: integer({ minimum: 1, maximum: 500 }),
+      cursor: string({ minLength: 1, maxLength: 2_048 }),
     }, ['pattern']),
   ),
 ];

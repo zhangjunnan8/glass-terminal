@@ -125,7 +125,11 @@ export class AgentFileWorkspaceAdapter implements WorkspaceTool {
     ));
   }
 
-  search(query: string, options?: { path?: string; maxResults?: number }) {
+  search(query: string, options?: {
+    path?: string;
+    maxResults?: number;
+    resultOffset?: number;
+  }) {
     this.assertToolLive();
     return this.track(this.files.search(
       this.owner,
@@ -137,7 +141,11 @@ export class AgentFileWorkspaceAdapter implements WorkspaceTool {
     ));
   }
 
-  glob(pattern: string, options?: { path?: string; maxResults?: number }) {
+  glob(pattern: string, options?: {
+    path?: string;
+    maxResults?: number;
+    resultOffset?: number;
+  }) {
     this.assertToolLive();
     return this.track(this.files.glob(
       this.owner,

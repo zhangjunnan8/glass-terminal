@@ -256,6 +256,14 @@ export class SessionManager {
     return this.store.readTerminalHistorySince(sessionId, cursor, maxCharacters);
   }
 
+  readTerminalHistoryBefore(
+    sessionId: string,
+    before?: TerminalHistoryCursor,
+    maxCharacters?: number,
+  ): TerminalHistorySlice {
+    return this.store.readTerminalHistoryBefore(sessionId, before, maxCharacters);
+  }
+
   currentTerminalHistoryCursor(sessionId: string): TerminalHistoryCursor {
     return this.store.currentTerminalHistoryCursor(sessionId);
   }

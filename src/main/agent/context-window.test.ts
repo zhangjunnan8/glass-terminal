@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { AgentMessage } from './agent-backend';
 import {
+  agentContextBudget,
   agentContextUsage,
   compactCompletedWorkspaceHistory,
   compressContextIfNeeded,
@@ -13,6 +14,17 @@ import {
 import { agentToolDefinitionsForAccess } from './agent-tool-definitions';
 
 describe('Agent context window', () => {
+  it('keeps an explicit output reserve out of the Provider input budget', () => {
+    const budget = agentContextBudget(
+      [{ role: 'user', content: 'hello' }],
+      8_192,
+      { safetyFactor: 1 },
+    );
+    expect(budget.inputLimitTokens + budget.outputReserveTokens).toBe(8_192);
+    expect(budget.outputReserveTokens).toBeGreaterThan(1_000);
+    expect(budget.fits).toBe(true);
+  });
+
   it('uses a conservative provider-agnostic token estimate for ASCII and CJK text', () => {
     expect(estimateTextTokens('a'.repeat(40))).toBe(10);
     expect(estimateTextTokens('上下文压缩')).toBe(5);
@@ -95,6 +107,33 @@ describe('Agent context window', () => {
       toolCalls: [{ arguments: '{"historyCompacted":true}' }],
     });
     expect(messages[1]).toMatchObject({ content: expect.stringContaining('"compacted":true') });
+  });
+
+  it('keeps an unconsumed halted tool group intact until a later Provider request', () => {
+    const messages: AgentMessage[] = [
+      {
+        role: 'assistant',
+        content: null,
+        toolResultsPending: true,
+        toolCalls: [{
+          id: 'pending-write',
+          name: 'workspace_write_file',
+          arguments: JSON.stringify({ path: 'a.txt', content: 'UNCONSUMED-CANARY' }),
+        }],
+      },
+      {
+        role: 'tool',
+        toolCallId: 'pending-write',
+        content: JSON.stringify({ ok: false, code: 'CONTEXT_BUDGET_EXCEEDED' }),
+      },
+      { role: 'user', content: 'continue after the local halt' },
+    ];
+
+    expect(compactCompletedWorkspaceHistory(messages)).toBe(false);
+    expect(JSON.stringify(messages)).toContain('UNCONSUMED-CANARY');
+    delete (messages[0] as Extract<AgentMessage, { role: 'assistant' }>).toolResultsPending;
+    expect(compactCompletedWorkspaceHistory(messages)).toBe(true);
+    expect(JSON.stringify(messages)).not.toContain('UNCONSUMED-CANARY');
   });
 
   it('summarizes older turns at the safe threshold and preserves the latest complete turn', async () => {

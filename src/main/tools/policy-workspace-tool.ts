@@ -195,7 +195,11 @@ export class PolicyWorkspaceTool implements WorkspaceTool {
     return this.delegate.applyPatch(path, expectedSha256, patches);
   }
 
-  async search(query: string, options?: { path?: string; maxResults?: number }) {
+  async search(query: string, options?: {
+    path?: string;
+    maxResults?: number;
+    resultOffset?: number;
+  }) {
     const path = options?.path ?? '.';
     this.authorizeOperation('search', { path }, () => {
       this.authorizePath(path, ['read'], ['readable'], 'workspace_search');
@@ -203,7 +207,11 @@ export class PolicyWorkspaceTool implements WorkspaceTool {
     return this.delegate.search(query, options);
   }
 
-  async glob(pattern: string, options?: { path?: string; maxResults?: number }) {
+  async glob(pattern: string, options?: {
+    path?: string;
+    maxResults?: number;
+    resultOffset?: number;
+  }) {
     const path = options?.path ?? '.';
     this.authorizeOperation('glob', { path }, () => {
       this.authorizePath(path, ['read'], ['readable'], 'workspace_glob');

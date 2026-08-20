@@ -154,6 +154,18 @@ It replaces the in-house `AgentLoop` while keeping every boundary below it intac
   If semantic summarization fails, a bounded deterministic fallback keeps the turn
   usable; cancellation is never swallowed by that fallback. Visible chat and the
   append-only audit/history remain intact.
+- The same conservative estimate is a hard Provider-request gate. It explicitly
+  reserves the final 15% of the model window for output, rejects an
+  incompressible current prompt locally with estimated/allowed token counts, and
+  rechecks after every tool result. If compaction cannot make the current
+  assistant/tool protocol group fit, the group is checkpointed intact and the
+  turn stops with a visible local error before another Provider request.
+- Read-only results consume the live remaining input budget. File reads support
+  line ranges and hash-bound continuation cursors; search, glob, and terminal
+  history return bounded pages with truncation metadata and opaque continuation
+  cursors. Mutating Workspace calls, terminal commands, and path arguments are
+  never shortened: a call that cannot fit with its protocol result is rejected
+  before execution and asks the model/user to split the operation.
 - Completed `workspace_*` tool bodies are reduced to stable metadata after the next
   reasoning step. Normal turns persist only a context delta; a compression or tool
   history rewrite persists a bounded checkpoint. Legacy full-checkpoint events are

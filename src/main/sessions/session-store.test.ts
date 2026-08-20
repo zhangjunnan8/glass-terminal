@@ -94,6 +94,21 @@ describe('SessionStore', () => {
     });
   });
 
+  it('pages terminal history backwards without overlap or omission', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    store.appendTerminalEvents(session.id, [output(2, 'ABCDEFGHIJ')]);
+    store.flushAll();
+
+    const newest = store.readTerminalHistoryBefore(session.id, undefined, 5);
+    const older = store.readTerminalHistoryBefore(session.id, newest.nextCursor, 100);
+
+    expect(newest).toMatchObject({ content: 'FGHIJ', truncated: true });
+    expect(older.truncated).toBe(false);
+    expect(older.content + newest.content).toBe('pre-promotion output\r\nABCDEFGHIJ');
+  });
+
   it('uses chunk offsets to skip unrelated compressed history', () => {
     const root = temporaryRoot();
     const store = new SessionStore(root);

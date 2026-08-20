@@ -635,6 +635,63 @@ export class SessionStore {
     };
   }
 
+  /**
+   * Reads terminal history backwards in bounded chronological pages. The
+   * returned cursor points at the beginning of this page, so passing it back
+   * retrieves the next older page without replaying newer output.
+   */
+  readTerminalHistoryBefore(
+    sessionId: string,
+    before?: TerminalHistoryCursor,
+    maxCharacters = 8_000,
+  ): TerminalHistorySlice {
+    this.get(sessionId);
+    if (!Number.isSafeInteger(maxCharacters) || maxCharacters < 1) {
+      throw new Error('Invalid terminal history page limit.');
+    }
+    if (
+      before !== undefined
+      && (
+        before.version !== 1
+        || !Number.isSafeInteger(before.position)
+        || before.position < 0
+      )
+    ) throw new Error('Invalid terminal history cursor.');
+
+    this.flush(sessionId);
+    const index = this.readLogIndex(sessionId);
+    const latest = index.nextHistoryPosition;
+    const earliest = index.chunks[0]?.historyStart ?? latest;
+    const end = before?.position ?? latest;
+    if (end > latest) {
+      throw new Error('Terminal history cursor is ahead of the current Session history.');
+    }
+    if (end < earliest) {
+      return {
+        content: '',
+        nextCursor: { version: 1, position: earliest },
+        truncated: true,
+      };
+    }
+    const start = Math.max(earliest, end - maxCharacters);
+    const pieces: string[] = [];
+    for (const chunk of index.chunks) {
+      if (chunk.historyEnd <= start || chunk.historyStart >= end) continue;
+      const text = this.readChunkText(sessionId, chunk);
+      if (text.length !== chunk.historyEnd - chunk.historyStart) {
+        throw new Error(`Terminal history index metadata mismatch for chunk ${chunk.sequence}.`);
+      }
+      const localStart = Math.max(0, start - chunk.historyStart);
+      const localEnd = Math.min(text.length, end - chunk.historyStart);
+      if (localEnd > localStart) pieces.push(text.slice(localStart, localEnd));
+    }
+    return {
+      content: pieces.join(''),
+      nextCursor: { version: 1, position: start },
+      truncated: start > earliest,
+    };
+  }
+
   readAudit(sessionId: string): SessionAuditEvent[] {
     this.get(sessionId);
     const path = join(this.sessionPath(sessionId), 'audit.jsonl');

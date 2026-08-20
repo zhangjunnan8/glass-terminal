@@ -59,6 +59,31 @@ export interface AgentContextTokenEstimate {
   boundToolCount: number;
 }
 
+export interface AgentContextBudget extends AgentContextTokenEstimate {
+  contextWindowTokens: number;
+  inputLimitTokens: number;
+  outputReserveTokens: number;
+  remainingInputTokens: number;
+  fits: boolean;
+}
+
+export class AgentContextBudgetExceededError extends Error {
+  readonly code = 'CONTEXT_BUDGET_EXCEEDED';
+
+  constructor(
+    readonly stage: 'current_prompt' | 'provider_request' | 'tool_result',
+    readonly estimatedTokens: number,
+    readonly allowedTokens: number,
+    detail: string,
+  ) {
+    super(
+      `${detail}（保守估算 ${estimatedTokens} tokens，当前安全输入上限 ${allowedTokens} tokens）。`
+      + '请缩短或拆分输入后重试；Glass Terminal 未向 Provider 发送该超限请求。',
+    );
+    this.name = 'AgentContextBudgetExceededError';
+  }
+}
+
 export function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMessage[] {
   return messages.map((message) => {
     if (message.role === 'assistant') {
@@ -149,6 +174,29 @@ export function estimateAgentContextTokens(
   };
 }
 
+/**
+ * One authoritative input budget for the meter, compaction gate, user prompt
+ * preflight, and tool-result pagination. The unused 15% is an explicit output
+ * reserve rather than available input space.
+ */
+export function agentContextBudget(
+  messages: readonly AgentMessage[],
+  contextWindowTokens: number,
+  options: ContextEstimationOptions = {},
+): AgentContextBudget {
+  const normalizedWindow = normalizedContextWindowTokens(contextWindowTokens);
+  const inputLimitTokens = contextCompressionThreshold(normalizedWindow);
+  const estimate = estimateAgentContextTokens(messages, options);
+  return {
+    ...estimate,
+    contextWindowTokens: normalizedWindow,
+    inputLimitTokens,
+    outputReserveTokens: normalizedWindow - inputLimitTokens,
+    remainingInputTokens: Math.max(0, inputLimitTokens - estimate.estimatedTokens),
+    fits: estimate.estimatedTokens < inputLimitTokens,
+  };
+}
+
 export function agentContextUsage(
   messages: readonly AgentMessage[],
   contextWindowTokens: number,
@@ -158,19 +206,24 @@ export function agentContextUsage(
 ): AgentContextUsage {
   const normalizedWindow = normalizedContextWindowTokens(contextWindowTokens);
   const compressionThresholdTokens = contextCompressionThreshold(normalizedWindow);
-  const estimate = estimateAgentContextTokens(messages, estimation);
+  const budget = agentContextBudget(messages, normalizedWindow, estimation);
   const providerReportedInputTokens = Number.isSafeInteger(
     estimation.providerReportedInputTokens,
   ) && Number(estimation.providerReportedInputTokens) >= 0
     ? Number(estimation.providerReportedInputTokens)
     : undefined;
   return {
-    ...estimate,
+    estimatedTokens: budget.estimatedTokens,
+    messageEstimatedTokens: budget.messageEstimatedTokens,
+    toolSchemaEstimatedTokens: budget.toolSchemaEstimatedTokens,
+    fixedOverheadTokens: budget.fixedOverheadTokens,
+    safetyFactor: budget.safetyFactor,
+    boundToolCount: budget.boundToolCount,
     contextWindowTokens: normalizedWindow,
     compressionThresholdTokens,
     percentage: Math.max(0, Math.min(
       100,
-      Math.round((estimate.estimatedTokens / compressionThresholdTokens) * 100),
+      Math.round((budget.estimatedTokens / compressionThresholdTokens) * 100),
     )),
     status,
     ...(providerReportedInputTokens !== undefined ? { providerReportedInputTokens } : {}),
@@ -221,10 +274,23 @@ export function compactCompletedWorkspaceHistory(
   messages: AgentMessage[],
   keepAssistant?: Extract<AgentMessage, { role: 'assistant' }>,
 ): boolean {
+  if (!keepAssistant) {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const candidate = messages[index]!;
+      if (candidate.role === 'tool') continue;
+      if (
+        candidate.role === 'assistant'
+        && candidate.toolCalls?.length
+        && messages.slice(index + 1).every((message) => message.role === 'tool')
+      ) keepAssistant = candidate;
+      break;
+    }
+  }
   const compactCalls = new Map<string, string>();
   let changed = false;
   for (const message of messages) {
     if (message.role !== 'assistant' || !message.toolCalls || message === keepAssistant) continue;
+    if (message.toolResultsPending) continue;
     message.toolCalls = message.toolCalls.map((call) => {
       if (!WORKSPACE_TOOL_NAMES.has(call.name) || call.arguments === '{"historyCompacted":true}') {
         return call;

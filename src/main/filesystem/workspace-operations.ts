@@ -46,10 +46,12 @@ export const DEFAULT_WORKSPACE_TRAVERSAL_LIMITS: Readonly<WorkspaceTraversalLimi
 
 export interface WorkspaceSearchOptions {
   maxResults?: number;
+  resultOffset?: number;
 }
 
 export interface WorkspaceGlobOptions {
   maxResults?: number;
+  resultOffset?: number;
 }
 
 interface WalkEntry {
@@ -121,6 +123,17 @@ function boundedMaxResults(
     throw new Error('maxResults 必须是正整数。');
   }
   return Math.min(requested, limits.maxResults);
+}
+
+function boundedResultOffset(
+  requested: number | undefined,
+  limits: Readonly<WorkspaceTraversalLimits>,
+): number {
+  if (requested === undefined) return 0;
+  if (!Number.isSafeInteger(requested) || requested < 0 || requested > limits.maxEntries) {
+    throw new Error(`resultOffset 必须是 0 到 ${limits.maxEntries} 的整数。`);
+  }
+  return requested;
 }
 
 async function walkWorkspace(
@@ -289,6 +302,8 @@ async function readSearchFile(
   maxReadBytes: number,
   matches: WorkspaceSearchMatch[],
   maxResults: number,
+  resultOffset: number,
+  seenMatches: { value: number },
 ): Promise<{
   bytes: number;
   scanned: boolean;
@@ -327,6 +342,10 @@ async function readSearchFile(
     offset >= 0;
     offset = content.indexOf(query, offset + query.length)
   ) {
+    if (seenMatches.value < resultOffset) {
+      seenMatches.value += 1;
+      continue;
+    }
     if (matches.length >= maxResults) {
       return { bytes: buffer.length, scanned: true, hasOverflowMatch: true, incomplete: false };
     }
@@ -334,6 +353,7 @@ async function readSearchFile(
       path: entry.path,
       ...previewAt(content, starts, offset, limits.maxPreviewChars),
     });
+    seenMatches.value += 1;
   }
   return { bytes: buffer.length, scanned: true, hasOverflowMatch: false, incomplete: false };
 }
@@ -352,12 +372,15 @@ export async function searchWorkspace(
     throw new Error(`搜索文本超过 ${limits.maxQueryBytes} 字节限制。`);
   }
   const maxResults = boundedMaxResults(options.maxResults, limits);
+  const resultOffset = boundedResultOffset(options.resultOffset, limits);
   const matches: WorkspaceSearchMatch[] = [];
+  const seenMatches = { value: 0 };
   const deadline = Date.now() + limits.maxDurationMs;
   let filesScanned = 0;
   let filesConsidered = 0;
   let bytesScanned = 0;
   let truncated = false;
+  let resultOverflow = false;
 
   const startStat = await filesystem.lstat(start);
   if (!startStat) throw new Error('搜索起点不存在。');
@@ -392,10 +415,13 @@ export async function searchWorkspace(
       Math.min(limits.maxFileBytes, limits.maxTotalBytes - bytesScanned),
       matches,
       maxResults,
+      resultOffset,
+      seenMatches,
     );
     if (result.scanned) filesScanned += 1;
     bytesScanned += result.bytes;
     if (result.incomplete) truncated = true;
+    if (result.hasOverflowMatch) resultOverflow = true;
     if (result.hasOverflowMatch || Date.now() > deadline) {
       truncated = true;
       return 'stop';
@@ -424,7 +450,15 @@ export async function searchWorkspace(
     || left.line - right.line
     || left.column - right.column
   ));
-  return { query, matches, filesScanned, truncated };
+  return {
+    query,
+    matches,
+    filesScanned,
+    truncated,
+    ...(resultOverflow && matches.length > 0
+      ? { nextOffset: resultOffset + matches.length }
+      : {}),
+  };
 }
 
 type GlobToken =
@@ -539,9 +573,12 @@ export async function globWorkspace(
   const normalizedPattern = normalizedGlobPattern(flavor, pattern, limits);
   const tokens = globTokens(normalizedPattern);
   const maxResults = boundedMaxResults(options.maxResults, limits);
+  const resultOffset = boundedResultOffset(options.resultOffset, limits);
   const paths: string[] = [];
   const deadline = Date.now() + limits.maxDurationMs;
   let overflow = false;
+  let resultOverflow = false;
+  let seenMatches = 0;
 
   const startStat = await filesystem.lstat(startDirectory);
   if (!startStat) throw new Error('Glob 起点不存在。');
@@ -566,14 +603,28 @@ export async function globWorkspace(
         return 'stop';
       }
       if (!matchesGlob(tokens, candidate)) return 'continue';
+      if (seenMatches < resultOffset) {
+        seenMatches += 1;
+        return 'continue';
+      }
       if (paths.length >= maxResults) {
         overflow = true;
+        resultOverflow = true;
         return 'stop';
       }
       paths.push(entry.path);
+      seenMatches += 1;
       return 'continue';
     },
   );
   paths.sort(compareNames);
-  return { pattern, paths, truncated: overflow || walk.truncated };
+  const truncated = overflow || walk.truncated;
+  return {
+    pattern,
+    paths,
+    truncated,
+    ...(resultOverflow && paths.length > 0
+      ? { nextOffset: resultOffset + paths.length }
+      : {}),
+  };
 }

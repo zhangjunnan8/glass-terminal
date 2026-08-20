@@ -1562,7 +1562,12 @@ export class AgentService {
         new Date().toISOString(),
       );
       this.cancelStreamEmit(runtime);
-      this.setHumanState(runtime, 'COMPLETED', controlLeaseId);
+      if (result.haltedError) {
+        runtime.error = result.haltedError;
+        this.setHumanState(runtime, 'FAILED', controlLeaseId);
+      } else {
+        this.setHumanState(runtime, 'COMPLETED', controlLeaseId);
+      }
       this.emit(runtime);
     } catch (error) {
       await closeTurnTools();

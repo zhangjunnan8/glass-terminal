@@ -120,6 +120,16 @@ function setup(options: {
         truncated: history.length > maxChars,
       };
     }),
+    readTerminalHistoryBefore: vi.fn((_sessionId, cursor, maxChars: number) => {
+      const history = options.history ?? 'terminal history';
+      const end = cursor?.position ?? history.length;
+      const start = Math.max(0, end - maxChars);
+      return {
+        content: history.slice(start, end),
+        nextCursor: { version: 1, position: start },
+        truncated: start > 0,
+      };
+    }),
   };
   const execute = options.execute ?? vi.fn(async () => ({
     commandId: 'command-1',
@@ -198,6 +208,7 @@ describe('SharedTerminalTool', () => {
       fixture.tool.interrupt('command-1'),
       fixture.tool.readVisible(),
       fixture.tool.readHistory(),
+      fixture.tool.readVisiblePage(),
       fixture.tool.getState(),
     ];
     for (const call of calls) await expect(call).rejects.toThrow(/binding.*stale/i);
@@ -226,10 +237,11 @@ describe('SharedTerminalTool', () => {
       fixture.tool.interrupt('command-1'),
       fixture.tool.readVisible(),
       fixture.tool.readHistory(),
+      fixture.tool.readVisiblePage(),
       fixture.tool.getState(),
     ];
     for (const call of calls) await expect(call).rejects.toBe(revoked);
-    expect(assertLive).toHaveBeenCalledTimes(6);
+    expect(assertLive).toHaveBeenCalledTimes(7);
     expect(fixture.execute).not.toHaveBeenCalled();
     expect(sendInput).not.toHaveBeenCalled();
     expect(interrupt).not.toHaveBeenCalled();
@@ -257,6 +269,26 @@ describe('SharedTerminalTool', () => {
       'session-1',
       undefined,
       5,
+    );
+  });
+
+  it('returns an opaque continuation cursor for the next older terminal page', async () => {
+    const { tool, sessionMock } = setup({ history: 'ABCDEFGHIJ' });
+
+    await expect(tool.readVisiblePage({ maxChars: 4 })).resolves.toEqual({
+      output: 'GHIJ',
+      truncated: true,
+      nextCursor: 'v1:6',
+    });
+    await expect(tool.readVisiblePage({ maxChars: 4, cursor: 'v1:6' })).resolves.toEqual({
+      output: 'CDEF',
+      truncated: true,
+      nextCursor: 'v1:2',
+    });
+    expect(sessionMock.readTerminalHistoryBefore).toHaveBeenLastCalledWith(
+      'session-1',
+      { version: 1, position: 6 },
+      4,
     );
   });
 
