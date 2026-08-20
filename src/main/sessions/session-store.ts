@@ -41,8 +41,8 @@ import {
 const LOG_SCHEMA_VERSION = 2;
 const TARGET_CHUNK_BYTES = 64 * 1024;
 const FLUSH_DELAY_MS = 200;
-const RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
 const MAX_SESSION_LOG_BYTES = 200 * 1024 * 1024;
+const DAY_MS = 24 * 60 * 60 * 1_000;
 const AUDIT_SEQUENCE_TAIL_BYTES = 256 * 1024;
 const PROVIDER_FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/u;
 
@@ -84,6 +84,12 @@ export interface TerminalHistorySlice {
   truncated: boolean;
 }
 
+export interface SessionStoreOptions {
+  terminalLogRetentionDays?: number;
+  /** Test seam; production always uses the 200 MiB default. */
+  maxTerminalLogBytes?: number;
+}
+
 interface PendingLog {
   events: TerminalJournalEvent[];
   bytes: number;
@@ -101,6 +107,20 @@ function terminalEventText(event: TerminalJournalEvent): string {
     return `\r\n[Earlier terminal output truncated: ${event.droppedBytes} bytes]\r\n`;
   }
   return '';
+}
+
+function validatedRetentionDays(days: number): number {
+  if (!Number.isSafeInteger(days) || days < 0) {
+    throw new Error('Terminal log retention days must be a non-negative integer.');
+  }
+  return days;
+}
+
+function validatedMaxLogBytes(bytes: number): number {
+  if (!Number.isSafeInteger(bytes) || bytes < 1) {
+    throw new Error('Terminal log capacity must be a positive integer.');
+  }
+  return bytes;
 }
 
 function readUtf8FileTail(path: string, maxBytes: number): FileTail {
@@ -237,9 +257,20 @@ export class SessionStore {
   private readonly sessions = new Map<string, SessionRecord>();
   private readonly pendingLogs = new Map<string, PendingLog>();
   private readonly workspaceOperations: WorkspaceOperationJournal;
+  private terminalLogRetentionDays: number;
+  private readonly maxTerminalLogBytes: number;
   private auditSequence = 0;
 
-  constructor(private readonly rootPath: string) {
+  constructor(
+    private readonly rootPath: string,
+    options: SessionStoreOptions = {},
+  ) {
+    this.terminalLogRetentionDays = validatedRetentionDays(
+      options.terminalLogRetentionDays ?? 90,
+    );
+    this.maxTerminalLogBytes = validatedMaxLogBytes(
+      options.maxTerminalLogBytes ?? MAX_SESSION_LOG_BYTES,
+    );
     this.workspaceOperations = new WorkspaceOperationJournal(rootPath);
     this.load();
     this.markInterruptedSessions();
@@ -451,7 +482,7 @@ export class SessionStore {
     }
   }
 
-  flush(sessionId: string): void {
+  flush(sessionId: string, enforceRetention = true): void {
     const pending = this.pendingLogs.get(sessionId);
     if (!pending || pending.events.length === 0) return;
     if (pending.timer) clearTimeout(pending.timer);
@@ -467,12 +498,41 @@ export class SessionStore {
     );
     index.chunks.push(chunk);
     index.nextHistoryPosition = chunk.historyEnd;
-    this.applyRetention(this.get(sessionId), index);
+    if (enforceRetention) this.applyRetention(this.get(sessionId), index);
     atomicWriteJson(this.logIndexPath(sessionId), index);
   }
 
   flushAll(): void {
     for (const sessionId of [...this.pendingLogs.keys()]) this.flush(sessionId);
+  }
+
+  setTerminalLogRetentionDays(days: number): void {
+    this.terminalLogRetentionDays = validatedRetentionDays(days);
+  }
+
+  /**
+   * Applies terminal-only retention one chunk at a time. Each removal is
+   * persisted before yielding so a concurrent journal append cannot be lost
+   * through a stale index write. Other Session journals are never touched.
+   */
+  async enforceTerminalLogRetention(): Promise<void> {
+    for (const sessionId of [...this.sessions.keys()]) {
+      while (true) {
+        this.flush(sessionId, false);
+        const session = this.get(sessionId);
+        if (session.pinned) break;
+        const index = this.readLogIndex(sessionId);
+        const total = index.chunks.reduce((sum, chunk) => sum + chunk.compressedBytes, 0);
+        const oldest = index.chunks[0];
+        if (!oldest || !this.shouldRemoveChunk(oldest, total)) break;
+        index.chunks.shift();
+        const chunkPath = this.safeChunkPath(session.id, oldest.file);
+        if (existsSync(chunkPath)) unlinkSync(chunkPath);
+        atomicWriteJson(this.logIndexPath(sessionId), index);
+        await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+      }
+      await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+    }
   }
 
   readTerminalEvents(sessionId: string): TerminalJournalEvent[] {
@@ -994,17 +1054,23 @@ export class SessionStore {
 
   private applyRetention(session: SessionRecord, index: LogIndex): void {
     if (session.pinned) return;
-    const cutoff = Date.now() - RETENTION_MS;
     let total = index.chunks.reduce((sum, chunk) => sum + chunk.compressedBytes, 0);
     while (index.chunks.length) {
       const oldest = index.chunks[0];
-      const expired = Date.parse(oldest.createdAt) < cutoff;
-      if (!expired && total <= MAX_SESSION_LOG_BYTES) break;
+      if (!this.shouldRemoveChunk(oldest, total)) break;
       index.chunks.shift();
       total -= oldest.compressedBytes;
       const path = this.safeChunkPath(session.id, oldest.file);
       if (existsSync(path)) unlinkSync(path);
     }
+  }
+
+  private shouldRemoveChunk(chunk: LogChunk, totalCompressedBytes: number): boolean {
+    const createdAt = Date.parse(chunk.createdAt);
+    const expired = this.terminalLogRetentionDays > 0
+      && Number.isFinite(createdAt)
+      && createdAt < Date.now() - this.terminalLogRetentionDays * DAY_MS;
+    return expired || totalCompressedBytes > this.maxTerminalLogBytes;
   }
 
   private sessionPath(sessionId: string): string {

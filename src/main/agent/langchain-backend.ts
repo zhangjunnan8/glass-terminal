@@ -270,14 +270,14 @@ export class LangChainBackend implements AgentBackend {
   private readonly threads = new Map<string, LangChainThreadRecord>();
   private readonly activeTurns = new Map<string, ActiveTurn>();
   private readonly modelFactory: () => Promise<ChatOpenAICompletions>;
-  private readonly maxRounds: number;
+  private readonly defaultMaxRounds: number;
   private readonly contextWindowTokens: number;
   private readonly customSummarize?: LangChainBackendOptions['summarize'];
   private modelPromise?: Promise<ChatOpenAICompletions>;
 
   constructor(options: LangChainBackendOptions) {
     this.modelFactory = options.modelFactory;
-    this.maxRounds = configuredMaxRounds(options.maxRounds);
+    this.defaultMaxRounds = configuredMaxRounds(options.maxRounds);
     this.contextWindowTokens = options.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
     this.customSummarize = options.summarize;
   }
@@ -313,6 +313,7 @@ export class LangChainBackend implements AgentBackend {
   }
 
   async sendMessage(input: SendAgentBackendMessageInput): Promise<AgentBackendResult> {
+    const maxRounds = configuredMaxRounds(input.maxRounds ?? this.defaultMaxRounds);
     const record = this.requireThread(input.thread);
     if (!input.gateway) throw new Error('LangChain Harness requires a per-turn ToolGateway.');
     if (this.activeTurns.has(record.handle.id)) {
@@ -419,7 +420,7 @@ export class LangChainBackend implements AgentBackend {
         return after;
       };
 
-      while (rounds < this.maxRounds) {
+      while (rounds < maxRounds) {
         throwIfCancelled(controller.signal);
         await refreshContext();
         const stream = await modelWithTools.stream(messages, { signal: controller.signal });
@@ -506,9 +507,9 @@ export class LangChainBackend implements AgentBackend {
       }
 
       throwIfCancelled(controller.signal);
-      if (rounds >= this.maxRounds) {
+      if (rounds >= maxRounds) {
         throw new Error(
-          `Agent 超出 ${this.maxRounds} 轮安全上限。请拆分任务、减少单次修改的文件数，或分多轮继续。`,
+          `Agent 超出 ${maxRounds} 轮安全上限。请拆分任务、减少单次修改的文件数，或分多轮继续。`,
         );
       }
       pendingToolAssistant = undefined;

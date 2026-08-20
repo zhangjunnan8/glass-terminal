@@ -40,6 +40,23 @@ export function SettingsWindow() {
   const saveSettings = useCallback(async () => {
     if (!draft) return;
     setSettingsMessage(null);
+    const retentionWillDeleteSooner = Boolean(
+      settings
+      && draft.logRetentionDays !== settings.logRetentionDays
+      && (
+        settings.logRetentionDays === 0
+        || (
+          draft.logRetentionDays > 0
+          && draft.logRetentionDays < settings.logRetentionDays
+        )
+      ),
+    );
+    if (
+      retentionWillDeleteSooner
+      && !window.confirm(
+        `将终端日志保留期从 ${settings!.logRetentionDays === 0 ? '永久' : `${settings!.logRetentionDays} 天`}缩短为 ${draft.logRetentionDays} 天。超过新期限的终端日志会在保存后异步永久删除，且无法恢复。是否继续？`,
+      )
+    ) return;
     try {
       const saved = await window.aiTerminal.settings.update({
         theme: draft.theme,
@@ -52,7 +69,7 @@ export function SettingsWindow() {
     } catch (error) {
       setSettingsMessage(errorMessage(error));
     }
-  }, [draft]);
+  }, [draft, settings]);
 
   const exportBackup = useCallback(async () => {
     setBackupPending(true);
@@ -157,7 +174,7 @@ export function SettingsWindow() {
             </label>
 
             <label className="settings-field">
-              <span>日志保留（天，0 表示永久）</span>
+              <span>终端日志保留（天，0 表示不限时间）</span>
               <input
                 type="number"
                 min={0}
@@ -166,6 +183,7 @@ export function SettingsWindow() {
                   logRetentionDays: Math.max(0, Number(event.target.value) || 0),
                 })}
               />
+              <small>无论天数设置如何，每个会话仍保留 200 MiB 安全容量上限。</small>
             </label>
 
             <label className="settings-field">

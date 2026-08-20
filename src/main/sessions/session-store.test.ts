@@ -136,6 +136,93 @@ describe('SessionStore', () => {
     });
   });
 
+  it.each([7, 30, 90, 180])(
+    'applies a live %i-day terminal-only retention policy asynchronously',
+    async (days) => {
+      const root = temporaryRoot();
+      const store = new SessionStore(root, { terminalLogRetentionDays: 0 });
+      const session = createSession(store);
+      const threadId = '55555555-5555-5555-5555-555555555555';
+      store.bindAgentThread(session.id, 'provider', threadId, 'd'.repeat(64));
+      store.appendThreadEvent(session.id, threadId, { type: 'retention-canary' });
+      const operation = store.beginWorkspaceOperation(session.id, {
+        operation: 'read',
+        backend: 'sftp',
+        target: { path: { scope: 'workspace', path: 'README.md' } },
+      });
+      store.finishWorkspaceOperation(operation, {
+        outcome: 'succeeded',
+        sideEffectCommitted: false,
+      });
+      const auditBefore = store.readAudit(session.id);
+      const threadBefore = store.readThreadEvents(session.id, threadId);
+      const operationsBefore = store.readWorkspaceOperations(session.id);
+      const indexPath = join(root, session.id, 'terminal', 'index.json');
+      const index = JSON.parse(readFileSync(indexPath, 'utf8'));
+      index.chunks[0].createdAt = new Date(Date.now() - (days + 1) * 86_400_000)
+        .toISOString();
+      writeFileSync(indexPath, JSON.stringify(index));
+
+      store.setTerminalLogRetentionDays(days);
+      let settled = false;
+      const cleanup = store.enforceTerminalLogRetention().then(() => { settled = true; });
+      expect(settled).toBe(false);
+      await cleanup;
+
+      expect(store.readTerminalHistory(session.id)).toBe('');
+      expect(readdirSync(join(root, session.id, 'terminal')))
+        .toEqual(['index.json']);
+      expect(existsSync(join(root, session.id, 'ai'))).toBe(true);
+      expect(existsSync(join(root, session.id, 'audit.jsonl'))).toBe(true);
+      expect(store.readAudit(session.id)).toEqual(auditBefore);
+      expect(store.readThreadEvents(session.id, threadId)).toEqual(threadBefore);
+      expect(store.readWorkspaceOperations(session.id)).toEqual(operationsBefore);
+    },
+  );
+
+  it('keeps old terminal chunks when days is zero but still enforces the capacity limit', async () => {
+    const root = temporaryRoot();
+    const unlimitedByTime = new SessionStore(root, {
+      terminalLogRetentionDays: 0,
+      maxTerminalLogBytes: 10_000,
+    });
+    const session = createSession(unlimitedByTime);
+    const indexPath = join(root, session.id, 'terminal', 'index.json');
+    const index = JSON.parse(readFileSync(indexPath, 'utf8'));
+    index.chunks[0].createdAt = new Date(0).toISOString();
+    writeFileSync(indexPath, JSON.stringify(index));
+    await unlimitedByTime.enforceTerminalLogRetention();
+    expect(unlimitedByTime.readTerminalHistory(session.id)).toContain('pre-promotion');
+
+    const capacityBound = new SessionStore(root, {
+      terminalLogRetentionDays: 0,
+      maxTerminalLogBytes: 1,
+    });
+    await capacityBound.enforceTerminalLogRetention();
+    expect(capacityBound.readTerminalHistory(session.id)).toBe('');
+  });
+
+  it('never automatically cleans terminal chunks for a pinned Session', async () => {
+    const root = temporaryRoot();
+    const initial = new SessionStore(root);
+    const session = createSession(initial);
+    const metadataPath = join(root, session.id, 'session.json');
+    const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
+    writeFileSync(metadataPath, JSON.stringify({ ...metadata, pinned: true }));
+    const indexPath = join(root, session.id, 'terminal', 'index.json');
+    const index = JSON.parse(readFileSync(indexPath, 'utf8'));
+    index.chunks[0].createdAt = new Date(0).toISOString();
+    writeFileSync(indexPath, JSON.stringify(index));
+
+    const pinned = new SessionStore(root, {
+      terminalLogRetentionDays: 7,
+      maxTerminalLogBytes: 1,
+    });
+    await pinned.enforceTerminalLogRetention();
+
+    expect(pinned.readTerminalHistory(session.id)).toContain('pre-promotion');
+  });
+
   it('reloads durable metadata, marks interrupted sessions, and keeps audit history', () => {
     const root = temporaryRoot();
     const initialStore = new SessionStore(root);

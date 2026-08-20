@@ -3217,6 +3217,35 @@ describe('AgentService shared-terminal controls', () => {
     ))).toHaveLength(1);
   });
 
+  it('freezes the live max-round setting per turn without replacing the backend thread', async () => {
+    const backend = new DeferredRecordingBackend();
+    let configuredMaxRounds = 5;
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      () => backend,
+      () => configuredMaxRounds,
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'first turn' });
+    await waitFor(() => backend.sendInputs.length === 1);
+    configuredMaxRounds = 1;
+    expect(backend.sendInputs[0]?.maxRounds).toBe(5);
+    backend.finish();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'second turn' });
+    await waitFor(() => backend.sendInputs.length === 2);
+    expect(backend.sendInputs[1]?.maxRounds).toBe(1);
+    expect(backend.createInputs).toHaveLength(1);
+    backend.finish();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+  });
+
   it('clears and persists partial streaming output before manual takeover', async () => {
     const provider = new DeferredStreamingProvider();
     const sessions = new FakeSessions();

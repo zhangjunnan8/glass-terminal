@@ -43,6 +43,8 @@ import type {
 export class SessionManager {
   private readonly removeJournalListener: () => void;
   private readonly contextTrackers = new Map<string, ShellContextTracker>();
+  private retentionCleanupRequested = false;
+  private retentionCleanupPromise?: Promise<void>;
 
   constructor(
     private readonly store: SessionStore,
@@ -256,6 +258,22 @@ export class SessionManager {
 
   currentTerminalHistoryCursor(sessionId: string): TerminalHistoryCursor {
     return this.store.currentTerminalHistoryCursor(sessionId);
+  }
+
+  setTerminalLogRetentionDays(days: number): Promise<void> {
+    this.store.setTerminalLogRetentionDays(days);
+    this.retentionCleanupRequested = true;
+    if (!this.retentionCleanupPromise) {
+      this.retentionCleanupPromise = (async () => {
+        while (this.retentionCleanupRequested) {
+          this.retentionCleanupRequested = false;
+          await this.store.enforceTerminalLogRetention();
+        }
+      })().finally(() => {
+        this.retentionCleanupPromise = undefined;
+      });
+    }
+    return this.retentionCleanupPromise;
   }
 
   readHistoryDetail(request: ReadSessionHistoryDetailRequest): SessionHistoryDetail {

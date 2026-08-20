@@ -296,6 +296,11 @@ handleTrusted('runtime:get-info', () => ({
 handleTrusted(SETTINGS_CHANNELS.get, () => requireAppSettingsStore().get());
 handleTrusted(SETTINGS_CHANNELS.update, (_event, patch: AppSettingsPatch) => {
   const updated = requireAppSettingsStore().update(patch);
+  if (patch.logRetentionDays !== undefined && sessionManager) {
+    void sessionManager.setTerminalLogRetentionDays(updated.logRetentionDays).catch((error) => {
+      console.error('Unable to apply terminal log retention policy:', error);
+    });
+  }
   for (const window of BrowserWindow.getAllWindows()) {
     if (!window.webContents.isDestroyed()) {
       try {
@@ -750,11 +755,18 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
     if (!result.ok) throw new Error(`Unable to prepare Agent smoke Provider: ${result.message}`);
   }
   sessionManager = new SessionManager(
-    new SessionStore(join(app.getPath('userData'), 'sessions')),
+    new SessionStore(join(app.getPath('userData'), 'sessions'), {
+      terminalLogRetentionDays: appSettingsStore.get().logRetentionDays,
+    }),
     terminalService,
     hostStore,
     remoteFilesystemProvider,
   );
+  void sessionManager
+    .setTerminalLogRetentionDays(appSettingsStore.get().logRetentionDays)
+    .catch((error) => {
+      console.error('Unable to apply startup terminal log retention policy:', error);
+    });
   hostService = new HostService(
     hostStore,
     new HostCredentialStore(secretStore),
@@ -804,6 +816,7 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
         contextWindowTokens: provider.contextWindowTokens,
       });
     },
+    () => requireAppSettingsStore().get().defaultMaxRounds,
   );
   createMainWindow();
   void codexAppServerService.startIfBound();

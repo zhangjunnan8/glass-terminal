@@ -61,6 +61,8 @@ export interface SendAgentBackendMessageInput {
   systemPrompt: string;
   terminalContext: string;
   fileAccessMode: AgentFileAccessMode;
+  /** Frozen per turn by AgentService; changing settings affects the next turn only. */
+  maxRounds?: number;
   /** Required for every turn. Backends must not retain or synthesize a default gateway. */
   gateway: ToolGateway;
   signal: AbortSignal;

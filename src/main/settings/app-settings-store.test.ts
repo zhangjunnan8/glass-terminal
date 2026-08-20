@@ -44,6 +44,11 @@ describe('AppSettingsStore', () => {
     });
   });
 
+  it.each([1, 5, 40, 64])('accepts the supported %i-round runtime limit', (rounds) => {
+    const store = new AppSettingsStore(fixture());
+    expect(store.update({ defaultMaxRounds: rounds }).defaultMaxRounds).toBe(rounds);
+  });
+
   it('drops unknown fields and falls back on invalid values', () => {
     const path = fixture();
     mkdirSync(dirname(path), { recursive: true });

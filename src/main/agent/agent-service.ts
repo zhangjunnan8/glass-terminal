@@ -497,6 +497,7 @@ export class AgentService {
   private readonly removeSensitiveSubmissionListener: () => void;
   private readonly fileService: AgentFileService;
   private readonly genericBackendFactory: GenericBackendFactory;
+  private readonly genericMaxRounds: () => number;
 
   constructor(
     private readonly terminals: TerminalService,
@@ -505,12 +506,14 @@ export class AgentService {
     private readonly codexAppServer?: CodexAppServerService,
     fileService?: AgentFileService,
     genericBackendFactory?: GenericBackendFactory,
+    genericMaxRounds?: () => number,
   ) {
     this.fileService = fileService ?? new AgentFileService(terminals, sessions);
     this.genericBackendFactory = genericBackendFactory
       ?? (() => {
         throw new Error('No Generic Provider harness is configured for this Agent Service.');
       });
+    this.genericMaxRounds = genericMaxRounds ?? (() => 40);
     this.removeExitListener = terminals.onExit((terminalId, ownerId) => {
       this.handleTerminalExit(terminalId, ownerId);
     });
@@ -1250,6 +1253,7 @@ export class AgentService {
     token: number,
     prompt: string,
     controlLeaseId?: string,
+    maxRounds?: number,
   ): Promise<void> {
     if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
       await this.runCodexTurn(runtime, token, prompt, controlLeaseId);
@@ -1488,6 +1492,7 @@ export class AgentService {
         terminalContext,
         fileAccessMode: runtime.fileAccessMode,
         gateway,
+        maxRounds,
         signal,
         onEvent,
       });
@@ -2623,6 +2628,9 @@ export class AgentService {
   ): AgentSessionView {
     runtime.turnToken += 1;
     const token = runtime.turnToken;
+    const maxRounds = runtime.backend.kind === 'generic-provider'
+      ? this.genericMaxRounds()
+      : undefined;
     runtime.abortController = new AbortController();
     runtime.error = undefined;
     runtime.activeExecution = undefined;
@@ -2650,7 +2658,7 @@ export class AgentService {
       this.setLockedState(runtime, 'THINKING');
     }
     this.emit(runtime);
-    void this.runTurn(runtime, token, prompt, runtime.controlLeaseId);
+    void this.runTurn(runtime, token, prompt, runtime.controlLeaseId, maxRounds);
     return cloneView(runtime);
   }
 
