@@ -139,6 +139,9 @@ It replaces the in-house `AgentLoop` while keeping every boundary below it intac
   streamed chunks via `collapseToolCallChunks`.
 - The harness owns no PTY, SSH, SFTP, or filesystem client; those remain under
   `TerminalService` and `AgentFileService`, reachable only through `ToolGateway`.
+- One Generic harness turn is bounded to 40 rounds by default (configurable
+  1–64 in the Settings window, hard cap 64), replacing the older 12-round
+  in-house `AgentLoop` cap.
 
 ## Known large-workspace limits
 

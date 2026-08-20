@@ -59,9 +59,10 @@
 
 ## 构建与发布状态
 
-当前 `npm run build` 只编译 renderer 与 Electron main/preload，不生成 `.exe` 或
-Windows Portable 包。发布打包仍需复制完整 Codex vendor 资源、处理代码签名/
-SmartScreen 和第三方 NOTICE，并在干净 Windows 环境验收。
+`npm run package` 已可产出 `release/win-unpacked/` 绿色版（electron-builder `--dir`、
+asar=false、afterPack 收尾），无需安装即可运行。仍待完成的发布工作：复制完整 Codex
+vendor 资源到包内（当前自动检测/手动选择外部 `codex.exe` 均可工作，但绿色版不自带）、
+代码签名/SmartScreen、第三方 NOTICE 收集，以及在干净 Windows 环境验收。
 
 ## 当前验证范围
 
