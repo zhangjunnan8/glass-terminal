@@ -560,7 +560,7 @@ describe('native Codex App Server renderer mode', () => {
     await settle();
     await settle();
 
-    const onExit = vi.mocked(bridge.terminal.onExit).mock.calls[0]![0];
+    const onExit = vi.mocked(bridge.terminal.onExit).mock.calls[0]![1];
     await act(async () => onExit({ terminalId: 'terminal-1', exitCode: 0 }));
     await settle();
 

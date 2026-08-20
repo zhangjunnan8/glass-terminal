@@ -14,6 +14,19 @@ import { CODEX_APP_SERVER_CHANNELS } from '../shared/codex-app-server';
 import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import { SETTINGS_CHANNELS, SETTINGS_WINDOW_CHANNELS } from '../shared/settings';
 import { BACKUP_CHANNELS, HOST_BACKUP_CHANNELS } from '../shared/backup';
+import { createTerminalEventDispatcher } from './terminal-event-dispatcher';
+
+const subscribeToTerminalData = createTerminalEventDispatcher<TerminalDataEvent>((dispatch) => {
+  ipcRenderer.on(TERMINAL_CHANNELS.data, (_event, payload: TerminalDataEvent) => {
+    dispatch(payload);
+  });
+});
+
+const subscribeToTerminalExit = createTerminalEventDispatcher<TerminalExitEvent>((dispatch) => {
+  ipcRenderer.on(TERMINAL_CHANNELS.exit, (_event, payload: TerminalExitEvent) => {
+    dispatch(payload);
+  });
+});
 
 const terminalBridge: DesktopBridge['terminal'] = {
   listShells: () => ipcRenderer.invoke(TERMINAL_CHANNELS.listShells),
@@ -37,20 +50,8 @@ const terminalBridge: DesktopBridge['terminal'] = {
     TERMINAL_CHANNELS.writeClipboardText,
     text,
   ),
-  onData: (listener) => {
-    const handler = (_event: Electron.IpcRendererEvent, payload: TerminalDataEvent) => {
-      listener(payload);
-    };
-    ipcRenderer.on(TERMINAL_CHANNELS.data, handler);
-    return () => ipcRenderer.removeListener(TERMINAL_CHANNELS.data, handler);
-  },
-  onExit: (listener) => {
-    const handler = (_event: Electron.IpcRendererEvent, payload: TerminalExitEvent) => {
-      listener(payload);
-    };
-    ipcRenderer.on(TERMINAL_CHANNELS.exit, handler);
-    return () => ipcRenderer.removeListener(TERMINAL_CHANNELS.exit, handler);
-  },
+  onData: subscribeToTerminalData,
+  onExit: subscribeToTerminalExit,
 };
 
 const hostBridge: DesktopBridge['hosts'] = {

@@ -291,12 +291,6 @@ export function App() {
     }).catch((error) => {
       setStartupError(errorMessage(error));
     });
-    const removeExitListener = window.aiTerminal.terminal.onExit((event) => {
-      setTabs((current) => current.map((tab) => (
-        tab.id === event.terminalId ? { ...tab, status: 'exited' } : tab
-      )));
-      void refreshSessions();
-    });
     const removeAgentListener = window.aiTerminal.agent.onStateChanged((state) => {
       setAgentStates((current) => mergeAgentState(current, state));
       setTabs((current) => current.map((tab) => (
@@ -326,11 +320,27 @@ export function App() {
       .catch((error: unknown) => setStartupError(errorMessage(error)));
     return () => {
       cancelled = true;
-      removeExitListener();
       removeAgentListener();
       removeCodexAppServerListener();
     };
   }, []);
+
+  const subscribedTerminalIds = tabs.map((tab) => tab.id).join('\0');
+  useEffect(() => {
+    if (!subscribedTerminalIds) return undefined;
+    const terminalIds = subscribedTerminalIds.split('\0');
+    const removeListeners = terminalIds.map((terminalId) => (
+      window.aiTerminal.terminal.onExit(terminalId, (event) => {
+        setTabs((current) => current.map((tab) => (
+          tab.id === event.terminalId ? { ...tab, status: 'exited' } : tab
+        )));
+        void refreshSessions();
+      })
+    ));
+    return () => {
+      for (const removeListener of removeListeners) removeListener();
+    };
+  }, [subscribedTerminalIds]);
 
   useEffect(() => {
     const handleOpenedTerminal = (event: Event) => {

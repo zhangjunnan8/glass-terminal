@@ -84,8 +84,14 @@ export interface DesktopBridge {
     close(terminalId: string): Promise<void>;
     readClipboardText(): Promise<string>;
     writeClipboardText(text: string): Promise<void>;
-    onData(listener: (event: TerminalDataEvent) => void): () => void;
-    onExit(listener: (event: TerminalExitEvent) => void): () => void;
+    onData(
+      terminalId: string,
+      listener: (event: TerminalDataEvent) => void,
+    ): () => void;
+    onExit(
+      terminalId: string,
+      listener: (event: TerminalExitEvent) => void,
+    ): () => void;
   };
   hosts: {
     list(): Promise<HostProfile[]>;

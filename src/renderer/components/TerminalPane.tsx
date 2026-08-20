@@ -112,13 +112,11 @@ export function TerminalPane({
       else void pasteClipboard();
       return false;
     });
-    const removeDataListener = window.aiTerminal.terminal.onData((event) => {
-      if (event.terminalId !== terminalId) return;
+    const removeDataListener = window.aiTerminal.terminal.onData(terminalId, (event) => {
       terminal.write(event.data);
       setHasOutput(true);
     });
-    const removeExitListener = window.aiTerminal.terminal.onExit((event) => {
-      if (event.terminalId !== terminalId) return;
+    const removeExitListener = window.aiTerminal.terminal.onExit(terminalId, (event) => {
       terminal.write(`\r\n\x1b[90m[进程已退出，退出码 ${event.exitCode}]\x1b[0m\r\n`);
     });
     void window.aiTerminal.terminal.attach(terminalId).then((pendingOutput) => {
