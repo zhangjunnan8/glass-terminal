@@ -487,6 +487,83 @@ describe('CodexAppServerTurnRunner native mode', () => {
     await expect(resultPromise).resolves.toMatchObject({ status: 'completed' });
   });
 
+  it('routes authoritative usage by thread and observes Codex compaction without invoking it', async () => {
+    const connection = new FakeConnection();
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));
+    const onContext = vi.fn();
+    runner.attach(connection);
+    const resultPromise = runner.run(createInput({ onContext }));
+    await waitForRequest(connection, 'turn/start');
+    const usage = (totalTokens: number) => ({
+      totalTokens,
+      inputTokens: totalTokens,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      reasoningOutputTokens: 0,
+    });
+
+    connection.emit('thread/tokenUsage/updated', {
+      threadId: 'another-thread',
+      tokenUsage: {
+        total: usage(900_000),
+        last: usage(12_000),
+        modelContextWindow: 64_000,
+      },
+    });
+    expect(onContext).not.toHaveBeenCalled();
+
+    connection.emit('thread/tokenUsage/updated', {
+      threadId: 'thread-new',
+      // Old compatible emitters may omit turnId.
+      tokenUsage: {
+        total: usage(900_000),
+        last: usage(12_000),
+        modelContextWindow: 64_000,
+      },
+    });
+    expect(onContext).toHaveBeenLastCalledWith({
+      type: 'usage-updated',
+      threadId: 'thread-new',
+      currentTokens: 12_000,
+      contextWindowTokens: 64_000,
+    });
+
+    connection.emit('thread/tokenUsage/updated', {
+      threadId: 'thread-new',
+      tokenUsage: {
+        total: usage(900_001),
+        last: usage(-1),
+        modelContextWindow: 64_000,
+      },
+    });
+    expect(onContext).toHaveBeenCalledTimes(1);
+
+    connection.emit('item/started', {
+      threadId: 'thread-new',
+      turnId: 'turn-1',
+      startedAtMs: 1_700_000_000_000,
+      item: { type: 'contextCompaction', id: 'compact-1' },
+    });
+    connection.emit('item/completed', {
+      threadId: 'thread-new',
+      turnId: 'turn-1',
+      completedAtMs: 1_700_000_001_000,
+      item: { type: 'contextCompaction', id: 'compact-1' },
+    });
+    expect(onContext).toHaveBeenNthCalledWith(2, expect.objectContaining({
+      type: 'compaction-started',
+      itemId: 'compact-1',
+    }));
+    expect(onContext).toHaveBeenNthCalledWith(3, expect.objectContaining({
+      type: 'compaction-completed',
+      occurredAt: '2023-11-14T22:13:21.000Z',
+    }));
+
+    completeTurn(connection);
+    await expect(resultPromise).resolves.toMatchObject({ status: 'completed' });
+    expect(connection.requests.some(({ method }) => method === 'thread/compact/start')).toBe(false);
+  });
+
   it('fails closed when the managed policy denies the workspace permission profile', async () => {
     const connection = new FakeConnection();
     connection.responder = (method) => {

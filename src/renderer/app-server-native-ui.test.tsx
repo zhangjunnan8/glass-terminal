@@ -336,6 +336,37 @@ describe('native Codex App Server renderer mode', () => {
     expect(container.querySelector('[data-testid="agent-codex-boundary"]')?.textContent)
       .toContain('当前终端始终由你控制');
     expect(container.querySelector('[data-testid="codex-agent-confirmation"]')).toBeNull();
+    const contextMeter = container.querySelector('[data-testid="agent-context-meter"]');
+    expect(contextMeter?.getAttribute('data-context-source')).toBe('provider-reported');
+    expect(contextMeter?.getAttribute('data-context-known')).toBe('false');
+    expect(contextMeter?.textContent).toContain('由 Codex 管理，等待用量数据');
+    expect(contextMeter?.textContent).not.toContain('0%');
+  });
+
+  it('shows provider-reported Codex usage in the shared circular meter', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    bridge.agent.getState = vi.fn().mockResolvedValue({
+      ...agentView(),
+      backend: { kind: CODEX_APP_SERVER_AGENT_BACKEND, policyVersion: 1 },
+      providerId: CODEX_APP_SERVER_AGENT_BACKEND,
+      contextUsage: {
+        source: 'provider-reported',
+        status: 'ready',
+        currentTokens: 32_000,
+        contextWindowTokens: 128_000,
+        percentage: 25,
+      },
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    const contextMeter = container.querySelector('[data-testid="agent-context-meter"]');
+    expect(contextMeter?.getAttribute('data-context-source')).toBe('provider-reported');
+    expect(contextMeter?.getAttribute('data-context-known')).toBe('true');
+    expect(contextMeter?.textContent).toContain('Codex 实际用量');
+    expect(contextMeter?.textContent).toContain('32k / 128k · 由 Codex 管理');
   });
 
   it('toggles only read access to current terminal through the native context API', async () => {

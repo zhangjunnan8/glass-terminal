@@ -12,7 +12,7 @@ import type {
   SendAgentBackendMessageInput,
 } from './agent-backend';
 import type { ToolGateway } from '../../shared/tools';
-import type { AgentContextUsage, AgentFileAccessMode } from '../../shared/agent';
+import type { AgentEstimatedContextUsage, AgentFileAccessMode } from '../../shared/agent';
 import { DEFAULT_CONTEXT_WINDOW_TOKENS } from '../../shared/context-window';
 import type { ProviderStore } from '../providers/provider-store';
 import {
@@ -466,7 +466,7 @@ export class LangChainBackend implements AgentBackend {
           : new Error('Structured context summary failed validation twice.');
       };
 
-      const refreshContext = async (): Promise<AgentContextUsage> => {
+      const refreshContext = async (): Promise<AgentEstimatedContextUsage> => {
         const before = agentContextUsage(
           transcript,
           this.contextWindowTokens,

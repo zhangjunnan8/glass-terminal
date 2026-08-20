@@ -5,6 +5,10 @@ import type {
   AppServerNotification,
   AppServerRequest,
 } from './app-server-client';
+import {
+  parseContextCompactionLifecycleV2,
+  parseThreadTokenUsageUpdatedV2,
+} from './app-server-protocol-v2';
 
 const DEFAULT_TERMINAL_READ_CHARS = 8_000;
 const MAX_TERMINAL_READ_CHARS = 30_000;
@@ -88,6 +92,23 @@ export interface CodexNativeApprovalEvent {
   itemId?: string;
 }
 
+export type CodexAppServerContextEvent =
+  | {
+    type: 'usage-updated';
+    threadId: string;
+    turnId?: string;
+    /** App Server's last/current turn usage; never tokenUsage.total lifetime usage. */
+    currentTokens: number;
+    contextWindowTokens?: number;
+  }
+  | {
+    type: 'compaction-started' | 'compaction-completed';
+    threadId: string;
+    turnId: string;
+    itemId: string;
+    occurredAt: string;
+  };
+
 export interface RunCodexTurnInput {
   prompt: string;
   model: string;
@@ -101,6 +122,7 @@ export interface RunCodexTurnInput {
   onThreadBound?(threadId: string): void;
   onDelta?(delta: string): void;
   onNativeApproval?(event: CodexNativeApprovalEvent): void;
+  onContext?(event: CodexAppServerContextEvent): void;
 }
 
 export interface RunCodexTurnResult {
@@ -368,7 +390,8 @@ function turnError(turn: Record<string, unknown>): string | undefined {
 }
 
 function isHandledTurnNotification(method: string): boolean {
-  return method === 'turn/started'
+  return method === 'thread/tokenUsage/updated'
+    || method === 'turn/started'
     || method === 'turn/completed'
     || method === 'item/agentMessage/delta'
     || method === 'item/started'
@@ -726,6 +749,27 @@ export class CodexAppServerTurnRunner {
     }
     if (!active.threadId || threadId !== active.threadId) return;
 
+    // Token telemetry is scoped authoritatively by thread. Older compatible
+    // App Servers can omit turnId, so it must not pass through turn filtering.
+    if (notification.method === 'thread/tokenUsage/updated') {
+      try {
+        const update = parseThreadTokenUsageUpdatedV2(params);
+        active.input.onContext?.({
+          type: 'usage-updated',
+          threadId: update.threadId,
+          ...(update.turnId ? { turnId: update.turnId } : {}),
+          currentTokens: update.tokenUsage.last.totalTokens,
+          ...(update.tokenUsage.modelContextWindow === null
+            ? {}
+            : { contextWindowTokens: update.tokenUsage.modelContextWindow }),
+        });
+      } catch {
+        // Telemetry is optional. Reject malformed/incompatible versions without
+        // failing the user's active turn or manufacturing a local estimate.
+      }
+      return;
+    }
+
     const candidateTurnId = notificationTurnId(notification);
     if (!candidateTurnId || candidateTurnId.length > MAX_PROTOCOL_ID_CHARS) {
       if (active.turnStartAcknowledged) {
@@ -803,6 +847,15 @@ export class CodexAppServerTurnRunner {
     }
 
     if (notification.method === 'item/started' || notification.method === 'item/completed') {
+      if (isRecord(params.item) && params.item.type === 'contextCompaction') {
+        try {
+          const event = parseContextCompactionLifecycleV2(notification.method, params);
+          if (event) active.input.onContext?.(event);
+        } catch {
+          // Provider lifecycle telemetry must never poison the active turn.
+        }
+        return;
+      }
       try {
         this.validateNotificationTurn(active, params);
         if (!isRecord(params.item)) {

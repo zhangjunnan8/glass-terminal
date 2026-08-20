@@ -554,6 +554,10 @@ export function App() {
     && activeGenericProviderId
     && selectedAgentBackend.providerId === activeGenericProviderId,
   );
+  const selectedCodexBackendMatchesActive = Boolean(
+    codexBackendSelected
+    && activeAgent?.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND,
+  );
   const selectedFileAccessMode: AgentFileAccessMode = !codexBackendSelected
     && selectedGenericBackendMatchesActive
     ? activeRuntimeFileAccessMode
@@ -2410,6 +2414,16 @@ export function App() {
               role="status"
             >{selectedAgentBackendStatus}</span>
           </div>
+          {agentControlsExpanded && codexBackendSelected && (
+            <div className="agent-controls">
+              <AgentContextMeter
+                providerManaged
+                usage={selectedCodexBackendMatchesActive
+                  ? activeAgent?.contextUsage
+                  : undefined}
+              />
+            </div>
+          )}
           {agentControlsExpanded && !codexBackendSelected && (
             <div className="agent-controls">
               <div className="agent-context-and-memory">

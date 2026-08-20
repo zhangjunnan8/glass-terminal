@@ -1,4 +1,4 @@
-import type { AgentContextUsage } from '../../shared/agent';
+import type { AgentContextUsage, AgentEstimatedContextUsage } from '../../shared/agent';
 import {
   CONTEXT_RECENT_KEEP_FRACTION,
   contextCompressionThreshold,
@@ -208,7 +208,7 @@ export function agentContextUsage(
   status: AgentContextUsage['status'] = 'ready',
   lastCompressedAt?: string,
   estimation: ContextEstimationOptions = {},
-): AgentContextUsage {
+): AgentEstimatedContextUsage {
   const normalizedWindow = normalizedContextWindowTokens(contextWindowTokens);
   const compressionThresholdTokens = contextCompressionThreshold(normalizedWindow);
   const budget = agentContextBudget(messages, normalizedWindow, estimation);
@@ -218,6 +218,7 @@ export function agentContextUsage(
     ? Number(estimation.providerReportedInputTokens)
     : undefined;
   return {
+    source: 'estimated',
     estimatedTokens: budget.estimatedTokens,
     messageEstimatedTokens: budget.messageEstimatedTokens,
     toolSchemaEstimatedTokens: budget.toolSchemaEstimatedTokens,

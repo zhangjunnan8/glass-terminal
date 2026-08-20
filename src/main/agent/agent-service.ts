@@ -10,6 +10,7 @@ import type {
   AgentBackendRef,
   AgentChatItem,
   AgentContextUsage,
+  AgentProviderContextUsage,
   AgentFileAccessMode,
   AgentFileAccessPolicy,
   AgentRuntimeState,
@@ -56,6 +57,7 @@ import {
   settleRunningToolActivities,
 } from './agent-tool-activity';
 import type { CodexAppServerService } from '../app-server/app-server-service';
+import type { CodexAppServerContextEvent } from '../app-server/app-server-turn-runner';
 import { SharedTerminalTool } from '../tools/shared-terminal-tool';
 import { SessionToolGateway } from '../tools/tool-gateway';
 import {
@@ -122,6 +124,71 @@ const BUSY_STATES = new Set<AgentRuntimeState>([
   'WAITING_AUTH',
   'TAKEOVER_PENDING',
 ]);
+
+function unknownCodexContextUsage(
+  status: AgentProviderContextUsage['status'] = 'ready',
+  previous?: AgentContextUsage,
+): AgentProviderContextUsage {
+  return {
+    source: 'provider-reported',
+    status,
+    ...(previous?.source === 'provider-reported' && previous.contextWindowTokens !== undefined
+      ? { contextWindowTokens: previous.contextWindowTokens }
+      : {}),
+    ...(previous?.lastCompressedAt ? { lastCompressedAt: previous.lastCompressedAt } : {}),
+  };
+}
+
+function reduceCodexContextUsage(
+  previous: AgentContextUsage | undefined,
+  event: CodexAppServerContextEvent,
+): AgentProviderContextUsage {
+  const providerPrevious = previous?.source === 'provider-reported' ? previous : undefined;
+  if (event.type === 'compaction-started') {
+    return {
+      source: 'provider-reported',
+      status: 'compressing',
+      ...(providerPrevious?.currentTokens !== undefined
+        ? { currentTokens: providerPrevious.currentTokens }
+        : {}),
+      ...(providerPrevious?.contextWindowTokens !== undefined
+        ? { contextWindowTokens: providerPrevious.contextWindowTokens }
+        : {}),
+      ...(providerPrevious?.percentage !== undefined
+        ? { percentage: providerPrevious.percentage }
+        : {}),
+      ...(providerPrevious?.lastCompressedAt
+        ? { lastCompressedAt: providerPrevious.lastCompressedAt }
+        : {}),
+    };
+  }
+  if (event.type === 'compaction-completed') {
+    // The pre-compaction occupancy is now stale. Keep only the known window and
+    // wait for Codex's next authoritative token update.
+    return {
+      ...unknownCodexContextUsage('ready', providerPrevious),
+      lastCompressedAt: event.occurredAt,
+    };
+  }
+  if (event.type !== 'usage-updated') return unknownCodexContextUsage('ready', providerPrevious);
+  const contextWindowTokens = event.contextWindowTokens
+    ?? providerPrevious?.contextWindowTokens;
+  const percentage = contextWindowTokens === undefined
+    ? undefined
+    : Math.max(0, Math.min(100, Math.round(
+      (event.currentTokens / contextWindowTokens) * 100,
+    )));
+  return {
+    source: 'provider-reported',
+    status: providerPrevious?.status ?? 'ready',
+    currentTokens: event.currentTokens,
+    ...(contextWindowTokens !== undefined ? { contextWindowTokens } : {}),
+    ...(percentage !== undefined ? { percentage } : {}),
+    ...(providerPrevious?.lastCompressedAt
+      ? { lastCompressedAt: providerPrevious.lastCompressedAt }
+      : {}),
+  };
+}
 
 const MAX_FILE_ACCESS_PATHS = 16;
 /** Upper bound on the ambient terminal context injected per turn. */
@@ -666,13 +733,13 @@ export class AgentService {
 
   handleCodexAppServerRestarted(): void {
     for (const runtime of this.runtimes.values()) {
-      if (
-        runtime.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND
-        || !runtime.backendTurnDraining
-      ) continue;
-      runtime.backendTurnDraining = false;
-      runtime.error = undefined;
-      this.setIndependentCodexState(runtime, 'PAUSED');
+      if (runtime.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND) continue;
+      runtime.contextUsage = unknownCodexContextUsage();
+      if (runtime.backendTurnDraining) {
+        runtime.backendTurnDraining = false;
+        runtime.error = undefined;
+        this.setIndependentCodexState(runtime, 'PAUSED');
+      }
       this.emit(runtime);
     }
   }
@@ -719,7 +786,9 @@ export class AgentService {
     );
     runtime.messages = replayed.messages;
     runtime.priorMessages = replayed.priorMessages;
-    runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
+    runtime.contextUsage = runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
+      ? unknownCodexContextUsage()
+      : this.contextUsageFor(runtime, runtime.priorMessages);
     runtime.activities = [];
     if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
       runtime.providerThreadId = replayed.providerThreadId;
@@ -1728,7 +1797,17 @@ export class AgentService {
           if (runtime.providerThreadId !== threadId) {
             this.sessions.bindProviderThread(runtime.sessionId, runtime.threadId, threadId);
             runtime.providerThreadId = threadId;
+            runtime.contextUsage = unknownCodexContextUsage();
+            this.emit(runtime);
           }
+        },
+        onContext: (event) => {
+          if (!this.isCurrentTurn(runtime, token)) return;
+          // App Server telemetry is thread-scoped. It must never leak across a
+          // selected/resumed Glass session, even if an old turn is still noisy.
+          if (!runtime.providerThreadId || event.threadId !== runtime.providerThreadId) return;
+          runtime.contextUsage = reduceCodexContextUsage(runtime.contextUsage, event);
+          this.emit(runtime);
         },
         onDelta: (delta) => {
           if (!delta || !this.isCurrentTurn(runtime, token)) return;
@@ -2191,7 +2270,7 @@ export class AgentService {
             safetyFactor: currentProvider?.contextEstimateSafetyFactor,
           },
         )
-        : undefined,
+        : unknownCodexContextUsage(),
       providerThreadId: canReuseThread && backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
         ? replayed.providerThreadId
         : undefined,
@@ -2622,7 +2701,9 @@ export class AgentService {
     runtime.fileAccessMode = 'off';
     runtime.fileAccessPolicy = disabledFileAccessPolicy();
     runtime.fileAccessRoot = undefined;
-    runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
+    runtime.contextUsage = runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
+      ? unknownCodexContextUsage()
+      : this.contextUsageFor(runtime, runtime.priorMessages);
   }
 
   private appendControlAudit(

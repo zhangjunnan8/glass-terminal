@@ -1,4 +1,4 @@
-import type { AgentContextUsage, AgentFileAccessMode } from '../../shared/agent';
+import type { AgentEstimatedContextUsage, AgentFileAccessMode } from '../../shared/agent';
 import type { AgentMemoryCard } from '../../shared/agent-memory';
 import type { ToolGateway } from '../../shared/tools';
 
@@ -26,7 +26,7 @@ export interface AgentBackendEvent {
   text?: string;
   toolCall?: AgentToolCall;
   result?: string;
-  contextUsage?: AgentContextUsage;
+  contextUsage?: AgentEstimatedContextUsage;
   compression?: { beforeTokens: number; afterTokens: number };
 }
 
@@ -35,7 +35,7 @@ export interface AgentBackendResult {
   messages: AgentMessage[];
   finalText: string;
   rounds: number;
-  contextUsage?: AgentContextUsage;
+  contextUsage?: AgentEstimatedContextUsage;
   contextPersistence?: {
     mode: 'delta' | 'checkpoint';
     messages: AgentMessage[];

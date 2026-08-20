@@ -16,6 +16,7 @@ describe('AgentContextMeter', () => {
     document.body.append(container);
     const root = createRoot(container);
     act(() => root.render(<AgentContextMeter usage={{
+      source: 'estimated',
       estimatedTokens: 27_200,
       messageEstimatedTokens: 20_000,
       toolSchemaEstimatedTokens: 3_600,
@@ -50,6 +51,7 @@ describe('AgentContextMeter', () => {
     document.body.append(container);
     const root = createRoot(container);
     act(() => root.render(<AgentContextMeter usage={{
+      source: 'estimated',
       estimatedTokens: 55_000,
       contextWindowTokens: 64_000,
       compressionThresholdTokens: 54_400,
@@ -61,6 +63,63 @@ describe('AgentContextMeter', () => {
     expect(container.querySelector('[role="progressbar"]')?.getAttribute('aria-label'))
       .toBe('正在压缩上下文');
     expect(container.textContent).toContain('正在压缩上下文');
+    act(() => root.unmount());
+  });
+
+  it('renders authoritative Codex usage without local estimate or auto-compaction claims', () => {
+    container = document.createElement('div');
+    document.body.append(container);
+    const root = createRoot(container);
+    act(() => root.render(<AgentContextMeter providerManaged usage={{
+      source: 'provider-reported',
+      currentTokens: 12_000,
+      contextWindowTokens: 64_000,
+      percentage: 19,
+      status: 'ready',
+    }} />));
+
+    const meter = container.querySelector('[data-testid="agent-context-meter"]');
+    expect(meter?.getAttribute('data-context-source')).toBe('provider-reported');
+    expect(meter?.getAttribute('data-context-known')).toBe('true');
+    expect(container.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow'))
+      .toBe('19');
+    expect(container.textContent).toContain('Codex 实际用量');
+    expect(container.textContent).toContain('12k / 64k · 由 Codex 管理');
+    expect(meter?.getAttribute('title')).toContain('不会主动触发压缩');
+    expect(meter?.getAttribute('title')).not.toContain('自动压缩');
+    act(() => root.unmount());
+  });
+
+  it('renders old or silent Codex versions as neutral unknown instead of zero percent', () => {
+    container = document.createElement('div');
+    document.body.append(container);
+    const root = createRoot(container);
+    act(() => root.render(<AgentContextMeter providerManaged usage={{
+      source: 'provider-reported',
+      status: 'ready',
+    }} />));
+
+    const meter = container.querySelector('[data-testid="agent-context-meter"]');
+    const progress = container.querySelector('[role="progressbar"]');
+    expect(meter?.getAttribute('data-context-known')).toBe('false');
+    expect(progress?.hasAttribute('aria-valuenow')).toBe(false);
+    expect(container.textContent).toContain('由 Codex 管理，等待用量数据');
+    expect(container.textContent).not.toContain('0%');
+    expect(container.textContent).not.toContain('估算');
+    act(() => root.unmount());
+  });
+
+  it('shows the provider-managed compaction lifecycle', () => {
+    container = document.createElement('div');
+    document.body.append(container);
+    const root = createRoot(container);
+    act(() => root.render(<AgentContextMeter providerManaged usage={{
+      source: 'provider-reported',
+      status: 'compressing',
+    }} />));
+    expect(container.textContent).toContain('Codex 正在压缩上下文');
+    expect(container.querySelector('[role="progressbar"]')?.getAttribute('aria-valuenow'))
+      .toBeNull();
     act(() => root.unmount());
   });
 });

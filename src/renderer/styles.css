@@ -474,6 +474,8 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .agent-context-meter.warning .agent-context-ring strong { color: #e7ba6e; }
 .agent-context-meter.compressing { border-color: #3d7c6c; background: #10251f; }
 .agent-context-meter.compressing .agent-context-ring-value { stroke: #77ddbd; animation: context-ring-pulse 900ms ease-in-out infinite alternate; }
+.agent-context-meter.unknown .agent-context-ring-value { stroke: #536377; }
+.agent-context-meter.unknown .agent-context-ring strong { color: #8291a4; }
 .agent-context-and-memory { display: grid; width: 100%; grid-template-columns: minmax(0, 1fr) auto; align-items: stretch; gap: 6px; }
 .agent-context-and-memory .agent-context-meter { margin: 0; }
 .agent-memory-control { position: relative; }
@@ -1360,6 +1362,8 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .app-shell[data-theme="light"] .agent-context-copy small { color: #65758a; }
 .app-shell[data-theme="light"] .agent-context-meter.warning .agent-context-ring-value { stroke: #a96800; }
 .app-shell[data-theme="light"] .agent-context-meter.compressing { border-color: #89bfae; background: #edf8f4; }
+.app-shell[data-theme="light"] .agent-context-meter.unknown .agent-context-ring-value { stroke: #8a99aa; }
+.app-shell[data-theme="light"] .agent-context-meter.unknown .agent-context-ring strong { color: #6e7f92; }
 .app-shell[data-theme="light"] .agent-header .agent-memory-trigger { color: #116e5b; border-color: #a8cfc3; background: #edf8f4; }
 .app-shell[data-theme="light"] .agent-memory-panel { color: #334158; border-color: #b9c7d5; background: #ffffff; box-shadow: 0 16px 48px #26384a33; }
 .app-shell[data-theme="light"] .agent-memory-panel > header small,

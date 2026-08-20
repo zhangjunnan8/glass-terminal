@@ -740,6 +740,11 @@ class DeferredStreamingCodexAppServer {
     this.input.onDelta?.(delta);
   }
 
+  context(event: Parameters<NonNullable<RunCodexTurnInput['onContext']>>[0]): void {
+    if (!this.input) throw new Error('Codex turn has not started.');
+    this.input.onContext?.(event);
+  }
+
   finish(finalText: string): void {
     if (!this.resolveTurn) throw new Error('Codex turn has not started.');
     this.resolveTurn({
@@ -1371,6 +1376,7 @@ describe('AgentService shared-terminal controls', () => {
     backend.emit({
       type: 'context_status',
       contextUsage: {
+        source: 'estimated',
         estimatedTokens: 54_400,
         contextWindowTokens: 64_000,
         compressionThresholdTokens: 54_400,
@@ -1386,6 +1392,7 @@ describe('AgentService shared-terminal controls', () => {
     backend.emit({
       type: 'context_status',
       contextUsage: {
+        source: 'estimated',
         estimatedTokens: 8_000,
         contextWindowTokens: 64_000,
         compressionThresholdTokens: 54_400,
@@ -3176,6 +3183,162 @@ describe('AgentService shared-terminal controls', () => {
       id: partialId,
       content: '**部分输出**',
     });
+  });
+
+  it('publishes only thread-matched Codex usage and invalidates stale values after compaction or restart', async () => {
+    const codex = new DeferredStreamingCodexAppServer();
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      codex as unknown as CodexAppServerService,
+    );
+
+    const started = service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Report current context.',
+      backend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      },
+    });
+    expect(started.contextUsage).toEqual({ source: 'provider-reported', status: 'ready' });
+    await waitFor(() => Boolean(codex.input));
+
+    codex.context({
+      type: 'usage-updated',
+      threadId: 'stale-thread',
+      currentTokens: 60_000,
+      contextWindowTokens: 64_000,
+    });
+    expect(service.getState(owner, 'terminal')?.contextUsage)
+      .toEqual({ source: 'provider-reported', status: 'ready' });
+
+    codex.context({
+      type: 'usage-updated',
+      threadId: 'provider-thread-stream',
+      currentTokens: 12_000,
+      contextWindowTokens: 64_000,
+    });
+    expect(service.getState(owner, 'terminal')?.contextUsage).toEqual({
+      source: 'provider-reported',
+      status: 'ready',
+      currentTokens: 12_000,
+      contextWindowTokens: 64_000,
+      percentage: 19,
+    });
+
+    codex.context({
+      type: 'compaction-started',
+      threadId: 'provider-thread-stream',
+      turnId: 'provider-turn-stream',
+      itemId: 'compact-1',
+      occurredAt: '2026-08-21T00:00:00.000Z',
+    });
+    expect(service.getState(owner, 'terminal')?.contextUsage).toMatchObject({
+      source: 'provider-reported', status: 'compressing', currentTokens: 12_000,
+    });
+    codex.context({
+      type: 'compaction-completed',
+      threadId: 'provider-thread-stream',
+      turnId: 'provider-turn-stream',
+      itemId: 'compact-1',
+      occurredAt: '2026-08-21T00:00:01.000Z',
+    });
+    expect(service.getState(owner, 'terminal')?.contextUsage).toEqual({
+      source: 'provider-reported',
+      status: 'ready',
+      contextWindowTokens: 64_000,
+      lastCompressedAt: '2026-08-21T00:00:01.000Z',
+    });
+
+    codex.context({
+      type: 'usage-updated',
+      threadId: 'provider-thread-stream',
+      currentTokens: 4_000,
+      contextWindowTokens: 64_000,
+    });
+    expect(service.getState(owner, 'terminal')?.contextUsage).toMatchObject({
+      currentTokens: 4_000, percentage: 6,
+    });
+    service.handleCodexAppServerRestarted();
+    expect(service.getState(owner, 'terminal')?.contextUsage)
+      .toEqual({ source: 'provider-reported', status: 'ready' });
+
+    codex.finish('done');
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+  });
+
+  it('invalidates provider usage when a Codex conversation is replayed after retract', async () => {
+    const codex = new DeferredStreamingCodexAppServer();
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      codex as unknown as CodexAppServerService,
+    );
+    const started = service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'A very long resumed conversation.',
+      backend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      },
+    });
+    const messageId = started.messages.find((message) => message.role === 'user')!.id;
+    await waitFor(() => Boolean(codex.input));
+    codex.context({
+      type: 'usage-updated',
+      threadId: 'provider-thread-stream',
+      currentTokens: 48_000,
+      contextWindowTokens: 64_000,
+    });
+    codex.finish('done');
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    expect(service.getState(owner, 'terminal')?.contextUsage).toMatchObject({
+      source: 'provider-reported', currentTokens: 48_000,
+    });
+
+    const retracted = service.revisePrompt(owner, {
+      terminalId: 'terminal', messageId, action: 'retract',
+    });
+    expect(retracted.contextUsage).toEqual({ source: 'provider-reported', status: 'ready' });
+  });
+
+  it('restores a long persisted Codex session with unknown usage until App Server reports it', () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      runtimeTerminalId: 'reconnected-terminal',
+      aiThreadId: '33333333-3333-3333-3333-333333333333',
+      agentBackend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      },
+      providerId: CODEX_APP_SERVER_AGENT_BACKEND,
+      providerThreadId: 'provider-thread-long',
+    };
+    sessions.persistedThreadEvents = Array.from({ length: 120 }, (_, index) => ({
+      type: 'chat',
+      timestamp: new Date(index + 1).toISOString(),
+      item: {
+        id: `message-${index}`,
+        role: index % 2 === 0 ? 'user' : 'assistant',
+        content: `Persisted message ${index}`,
+        createdAt: new Date(index + 1).toISOString(),
+      },
+    }));
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+    );
+
+    const restored = service.getState(browserOwner(), 'reconnected-terminal');
+    expect(restored?.messages).toHaveLength(120);
+    expect(restored?.contextUsage).toEqual({ source: 'provider-reported', status: 'ready' });
   });
 
   it('keeps the visible terminal human-owned and disables manual takeover for App Server', async () => {

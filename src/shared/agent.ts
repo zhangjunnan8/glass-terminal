@@ -112,7 +112,28 @@ export interface AgentToolActivity {
   turnId?: string;
 }
 
-export interface AgentContextUsage {
+interface AgentContextUsageBase {
+  /** Identifies whether Glass estimated this value or Codex reported it. */
+  source: 'estimated' | 'provider-reported';
+  status: 'ready' | 'compressing';
+  lastCompressedAt?: string;
+  // Optional on the shared union so diagnostic consumers can inspect a metric
+  // after checking its source. Estimated sessions make these fields required.
+  estimatedTokens?: number;
+  messageEstimatedTokens?: number;
+  toolSchemaEstimatedTokens?: number;
+  fixedOverheadTokens?: number;
+  safetyFactor?: number;
+  boundToolCount?: number;
+  providerReportedInputTokens?: number;
+  currentTokens?: number;
+  contextWindowTokens?: number;
+  compressionThresholdTokens?: number;
+  percentage?: number;
+}
+
+export interface AgentEstimatedContextUsage extends AgentContextUsageBase {
+  source: 'estimated';
   /** Conservative final estimate after fixed overhead and the safety factor. */
   estimatedTokens: number;
   /** Message-only estimate before the safety factor. */
@@ -133,9 +154,19 @@ export interface AgentContextUsage {
   compressionThresholdTokens: number;
   /** Usage against the compression threshold, clamped to 0-100 for the UI. */
   percentage: number;
-  status: 'ready' | 'compressing';
-  lastCompressedAt?: string;
 }
+
+export interface AgentProviderContextUsage extends AgentContextUsageBase {
+  source: 'provider-reported';
+  /** Current context occupancy reported for the latest Codex turn, not lifetime usage. */
+  currentTokens?: number;
+  /** Codex model context window. Missing means the installed CLI has not reported it. */
+  contextWindowTokens?: number;
+  /** Current occupancy against the Codex model window. Missing is rendered as unknown. */
+  percentage?: number;
+}
+
+export type AgentContextUsage = AgentEstimatedContextUsage | AgentProviderContextUsage;
 
 export interface AgentSessionView {
   revision: number;
@@ -162,7 +193,7 @@ export interface AgentSessionView {
   memories?: AgentMemoryCard[];
   /** Bounded, metadata-only summaries of recent tool use. */
   activities: AgentToolActivity[];
-  /** Present for Generic Provider sessions; Codex owns its context internally. */
+  /** Generic estimates or authoritative Codex provider-managed context state. */
   contextUsage?: AgentContextUsage;
   streamingMessageId?: string;
   /** Stable local turn identity for validating Assistant delta events. */
