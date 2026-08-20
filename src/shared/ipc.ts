@@ -63,7 +63,9 @@ import type { AppSettings, AppSettingsPatch } from './settings';
 import type {
   BackupExportRequest,
   BackupExportResult,
-  BackupImportResult,
+  BackupImportRequest,
+  BackupImportResponse,
+  HostBackupExportRequest,
 } from './backup';
 
 export interface RuntimeInfo {
@@ -184,11 +186,11 @@ export interface DesktopBridge {
   };
   backup: {
     export(request: BackupExportRequest): Promise<BackupExportResult | null>;
-    import(): Promise<BackupImportResult | null>;
+    import(request?: BackupImportRequest): Promise<BackupImportResponse | null>;
   };
   hostBackup: {
-    export(): Promise<BackupExportResult | null>;
-    import(): Promise<BackupImportResult | null>;
+    export(request?: HostBackupExportRequest): Promise<BackupExportResult | null>;
+    import(request?: BackupImportRequest): Promise<BackupImportResponse | null>;
   };
   settingsWindow: {
     open(): Promise<void>;

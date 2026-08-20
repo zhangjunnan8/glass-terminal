@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { AppSettings } from '../shared/settings';
+import type { BackupImportChallenge, BackupImportResponse } from '../shared/backup';
 import { AiServiceSettings } from './AiServiceSettings';
 import { useSystemTheme } from './theme';
 
@@ -7,6 +8,12 @@ type SettingsSection = 'general' | 'ai' | 'data';
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isImportChallenge(
+  response: BackupImportResponse,
+): response is BackupImportChallenge {
+  return 'challenge' in response;
 }
 
 export function SettingsWindow() {
@@ -17,6 +24,11 @@ export function SettingsWindow() {
   const [backupMessage, setBackupMessage] = useState<string | null>(null);
   const [backupPending, setBackupPending] = useState(false);
   const [includeLogs, setIncludeLogs] = useState(false);
+  const [includeCredentials, setIncludeCredentials] = useState(false);
+  const [exportPassphrase, setExportPassphrase] = useState('');
+  const [exportPassphraseConfirmation, setExportPassphraseConfirmation] = useState('');
+  const [importChallenge, setImportChallenge] = useState<BackupImportChallenge | null>(null);
+  const [importPassphrase, setImportPassphrase] = useState('');
   const [version, setVersion] = useState('');
   const systemTheme = useSystemTheme();
 
@@ -72,41 +84,89 @@ export function SettingsWindow() {
   }, [draft, settings]);
 
   const exportBackup = useCallback(async () => {
+    if (includeCredentials && exportPassphrase.trim().length < 12) {
+      setBackupMessage('包含凭据时，备份口令至少需要 12 个字符。');
+      return;
+    }
+    if (includeCredentials && exportPassphrase !== exportPassphraseConfirmation) {
+      setBackupMessage('两次输入的备份口令不一致。');
+      return;
+    }
     setBackupPending(true);
     setBackupMessage(null);
     try {
-      const result = await window.aiTerminal.backup.export({ includeLogs });
+      const result = await window.aiTerminal.backup.export({
+        includeLogs,
+        includeCredentials,
+        ...(includeCredentials ? {
+          passphrase: exportPassphrase,
+          passphraseConfirmation: exportPassphraseConfirmation,
+        } : {}),
+      });
       if (result) {
-        setBackupMessage(`已导出 ${result.sections.length} 个分区（${result.bytes} 字节）。`);
+        setBackupMessage(
+          `已导出 ${result.sections.length} 个分区（${result.bytes} 字节）${result.encrypted ? '，整包已加密' : '，未包含凭据'}。`,
+        );
+        setExportPassphrase('');
+        setExportPassphraseConfirmation('');
       }
     } catch (error) {
       setBackupMessage(errorMessage(error));
     } finally {
       setBackupPending(false);
     }
-  }, [includeLogs]);
+  }, [exportPassphrase, exportPassphraseConfirmation, includeCredentials, includeLogs]);
+
+  const applyImportResponse = useCallback((response: BackupImportResponse) => {
+    if (isImportChallenge(response)) {
+      setImportChallenge(response);
+      setImportPassphrase('');
+      setBackupMessage(response.message);
+      return;
+    }
+    setImportChallenge(null);
+    setImportPassphrase('');
+    const skipped = response.sectionsSkipped.length
+      ? `，跳过 ${response.sectionsSkipped.length} 个分区`
+      : '';
+    setBackupMessage(
+      response.needsRestart
+        ? `已导入 ${response.sectionsImported.length} 个分区${skipped}。重启后生效。`
+        : `已导入 ${response.sectionsImported.length} 个分区${skipped}。`,
+    );
+  }, []);
 
   const importBackup = useCallback(async () => {
     setBackupPending(true);
     setBackupMessage(null);
     try {
       const result = await window.aiTerminal.backup.import();
-      if (result) {
-        const skipped = result.sectionsSkipped.length
-          ? `，跳过 ${result.sectionsSkipped.length} 个分区`
-          : '';
-        setBackupMessage(
-          result.needsRestart
-            ? `已导入 ${result.sectionsImported.length} 个分区${skipped}。重启后生效。`
-            : `已导入 ${result.sectionsImported.length} 个分区${skipped}。`,
-        );
-      }
+      if (result) applyImportResponse(result);
     } catch (error) {
       setBackupMessage(errorMessage(error));
     } finally {
       setBackupPending(false);
     }
-  }, []);
+  }, [applyImportResponse]);
+
+  const continueBackupImport = useCallback(async () => {
+    if (!importChallenge) return;
+    setBackupPending(true);
+    setBackupMessage(null);
+    try {
+      const result = await window.aiTerminal.backup.import({
+        token: importChallenge.token,
+        ...(importChallenge.challenge === 'passphrase-required'
+          ? { passphrase: importPassphrase }
+          : { confirmLegacyPlaintext: true }),
+      });
+      if (result) applyImportResponse(result);
+    } catch (error) {
+      setBackupMessage(errorMessage(error));
+    } finally {
+      setBackupPending(false);
+    }
+  }, [applyImportResponse, importChallenge, importPassphrase]);
 
   const dirty = Boolean(
     draft && settings && JSON.stringify(draft) !== JSON.stringify(settings),
@@ -217,8 +277,8 @@ export function SettingsWindow() {
           <section className="settings-card">
             <h2>数据导出与导入</h2>
             <p className="settings-description">
-              导出将生成一个可移植的备份文件，包含通用偏好、Provider 配置与 Provider
-              API Key。SSH 主机配置独立管理，不包含在通用备份中。导入后需要重启应用生效。
+              导出默认只包含通用偏好与 Provider 配置，不包含 API Key。SSH 主机配置独立管理。
+              如显式包含凭据，整个备份（包括内部文件名）都会使用口令加密。导入后需要重启应用生效。
             </p>
 
             <div className="settings-actions">
@@ -230,7 +290,46 @@ export function SettingsWindow() {
                 />
                 <span>包含会话日志</span>
               </label>
+              <label className="settings-check">
+                <input
+                  type="checkbox"
+                  data-testid="backup-include-credentials"
+                  checked={includeCredentials}
+                  onChange={(event) => {
+                    setIncludeCredentials(event.target.checked);
+                    if (!event.target.checked) {
+                      setExportPassphrase('');
+                      setExportPassphraseConfirmation('');
+                    }
+                  }}
+                />
+                <span>包含 Provider API Key（必须整包加密）</span>
+              </label>
             </div>
+
+            {includeCredentials && (
+              <div className="settings-backup-passphrases" data-testid="backup-passphrase-fields">
+                <label className="settings-field">
+                  <span>备份口令</span>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={exportPassphrase}
+                    onChange={(event) => setExportPassphrase(event.target.value)}
+                  />
+                </label>
+                <label className="settings-field">
+                  <span>再次输入口令</span>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={exportPassphraseConfirmation}
+                    onChange={(event) => setExportPassphraseConfirmation(event.target.value)}
+                  />
+                </label>
+                <p className="settings-hint">口令不会保存；遗失后无法恢复加密备份。</p>
+              </div>
+            )}
 
             <div className="settings-actions">
               <button
@@ -253,6 +352,50 @@ export function SettingsWindow() {
           </section>
         )}
       </main>
+      {importChallenge && (
+        <div className="modal-backdrop" data-testid="backup-import-challenge">
+          <section className="modal backup-import-modal" role="dialog" aria-modal="true">
+            <h2>{importChallenge.challenge === 'passphrase-required'
+              ? '解密备份'
+              : '旧版明文备份风险确认'}</h2>
+            <p>{importChallenge.message}</p>
+            {importChallenge.challenge === 'passphrase-required' && (
+              <label>
+                <span>备份口令</span>
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  autoFocus
+                  value={importPassphrase}
+                  onChange={(event) => setImportPassphrase(event.target.value)}
+                />
+              </label>
+            )}
+            <div className="modal-actions">
+              <button
+                type="button"
+                disabled={backupPending}
+                onClick={() => {
+                  setImportChallenge(null);
+                  setImportPassphrase('');
+                }}
+              >取消</button>
+              <button
+                type="button"
+                className="danger-action"
+                disabled={
+                  backupPending
+                  || (
+                    importChallenge.challenge === 'passphrase-required'
+                    && !importPassphrase
+                  )
+                }
+                onClick={() => void continueBackupImport()}
+              >{importChallenge.challenge === 'passphrase-required' ? '解密并导入' : '确认风险并导入'}</button>
+            </div>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

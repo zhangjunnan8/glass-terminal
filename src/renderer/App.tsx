@@ -19,6 +19,7 @@ import {
 import type { RuntimeInfo } from '../shared/ipc';
 import { PRODUCT_NAME } from '../shared/product';
 import type { AppSettings } from '../shared/settings';
+import type { BackupImportChallenge, BackupImportResponse } from '../shared/backup';
 import type { SessionRecord } from '../shared/session';
 import type { ProviderProfile } from '../shared/provider';
 import {
@@ -125,6 +126,12 @@ interface FileAccessChallenge {
 type AgentBackendKind = AgentBackendRef['kind'];
 type SidebarView = 'terminals' | 'hosts' | 'history';
 
+function isBackupImportChallenge(
+  response: BackupImportResponse,
+): response is BackupImportChallenge {
+  return 'challenge' in response;
+}
+
 const CODEX_AGENT_BACKEND: AgentBackendRef = {
   kind: CODEX_APP_SERVER_AGENT_BACKEND,
   policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
@@ -200,6 +207,13 @@ export function App() {
   const [hostFolderActionPending, setHostFolderActionPending] = useState(false);
   const [hostTreeDrag, setHostTreeDrag] = useState<HostTreeDrag | null>(null);
   const [hostBackupNotice, setHostBackupNotice] = useState<string | null>(null);
+  const [hostBackupExportOpen, setHostBackupExportOpen] = useState(false);
+  const [hostBackupIncludeCredentials, setHostBackupIncludeCredentials] = useState(false);
+  const [hostBackupPassphrase, setHostBackupPassphrase] = useState('');
+  const [hostBackupPassphraseConfirmation, setHostBackupPassphraseConfirmation] = useState('');
+  const [hostBackupImportChallenge, setHostBackupImportChallenge] = useState<BackupImportChallenge | null>(null);
+  const [hostBackupImportPassphrase, setHostBackupImportPassphrase] = useState('');
+  const [hostBackupPending, setHostBackupPending] = useState(false);
   const [sessions, setSessions] = useState<SessionRecord[]>([]);
   const [providers, setProviders] = useState<ProviderProfile[]>([]);
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
@@ -727,30 +741,89 @@ export function App() {
   }
 
   async function exportHosts() {
+    if (hostBackupIncludeCredentials && hostBackupPassphrase.trim().length < 12) {
+      setHostBackupNotice('包含 SSH 凭据时，备份口令至少需要 12 个字符。');
+      return;
+    }
+    if (
+      hostBackupIncludeCredentials
+      && hostBackupPassphrase !== hostBackupPassphraseConfirmation
+    ) {
+      setHostBackupNotice('两次输入的备份口令不一致。');
+      return;
+    }
     setHostBackupNotice(null);
+    setHostBackupPending(true);
     try {
-      const result = await window.aiTerminal.hostBackup.export();
-      if (result) setHostBackupNotice(`已导出 ${result.sections.length} 个分区。`);
+      const result = await window.aiTerminal.hostBackup.export({
+        includeCredentials: hostBackupIncludeCredentials,
+        ...(hostBackupIncludeCredentials ? {
+          passphrase: hostBackupPassphrase,
+          passphraseConfirmation: hostBackupPassphraseConfirmation,
+        } : {}),
+      });
+      if (result) {
+        setHostBackupNotice(
+          `已导出 ${result.sections.length} 个分区${result.encrypted ? '，整包已加密' : '，未包含 SSH 凭据'}。`,
+        );
+        setHostBackupExportOpen(false);
+        setHostBackupPassphrase('');
+        setHostBackupPassphraseConfirmation('');
+      }
     } catch (error) {
       setHostBackupNotice(errorMessage(error));
+    } finally {
+      setHostBackupPending(false);
     }
+  }
+
+  async function applyHostImportResponse(response: BackupImportResponse): Promise<void> {
+    if (isBackupImportChallenge(response)) {
+      setHostBackupImportChallenge(response);
+      setHostBackupImportPassphrase('');
+      setHostBackupNotice(response.message);
+      return;
+    }
+    setHostBackupImportChallenge(null);
+    setHostBackupImportPassphrase('');
+    await refreshHosts();
+    await refreshHostFolders();
+    setHostBackupNotice(
+      response.needsRestart
+        ? `已导入 ${response.sectionsImported.length} 个分区，重启后生效。`
+        : `已导入 ${response.sectionsImported.length} 个分区。`,
+    );
   }
 
   async function importHosts() {
     setHostBackupNotice(null);
+    setHostBackupPending(true);
     try {
       const result = await window.aiTerminal.hostBackup.import();
-      if (result) {
-        await refreshHosts();
-        await refreshHostFolders();
-        setHostBackupNotice(
-          result.needsRestart
-            ? `已导入 ${result.sectionsImported.length} 个分区，重启后生效。`
-            : `已导入 ${result.sectionsImported.length} 个分区。`,
-        );
-      }
+      if (result) await applyHostImportResponse(result);
     } catch (error) {
       setHostBackupNotice(errorMessage(error));
+    } finally {
+      setHostBackupPending(false);
+    }
+  }
+
+  async function continueHostImport() {
+    if (!hostBackupImportChallenge) return;
+    setHostBackupNotice(null);
+    setHostBackupPending(true);
+    try {
+      const result = await window.aiTerminal.hostBackup.import({
+        token: hostBackupImportChallenge.token,
+        ...(hostBackupImportChallenge.challenge === 'passphrase-required'
+          ? { passphrase: hostBackupImportPassphrase }
+          : { confirmLegacyPlaintext: true }),
+      });
+      if (result) await applyHostImportResponse(result);
+    } catch (error) {
+      setHostBackupNotice(errorMessage(error));
+    } finally {
+      setHostBackupPending(false);
     }
   }
 
@@ -1740,8 +1813,13 @@ export function App() {
             : sidebarView === 'hosts' ? '主机' : '会话历史'}</span>
           {sidebarView === 'hosts' && (
             <>
-              <button title="导出主机配置" onClick={() => void exportHosts()}>⇩</button>
-              <button title="导入主机配置" onClick={() => void importHosts()}>⇧</button>
+              <button title="导出主机配置" onClick={() => {
+                setHostBackupIncludeCredentials(false);
+                setHostBackupPassphrase('');
+                setHostBackupPassphraseConfirmation('');
+                setHostBackupExportOpen(true);
+              }}>⇩</button>
+              <button title="导入主机配置" disabled={hostBackupPending} onClick={() => void importHosts()}>⇧</button>
               <button title="添加主机" onClick={() => openHostEditor(null)}>＋</button>
             </>
           )}
@@ -2986,6 +3064,114 @@ export function App() {
               >{fileAccessChallenge.mode === 'full-access'
                   ? '我已了解风险，允许完整文件系统访问'
                   : '允许本次读写与删除'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {hostBackupExportOpen && (
+        <div className="modal-backdrop" data-testid="host-backup-export-dialog">
+          <div className="modal compact-modal host-backup-modal">
+            <div className="modal-header"><strong>导出 SSH 主机配置</strong></div>
+            <p>默认只导出主机元数据，不包含密码或私钥口令。</p>
+            <label className="credential-save-check">
+              <input
+                type="checkbox"
+                checked={hostBackupIncludeCredentials}
+                onChange={(event) => {
+                  setHostBackupIncludeCredentials(event.target.checked);
+                  if (!event.target.checked) {
+                    setHostBackupPassphrase('');
+                    setHostBackupPassphraseConfirmation('');
+                  }
+                }}
+              />
+              <span>包含 SSH 凭据（必须整包加密）</span>
+            </label>
+            {hostBackupIncludeCredentials && (
+              <>
+                <label>
+                  <span>备份口令</span>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={hostBackupPassphrase}
+                    onChange={(event) => setHostBackupPassphrase(event.target.value)}
+                  />
+                </label>
+                <label>
+                  <span>再次输入口令</span>
+                  <input
+                    type="password"
+                    autoComplete="new-password"
+                    value={hostBackupPassphraseConfirmation}
+                    onChange={(event) => setHostBackupPassphraseConfirmation(event.target.value)}
+                  />
+                </label>
+                <p className="risk-note">口令不会保存；遗失后无法恢复加密备份。</p>
+              </>
+            )}
+            <div className="modal-actions">
+              <button
+                type="button"
+                disabled={hostBackupPending}
+                onClick={() => setHostBackupExportOpen(false)}
+              >取消</button>
+              <button
+                type="button"
+                className="primary"
+                disabled={hostBackupPending}
+                onClick={() => void exportHosts()}
+              >{hostBackupPending ? '正在导出…' : '选择保存位置…'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {hostBackupImportChallenge && (
+        <div className="modal-backdrop" data-testid="host-backup-import-challenge">
+          <div className="modal compact-modal host-backup-modal">
+            <div className="modal-header"><strong>{
+              hostBackupImportChallenge.challenge === 'passphrase-required'
+                ? '解密主机备份'
+                : '旧版明文主机备份风险确认'
+            }</strong></div>
+            <p>{hostBackupImportChallenge.message}</p>
+            {hostBackupImportChallenge.challenge === 'passphrase-required' && (
+              <label>
+                <span>备份口令</span>
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  autoFocus
+                  value={hostBackupImportPassphrase}
+                  onChange={(event) => setHostBackupImportPassphrase(event.target.value)}
+                />
+              </label>
+            )}
+            <div className="modal-actions">
+              <button
+                type="button"
+                disabled={hostBackupPending}
+                onClick={() => {
+                  setHostBackupImportChallenge(null);
+                  setHostBackupImportPassphrase('');
+                }}
+              >取消</button>
+              <button
+                type="button"
+                className="danger-action"
+                disabled={
+                  hostBackupPending
+                  || (
+                    hostBackupImportChallenge.challenge === 'passphrase-required'
+                    && !hostBackupImportPassphrase
+                  )
+                }
+                onClick={() => void continueHostImport()}
+              >{hostBackupImportChallenge.challenge === 'passphrase-required'
+                  ? '解密并导入'
+                  : '确认风险并导入'}</button>
             </div>
           </div>
         </div>

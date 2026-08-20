@@ -148,10 +148,10 @@ export class SafeZipArchive {
   private readonly entries: Map<string, AdmZip.IZipEntry>;
   private actualBytes = 0;
 
-  constructor(path: string) {
+  constructor(source: string | Buffer) {
     let archiveBytes: number;
     try {
-      archiveBytes = statSync(path).size;
+      archiveBytes = typeof source === 'string' ? statSync(source).size : source.byteLength;
     } catch {
       throw importError('ZIP 文件不存在或无法读取。');
     }
@@ -160,7 +160,7 @@ export class SafeZipArchive {
     }
     let zip: AdmZip;
     try {
-      zip = new AdmZip(path);
+      zip = new AdmZip(source);
     } catch {
       throw importError('ZIP 文件损坏或无法读取。');
     }

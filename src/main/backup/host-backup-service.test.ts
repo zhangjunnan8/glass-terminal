@@ -11,6 +11,7 @@ import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MemorySecretStore } from '../providers/secret-store';
 import { HostBackupService } from './host-backup-service';
+import { decryptBackupPayload } from './backup-crypto';
 
 const roots: string[] = [];
 
@@ -79,7 +80,25 @@ afterEach(() => {
 });
 
 describe('HostBackupService', () => {
-  it('exports hosts plus SSH secrets, then imports them cleanly', async () => {
+  it('excludes SSH credentials from the default plaintext Host export', async () => {
+    const source = fixture();
+    seedHosts(source);
+    const secrets = new MemorySecretStore();
+    await secrets.set('AI Terminal/ssh/00000000-0000-4000-8000-000000000001', 'host-canary');
+    const bundlePath = join(source, 'hosts-no-credentials.aithosts');
+
+    const exported = await new HostBackupService(hostsPath(source), secrets, '1.0.0')
+      .exportToFile(bundlePath);
+
+    expect(exported).toMatchObject({ encrypted: false, credentialsIncluded: false });
+    expect(new HostBackupService(hostsPath(source), secrets, '1.0.0').inspectImportFile(bundlePath))
+      .toMatchObject({ encrypted: false, legacyPlaintextCredentials: false });
+    expect(exported.sections).toEqual(['hosts']);
+    expect(readFileSync(bundlePath, 'utf8')).not.toContain('host-canary');
+    expect(JSON.parse(readFileSync(bundlePath, 'utf8')).sections).not.toHaveProperty('hostSecrets');
+  });
+
+  it('encrypts Host credentials as a whole bundle, then imports them cleanly', async () => {
     const source = fixture();
     seedHosts(source);
     const secrets = new MemorySecretStore();
@@ -87,14 +106,28 @@ describe('HostBackupService', () => {
     await secrets.set('AI Terminal/provider/00000000-0000-4000-8000-000000000002', 'api-key');
 
     const bundlePath = join(source, 'hosts.aithosts');
+    const passphrase = 'host backup encryption password';
     const exported = await new HostBackupService(
       hostsPath(source),
       secrets,
       '1.0.0',
-    ).exportToFile(bundlePath);
+    ).exportToFile(bundlePath, {
+      includeCredentials: true,
+      passphrase,
+      passphraseConfirmation: passphrase,
+    });
 
     expect(exported.sections).toEqual(['hosts', 'hostSecrets']);
-    const bundle = JSON.parse(readFileSync(bundlePath, 'utf8')) as {
+    expect(exported).toMatchObject({ encrypted: true, credentialsIncluded: true });
+    expect(new HostBackupService(hostsPath(source), secrets, '1.0.0')
+      .inspectImportFile(bundlePath)).toMatchObject({
+      encrypted: true,
+      legacyPlaintextCredentials: false,
+    });
+    const encrypted = readFileSync(bundlePath);
+    expect(encrypted.includes(Buffer.from('host-pass'))).toBe(false);
+    expect(encrypted.includes(Buffer.from('hostSecrets'))).toBe(false);
+    const bundle = JSON.parse((await decryptBackupPayload(encrypted, passphrase)).toString('utf8')) as {
       sections: Record<string, { schemaVersion: number; data: unknown }>;
     };
     expect(bundle.sections.hostSecrets.data).toEqual({
@@ -107,7 +140,7 @@ describe('HostBackupService', () => {
       hostsPath(target),
       targetSecrets,
       '1.0.0',
-    ).importFromFile(bundlePath);
+    ).importFromFile(bundlePath, { passphrase });
 
     expect(imported.sectionsImported).toEqual(['hosts', 'hostSecrets']);
     expect(JSON.parse(readFileSync(hostsPath(target), 'utf8')).hosts[0]).toMatchObject({
@@ -120,14 +153,54 @@ describe('HostBackupService', () => {
     )).toBe('host-pass');
   });
 
+  it('detects old plaintext Host credentials and requires explicit risk consent', async () => {
+    const target = fixture();
+    seedHosts(target);
+    const before = readFileSync(hostsPath(target));
+    const secrets = new MemorySecretStore();
+    await secrets.set(
+      'AI Terminal/ssh/00000000-0000-4000-8000-000000000001',
+      'existing-host-secret',
+    );
+    const legacyPath = join(fixture(), 'legacy-plaintext.aithosts');
+    writeFileSync(legacyPath, JSON.stringify(portableManifest({
+      hosts: {
+        schemaVersion: 1,
+        data: JSON.parse(readFileSync(hostsPath(target), 'utf8')) as unknown,
+      },
+      hostSecrets: {
+        schemaVersion: 1,
+        data: {
+          'AI Terminal/ssh/00000000-0000-4000-8000-000000000001': 'plaintext-host-secret',
+        },
+      },
+    })));
+    const service = new HostBackupService(hostsPath(target), secrets, '1.0.0');
+
+    expect(service.inspectImportFile(legacyPath)).toMatchObject({
+      encrypted: false,
+      legacyPlaintextCredentials: true,
+    });
+    await expect(service.importFromFile(legacyPath)).rejects.toThrow('显式确认风险');
+    expect(readFileSync(hostsPath(target))).toEqual(before);
+    expect(await secrets.get(
+      'AI Terminal/ssh/00000000-0000-4000-8000-000000000001',
+    )).toBe('existing-host-secret');
+  });
+
   it('replaces stale SSH secrets without touching Provider secrets', async () => {
     const source = fixture();
     seedHosts(source);
     const sourceSecrets = new MemorySecretStore();
     await sourceSecrets.set('AI Terminal/ssh/00000000-0000-4000-8000-000000000001', 'new-pass');
     const bundlePath = join(source, 'hosts.aithosts');
+    const passphrase = 'stale host credential password';
     await new HostBackupService(hostsPath(source), sourceSecrets, '1.0.0')
-      .exportToFile(bundlePath);
+      .exportToFile(bundlePath, {
+        includeCredentials: true,
+        passphrase,
+        passphraseConfirmation: passphrase,
+      });
 
     const targetSecrets = new MemorySecretStore();
     await targetSecrets.set('AI Terminal/ssh/00000000-0000-4000-8000-000000000001', 'old-pass');
@@ -135,7 +208,7 @@ describe('HostBackupService', () => {
     await targetSecrets.set('AI Terminal/provider/00000000-0000-4000-8000-000000000004', 'api-key');
 
     await new HostBackupService(hostsPath(fixture()), targetSecrets, '1.0.0')
-      .importFromFile(bundlePath);
+      .importFromFile(bundlePath, { passphrase });
 
     expect(await targetSecrets.get(
       'AI Terminal/ssh/00000000-0000-4000-8000-000000000001',
@@ -161,7 +234,9 @@ describe('HostBackupService', () => {
       hostSecrets: { schemaVersion: 1, data: {} },
     })));
     await expect(new HostBackupService(hostsPath(target), secrets, '1.0.0')
-      .importFromFile(malformedPath)).rejects.toThrow('Host store');
+      .importFromFile(malformedPath, {
+        allowLegacyPlaintextCredentials: true,
+      })).rejects.toThrow('Host store');
     expect(readFileSync(hostsPath(target))).toEqual(before);
 
     const source = fixture();
@@ -176,7 +251,9 @@ describe('HostBackupService', () => {
     const missingSecretPath = join(fixture(), 'missing-secret.aithosts');
     writeFileSync(missingSecretPath, JSON.stringify(sourceManifest));
     await expect(new HostBackupService(hostsPath(target), secrets, '1.0.0')
-      .importFromFile(missingSecretPath)).rejects.toThrow('缺少元数据声明为已配置的凭据');
+      .importFromFile(missingSecretPath, {
+        allowLegacyPlaintextCredentials: true,
+      })).rejects.toThrow('缺少元数据声明为已配置的凭据');
     expect(readFileSync(hostsPath(target))).toEqual(before);
     expect(await secrets.get(
       'AI Terminal/ssh/00000000-0000-4000-8000-000000000001',
@@ -192,8 +269,13 @@ describe('HostBackupService', () => {
       'new-pass',
     );
     const bundlePath = join(source, 'hosts.aithosts');
+    const passphrase = 'host secret rollback password';
     await new HostBackupService(hostsPath(source), sourceSecrets, '1.0.0')
-      .exportToFile(bundlePath);
+      .exportToFile(bundlePath, {
+        includeCredentials: true,
+        passphrase,
+        passphraseConfirmation: passphrase,
+      });
 
     const target = fixture();
     seedHosts(target);
@@ -211,7 +293,7 @@ describe('HostBackupService', () => {
     targetSecrets.failNextSet = true;
 
     await expect(new HostBackupService(hostsPath(target), targetSecrets, '1.0.0')
-      .importFromFile(bundlePath)).rejects.toThrow('host secret failure');
+      .importFromFile(bundlePath, { passphrase })).rejects.toThrow('host secret failure');
     expect(readFileSync(hostsPath(target))).toEqual(before);
     expect(await targetSecrets.get(
       'AI Terminal/ssh/00000000-0000-4000-8000-000000000001',
@@ -249,7 +331,9 @@ describe('HostBackupService', () => {
       hostsPath(target),
       new MemorySecretStore(),
       '1.0.0',
-    ).importFromFile(bundlePath);
+    ).importFromFile(bundlePath, {
+      allowLegacyPlaintextCredentials: true,
+    });
 
     const migrated = JSON.parse(readFileSync(hostsPath(target), 'utf8')) as {
       version: number;

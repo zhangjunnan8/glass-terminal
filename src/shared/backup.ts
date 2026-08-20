@@ -20,8 +20,18 @@ export interface BackupManifest {
 }
 
 export interface BackupExportRequest {
-  /** Reserved for the optional session-log inclusion phase. */
   includeLogs?: boolean;
+  /** Defaults to false. Credential-bearing exports are always whole-file encrypted. */
+  includeCredentials?: boolean;
+  passphrase?: string;
+  passphraseConfirmation?: string;
+}
+
+export interface HostBackupExportRequest {
+  /** Defaults to false. Credential-bearing exports are always whole-file encrypted. */
+  includeCredentials?: boolean;
+  passphrase?: string;
+  passphraseConfirmation?: string;
 }
 
 export interface BackupExportResult {
@@ -29,6 +39,8 @@ export interface BackupExportResult {
   exportedAt: string;
   sections: string[];
   bytes: number;
+  encrypted: boolean;
+  credentialsIncluded: boolean;
 }
 
 export interface BackupSkippedSection {
@@ -41,6 +53,21 @@ export interface BackupImportResult {
   sectionsSkipped: BackupSkippedSection[];
   needsRestart: boolean;
 }
+
+export interface BackupImportRequest {
+  /** Omitted on the initial file-selection request. */
+  token?: string;
+  passphrase?: string;
+  confirmLegacyPlaintext?: boolean;
+}
+
+export interface BackupImportChallenge {
+  challenge: 'passphrase-required' | 'legacy-plaintext-confirmation';
+  token: string;
+  message: string;
+}
+
+export type BackupImportResponse = BackupImportResult | BackupImportChallenge;
 
 export const BACKUP_CHANNELS = {
   export: 'backup:export',

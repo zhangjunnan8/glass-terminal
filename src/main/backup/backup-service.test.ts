@@ -14,6 +14,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import AdmZip from 'adm-zip';
 import { MemorySecretStore } from '../providers/secret-store';
 import { BackupService } from './backup-service';
+import { decryptBackupPayload } from './backup-crypto';
 
 const roots: string[] = [];
 
@@ -55,8 +56,10 @@ function seedConfig(root: string) {
   writeFileSync(p.codexAppServer, JSON.stringify({ bound: true }), 'utf8');
 }
 
-function readManifest(bundlePath: string) {
-  const zip = new AdmZip(bundlePath);
+async function readManifest(bundlePath: string, passphrase?: string) {
+  const source = readFileSync(bundlePath);
+  const payload = passphrase ? await decryptBackupPayload(source, passphrase) : source;
+  const zip = new AdmZip(payload);
   const entry = zip.getEntry('manifest.json');
   expect(entry).toBeTruthy();
   return JSON.parse(entry!.getData().toString('utf8')) as {
@@ -111,7 +114,25 @@ afterEach(() => {
 });
 
 describe('BackupService', () => {
-  it('exports config and only Provider secrets, then imports them cleanly', async () => {
+  it('excludes credentials by default without leaking a configured API key', async () => {
+    const source = fixture();
+    seedConfig(source);
+    const secrets = new MemorySecretStore();
+    await secrets.set('AI Terminal/provider/00000000-0000-4000-8000-000000000001', 'default-canary-key');
+    const bundlePath = join(source, 'credential-free.aitbak');
+
+    const exported = await new BackupService(paths(source), secrets, '1.0.0')
+      .exportToFile(bundlePath);
+
+    expect(exported).toMatchObject({ encrypted: false, credentialsIncluded: false });
+    expect(new BackupService(paths(source), secrets, '1.0.0').inspectImportFile(bundlePath))
+      .toMatchObject({ encrypted: false, legacyPlaintextCredentials: false });
+    expect(exported.sections).not.toContain('providerSecrets');
+    expect(readFileSync(bundlePath).includes(Buffer.from('default-canary-key'))).toBe(false);
+    expect((await readManifest(bundlePath)).sections).not.toHaveProperty('providerSecrets');
+  });
+
+  it('encrypts the entire credential-bearing bundle and imports it cleanly', async () => {
     const source = fixture();
     seedConfig(source);
     const secrets = new MemorySecretStore();
@@ -120,7 +141,12 @@ describe('BackupService', () => {
 
     const service = new BackupService(paths(source), secrets, '1.0.0');
     const bundlePath = join(source, 'backup.aitbak');
-    const exported = await service.exportToFile(bundlePath);
+    const passphrase = 'correct horse battery staple';
+    const exported = await service.exportToFile(bundlePath, {
+      includeCredentials: true,
+      passphrase,
+      passphraseConfirmation: passphrase,
+    });
 
     expect(exported.sections).toEqual([
       'settings',
@@ -128,9 +154,18 @@ describe('BackupService', () => {
       'codexAppServer',
       'providerSecrets',
     ]);
-    const manifest = readManifest(bundlePath);
+    expect(exported).toMatchObject({ encrypted: true, credentialsIncluded: true });
+    expect(service.inspectImportFile(bundlePath)).toMatchObject({
+      encrypted: true,
+      legacyPlaintextCredentials: false,
+    });
+    const encryptedBytes = readFileSync(bundlePath);
+    expect(encryptedBytes.includes(Buffer.from('api-key'))).toBe(false);
+    expect(encryptedBytes.includes(Buffer.from('provider-secrets.json'))).toBe(false);
+    const manifest = await readManifest(bundlePath, passphrase);
     expect(manifest.sections.providerSecrets.file).toBe('sections/provider-secrets.json');
-    const secretsEntry = new AdmZip(bundlePath).getEntry('sections/provider-secrets.json')!;
+    const plaintext = await decryptBackupPayload(encryptedBytes, passphrase);
+    const secretsEntry = new AdmZip(plaintext).getEntry('sections/provider-secrets.json')!;
     expect(JSON.parse(secretsEntry.getData().toString('utf8'))).toEqual({
       'AI Terminal/provider/00000000-0000-4000-8000-000000000001': 'api-key',
     });
@@ -138,7 +173,7 @@ describe('BackupService', () => {
     const target = fixture();
     const targetSecrets = new MemorySecretStore();
     const imported = await new BackupService(paths(target), targetSecrets, '1.0.0')
-      .importFromFile(bundlePath);
+      .importFromFile(bundlePath, { passphrase });
 
     expect(imported.sectionsImported).toEqual([
       'settings',
@@ -155,20 +190,103 @@ describe('BackupService', () => {
     )).toBe('api-key');
   });
 
+  it('authenticates encrypted bytes before changing files or Provider secrets', async () => {
+    const source = fixture();
+    seedConfig(source);
+    const sourceSecrets = new MemorySecretStore();
+    await sourceSecrets.set(
+      'AI Terminal/provider/00000000-0000-4000-8000-000000000001',
+      'incoming-secret',
+    );
+    const encryptedPath = join(source, 'authenticated.aitbak');
+    const passphrase = 'authenticated backup password';
+    await new BackupService(paths(source), sourceSecrets, '1.0.0')
+      .exportToFile(encryptedPath, {
+        includeCredentials: true,
+        passphrase,
+        passphraseConfirmation: passphrase,
+      });
+    const encrypted = readFileSync(encryptedPath);
+
+    const target = fixture();
+    seedConfig(target);
+    const targetSecrets = new MemorySecretStore();
+    await targetSecrets.set(
+      'AI Terminal/provider/00000000-0000-4000-8000-000000000001',
+      'existing-secret',
+    );
+    const before = configSnapshot(target);
+    const candidatePath = join(fixture(), 'candidate.aitbak');
+    const tampered = Buffer.from(encrypted);
+    tampered[tampered.length - 1] ^= 0xff;
+    const candidates = [
+      { bytes: encrypted, candidatePassphrase: 'incorrect backup password' },
+      { bytes: tampered, candidatePassphrase: passphrase },
+      { bytes: encrypted.subarray(0, encrypted.length - 8), candidatePassphrase: passphrase },
+    ];
+
+    for (const candidate of candidates) {
+      writeFileSync(candidatePath, candidate.bytes);
+      await expect(new BackupService(paths(target), targetSecrets, '1.0.0')
+        .importFromFile(candidatePath, { passphrase: candidate.candidatePassphrase }))
+        .rejects.toThrow('备份口令错误');
+      expectConfigSnapshot(target, before);
+      expect(await targetSecrets.get(
+        'AI Terminal/provider/00000000-0000-4000-8000-000000000001',
+      )).toBe('existing-secret');
+    }
+  });
+
+  it('detects old plaintext credentials and refuses them without explicit risk consent', async () => {
+    const source = fixture();
+    seedConfig(source);
+    const sourceSecrets = new MemorySecretStore();
+    await sourceSecrets.set(
+      'AI Terminal/provider/00000000-0000-4000-8000-000000000001',
+      'legacy-plaintext-secret',
+    );
+    const encryptedPath = join(source, 'source.aitbak');
+    const passphrase = 'legacy conversion password';
+    await new BackupService(paths(source), sourceSecrets, '1.0.0')
+      .exportToFile(encryptedPath, {
+        includeCredentials: true,
+        passphrase,
+        passphraseConfirmation: passphrase,
+      });
+    const legacyPath = join(source, 'legacy-plaintext.aitbak');
+    writeFileSync(
+      legacyPath,
+      await decryptBackupPayload(readFileSync(encryptedPath), passphrase),
+    );
+    const service = new BackupService(paths(fixture()), new MemorySecretStore(), '1.0.0');
+
+    expect(service.inspectImportFile(legacyPath)).toMatchObject({
+      encrypted: false,
+      legacyPlaintextCredentials: true,
+    });
+    await expect(service.importFromFile(legacyPath)).rejects.toThrow('显式确认风险');
+  });
+
   it('removes stale Provider secrets on import without touching Host secrets', async () => {
     const source = fixture();
     seedConfig(source);
     const sourceSecrets = new MemorySecretStore();
     await sourceSecrets.set('AI Terminal/provider/00000000-0000-4000-8000-000000000001', 'new-key');
     const bundlePath = join(source, 'backup.aitbak');
-    await new BackupService(paths(source), sourceSecrets, '1.0.0').exportToFile(bundlePath);
+    const passphrase = 'provider namespace backup';
+    await new BackupService(paths(source), sourceSecrets, '1.0.0').exportToFile(bundlePath, {
+      includeCredentials: true,
+      passphrase,
+      passphraseConfirmation: passphrase,
+    });
 
     const targetSecrets = new MemorySecretStore();
     await targetSecrets.set('AI Terminal/provider/00000000-0000-4000-8000-000000000001', 'old-key');
     await targetSecrets.set('AI Terminal/provider/00000000-0000-4000-8000-000000000003', 'stale');
     await targetSecrets.set('AI Terminal/ssh/00000000-0000-4000-8000-000000000004', 'host-pass');
 
-    await new BackupService(paths(fixture()), targetSecrets, '1.0.0').importFromFile(bundlePath);
+    await new BackupService(paths(fixture()), targetSecrets, '1.0.0')
+      .importFromFile(bundlePath, { passphrase });
 
     expect(await targetSecrets.get(
       'AI Terminal/provider/00000000-0000-4000-8000-000000000001',
@@ -351,7 +469,12 @@ describe('BackupService', () => {
       'new-key',
     );
     const bundlePath = join(source, 'transaction.aitbak');
-    await new BackupService(paths(source), sourceSecrets, '1.0.0').exportToFile(bundlePath);
+    const passphrase = 'secret rollback password';
+    await new BackupService(paths(source), sourceSecrets, '1.0.0').exportToFile(bundlePath, {
+      includeCredentials: true,
+      passphrase,
+      passphraseConfirmation: passphrase,
+    });
 
     const target = fixture();
     seedConfig(target);
@@ -368,7 +491,7 @@ describe('BackupService', () => {
       },
     });
 
-    await expect(service.importFromFile(bundlePath)).rejects.toThrow('mid-commit');
+    await expect(service.importFromFile(bundlePath, { passphrase })).rejects.toThrow('mid-commit');
     expectConfigSnapshot(target, before);
     expect(await targetSecrets.get(
       'AI Terminal/provider/00000000-0000-4000-8000-000000000001',
@@ -384,7 +507,12 @@ describe('BackupService', () => {
       'new-key',
     );
     const bundlePath = join(source, 'secret-failure.aitbak');
-    await new BackupService(paths(source), sourceSecrets, '1.0.0').exportToFile(bundlePath);
+    const passphrase = 'secret store failure password';
+    await new BackupService(paths(source), sourceSecrets, '1.0.0').exportToFile(bundlePath, {
+      includeCredentials: true,
+      passphrase,
+      passphraseConfirmation: passphrase,
+    });
 
     const target = fixture();
     seedConfig(target);
@@ -398,7 +526,7 @@ describe('BackupService', () => {
     targetSecrets.failNextSet = true;
 
     await expect(new BackupService(paths(target), targetSecrets, '1.0.0')
-      .importFromFile(bundlePath)).rejects.toThrow('secret write failure');
+      .importFromFile(bundlePath, { passphrase })).rejects.toThrow('secret write failure');
     expectConfigSnapshot(target, before);
     expect(await targetSecrets.get(
       'AI Terminal/provider/00000000-0000-4000-8000-000000000001',
@@ -426,6 +554,8 @@ describe('BackupService', () => {
       paths(fixture()),
       new MemorySecretStore(),
       '1.0.0',
-    ).importFromFile(bundlePath)).rejects.toThrow('没有元数据引用');
+    ).importFromFile(bundlePath, {
+      allowLegacyPlaintextCredentials: true,
+    })).rejects.toThrow('没有元数据引用');
   });
 });

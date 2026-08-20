@@ -1,11 +1,11 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { readFileSync } from 'node:fs';
 import {
   BACKUP_FORMAT_VERSION,
   HOST_SECRET_PREFIX,
 } from '../../shared/backup';
 import type {
   BackupExportResult,
+  HostBackupExportRequest,
   BackupImportResult,
   BackupManifest,
 } from '../../shared/backup';
@@ -16,12 +16,21 @@ import {
   type ImportTransactionHooks,
   parseBackupManifest,
   parseSecretMap,
-  portableJsonBytes,
   readSecretNamespace,
   replaceSecretNamespace,
   validateCredentialBindings,
   verifyFileBytes,
 } from './import-safety';
+import {
+  type BackupImportFileOptions,
+  backupPayloadFingerprint,
+  encryptBackupPayload,
+  isEncryptedBackupPayload,
+  loadBackupPayload,
+  readBackupFile,
+  validateBackupPassphrase,
+  writeBackupFileAtomic,
+} from './backup-crypto';
 
 const HOSTS_SECTION = 'hosts';
 const HOST_SECRETS_SECTION = 'hostSecrets';
@@ -39,36 +48,102 @@ export class HostBackupService {
     private readonly importHooks: ImportTransactionHooks = {},
   ) {}
 
-  async exportToFile(path: string): Promise<BackupExportResult> {
+  async exportToFile(
+    path: string,
+    request: HostBackupExportRequest = {},
+  ): Promise<BackupExportResult> {
+    const includeCredentials = request.includeCredentials === true;
+    const passphrase = includeCredentials
+      ? validateBackupPassphrase(request.passphrase, request.passphraseConfirmation)
+      : undefined;
     const hosts = readJson(this.hostsPath);
-    const hostSecrets = await this.readHostSecrets();
+    const hostSecrets = includeCredentials ? await this.readHostSecrets() : [];
     const manifest: BackupManifest = {
       formatVersion: BACKUP_FORMAT_VERSION,
       appVersion: this.appVersion,
       exportedAt: new Date().toISOString(),
       sections: {
         ...(hosts === undefined ? {} : { [HOSTS_SECTION]: { schemaVersion: 1, data: hosts } }),
-        [HOST_SECRETS_SECTION]: {
-          schemaVersion: 1,
-          data: Object.fromEntries(
-            hostSecrets.map((entry) => [entry.reference, entry.secret]),
-          ),
-        },
+        ...(includeCredentials ? {
+          [HOST_SECRETS_SECTION]: {
+            schemaVersion: 1,
+            data: Object.fromEntries(
+              hostSecrets.map((entry) => [entry.reference, entry.secret]),
+            ),
+          },
+        } : {}),
       },
     };
-    const serialized = `${JSON.stringify(manifest, null, 2)}\n`;
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, serialized, 'utf8');
+    const plaintext = Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+    let output: Buffer<ArrayBufferLike> = plaintext;
+    try {
+      if (includeCredentials) output = await encryptBackupPayload(plaintext, passphrase!);
+      writeBackupFileAtomic(path, output);
+    } finally {
+      if (includeCredentials) plaintext.fill(0);
+    }
     return {
       path,
       exportedAt: manifest.exportedAt,
       sections: Object.keys(manifest.sections),
-      bytes: Buffer.byteLength(serialized, 'utf8'),
+      bytes: output.byteLength,
+      encrypted: includeCredentials,
+      credentialsIncluded: includeCredentials,
     };
   }
 
-  async importFromFile(path: string): Promise<BackupImportResult> {
-    const manifest = parseBackupManifest(parsePortableManifest(path));
+  inspectImportFile(path: string): {
+    encrypted: boolean;
+    legacyPlaintextCredentials: boolean;
+    fingerprint: string;
+  } {
+    const source = readBackupFile(path);
+    const fingerprint = backupPayloadFingerprint(source);
+    if (isEncryptedBackupPayload(source)) {
+      source.fill(0);
+      return { encrypted: true, legacyPlaintextCredentials: false, fingerprint };
+    }
+    try {
+      const manifest = parseBackupManifest(parsePortableManifest(source));
+      return {
+        encrypted: false,
+        legacyPlaintextCredentials: manifest.sections[HOST_SECRETS_SECTION] !== undefined,
+        fingerprint,
+      };
+    } finally {
+      source.fill(0);
+    }
+  }
+
+  async importFromFile(
+    path: string,
+    options: BackupImportFileOptions = {},
+  ): Promise<BackupImportResult> {
+    const loaded = await loadBackupPayload(path, options.passphrase);
+    if (options.expectedFingerprint && loaded.fingerprint !== options.expectedFingerprint) {
+      loaded.payload.fill(0);
+      throw new Error('备份文件在确认期间发生变化，请重新选择。');
+    }
+    try {
+      return await this.importManifest(
+        parseBackupManifest(parsePortableManifest(loaded.payload)),
+        loaded.encrypted || options.allowLegacyPlaintextCredentials === true,
+      );
+    } finally {
+      loaded.payload.fill(0);
+    }
+  }
+
+  private async importManifest(
+    manifest: BackupManifest,
+    credentialsMayBeImported: boolean,
+  ): Promise<BackupImportResult> {
+    if (
+      manifest.sections[HOST_SECRETS_SECTION] !== undefined
+      && !credentialsMayBeImported
+    ) {
+      throw new Error('旧版明文主机备份可能包含 SSH 密码或私钥口令，必须显式确认风险后才能导入。');
+    }
     const sectionsImported: string[] = [];
     const sectionsSkipped: BackupImportResult['sectionsSkipped'] = [];
     const transaction = new ImportFilesystemTransaction(this.importHooks);
@@ -159,8 +234,7 @@ export class HostBackupService {
   }
 }
 
-function parsePortableManifest(path: string): unknown {
-  const raw = portableJsonBytes(path);
+function parsePortableManifest(raw: Buffer): unknown {
   try {
     return JSON.parse(raw.toString('utf8')) as unknown;
   } catch {

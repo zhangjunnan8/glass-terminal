@@ -209,12 +209,12 @@ const settingsBridge: DesktopBridge['settings'] = {
 
 const backupBridge: DesktopBridge['backup'] = {
   export: (request) => ipcRenderer.invoke(BACKUP_CHANNELS.export, request),
-  import: () => ipcRenderer.invoke(BACKUP_CHANNELS.import),
+  import: (request) => ipcRenderer.invoke(BACKUP_CHANNELS.import, request),
 };
 
 const hostBackupBridge: DesktopBridge['hostBackup'] = {
-  export: () => ipcRenderer.invoke(HOST_BACKUP_CHANNELS.export),
-  import: () => ipcRenderer.invoke(HOST_BACKUP_CHANNELS.import),
+  export: (request) => ipcRenderer.invoke(HOST_BACKUP_CHANNELS.export, request),
+  import: (request) => ipcRenderer.invoke(HOST_BACKUP_CHANNELS.import, request),
 };
 
 const settingsWindowBridge: DesktopBridge['settingsWindow'] = {

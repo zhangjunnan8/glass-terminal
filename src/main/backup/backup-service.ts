@@ -1,5 +1,5 @@
-import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Dirent } from 'node:fs';
 import AdmZip from 'adm-zip';
 import {
@@ -8,6 +8,7 @@ import {
 } from '../../shared/backup';
 import type {
   BackupExportResult,
+  BackupExportRequest,
   BackupImportResult,
   BackupManifest,
   BackupSectionEnvelope,
@@ -30,6 +31,16 @@ import {
   validateSessionData,
   verifyFileBytes,
 } from './import-safety';
+import {
+  type BackupImportFileOptions,
+  backupPayloadFingerprint,
+  encryptBackupPayload,
+  isEncryptedBackupPayload,
+  loadBackupPayload,
+  readBackupFile,
+  validateBackupPassphrase,
+  writeBackupFileAtomic,
+} from './backup-crypto';
 
 interface BackupPaths {
   settings: string;
@@ -61,7 +72,16 @@ export class BackupService {
     private readonly importHooks: ImportTransactionHooks = {},
   ) {}
 
-  async exportToFile(path: string, includeLogs = false): Promise<BackupExportResult> {
+  async exportToFile(
+    path: string,
+    request: BackupExportRequest | boolean = {},
+  ): Promise<BackupExportResult> {
+    const options = typeof request === 'boolean' ? { includeLogs: request } : request;
+    const includeLogs = options.includeLogs === true;
+    const includeCredentials = options.includeCredentials === true;
+    const passphrase = includeCredentials
+      ? validateBackupPassphrase(options.passphrase, options.passphraseConfirmation)
+      : undefined;
     const zip = new AdmZip();
     const sections: Record<string, BackupSectionEnvelope> = {};
 
@@ -73,17 +93,19 @@ export class BackupService {
       sections[name] = { schemaVersion: 1, file: entry };
     }
 
-    const providerSecrets = await this.readProviderSecrets();
-    zip.addFile(
-      'sections/provider-secrets.json',
-      jsonBytes(Object.fromEntries(
-        providerSecrets.map((entry) => [entry.reference, entry.secret]),
-      )),
-    );
-    sections[PROVIDER_SECRETS_SECTION] = {
-      schemaVersion: 1,
-      file: 'sections/provider-secrets.json',
-    };
+    if (includeCredentials) {
+      const providerSecrets = await this.readProviderSecrets();
+      zip.addFile(
+        'sections/provider-secrets.json',
+        jsonBytes(Object.fromEntries(
+          providerSecrets.map((entry) => [entry.reference, entry.secret]),
+        )),
+      );
+      sections[PROVIDER_SECRETS_SECTION] = {
+        schemaVersion: 1,
+        file: 'sections/provider-secrets.json',
+      };
+    }
 
     if (includeLogs) {
       this.addSessionsToZip(zip, this.paths.sessions);
@@ -98,22 +120,84 @@ export class BackupService {
     };
     zip.addFile('manifest.json', jsonBytes(manifest));
 
-    mkdirSync(dirname(path), { recursive: true });
-    zip.writeZip(path);
+    const plaintext = zip.toBuffer();
+    let output: Buffer<ArrayBufferLike> = plaintext;
+    try {
+      if (includeCredentials) output = await encryptBackupPayload(plaintext, passphrase!);
+      writeBackupFileAtomic(path, output);
+    } finally {
+      if (includeCredentials) plaintext.fill(0);
+    }
     return {
       path,
       exportedAt: manifest.exportedAt,
       sections: Object.keys(manifest.sections),
-      bytes: readFileSync(path).byteLength,
+      bytes: output.byteLength,
+      encrypted: includeCredentials,
+      credentialsIncluded: includeCredentials,
     };
   }
 
-  async importFromFile(path: string): Promise<BackupImportResult> {
-    const archive = new SafeZipArchive(path);
+  inspectImportFile(path: string): {
+    encrypted: boolean;
+    legacyPlaintextCredentials: boolean;
+    fingerprint: string;
+  } {
+    const source = readBackupFile(path);
+    const fingerprint = backupPayloadFingerprint(source);
+    if (isEncryptedBackupPayload(source)) {
+      source.fill(0);
+      return { encrypted: true, legacyPlaintextCredentials: false, fingerprint };
+    }
+    try {
+      const archive = new SafeZipArchive(source);
+      const manifest = parseBackupManifest(parseJsonBuffer(
+        archive.read('manifest.json', BACKUP_IMPORT_LIMITS.maxManifestBytes),
+        'manifest.json',
+      ));
+      return {
+        encrypted: false,
+        legacyPlaintextCredentials: manifest.sections[PROVIDER_SECRETS_SECTION] !== undefined,
+        fingerprint,
+      };
+    } finally {
+      source.fill(0);
+    }
+  }
+
+  async importFromFile(
+    path: string,
+    options: BackupImportFileOptions = {},
+  ): Promise<BackupImportResult> {
+    const loaded = await loadBackupPayload(path, options.passphrase);
+    if (options.expectedFingerprint && loaded.fingerprint !== options.expectedFingerprint) {
+      loaded.payload.fill(0);
+      throw new Error('备份文件在确认期间发生变化，请重新选择。');
+    }
+    try {
+      return await this.importArchive(
+        new SafeZipArchive(loaded.payload),
+        loaded.encrypted || options.allowLegacyPlaintextCredentials === true,
+      );
+    } finally {
+      loaded.payload.fill(0);
+    }
+  }
+
+  private async importArchive(
+    archive: SafeZipArchive,
+    credentialsMayBeImported: boolean,
+  ): Promise<BackupImportResult> {
     const manifest = parseBackupManifest(parseJsonBuffer(
       archive.read('manifest.json', BACKUP_IMPORT_LIMITS.maxManifestBytes),
       'manifest.json',
     ));
+    if (
+      manifest.sections[PROVIDER_SECRETS_SECTION] !== undefined
+      && !credentialsMayBeImported
+    ) {
+      throw new Error('旧版明文备份可能包含 Provider API Key，必须显式确认风险后才能导入。');
+    }
     const transaction = new ImportFilesystemTransaction(this.importHooks);
     const sectionsImported: string[] = [];
     const sectionsSkipped: BackupImportResult['sectionsSkipped'] = [];

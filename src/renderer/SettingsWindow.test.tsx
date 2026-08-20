@@ -46,6 +46,12 @@ function setNumberInput(input: HTMLInputElement, value: string): void {
   input.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
+function setTextInput(input: HTMLInputElement, value: string): void {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+  setter?.call(input, value);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
 async function settle(): Promise<void> {
   await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
 }
@@ -111,5 +117,94 @@ describe('SettingsWindow runtime settings', () => {
     expect(bridge.settings.update).toHaveBeenCalledWith(expect.objectContaining({
       logRetentionDays: 0,
     }));
+  });
+
+  it('defaults to a credential-free export and requires matching passphrases when enabled', async () => {
+    const bridge = settingsBridge();
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<SettingsWindow />));
+    await settle();
+    await act(async () => [...container.querySelectorAll('button')]
+      .find((button) => button.textContent === '数据')!.click());
+
+    const includeCredentials = container.querySelector<HTMLInputElement>(
+      '[data-testid="backup-include-credentials"]',
+    )!;
+    expect(includeCredentials.checked).toBe(false);
+    expect(container.querySelector('[data-testid="backup-passphrase-fields"]')).toBeNull();
+
+    const exportButton = [...container.querySelectorAll('button')]
+      .find((button) => button.textContent === '导出配置…')!;
+    await act(async () => exportButton.click());
+    await settle();
+    expect(bridge.backup.export).toHaveBeenCalledWith({
+      includeLogs: false,
+      includeCredentials: false,
+    });
+
+    vi.mocked(bridge.backup.export).mockClear();
+    await act(async () => includeCredentials.click());
+    const passwordInputs = container.querySelectorAll<HTMLInputElement>(
+      '[data-testid="backup-passphrase-fields"] input[type="password"]',
+    );
+    await act(async () => {
+      setTextInput(passwordInputs[0]!, 'long enough password');
+      setTextInput(passwordInputs[1]!, 'does not match password');
+      exportButton.click();
+    });
+    expect(bridge.backup.export).not.toHaveBeenCalled();
+    expect(container.textContent).toContain('不一致');
+
+    await act(async () => {
+      setTextInput(passwordInputs[1]!, 'long enough password');
+      exportButton.click();
+    });
+    await settle();
+    expect(bridge.backup.export).toHaveBeenCalledWith({
+      includeLogs: false,
+      includeCredentials: true,
+      passphrase: 'long enough password',
+      passphraseConfirmation: 'long enough password',
+    });
+  });
+
+  it('requests an encrypted import passphrase after file detection and reuses the bound token', async () => {
+    const bridge = settingsBridge();
+    vi.mocked(bridge.backup.import)
+      .mockResolvedValueOnce({
+        challenge: 'passphrase-required',
+        token: 'bound-import-token',
+        message: '检测到整包加密备份。',
+      })
+      .mockResolvedValueOnce({
+        sectionsImported: ['settings'],
+        sectionsSkipped: [],
+        needsRestart: true,
+      });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<SettingsWindow />));
+    await settle();
+    await act(async () => [...container.querySelectorAll('button')]
+      .find((button) => button.textContent === '数据')!.click());
+    await act(async () => [...container.querySelectorAll('button')]
+      .find((button) => button.textContent === '导入配置…')!.click());
+    await settle();
+
+    const modal = container.querySelector<HTMLElement>('[data-testid="backup-import-challenge"]')!;
+    expect(modal.textContent).toContain('解密备份');
+    await act(async () => setTextInput(
+      modal.querySelector<HTMLInputElement>('input[type="password"]')!,
+      'import password',
+    ));
+    await act(async () => [...modal.querySelectorAll('button')]
+      .find((button) => button.textContent === '解密并导入')!.click());
+    await settle();
+
+    expect(bridge.backup.import).toHaveBeenNthCalledWith(1);
+    expect(bridge.backup.import).toHaveBeenNthCalledWith(2, {
+      token: 'bound-import-token',
+      passphrase: 'import password',
+    });
+    expect(container.textContent).toContain('重启后生效');
   });
 });

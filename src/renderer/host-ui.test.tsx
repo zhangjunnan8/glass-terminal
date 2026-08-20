@@ -122,6 +122,10 @@ function hostBridge() {
       onStateChanged: vi.fn(() => () => undefined),
       onAssistantDelta: vi.fn(() => () => undefined),
     },
+    hostBackup: {
+      export: vi.fn().mockResolvedValue(null),
+      import: vi.fn().mockResolvedValue(null),
+    },
     sftp: {},
   } as unknown as DesktopBridge;
   return bridge;
@@ -312,5 +316,73 @@ describe('主机分组与协议界面', () => {
     });
     expect(modal.textContent).toContain('VNC 尚未接入');
     expect(modal.querySelector<HTMLButtonElement>('button[type="submit"]')!.disabled).toBe(true);
+  });
+
+  it('主机备份默认不包含凭据，包含凭据时必须提供匹配口令', async () => {
+    await openHosts();
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[title="导出主机配置"]')!.click();
+    });
+    let dialog = container.querySelector<HTMLElement>('[data-testid="host-backup-export-dialog"]')!;
+    const checkbox = dialog.querySelector<HTMLInputElement>('input[type="checkbox"]')!;
+    expect(checkbox.checked).toBe(false);
+    expect(dialog.querySelectorAll('input[type="password"]')).toHaveLength(0);
+
+    await act(async () => [...dialog.querySelectorAll('button')]
+      .find((button) => button.textContent === '选择保存位置…')!.click());
+    await settle();
+    expect(bridge.hostBackup.export).toHaveBeenCalledWith({ includeCredentials: false });
+
+    vi.mocked(bridge.hostBackup.export).mockClear();
+    await act(async () => checkbox.click());
+    dialog = container.querySelector<HTMLElement>('[data-testid="host-backup-export-dialog"]')!;
+    const passwords = dialog.querySelectorAll<HTMLInputElement>('input[type="password"]');
+    await act(async () => {
+      setInputValue(passwords[0]!, 'host backup password');
+      setInputValue(passwords[1]!, 'host backup password');
+    });
+    await act(async () => [...dialog.querySelectorAll('button')]
+      .find((button) => button.textContent === '选择保存位置…')!.click());
+    await settle();
+
+    expect(bridge.hostBackup.export).toHaveBeenCalledWith({
+      includeCredentials: true,
+      passphrase: 'host backup password',
+      passphraseConfirmation: 'host backup password',
+    });
+  });
+
+  it('导入旧版明文凭据备份时，使用绑定令牌请求明确风险确认', async () => {
+    vi.mocked(bridge.hostBackup.import)
+      .mockResolvedValueOnce({
+        challenge: 'legacy-plaintext-confirmation',
+        token: 'legacy-host-token',
+        message: '旧版备份中的 SSH 凭据未加密。',
+      })
+      .mockResolvedValueOnce({
+        sectionsImported: ['hosts', 'hostSecrets'],
+        sectionsSkipped: [],
+        needsRestart: false,
+      });
+    await openHosts();
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[title="导入主机配置"]')!.click();
+    });
+    await settle();
+
+    const dialog = container.querySelector<HTMLElement>(
+      '[data-testid="host-backup-import-challenge"]',
+    )!;
+    expect(dialog.textContent).toContain('旧版明文主机备份风险确认');
+    expect(dialog.textContent).toContain('SSH 凭据未加密');
+    await act(async () => [...dialog.querySelectorAll('button')]
+      .find((button) => button.textContent === '确认风险并导入')!.click());
+    await settle();
+
+    expect(bridge.hostBackup.import).toHaveBeenNthCalledWith(1);
+    expect(bridge.hostBackup.import).toHaveBeenNthCalledWith(2, {
+      token: 'legacy-host-token',
+      confirmLegacyPlaintext: true,
+    });
   });
 });

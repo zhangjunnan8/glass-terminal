@@ -795,6 +795,8 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .connection-summary { margin-bottom: 14px; padding: 10px; color: #a0b2c7; border: 1px solid #253346; border-radius: 4px; background: #0b121b; font: 13px "Cascadia Code", Consolas, monospace; }
 .modal .credential-save-check { display: flex; height: auto; margin-top: 13px; flex-direction: row; align-items: center; gap: 9px; color: #c4d0df; font-size: 14px; cursor: pointer; }
 .modal .credential-save-check input { width: 18px; height: 18px; flex: 0 0 18px; accent-color: #67d2b0; }
+.host-backup-modal > label:not(.credential-save-check) { margin-top: 11px; }
+.host-backup-modal .risk-note { margin: 12px 0 0; padding: 8px 10px; color: #cdbb88; border: 1px solid #5b4d2d; border-radius: 4px; background: #211b0f; }
 .credential-forget-button { min-height: 34px; padding: 7px 10px; color: #e1b77e; border: 1px solid #59462c; border-radius: 4px; background: #251d11; cursor: pointer; font-size: 13px; }
 .credential-forget-button:disabled { cursor: not-allowed; opacity: .55; }
 .secure-note { padding-left: 16px; position: relative; }

@@ -2,6 +2,7 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
 import type { IpcMainInvokeEvent } from 'electron';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { randomUUID } from 'node:crypto';
 import { PRODUCT_NAME } from '../shared/product';
 import { HOST_CHANNELS } from '../shared/host';
 import type {
@@ -32,8 +33,9 @@ import type { AppSettingsPatch } from '../shared/settings';
 import { BACKUP_CHANNELS, HOST_BACKUP_CHANNELS } from '../shared/backup';
 import type {
   BackupExportRequest,
-  BackupExportResult,
-  BackupImportResult,
+  BackupImportRequest,
+  BackupImportResponse,
+  HostBackupExportRequest,
 } from '../shared/backup';
 import { AGENT_CHANNELS } from '../shared/agent';
 import type {
@@ -110,6 +112,17 @@ let backupService: BackupService | undefined;
 let hostBackupService: HostBackupService | undefined;
 let settingsWindow: BrowserWindow | null = null;
 const trustedRendererContents = new Set<number>();
+type PendingBackupKind = 'general' | 'host';
+interface PendingBackupImport {
+  kind: PendingBackupKind;
+  ownerId: number;
+  path: string;
+  fingerprint: string;
+  challenge: 'passphrase-required' | 'legacy-plaintext-confirmation';
+  expiresAt: number;
+}
+const pendingBackupImports = new Map<string, PendingBackupImport>();
+const PENDING_BACKUP_IMPORT_TTL_MS = 10 * 60 * 1000;
 const ownsSingleInstance = acquireSingleInstance(
   app,
   () => BrowserWindow.getAllWindows(),
@@ -166,6 +179,63 @@ function requireBackupService(): BackupService {
 function requireHostBackupService(): HostBackupService {
   if (!hostBackupService) throw new Error('Host backup service is not ready.');
   return hostBackupService;
+}
+
+function clearExpiredBackupImports(): void {
+  const now = Date.now();
+  for (const [token, pending] of pendingBackupImports) {
+    if (pending.expiresAt <= now) pendingBackupImports.delete(token);
+  }
+}
+
+function clearBackupImportsOwnedBy(ownerId: number): void {
+  for (const [token, pending] of pendingBackupImports) {
+    if (pending.ownerId === ownerId) pendingBackupImports.delete(token);
+  }
+}
+
+function createBackupImportChallenge(
+  kind: PendingBackupKind,
+  ownerId: number,
+  path: string,
+  fingerprint: string,
+  challenge: PendingBackupImport['challenge'],
+): BackupImportResponse {
+  clearExpiredBackupImports();
+  for (const [token, pending] of pendingBackupImports) {
+    if (pending.ownerId === ownerId && pending.kind === kind) pendingBackupImports.delete(token);
+  }
+  const token = randomUUID();
+  pendingBackupImports.set(token, {
+    kind,
+    ownerId,
+    path,
+    fingerprint,
+    challenge,
+    expiresAt: Date.now() + PENDING_BACKUP_IMPORT_TTL_MS,
+  });
+  return {
+    challenge,
+    token,
+    message: challenge === 'passphrase-required'
+      ? '检测到整包加密备份。请输入导出时设置的口令；口令只用于本次内存解密。'
+      : kind === 'host'
+        ? '这是旧版明文主机备份，可能包含 SSH 密码或私钥口令。仅在确认其来源可信且存储安全时继续。'
+        : '这是旧版明文配置备份，可能包含 Provider API Key。仅在确认其来源可信且存储安全时继续。',
+  };
+}
+
+function pendingBackupImport(
+  ownerId: number,
+  kind: PendingBackupKind,
+  token: string,
+): PendingBackupImport {
+  clearExpiredBackupImports();
+  const pending = pendingBackupImports.get(token);
+  if (!pending || pending.ownerId !== ownerId || pending.kind !== kind) {
+    throw new Error('备份导入确认已失效，请重新选择文件。');
+  }
+  return pending;
 }
 
 function isTrustedEntryUrl(url: string): boolean {
@@ -230,6 +300,7 @@ function createMainWindow(): BrowserWindow {
   trustedRendererContents.add(contentsId);
   contents.once('destroyed', () => {
     trustedRendererContents.delete(contentsId);
+    clearBackupImportsOwnedBy(contentsId);
     agentService?.closeOwnedBy(contentsId);
     terminalService.closeOwnedBy(contentsId);
   });
@@ -278,6 +349,7 @@ function showSettingsWindow(): void {
   trustedRendererContents.add(contentsId);
   contents.once('destroyed', () => {
     trustedRendererContents.delete(contentsId);
+    clearBackupImportsOwnedBy(contentsId);
     agentService?.closeOwnedBy(contentsId);
     terminalService.closeOwnedBy(contentsId);
   });
@@ -316,7 +388,7 @@ handleTrusted(SETTINGS_CHANNELS.update, (_event, patch: AppSettingsPatch) => {
 handleTrusted(SETTINGS_WINDOW_CHANNELS.open, () => {
   showSettingsWindow();
 });
-handleTrusted(BACKUP_CHANNELS.export, async (event, request: BackupExportRequest) => {
+handleTrusted(BACKUP_CHANNELS.export, async (event, request: BackupExportRequest = {}) => {
   const ownerWindow = BrowserWindow.fromWebContents(event.sender);
   if (!ownerWindow) throw new Error('无法打开导出窗口。');
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -326,20 +398,69 @@ handleTrusted(BACKUP_CHANNELS.export, async (event, request: BackupExportRequest
     filters: [{ name: 'Glass Terminal 备份', extensions: ['aitbak'] }],
   });
   if (selection.canceled || !selection.filePath) return null;
-  return requireBackupService().exportToFile(selection.filePath, request.includeLogs === true);
+  return requireBackupService().exportToFile(selection.filePath, request);
 });
-handleTrusted(BACKUP_CHANNELS.import, async (event) => {
+handleTrusted(BACKUP_CHANNELS.import, async (
+  event,
+  request: BackupImportRequest = {},
+): Promise<BackupImportResponse | null> => {
   const ownerWindow = BrowserWindow.fromWebContents(event.sender);
   if (!ownerWindow) throw new Error('无法打开导入窗口。');
+  if (request.token) {
+    const pending = pendingBackupImport(event.sender.id, 'general', request.token);
+    if (pending.challenge === 'passphrase-required') {
+      if (!request.passphrase) throw new Error('请输入备份口令。');
+      const result = await requireBackupService().importFromFile(pending.path, {
+        passphrase: request.passphrase,
+        expectedFingerprint: pending.fingerprint,
+      });
+      pendingBackupImports.delete(request.token);
+      return result;
+    }
+    if (request.confirmLegacyPlaintext !== true) {
+      throw new Error('必须确认旧版明文备份风险后才能继续。');
+    }
+    const result = await requireBackupService().importFromFile(pending.path, {
+      allowLegacyPlaintextCredentials: true,
+      expectedFingerprint: pending.fingerprint,
+    });
+    pendingBackupImports.delete(request.token);
+    return result;
+  }
   const selection = await dialog.showOpenDialog(ownerWindow, {
     title: '导入 Glass Terminal 配置',
     properties: ['openFile'],
     filters: [{ name: 'Glass Terminal 备份', extensions: ['aitbak'] }],
   });
   if (selection.canceled || !selection.filePaths[0]) return null;
-  return requireBackupService().importFromFile(selection.filePaths[0]);
+  const path = selection.filePaths[0];
+  const inspection = requireBackupService().inspectImportFile(path);
+  if (inspection.encrypted) {
+    return createBackupImportChallenge(
+      'general',
+      event.sender.id,
+      path,
+      inspection.fingerprint,
+      'passphrase-required',
+    );
+  }
+  if (inspection.legacyPlaintextCredentials) {
+    return createBackupImportChallenge(
+      'general',
+      event.sender.id,
+      path,
+      inspection.fingerprint,
+      'legacy-plaintext-confirmation',
+    );
+  }
+  return requireBackupService().importFromFile(path, {
+    expectedFingerprint: inspection.fingerprint,
+  });
 });
-handleTrusted(HOST_BACKUP_CHANNELS.export, async (event) => {
+handleTrusted(HOST_BACKUP_CHANNELS.export, async (
+  event,
+  request: HostBackupExportRequest = {},
+) => {
   const ownerWindow = BrowserWindow.fromWebContents(event.sender);
   if (!ownerWindow) throw new Error('无法打开主机导出窗口。');
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -349,18 +470,64 @@ handleTrusted(HOST_BACKUP_CHANNELS.export, async (event) => {
     filters: [{ name: 'Glass Terminal 主机备份', extensions: ['aithosts', 'json'] }],
   });
   if (selection.canceled || !selection.filePath) return null;
-  return requireHostBackupService().exportToFile(selection.filePath);
+  return requireHostBackupService().exportToFile(selection.filePath, request);
 });
-handleTrusted(HOST_BACKUP_CHANNELS.import, async (event) => {
+handleTrusted(HOST_BACKUP_CHANNELS.import, async (
+  event,
+  request: BackupImportRequest = {},
+): Promise<BackupImportResponse | null> => {
   const ownerWindow = BrowserWindow.fromWebContents(event.sender);
   if (!ownerWindow) throw new Error('无法打开主机导入窗口。');
+  if (request.token) {
+    const pending = pendingBackupImport(event.sender.id, 'host', request.token);
+    if (pending.challenge === 'passphrase-required') {
+      if (!request.passphrase) throw new Error('请输入备份口令。');
+      const result = await requireHostBackupService().importFromFile(pending.path, {
+        passphrase: request.passphrase,
+        expectedFingerprint: pending.fingerprint,
+      });
+      pendingBackupImports.delete(request.token);
+      return result;
+    }
+    if (request.confirmLegacyPlaintext !== true) {
+      throw new Error('必须确认旧版明文主机备份风险后才能继续。');
+    }
+    const result = await requireHostBackupService().importFromFile(pending.path, {
+      allowLegacyPlaintextCredentials: true,
+      expectedFingerprint: pending.fingerprint,
+    });
+    pendingBackupImports.delete(request.token);
+    return result;
+  }
   const selection = await dialog.showOpenDialog(ownerWindow, {
     title: '导入 SSH 主机配置',
     properties: ['openFile'],
     filters: [{ name: 'Glass Terminal 主机备份', extensions: ['aithosts', 'json'] }],
   });
   if (selection.canceled || !selection.filePaths[0]) return null;
-  return requireHostBackupService().importFromFile(selection.filePaths[0]);
+  const path = selection.filePaths[0];
+  const inspection = requireHostBackupService().inspectImportFile(path);
+  if (inspection.encrypted) {
+    return createBackupImportChallenge(
+      'host',
+      event.sender.id,
+      path,
+      inspection.fingerprint,
+      'passphrase-required',
+    );
+  }
+  if (inspection.legacyPlaintextCredentials) {
+    return createBackupImportChallenge(
+      'host',
+      event.sender.id,
+      path,
+      inspection.fingerprint,
+      'legacy-plaintext-confirmation',
+    );
+  }
+  return requireHostBackupService().importFromFile(path, {
+    expectedFingerprint: inspection.fingerprint,
+  });
 });
 
 handleTrusted(TERMINAL_CHANNELS.listShells, () => terminalService.listShells());
