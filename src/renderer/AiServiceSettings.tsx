@@ -3,8 +3,11 @@ import type { FormEvent } from 'react';
 import type { CodexAppServerSnapshot, CodexModelInfo } from '../shared/codex-app-server';
 import type { ProviderInput, ProviderProfile } from '../shared/provider';
 import {
+  DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR,
   DEFAULT_CONTEXT_WINDOW_TOKENS,
+  MAX_CONTEXT_ESTIMATE_SAFETY_FACTOR,
   MAX_CONTEXT_WINDOW_TOKENS,
+  MIN_CONTEXT_ESTIMATE_SAFETY_FACTOR,
   MIN_CONTEXT_WINDOW_TOKENS,
 } from '../shared/context-window';
 import {
@@ -247,6 +250,9 @@ export function AiServiceSettings() {
     const baseUrlInput = form.elements.namedItem('baseUrl') as HTMLInputElement;
     const modelInput = form.elements.namedItem('modelId') as HTMLInputElement;
     const contextWindowInput = form.elements.namedItem('contextWindowTokens') as HTMLInputElement;
+    const contextSafetyInput = form.elements.namedItem(
+      'contextEstimateSafetyFactor',
+    ) as HTMLInputElement;
     const apiKeyInput = form.elements.namedItem('apiKey') as HTMLInputElement;
     const makeDefaultInput = form.elements.namedItem('makeDefault') as HTMLInputElement;
     const input: ProviderInput = {
@@ -255,6 +261,7 @@ export function AiServiceSettings() {
       baseUrl: baseUrlInput.value,
       modelId: modelInput.value,
       contextWindowTokens: Number(contextWindowInput.value),
+      contextEstimateSafetyFactor: Number(contextSafetyInput.value),
       makeDefault: makeDefaultInput.checked,
     };
     if (apiKeyInput.value) input.apiKey = apiKeyInput.value;
@@ -904,6 +911,23 @@ export function AiServiceSettings() {
               </label>
               <small id="provider-context-window-note" className="provider-field-note">
                 请填写该模型的输入窗口；到达 85% 安全阈值时会自动压缩旧上下文。
+              </small>
+              <label>
+                估算安全系数
+                <input
+                  name="contextEstimateSafetyFactor"
+                  type="number"
+                  min={MIN_CONTEXT_ESTIMATE_SAFETY_FACTOR}
+                  max={MAX_CONTEXT_ESTIMATE_SAFETY_FACTOR}
+                  step={0.05}
+                  required
+                  defaultValue={editingProvider?.contextEstimateSafetyFactor
+                    ?? DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR}
+                  aria-describedby="provider-context-safety-note"
+                />
+              </label>
+              <small id="provider-context-safety-note" className="provider-field-note">
+                默认 1.15。会对消息、实际工具 Schema 和包装开销的本地估算统一留出余量。
               </small>
               <label>
                 API Key

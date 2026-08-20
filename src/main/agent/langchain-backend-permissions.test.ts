@@ -7,6 +7,10 @@ import type { AgentFileAccessMode } from '../../shared/agent';
 import type { AgentBackendEvent, AgentMessage } from './agent-backend';
 import type { TerminalTool, ToolGateway, WorkspaceTool } from '../../shared/tools';
 import { LangChainBackend } from './langchain-backend';
+import {
+  agentToolDefinitionsForAccess,
+  type AgentFunctionToolDefinition,
+} from './agent-tool-definitions';
 
 /**
  * Verifies the LangChain harness never exposes workspace tools the Session
@@ -87,21 +91,26 @@ async function startToolCaptureServer(): Promise<{
   baseUrl: string;
   server: Server;
   getTools: () => string[];
+  getDefinitions: () => AgentFunctionToolDefinition[];
 }> {
-  let capturedTools: string[] = [];
+  let capturedDefinitions: AgentFunctionToolDefinition[] = [];
   const server = createServer((request, response) => {
     let body = '';
     request.setEncoding('utf8');
     request.on('data', (chunk) => { body += chunk; });
     request.on('end', () => {
-      const parsed = JSON.parse(body) as { tools?: Array<{ function?: { name?: string } }> };
-      capturedTools = (parsed.tools ?? []).map((entry) => entry.function?.name ?? '');
+      const parsed = JSON.parse(body) as { tools?: AgentFunctionToolDefinition[] };
+      capturedDefinitions = parsed.tools ?? [];
       response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
       response.write(`data: ${JSON.stringify({
         choices: [{ index: 0, delta: { content: 'done' }, finish_reason: null }],
       })}\n\n`);
       response.write(`data: ${JSON.stringify({
         choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      })}\n\n`);
+      response.write(`data: ${JSON.stringify({
+        choices: [],
+        usage: { prompt_tokens: 321, completion_tokens: 1, total_tokens: 322 },
       })}\n\n`);
       response.end('data: [DONE]\n\n');
     });
@@ -111,11 +120,16 @@ async function startToolCaptureServer(): Promise<{
   return {
     baseUrl: `http://127.0.0.1:${address.port}/v1`,
     server,
-    getTools: () => [...capturedTools],
+    getTools: () => capturedDefinitions.map((entry) => entry.function.name),
+    getDefinitions: () => structuredClone(capturedDefinitions),
   };
 }
 
-async function runTurn(mode: AgentFileAccessMode): Promise<string[]> {
+async function runTurn(mode: AgentFileAccessMode): Promise<{
+  tools: string[];
+  definitions: AgentFunctionToolDefinition[];
+  contextUsage: Awaited<ReturnType<LangChainBackend['sendMessage']>>['contextUsage'];
+}> {
   const capture = await startToolCaptureServer();
   try {
     const model = new ChatOpenAICompletions({
@@ -127,7 +141,7 @@ async function runTurn(mode: AgentFileAccessMode): Promise<string[]> {
     });
     const backend = new LangChainBackend({ modelFactory: () => Promise.resolve(model) });
     const thread = await backend.createThread({ id: `perm-${mode}` });
-    await backend.sendMessage({
+    const result = await backend.sendMessage({
       thread,
       prompt: 'hello',
       systemPrompt: 'system',
@@ -136,7 +150,11 @@ async function runTurn(mode: AgentFileAccessMode): Promise<string[]> {
       gateway: buildGateway(mode),
       signal: new AbortController().signal,
     });
-    return capture.getTools();
+    return {
+      tools: capture.getTools(),
+      definitions: capture.getDefinitions(),
+      contextUsage: result.contextUsage,
+    };
   } finally {
     await new Promise<void>((resolve) => capture.server.close(() => resolve()));
   }
@@ -144,13 +162,13 @@ async function runTurn(mode: AgentFileAccessMode): Promise<string[]> {
 
 describe('LangChainBackend workspace tool gating', () => {
   it('advertises only terminal tools when file access is off', async () => {
-    const tools = await runTurn('off');
+    const { tools } = await runTurn('off');
     expect(tools).toContain('terminal_execute');
     expect(tools.filter((tool) => tool.startsWith('workspace_'))).toEqual([]);
   });
 
   it('advertises read tools but never write tools in read-only mode', async () => {
-    const tools = await runTurn('read-only');
+    const { tools } = await runTurn('read-only');
     expect(tools).toContain('workspace_list');
     expect(tools).toContain('workspace_read_file');
     expect(tools).toContain('workspace_search');
@@ -163,13 +181,32 @@ describe('LangChainBackend workspace tool gating', () => {
   });
 
   it('advertises read and write tools in read-write mode', async () => {
-    const tools = await runTurn('read-write');
+    const { tools } = await runTurn('read-write');
     expect(tools).toContain('workspace_read_file');
     expect(tools).toContain('workspace_apply_patch');
     expect(tools).toContain('workspace_write_file');
     expect(tools).toContain('workspace_mkdir');
     expect(tools).toContain('workspace_rename');
     expect(tools).toContain('workspace_delete');
+  });
+
+  it('estimates the same serialized tool definitions dispatched to the Provider', async () => {
+    const result = await runTurn('read-only');
+    const expected = agentToolDefinitionsForAccess({
+      fileAccessMode: 'read-only',
+      workspaceAvailable: true,
+      workspaceEnabled: true,
+      workspaceRead: true,
+    });
+
+    expect(result.definitions).toEqual(expected);
+    expect(result.contextUsage).toMatchObject({
+      boundToolCount: expected.length,
+      safetyFactor: 1.15,
+      providerReportedInputTokens: 321,
+    });
+    expect(result.contextUsage!.toolSchemaEstimatedTokens).toBeGreaterThan(0);
+    expect(result.contextUsage!.estimatedTokens).not.toBe(321);
   });
 
   it('compresses a full resumed context before dispatch and persists a bounded checkpoint', async () => {

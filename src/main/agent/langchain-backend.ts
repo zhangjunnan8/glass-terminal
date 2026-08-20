@@ -2,7 +2,6 @@ import type {
   AIMessage,
   BaseMessage,
 } from '@langchain/core/messages';
-import type { StructuredToolInterface } from '@langchain/core/tools';
 import type { ChatOpenAICompletions } from '@langchain/openai';
 import type {
   AgentBackend,
@@ -22,6 +21,10 @@ import {
   compactCompletedWorkspaceHistory,
   compressContextIfNeeded,
 } from './context-window';
+import {
+  boundAgentToolDefinitions,
+  type AgentFunctionToolDefinition,
+} from './agent-tool-definitions';
 
 /**
  * LangChain-backed harness. It satisfies the project's `AgentBackend` boundary
@@ -61,10 +64,8 @@ interface LangChainRuntime {
   HumanMessage: any;
   SystemMessage: any;
   ToolMessage: any;
-  tool: any;
   ChatOpenAICompletions: any;
   concat: any;
-  z: any;
 }
 
 let langChainRuntimePromise: Promise<LangChainRuntime> | undefined;
@@ -73,21 +74,17 @@ function loadLangChainRuntime(): Promise<LangChainRuntime> {
   if (!langChainRuntimePromise) {
     langChainRuntimePromise = Promise.all([
       import('@langchain/core/messages'),
-      import('@langchain/core/tools'),
       import('@langchain/openai'),
       import('@langchain/core/utils/stream'),
-      import('zod'),
-    ]).then(([messages, tools, openai, stream, zod]) => ({
+    ]).then(([messages, openai, stream]) => ({
       AIMessage: messages.AIMessage,
       AIMessageChunk: messages.AIMessageChunk,
       collapseToolCallChunks: messages.collapseToolCallChunks,
       HumanMessage: messages.HumanMessage,
       SystemMessage: messages.SystemMessage,
       ToolMessage: messages.ToolMessage,
-      tool: tools.tool,
       ChatOpenAICompletions: openai.ChatOpenAICompletions,
       concat: stream.concat,
-      z: zod.z,
     }));
   }
   return langChainRuntimePromise;
@@ -102,6 +99,7 @@ export interface LangChainBackendOptions {
   modelFactory: () => Promise<ChatOpenAICompletions>;
   maxRounds?: number;
   contextWindowTokens?: number;
+  contextEstimateSafetyFactor?: number;
   /** Test seam; production summarizes with the selected Provider model. */
   summarize?: (serializedHistory: string, signal: AbortSignal) => Promise<string>;
 }
@@ -249,6 +247,25 @@ function errorResult(error: unknown): string {
   });
 }
 
+function providerReportedInputTokens(response: unknown): number | undefined {
+  if (!response || typeof response !== 'object') return undefined;
+  const message = response as {
+    usage_metadata?: Record<string, unknown>;
+    response_metadata?: Record<string, unknown>;
+  };
+  const tokenUsage = message.response_metadata?.tokenUsage;
+  const candidates = [
+    message.usage_metadata?.input_tokens,
+    message.usage_metadata?.inputTokens,
+    tokenUsage && typeof tokenUsage === 'object'
+      ? (tokenUsage as Record<string, unknown>).promptTokens
+      : undefined,
+  ];
+  return candidates.find((value): value is number => (
+    typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
+  ));
+}
+
 function requireString(args: Record<string, unknown>, field: string, toolName: string): string {
   const value = args[field];
   if (typeof value !== 'string' || !value) {
@@ -272,6 +289,7 @@ export class LangChainBackend implements AgentBackend {
   private readonly modelFactory: () => Promise<ChatOpenAICompletions>;
   private readonly defaultMaxRounds: number;
   private readonly contextWindowTokens: number;
+  private readonly contextEstimateSafetyFactor: number | undefined;
   private readonly customSummarize?: LangChainBackendOptions['summarize'];
   private modelPromise?: Promise<ChatOpenAICompletions>;
 
@@ -279,6 +297,7 @@ export class LangChainBackend implements AgentBackend {
     this.modelFactory = options.modelFactory;
     this.defaultMaxRounds = configuredMaxRounds(options.maxRounds);
     this.contextWindowTokens = options.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
+    this.contextEstimateSafetyFactor = options.contextEstimateSafetyFactor;
     this.customSummarize = options.summarize;
   }
 
@@ -329,9 +348,8 @@ export class LangChainBackend implements AgentBackend {
     try {
       const runtime = await loadLangChainRuntime();
       const model = await this.resolveModel();
-      const modelWithTools = model.bindTools(
-        this.buildTools(input.gateway, input.fileAccessMode, runtime),
-      );
+      const tools = this.buildTools(input.gateway, input.fileAccessMode);
+      const modelWithTools = model.bindTools(tools as never);
       let messages: BaseMessage[] = [
         new runtime.SystemMessage(input.systemPrompt),
         ...record.priorMessages.map((message) => toLangChainMessage(message, runtime)),
@@ -353,7 +371,14 @@ export class LangChainBackend implements AgentBackend {
       const initialPriorCount = record.priorMessages.length;
       let contextWasRewritten = record.requiresCheckpoint;
       let lastCompressedAt: string | undefined;
+      let lastProviderReportedInputTokens: number | undefined;
       let pendingToolAssistant: Extract<AgentMessage, { role: 'assistant' }> | undefined;
+
+      const estimation = () => ({
+        tools,
+        safetyFactor: this.contextEstimateSafetyFactor,
+        providerReportedInputTokens: lastProviderReportedInputTokens,
+      });
 
       const summarize = async (serializedHistory: string): Promise<string> => {
         if (this.customSummarize) {
@@ -380,6 +405,7 @@ export class LangChainBackend implements AgentBackend {
           this.contextWindowTokens,
           'ready',
           lastCompressedAt,
+          estimation(),
         );
         input.onEvent?.({ type: 'context_status', contextUsage: before });
         if (before.percentage < 100) return before;
@@ -392,7 +418,11 @@ export class LangChainBackend implements AgentBackend {
           transcript,
           this.contextWindowTokens,
           summarize,
-          { keepAssistant: pendingToolAssistant, signal: controller.signal },
+          {
+            keepAssistant: pendingToolAssistant,
+            signal: controller.signal,
+            estimation: estimation(),
+          },
         );
         throwIfCancelled(controller.signal);
         transcript = compacted.messages;
@@ -404,6 +434,7 @@ export class LangChainBackend implements AgentBackend {
           this.contextWindowTokens,
           'ready',
           lastCompressedAt,
+          estimation(),
         );
         input.onEvent?.({
           type: 'context_status',
@@ -427,6 +458,8 @@ export class LangChainBackend implements AgentBackend {
         let full: unknown;
         for await (const chunk of stream) {
           throwIfCancelled(controller.signal);
+          lastProviderReportedInputTokens = providerReportedInputTokens(chunk)
+            ?? lastProviderReportedInputTokens;
           if (chunk.content) {
             const text = typeof chunk.content === 'string' ? chunk.content : '';
             if (text) input.onEvent?.({ type: 'assistant_delta', text });
@@ -434,6 +467,8 @@ export class LangChainBackend implements AgentBackend {
           full = full === undefined ? chunk : runtime.concat(full, chunk);
         }
         throwIfCancelled(controller.signal);
+        lastProviderReportedInputTokens = providerReportedInputTokens(full)
+          ?? lastProviderReportedInputTokens;
         const toolCalls = full
           ? runtime.collapseToolCallChunks((full as { tool_call_chunks?: unknown[] }).tool_call_chunks ?? [])
             .tool_calls
@@ -568,144 +603,8 @@ export class LangChainBackend implements AgentBackend {
   private buildTools(
     gateway: ToolGateway,
     fileAccessMode: AgentFileAccessMode,
-    runtime: LangChainRuntime,
-  ): StructuredToolInterface[] {
-    const run = (name: string) => (
-      (args: Record<string, unknown>) => this.executeTool(gateway, fileAccessMode, name, args)
-    );
-
-    const tools: StructuredToolInterface[] = [
-      runtime.tool(run('terminal_execute'), {
-        name: 'terminal_execute',
-        description:
-          'Request execution of one command in the same visible terminal. '
-          + 'User approval is required unless Full Takeover is explicitly active.',
-        schema: runtime.z.object({
-          command: runtime.z.string().min(1).describe('The single shell command to execute.'),
-          reason: runtime.z.string().optional().describe('Optional one-line justification.'),
-        }),
-      }),
-      runtime.tool(run('terminal_read'), {
-        name: 'terminal_read',
-        description: 'Read a bounded recent portion of the exact visible terminal history.',
-        schema: runtime.z.object({
-          maxChars: runtime.z.number().int().min(100).max(30_000).optional(),
-        }),
-      }),
-      runtime.tool(run('terminal_state'), {
-        name: 'terminal_state',
-        description: 'Get the current terminal transport, shell, cwd/user, and control state.',
-        schema: runtime.z.object({}),
-      }),
-    ];
-
-    const workspace = gateway.workspace;
-    const permissions = gateway.context.permissions.workspace;
-    if (!workspace || !permissions.enabled || fileAccessMode === 'off') return tools;
-
-    const modeCanWrite = fileAccessMode === 'read-write' || fileAccessMode === 'full-access';
-
-    if (permissions.read) {
-      tools.push(
-        runtime.tool(run('workspace_list'), {
-          name: 'workspace_list',
-          description: 'List one bounded directory inside the explicit Workspace Root without running a shell command.',
-          schema: runtime.z.object({
-            path: runtime.z.string().max(4_096).optional().describe('Directory path relative to the Workspace Root.'),
-          }),
-        }),
-        runtime.tool(run('workspace_read_file'), {
-          name: 'workspace_read_file',
-          description:
-            'Read one needed, bounded text file inside the Workspace Root and return its SHA-256. '
-            + 'Supports UTF-8 and Windows GBK (ANSI) encodings; edits keep the file\'s original encoding. '
-            + 'Prefer small, targeted reads; never use cat/Get-Content/type in the terminal for this.',
-          schema: runtime.z.object({
-            path: runtime.z.string().min(1).max(4_096).describe('File path relative to the Workspace Root.'),
-          }),
-        }),
-        runtime.tool(run('workspace_stat'), {
-          name: 'workspace_stat',
-          description: 'Inspect one file, directory, or symbolic link inside the Workspace Root without reading its contents.',
-          schema: runtime.z.object({
-            path: runtime.z.string().min(1).max(4_096),
-          }),
-        }),
-        runtime.tool(run('workspace_search'), {
-          name: 'workspace_search',
-          description: 'Search bounded UTF-8 workspace files for literal text and return structured line/column previews. Use this instead of grep in the terminal.',
-          schema: runtime.z.object({
-            query: runtime.z.string().min(1).max(4_096),
-            path: runtime.z.string().max(4_096).optional(),
-            maxResults: runtime.z.number().int().min(1).max(200).optional(),
-          }),
-        }),
-        runtime.tool(run('workspace_glob'), {
-          name: 'workspace_glob',
-          description: 'Find bounded workspace paths matching a glob pattern without running find, dir, or another shell command.',
-          schema: runtime.z.object({
-            pattern: runtime.z.string().min(1).max(4_096),
-            path: runtime.z.string().max(4_096).optional(),
-            maxResults: runtime.z.number().int().min(1).max(500).optional(),
-          }),
-        }),
-      );
-    }
-
-    if (modeCanWrite) {
-      tools.push(
-        runtime.tool(run('workspace_apply_patch'), {
-          name: 'workspace_apply_patch',
-          description:
-            'Preferred way to modify an existing file. Atomically apply exact, unique text replacements and return a diff. '
-            + 'Works on UTF-8 and Windows GBK (ANSI) text; the file keeps its original encoding on write-back. '
-            + 'expectedSha256 must come from the latest workspace_read_file; re-read after a conflict.',
-          schema: runtime.z.object({
-            path: runtime.z.string().min(1).max(4_096),
-            expectedSha256: runtime.z.string().regex(/^[a-fA-F0-9]{64}$/),
-            patches: runtime.z.array(runtime.z.object({
-              search: runtime.z.string().min(1).max(131_072),
-              replace: runtime.z.string().max(131_072),
-            })).min(1).max(64),
-          }),
-        }),
-        runtime.tool(run('workspace_write_file'), {
-          name: 'workspace_write_file',
-          description:
-            'Atomically create one bounded UTF-8 text file. For an existing file prefer workspace_apply_patch; pass null only when the path must not exist.',
-          schema: runtime.z.object({
-            path: runtime.z.string().min(1).max(4_096),
-            content: runtime.z.string().max(131_072),
-            expectedSha256: runtime.z.string().regex(/^[a-fA-F0-9]{64}$/).nullable(),
-          }),
-        }),
-        runtime.tool(run('workspace_mkdir'), {
-          name: 'workspace_mkdir',
-          description: 'Create one directory inside the Workspace Root without running a shell command.',
-          schema: runtime.z.object({
-            path: runtime.z.string().min(1).max(4_096),
-          }),
-        }),
-        runtime.tool(run('workspace_rename'), {
-          name: 'workspace_rename',
-          description: 'Rename or move one workspace path to another path inside the same Workspace Root.',
-          schema: runtime.z.object({
-            source: runtime.z.string().min(1).max(4_096),
-            destination: runtime.z.string().min(1).max(4_096),
-          }),
-        }),
-        runtime.tool(run('workspace_delete'), {
-          name: 'workspace_delete',
-          description: 'Delete one workspace path. Recursive directory deletion must be explicitly requested.',
-          schema: runtime.z.object({
-            path: runtime.z.string().min(1).max(4_096),
-            recursive: runtime.z.boolean().optional(),
-          }),
-        }),
-      );
-    }
-
-    return tools;
+  ): AgentFunctionToolDefinition[] {
+    return boundAgentToolDefinitions(gateway, fileAccessMode);
   }
 
   private async executeTool(

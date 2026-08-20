@@ -60,9 +60,10 @@ describe('ProviderStore', () => {
     expect(await secrets.get(reference)).toBe('super-secret-provider-key');
     expect(profile.baseUrl).toBe('https://provider.example/v1');
     expect(profile.contextWindowTokens).toBe(64_000);
+    expect(profile.contextEstimateSafetyFactor).toBe(1.15);
   });
 
-  it('persists a validated model context window without changing recipient identity', async () => {
+  it('persists validated context estimates without changing recipient identity', async () => {
     const { store } = fixture();
     const profile = await store.save({
       name: 'Context Provider',
@@ -77,9 +78,11 @@ describe('ProviderStore', () => {
       baseUrl: profile.baseUrl,
       modelId: profile.modelId,
       contextWindowTokens: 256_000,
+      contextEstimateSafetyFactor: 1.35,
     });
 
     expect(updated.contextWindowTokens).toBe(256_000);
+    expect(updated.contextEstimateSafetyFactor).toBe(1.35);
     expect(updated.recipientRevision).toBe(profile.recipientRevision);
     await expect(store.save({
       id: profile.id,
@@ -88,6 +91,37 @@ describe('ProviderStore', () => {
       modelId: profile.modelId,
       contextWindowTokens: 1_000,
     })).rejects.toThrow('上下文窗口必须是');
+    await expect(store.save({
+      id: profile.id,
+      name: profile.name,
+      baseUrl: profile.baseUrl,
+      modelId: profile.modelId,
+      contextEstimateSafetyFactor: 2.01,
+    })).rejects.toThrow('估算安全系数必须是');
+  });
+
+  it('gives old Provider metadata a stable default safety factor', () => {
+    const { path, secrets } = fixture();
+    writeFileSync(path, JSON.stringify([{
+      id: 'legacy-provider',
+      name: 'Legacy',
+      kind: 'generic-openai-compatible',
+      baseUrl: 'https://legacy.example/v1',
+      modelId: 'legacy-model',
+      apiKeyReference: 'AI Terminal/provider/legacy-provider',
+      recipientTransitionPending: false,
+      recipientRevision: 'stable-recipient',
+      apiKeyConfigured: false,
+      isDefault: true,
+      status: 'not-tested',
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    }]));
+
+    const profile = new ProviderStore(path, secrets).get('legacy-provider');
+
+    expect(profile.contextEstimateSafetyFactor).toBe(1.15);
+    expect(profile.recipientRevision).toBe('stable-recipient');
   });
 
   it('becomes Ready only after a successful authenticated connection test', async () => {

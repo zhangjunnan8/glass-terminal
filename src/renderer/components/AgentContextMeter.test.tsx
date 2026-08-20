@@ -17,6 +17,12 @@ describe('AgentContextMeter', () => {
     const root = createRoot(container);
     act(() => root.render(<AgentContextMeter usage={{
       estimatedTokens: 27_200,
+      messageEstimatedTokens: 20_000,
+      toolSchemaEstimatedTokens: 3_600,
+      fixedOverheadTokens: 52,
+      safetyFactor: 1.15,
+      boundToolCount: 8,
+      providerReportedInputTokens: 19_800,
       contextWindowTokens: 64_000,
       compressionThresholdTokens: 54_400,
       percentage: 50,
@@ -30,6 +36,12 @@ describe('AgentContextMeter', () => {
     expect(container.querySelector('.agent-context-ring-value')?.getAttribute('stroke-dasharray'))
       .toBe('50 100');
     expect(container.textContent).toContain('27k / 54k');
+    expect(meter?.getAttribute('title')).toContain('上下文估算值 27,200');
+    expect(meter?.getAttribute('title')).toContain('消息估算 20,000');
+    expect(meter?.getAttribute('title')).toContain('工具 Schema 估算 3,600 tokens（8 个工具）');
+    expect(meter?.getAttribute('title')).toContain('估算安全系数 ×1.15');
+    expect(meter?.getAttribute('title')).toContain('模型窗口 64,000');
+    expect(meter?.getAttribute('title')).toContain('仅诊断');
     act(() => root.unmount());
   });
 

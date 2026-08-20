@@ -47,6 +47,17 @@ function providerBridge(discoverModels: DesktopBridge['providers']['discoverMode
     providers: {
       list: vi.fn().mockResolvedValue([]),
       discoverModels,
+      save: vi.fn().mockImplementation(async (input) => ({
+        ...input,
+        id: 'saved-provider',
+        kind: 'generic-openai-compatible',
+        recipientRevision: 'recipient-1',
+        apiKeyConfigured: true,
+        isDefault: true,
+        status: 'not-tested',
+        createdAt: '2026-08-20T00:00:00.000Z',
+        updatedAt: '2026-08-20T00:00:00.000Z',
+      })),
     },
     codexAppServer: {
       getState: vi.fn(() => new Promise(() => undefined)),
@@ -146,5 +157,38 @@ describe('compatible API model picker', () => {
 
     await act(async () => setInputValue(modelInput, 'manually-entered-model'));
     expect(modelInput.value).toBe('manually-entered-model');
+  });
+
+  it('shows and saves the configurable context estimation safety factor', async () => {
+    const bridge = providerBridge(vi.fn().mockResolvedValue({
+      models: ['gpt-5'],
+      message: '已检索到 1 个可用模型。',
+    }));
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<AiServiceSettings />));
+    await settle();
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[data-testid="provider-kind-generic"]')!.click();
+    });
+
+    const factor = container.querySelector<HTMLInputElement>(
+      'input[name="contextEstimateSafetyFactor"]',
+    )!;
+    expect(factor.value).toBe('1.15');
+    expect(factor.min).toBe('1');
+    expect(factor.max).toBe('2');
+    await act(async () => setInputValue(factor, '1.4'));
+    await act(async () => setInputValue(
+      container.querySelector<HTMLInputElement>('input[name="apiKey"]')!,
+      'test-key',
+    ));
+    await act(async () => container.querySelector<HTMLFormElement>('.provider-form')!
+      .dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })));
+    await settle();
+
+    expect(bridge.providers.save).toHaveBeenCalledWith(expect.objectContaining({
+      contextWindowTokens: 64_000,
+      contextEstimateSafetyFactor: 1.4,
+    }));
   });
 });

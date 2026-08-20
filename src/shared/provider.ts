@@ -12,6 +12,8 @@ export interface ProviderProfile {
    * Automatic compression triggers before this hard ceiling.
    */
   contextWindowTokens?: number;
+  /** Conservative multiplier applied to local message/tool-schema estimates. */
+  contextEstimateSafetyFactor?: number;
   /**
    * Opaque, non-secret identity revision for endpoint/model/credential changes.
    * Routine status tests, display-name edits, and default selection preserve it.
@@ -33,6 +35,7 @@ export interface ProviderInput {
   baseUrl: string;
   modelId: string;
   contextWindowTokens?: number;
+  contextEstimateSafetyFactor?: number;
   apiKey?: string;
   makeDefault?: boolean;
 }

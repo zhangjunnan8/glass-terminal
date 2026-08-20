@@ -19,8 +19,11 @@ import type {
   ProviderProfile,
 } from '../../shared/provider';
 import {
+  MAX_CONTEXT_ESTIMATE_SAFETY_FACTOR,
   MAX_CONTEXT_WINDOW_TOKENS,
+  MIN_CONTEXT_ESTIMATE_SAFETY_FACTOR,
   MIN_CONTEXT_WINDOW_TOKENS,
+  normalizedContextEstimateSafetyFactor,
   normalizedContextWindowTokens,
 } from '../../shared/context-window';
 import { PROVIDER_SECRET_PREFIX } from '../../shared/backup';
@@ -168,6 +171,9 @@ function parseProfiles(value: unknown): StoredProviderProfile[] {
       baseUrl: profile.baseUrl,
       modelId: profile.modelId,
       contextWindowTokens: normalizedContextWindowTokens(profile.contextWindowTokens),
+      contextEstimateSafetyFactor: normalizedContextEstimateSafetyFactor(
+        profile.contextEstimateSafetyFactor,
+      ),
       apiKeyReference: profile.apiKeyReference,
       recipientTransitionPending,
       recipientRevision: typeof profile.recipientRevision === 'string'
@@ -311,6 +317,18 @@ export class ProviderStore {
     const contextWindowTokens = normalizedContextWindowTokens(
       input.contextWindowTokens ?? existing?.contextWindowTokens,
     );
+    if (
+      input.contextEstimateSafetyFactor !== undefined
+      && normalizedContextEstimateSafetyFactor(input.contextEstimateSafetyFactor)
+        !== input.contextEstimateSafetyFactor
+    ) {
+      throw new Error(
+        `估算安全系数必须是 ${MIN_CONTEXT_ESTIMATE_SAFETY_FACTOR}-${MAX_CONTEXT_ESTIMATE_SAFETY_FACTOR} 之间的数值。`,
+      );
+    }
+    const contextEstimateSafetyFactor = normalizedContextEstimateSafetyFactor(
+      input.contextEstimateSafetyFactor ?? existing?.contextEstimateSafetyFactor,
+    );
     const apiKeyReference = existing?.apiKeyReference ?? `AI Terminal/provider/${id}`;
     const suppliedKey = input.apiKey && input.apiKey.trim() ? input.apiKey : undefined;
     const keyReplaced = Boolean(suppliedKey);
@@ -327,6 +345,7 @@ export class ProviderStore {
       baseUrl,
       modelId,
       contextWindowTokens,
+      contextEstimateSafetyFactor,
       apiKeyReference,
       recipientTransitionPending: suppliedKey
         ? true

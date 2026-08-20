@@ -189,9 +189,12 @@ are not physically rewritten, and replay still reads the complete thread event
 file to rebuild visible chat and support retract/replace. A future indexed context
 snapshot or safe log compactor is needed to remove that historical disk/read cost.
 
-The token count is a conservative provider-agnostic estimate (ASCII roughly four
-characters per token; non-ASCII at least one token per code point), not the exact
-tokenizer for every custom endpoint. Providers with unusual tokenization should be
-configured with a smaller effective window. The Session API also has callers that
-read the complete terminal history before applying a tail limit. These remain
-long-session performance limits outside the bounded model working context.
+The token count is a conservative provider-agnostic estimate (ASCII word/space
+runs roughly four characters per token, syntax punctuation charged individually,
+and non-ASCII at least one token per code point), not the exact
+tokenizer for every custom endpoint. It includes the messages, the exact serialized
+OpenAI function-tool definitions exposed by the current file-access mode, fixed
+request/tool wrapping allowances, and a per-Provider safety factor (default 1.15,
+range 1.0–2.0). Provider-reported prompt usage is diagnostic only and never reduces
+that local safety estimate. Terminal tail reads use incremental journal cursors;
+full history remains reserved for explicit replay/export paths.

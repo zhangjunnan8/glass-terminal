@@ -5,18 +5,68 @@ import {
   agentContextUsage,
   compactCompletedWorkspaceHistory,
   compressContextIfNeeded,
+  estimateAgentContextTokens,
   estimateAgentMessagesTokens,
+  estimateAgentToolSchemaTokens,
   estimateTextTokens,
 } from './context-window';
+import { agentToolDefinitionsForAccess } from './agent-tool-definitions';
 
 describe('Agent context window', () => {
   it('uses a conservative provider-agnostic token estimate for ASCII and CJK text', () => {
     expect(estimateTextTokens('a'.repeat(40))).toBe(10);
     expect(estimateTextTokens('上下文压缩')).toBe(5);
+    expect(estimateTextTokens('{}[]():;,'.repeat(4)))
+      .toBeGreaterThan(estimateTextTokens('a'.repeat(36)));
     expect(estimateAgentMessagesTokens([
       { role: 'user', content: '上下文' },
       { role: 'assistant', content: 'done' },
     ])).toBeGreaterThan(10);
+  });
+
+  it('includes exact exposed tool schemas, wrapping overhead, and the configured safety factor', () => {
+    const messages: AgentMessage[] = [{
+      role: 'assistant',
+      content: '```ts\nconst result = await run();\n```',
+      toolCalls: [{
+        id: 'call-1',
+        name: 'workspace_read_file',
+        arguments: '{"path":"源码/index.ts"}',
+      }],
+    }];
+    const offTools = agentToolDefinitionsForAccess({
+      fileAccessMode: 'off',
+      workspaceAvailable: false,
+      workspaceEnabled: false,
+      workspaceRead: false,
+    });
+    const readTools = agentToolDefinitionsForAccess({
+      fileAccessMode: 'read-only',
+      workspaceAvailable: true,
+      workspaceEnabled: true,
+      workspaceRead: true,
+    });
+    const writeTools = agentToolDefinitionsForAccess({
+      fileAccessMode: 'read-write',
+      workspaceAvailable: true,
+      workspaceEnabled: true,
+      workspaceRead: true,
+    });
+
+    expect(offTools).toHaveLength(3);
+    expect(readTools).toHaveLength(8);
+    expect(writeTools).toHaveLength(13);
+    expect(estimateAgentToolSchemaTokens(offTools))
+      .toBeLessThan(estimateAgentToolSchemaTokens(readTools));
+    expect(estimateAgentToolSchemaTokens(readTools))
+      .toBeLessThan(estimateAgentToolSchemaTokens(writeTools));
+
+    const raw = estimateAgentContextTokens(messages, { tools: readTools, safetyFactor: 1 });
+    const guarded = estimateAgentContextTokens(messages, { tools: readTools, safetyFactor: 1.5 });
+    expect(raw.messageEstimatedTokens).toBe(estimateAgentMessagesTokens(messages));
+    expect(raw.toolSchemaEstimatedTokens).toBeGreaterThan(0);
+    expect(raw.fixedOverheadTokens).toBeGreaterThan(0);
+    expect(guarded.estimatedTokens).toBe(Math.ceil(raw.estimatedTokens * 1.5));
   });
 
   it('removes completed Workspace bodies after one reasoning step', () => {

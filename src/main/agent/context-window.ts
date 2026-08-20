@@ -2,13 +2,17 @@ import type { AgentContextUsage } from '../../shared/agent';
 import {
   CONTEXT_RECENT_KEEP_FRACTION,
   contextCompressionThreshold,
+  normalizedContextEstimateSafetyFactor,
   normalizedContextWindowTokens,
 } from '../../shared/context-window';
 import type { AgentMessage } from './agent-backend';
+import type { AgentFunctionToolDefinition } from './agent-tool-definitions';
 
 const MAX_SUMMARY_TOKENS = 4_096;
 const MIN_SUMMARY_TOKENS = 512;
 const SUMMARY_MESSAGE_PREFIX = '[Glass Terminal automatic context summary]\n';
+const FIXED_REQUEST_OVERHEAD_TOKENS = 16;
+const PER_TOOL_WRAPPER_TOKENS = 8;
 
 const WORKSPACE_TOOL_NAMES = new Set([
   'workspace_list',
@@ -40,6 +44,21 @@ export interface ContextCompressionResult {
 
 export type ContextSummarizer = (serializedHistory: string) => Promise<string>;
 
+export interface ContextEstimationOptions {
+  tools?: readonly AgentFunctionToolDefinition[];
+  safetyFactor?: number;
+  providerReportedInputTokens?: number;
+}
+
+export interface AgentContextTokenEstimate {
+  estimatedTokens: number;
+  messageEstimatedTokens: number;
+  toolSchemaEstimatedTokens: number;
+  fixedOverheadTokens: number;
+  safetyFactor: number;
+  boundToolCount: number;
+}
+
 export function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMessage[] {
   return messages.map((message) => {
     if (message.role === 'assistant') {
@@ -53,18 +72,30 @@ export function cloneAgentMessages(messages: readonly AgentMessage[]): AgentMess
 }
 
 /**
- * Conservative synchronous estimator: ASCII prose averages roughly four
- * characters per token, while CJK and other non-ASCII code points count as at
- * least one token. This deliberately errs high for provider-agnostic safety.
+ * Conservative synchronous estimator: ASCII word/space runs average roughly
+ * four characters per token, syntax punctuation is charged individually, and
+ * CJK/other non-ASCII code points count as at least one token. Treating dense
+ * code and JSON differently avoids the worst undercount from prose-only rules.
  */
 export function estimateTextTokens(text: string): number {
-  let ascii = 0;
+  let asciiWord = 0;
+  let asciiSyntax = 0;
   let nonAscii = 0;
   for (const character of text) {
-    if (character.codePointAt(0)! <= 0x7f) ascii += 1;
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint <= 0x7f) {
+      if (
+        (codePoint >= 0x30 && codePoint <= 0x39)
+        || (codePoint >= 0x41 && codePoint <= 0x5a)
+        || (codePoint >= 0x61 && codePoint <= 0x7a)
+        || codePoint === 0x20
+        || (codePoint >= 0x09 && codePoint <= 0x0d)
+      ) asciiWord += 1;
+      else asciiSyntax += 1;
+    }
     else nonAscii += character.length > 1 ? 2 : 1;
   }
-  return Math.ceil(ascii / 4) + nonAscii;
+  return Math.ceil(asciiWord / 4) + asciiSyntax + nonAscii;
 }
 
 export function estimateAgentMessagesTokens(messages: readonly AgentMessage[]): number {
@@ -81,24 +112,68 @@ export function estimateAgentMessagesTokens(messages: readonly AgentMessage[]): 
   }, 3);
 }
 
+export function estimateAgentToolSchemaTokens(
+  tools: readonly AgentFunctionToolDefinition[],
+): number {
+  return tools.reduce((total, definition) => (
+    total
+    + PER_TOOL_WRAPPER_TOKENS
+    + estimateTextTokens(JSON.stringify(definition))
+  ), 0);
+}
+
+/**
+ * Provider-independent request estimate used by both the meter and automatic
+ * compression. Provider usage metadata never feeds back into this safety path.
+ */
+export function estimateAgentContextTokens(
+  messages: readonly AgentMessage[],
+  options: ContextEstimationOptions = {},
+): AgentContextTokenEstimate {
+  const messageEstimatedTokens = estimateAgentMessagesTokens(messages);
+  const tools = options.tools ?? [];
+  const toolSchemaEstimatedTokens = estimateAgentToolSchemaTokens(tools);
+  const fixedOverheadTokens = FIXED_REQUEST_OVERHEAD_TOKENS;
+  const safetyFactor = normalizedContextEstimateSafetyFactor(options.safetyFactor);
+  return {
+    estimatedTokens: Math.ceil((
+      messageEstimatedTokens
+      + toolSchemaEstimatedTokens
+      + fixedOverheadTokens
+    ) * safetyFactor),
+    messageEstimatedTokens,
+    toolSchemaEstimatedTokens,
+    fixedOverheadTokens,
+    safetyFactor,
+    boundToolCount: tools.length,
+  };
+}
+
 export function agentContextUsage(
   messages: readonly AgentMessage[],
   contextWindowTokens: number,
   status: AgentContextUsage['status'] = 'ready',
   lastCompressedAt?: string,
+  estimation: ContextEstimationOptions = {},
 ): AgentContextUsage {
   const normalizedWindow = normalizedContextWindowTokens(contextWindowTokens);
   const compressionThresholdTokens = contextCompressionThreshold(normalizedWindow);
-  const estimatedTokens = estimateAgentMessagesTokens(messages);
+  const estimate = estimateAgentContextTokens(messages, estimation);
+  const providerReportedInputTokens = Number.isSafeInteger(
+    estimation.providerReportedInputTokens,
+  ) && Number(estimation.providerReportedInputTokens) >= 0
+    ? Number(estimation.providerReportedInputTokens)
+    : undefined;
   return {
-    estimatedTokens,
+    ...estimate,
     contextWindowTokens: normalizedWindow,
     compressionThresholdTokens,
     percentage: Math.max(0, Math.min(
       100,
-      Math.round((estimatedTokens / compressionThresholdTokens) * 100),
+      Math.round((estimate.estimatedTokens / compressionThresholdTokens) * 100),
     )),
     status,
+    ...(providerReportedInputTokens !== undefined ? { providerReportedInputTokens } : {}),
     ...(lastCompressedAt ? { lastCompressedAt } : {}),
   };
 }
@@ -266,6 +341,7 @@ export async function compressContextIfNeeded(
     keepAssistant?: Extract<AgentMessage, { role: 'assistant' }>;
     now?: () => string;
     signal?: AbortSignal;
+    estimation?: ContextEstimationOptions;
   } = {},
 ): Promise<ContextCompressionResult> {
   const messages = cloneAgentMessages(inputMessages);
@@ -273,7 +349,7 @@ export async function compressContextIfNeeded(
     ? messages[inputMessages.indexOf(options.keepAssistant)] as Extract<AgentMessage, { role: 'assistant' }>
     : undefined;
   const rewritten = compactCompletedWorkspaceHistory(messages, keepAssistant);
-  const beforeTokens = estimateAgentMessagesTokens(messages);
+  const beforeTokens = estimateAgentContextTokens(messages, options.estimation).estimatedTokens;
   const normalizedWindow = normalizedContextWindowTokens(contextWindowTokens);
   if (beforeTokens < contextCompressionThreshold(normalizedWindow)) {
     return { messages, beforeTokens, afterTokens: beforeTokens, compressed: false, rewritten };
@@ -317,7 +393,7 @@ export async function compressContextIfNeeded(
   return {
     messages: compacted,
     beforeTokens,
-    afterTokens: estimateAgentMessagesTokens(compacted),
+    afterTokens: estimateAgentContextTokens(compacted, options.estimation).estimatedTokens,
     compressed: true,
     rewritten: true,
     lastCompressedAt,

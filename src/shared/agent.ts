@@ -107,8 +107,20 @@ export interface AgentToolActivity {
 }
 
 export interface AgentContextUsage {
-  /** Conservative, provider-agnostic estimate of the active model context. */
+  /** Conservative final estimate after fixed overhead and the safety factor. */
   estimatedTokens: number;
+  /** Message-only estimate before the safety factor. */
+  messageEstimatedTokens?: number;
+  /** Exact bound tool definitions estimated before the safety factor. */
+  toolSchemaEstimatedTokens?: number;
+  /** Provider/request wrapping allowance before the safety factor. */
+  fixedOverheadTokens?: number;
+  /** Configured multiplier applied to all locally estimated input components. */
+  safetyFactor?: number;
+  /** Number of tool definitions represented by toolSchemaEstimatedTokens. */
+  boundToolCount?: number;
+  /** Last Provider-reported input usage, retained for diagnostics only. */
+  providerReportedInputTokens?: number;
   /** Configured hard model input window for the selected Provider. */
   contextWindowTokens: number;
   /** Safe threshold at which Glass Terminal automatically compacts context. */

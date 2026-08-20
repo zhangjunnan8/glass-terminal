@@ -30,7 +30,10 @@ import type {
   TerminalInputMode,
 } from '../../shared/agent';
 import type { ProviderProfile } from '../../shared/provider';
-import { DEFAULT_CONTEXT_WINDOW_TOKENS } from '../../shared/context-window';
+import {
+  DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR,
+  DEFAULT_CONTEXT_WINDOW_TOKENS,
+} from '../../shared/context-window';
 import type { CodexVisibleTerminalContext } from '../../shared/codex-app-server';
 import type { SessionAuditEvent, SessionRecord } from '../../shared/session';
 import { SESSION_CHANNELS } from '../../shared/session';
@@ -59,6 +62,7 @@ import {
 } from '../tools/session-tool-context';
 import { AgentFileWorkspaceAdapter } from '../tools/agent-file-workspace-adapter';
 import { agentContextUsage } from './context-window';
+import { agentToolDefinitionsForAccess } from './agent-tool-definitions';
 
 interface ApprovalResolution {
   decision: 'execute' | 'edit' | 'reject';
@@ -797,6 +801,7 @@ export class AgentService {
       runtime.fileAccessMode = 'off';
       runtime.fileAccessPolicy = disabledFileAccessPolicy();
       runtime.fileAccessRoot = undefined;
+      runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
       runtime.error = undefined;
       if (hadFileAccess) {
         this.appendControlAudit(runtime, 'file_permission_changed', 'user', {
@@ -907,6 +912,7 @@ export class AgentService {
     runtime.fileAccessMode = request.mode;
     runtime.fileAccessPolicy = fileAccessPolicy;
     runtime.fileAccessRoot = fileAccessRoot;
+    runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
     runtime.error = undefined;
     if (narrowsExistingAuthority) {
       // Revocation and strict narrowing are fail-closed even if audit storage is unavailable.
@@ -1306,7 +1312,12 @@ export class AgentService {
       if (!acceptBackendEvents || !this.isCurrentTurn(runtime, token)) return;
       if (event.type === 'context_status' && event.contextUsage) {
         const previous = runtime.contextUsage;
-        runtime.contextUsage = { ...event.contextUsage };
+        runtime.contextUsage = {
+          ...event.contextUsage,
+          ...(event.contextUsage.safetyFactor === undefined && previous?.safetyFactor !== undefined
+            ? { safetyFactor: previous.safetyFactor }
+            : {}),
+        };
         if (event.compression) {
           this.sessions.appendAudit(runtime.sessionId, 'context_compressed', 'system', {
             beforeTokens: event.compression.beforeTokens,
@@ -2102,6 +2113,17 @@ export class AgentService {
         ? agentContextUsage(
           replayed.priorMessages,
           currentProvider?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+          'ready',
+          undefined,
+          {
+            tools: agentToolDefinitionsForAccess({
+              fileAccessMode: 'off',
+              workspaceAvailable: false,
+              workspaceEnabled: false,
+              workspaceRead: false,
+            }),
+            safetyFactor: currentProvider?.contextEstimateSafetyFactor,
+          },
         )
         : undefined,
       providerThreadId: canReuseThread && backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
@@ -2131,6 +2153,7 @@ export class AgentService {
     fingerprint?: string;
     ready: boolean;
     contextWindowTokens?: number;
+    contextEstimateSafetyFactor?: number;
   } {
     try {
       const profile = this.providers.get(providerId);
@@ -2138,6 +2161,8 @@ export class AgentService {
         fingerprint: providerFingerprint(profile),
         ready: profile.status === 'ready',
         contextWindowTokens: profile.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+        contextEstimateSafetyFactor: profile.contextEstimateSafetyFactor
+          ?? DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR,
       };
     } catch {
       return { ready: false };
@@ -2145,18 +2170,40 @@ export class AgentService {
   }
 
   private contextUsageFor(
-    runtime: Pick<AgentRuntimeRecord, 'backend'>,
+    runtime: Pick<
+      AgentRuntimeRecord,
+      'backend' | 'fileAccessMode' | 'fileAccessPolicy' | 'fileAccessRoot' | 'contextUsage'
+    >,
     messages: readonly AgentMessage[],
   ): AgentContextUsage | undefined {
     if (runtime.backend.kind !== 'generic-provider') return undefined;
     let contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS;
+    let safetyFactor = DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR;
     try {
-      contextWindowTokens = this.providers.get(runtime.backend.providerId).contextWindowTokens
-        ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
+      const provider = this.providers.get(runtime.backend.providerId);
+      contextWindowTokens = provider.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
+      safetyFactor = provider.contextEstimateSafetyFactor
+        ?? DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR;
     } catch {
       // A deleted/unready Provider retains a bounded display estimate only.
     }
-    return agentContextUsage(messages, contextWindowTokens);
+    const workspaceEnabled = runtime.fileAccessMode !== 'off' && Boolean(runtime.fileAccessRoot);
+    return agentContextUsage(
+      messages,
+      contextWindowTokens,
+      'ready',
+      runtime.contextUsage?.lastCompressedAt,
+      {
+        safetyFactor,
+        tools: agentToolDefinitionsForAccess({
+          fileAccessMode: runtime.fileAccessMode,
+          workspaceAvailable: Boolean(runtime.fileAccessRoot),
+          workspaceEnabled,
+          workspaceRead: workspaceEnabled && runtime.fileAccessPolicy.read,
+        }),
+        providerReportedInputTokens: runtime.contextUsage?.providerReportedInputTokens,
+      },
+    );
   }
 
   /**
@@ -2171,16 +2218,21 @@ export class AgentService {
     const readinessLost = runtime.providerReady === true && !currentProvider.ready;
     const currentContextWindow = currentProvider.contextWindowTokens
       ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
+    const currentSafetyFactor = currentProvider.contextEstimateSafetyFactor
+      ?? DEFAULT_CONTEXT_ESTIMATE_SAFETY_FACTOR;
     if (
       !fingerprintChanged
       && currentProvider.ready
-      && runtime.contextUsage?.contextWindowTokens !== currentContextWindow
+      && (
+        runtime.contextUsage?.contextWindowTokens !== currentContextWindow
+        || runtime.contextUsage?.safetyFactor !== currentSafetyFactor
+      )
     ) {
-      // Context-window tuning is harmless Provider metadata: preserve history and
-      // file grants, but rebuild the backend so its next turn uses the new budget.
+      // Context estimation tuning is harmless Provider metadata: preserve
+      // history/file grants, but rebuild so the next turn uses the new budget.
       runtime.harnessBackend = undefined;
       runtime.harnessThread = undefined;
-      runtime.contextUsage = agentContextUsage(runtime.priorMessages, currentContextWindow);
+      runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
     }
     if (!fingerprintChanged && !runtime.providerConversationResetPending && !readinessLost) {
       runtime.providerReady = currentProvider.ready;
@@ -2503,6 +2555,7 @@ export class AgentService {
     runtime.fileAccessMode = 'off';
     runtime.fileAccessPolicy = disabledFileAccessPolicy();
     runtime.fileAccessRoot = undefined;
+    runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
   }
 
   private appendControlAudit(

@@ -1852,6 +1852,8 @@ describe('AgentService shared-terminal controls', () => {
       writablePaths: [],
       fullAccess: false,
     });
+    expect(readOnly.contextUsage).toMatchObject({ boundToolCount: 8, safetyFactor: 1.15 });
+    const readOnlyToolTokens = readOnly.contextUsage!.toolSchemaEstimatedTokens!;
     readOnly.fileAccessPolicy!.read = false;
     readOnly.fileAccessPolicy!.readablePaths[0] = '/tampered';
     expect(service.getState(owner, 'terminal')?.fileAccessPolicy).toEqual({
@@ -1876,6 +1878,8 @@ describe('AgentService shared-terminal controls', () => {
       writablePaths: ['/work'],
       fullAccess: false,
     });
+    expect(readWrite.contextUsage).toMatchObject({ boundToolCount: 13, safetyFactor: 1.15 });
+    expect(readWrite.contextUsage!.toolSchemaEstimatedTokens).toBeGreaterThan(readOnlyToolTokens);
 
     const disabled = await service.setFileAccess(owner, {
       terminalId: 'terminal', mode: 'off', backend,
@@ -1883,6 +1887,7 @@ describe('AgentService shared-terminal controls', () => {
     expect(disabled).toMatchObject({
       fileAccessMode: 'off',
       fileAccessRoot: undefined,
+      contextUsage: { boundToolCount: 3, safetyFactor: 1.15 },
       fileAccessPolicy: {
         read: false,
         write: false,
@@ -2405,8 +2410,11 @@ describe('AgentService shared-terminal controls', () => {
     expect(backendAdapter.priorMessagesAtSend[1]).not.toEqual([]);
   });
 
-  it('rebuilds the Generic backend for a changed context window without losing history', async () => {
-    let profile = readyProviderProfile('provider', { contextWindowTokens: 64_000 });
+  it('hot-applies changed context estimation settings without losing history', async () => {
+    let profile = readyProviderProfile('provider', {
+      contextWindowTokens: 64_000,
+      contextEstimateSafetyFactor: 1.15,
+    });
     const providers = {
       get: () => profile,
       list: () => [profile],
@@ -2429,7 +2437,11 @@ describe('AgentService shared-terminal controls', () => {
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
     const threadId = service.getState(owner, 'terminal')!.threadId;
 
-    profile = { ...profile, contextWindowTokens: 128_000 };
+    profile = {
+      ...profile,
+      contextWindowTokens: 128_000,
+      contextEstimateSafetyFactor: 1.4,
+    };
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'second turn', backend });
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
 
@@ -2437,7 +2449,10 @@ describe('AgentService shared-terminal controls', () => {
     expect(backends[1]!.resumeInputs[0]?.priorMessages).not.toEqual([]);
     expect(service.getState(owner, 'terminal')).toMatchObject({
       threadId,
-      contextUsage: { contextWindowTokens: 128_000 },
+      contextUsage: {
+        contextWindowTokens: 128_000,
+        safetyFactor: 1.4,
+      },
     });
   });
 

@@ -989,6 +989,7 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
           requireProviderStore(),
         ).build(),
         contextWindowTokens: provider.contextWindowTokens,
+        contextEstimateSafetyFactor: provider.contextEstimateSafetyFactor,
       });
     },
     () => requireAppSettingsStore().get().defaultMaxRounds,
