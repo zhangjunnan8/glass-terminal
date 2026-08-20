@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import {
   BACKUP_FORMAT_VERSION,
@@ -9,21 +9,34 @@ import type {
   BackupImportResult,
   BackupManifest,
 } from '../../shared/backup';
-import type { SecretEntry, SecretStore } from '../providers/secret-store';
+import { HostStore } from '../hosts/host-store';
+import { isAllowedCredentialReference, type SecretEntry, type SecretStore } from '../providers/secret-store';
+import {
+  ImportFilesystemTransaction,
+  type ImportTransactionHooks,
+  parseBackupManifest,
+  parseSecretMap,
+  portableJsonBytes,
+  readSecretNamespace,
+  replaceSecretNamespace,
+  validateCredentialBindings,
+  verifyFileBytes,
+} from './import-safety';
 
 const HOSTS_SECTION = 'hosts';
 const HOST_SECRETS_SECTION = 'hostSecrets';
 
 /**
- * Independent SSH-host backup. It carries `hosts.json` plus the matching SSH
- * host credentials, keeping host configuration fully separate from the general
- * application-settings backup.
+ * Independent SSH-host backup. Import validates Host schema and credential
+ * bindings against staged data before replacing either live metadata or the
+ * SecretStore namespace.
  */
 export class HostBackupService {
   constructor(
     private readonly hostsPath: string,
     private readonly secretStore: SecretStore,
     private readonly appVersion: string,
+    private readonly importHooks: ImportTransactionHooks = {},
   ) {}
 
   async exportToFile(path: string): Promise<BackupExportResult> {
@@ -55,86 +68,126 @@ export class HostBackupService {
   }
 
   async importFromFile(path: string): Promise<BackupImportResult> {
-    const raw = readFileSync(path, 'utf8');
-    const manifest = parseManifest(JSON.parse(raw) as unknown);
+    const manifest = parseBackupManifest(parsePortableManifest(path));
     const sectionsImported: string[] = [];
     const sectionsSkipped: BackupImportResult['sectionsSkipped'] = [];
+    const transaction = new ImportFilesystemTransaction(this.importHooks);
+    let expectedHosts: Buffer | undefined;
+    let incomingBindings: ReadonlyMap<string, boolean> | undefined;
+    let incomingSecrets: Map<string, string> | undefined;
 
-    const hostsEnvelope = manifest.sections[HOSTS_SECTION];
-    if (hostsEnvelope !== undefined) {
-      if (hostsEnvelope.schemaVersion !== 1) {
-        sectionsSkipped.push({
-          section: HOSTS_SECTION,
-          reason: `schemaVersion ${hostsEnvelope.schemaVersion} 不受支持`,
-        });
-      } else {
-        writeJson(this.hostsPath, hostsEnvelope.data);
-        sectionsImported.push(HOSTS_SECTION);
+    try {
+      const hostsEnvelope = manifest.sections[HOSTS_SECTION];
+      if (hostsEnvelope !== undefined) {
+        if (hostsEnvelope.schemaVersion !== 1) {
+          sectionsSkipped.push({
+            section: HOSTS_SECTION,
+            reason: `schemaVersion ${hostsEnvelope.schemaVersion} 不受支持`,
+          });
+        } else {
+          if (hostsEnvelope.file !== undefined || hostsEnvelope.data === undefined) {
+            throw new Error('Host section 必须包含内联 data。');
+          }
+          const staged = transaction.stageFile(
+            this.hostsPath,
+            `${JSON.stringify(hostsEnvelope.data, null, 2)}\n`,
+          );
+          incomingBindings = validateStagedHosts(staged);
+          expectedHosts = readFileSync(staged);
+          sectionsImported.push(HOSTS_SECTION);
+        }
       }
-    }
 
-    const secretsEnvelope = manifest.sections[HOST_SECRETS_SECTION];
-    if (secretsEnvelope !== undefined) {
-      if (secretsEnvelope.schemaVersion !== 1) {
-        sectionsSkipped.push({
-          section: HOST_SECRETS_SECTION,
-          reason: `schemaVersion ${secretsEnvelope.schemaVersion} 不受支持`,
-        });
-      } else {
-        await this.replaceHostSecrets(secretsEnvelope.data);
-        sectionsImported.push(HOST_SECRETS_SECTION);
+      const secretsEnvelope = manifest.sections[HOST_SECRETS_SECTION];
+      if (secretsEnvelope !== undefined) {
+        if (secretsEnvelope.schemaVersion !== 1) {
+          sectionsSkipped.push({
+            section: HOST_SECRETS_SECTION,
+            reason: `schemaVersion ${secretsEnvelope.schemaVersion} 不受支持`,
+          });
+        } else {
+          if (secretsEnvelope.file !== undefined || secretsEnvelope.data === undefined) {
+            throw new Error('Host 凭据 section 必须包含内联 data。');
+          }
+          incomingSecrets = parseSecretMap(
+            secretsEnvelope.data,
+            HOST_SECRET_PREFIX,
+            'Host 凭据 section',
+          );
+          sectionsImported.push(HOST_SECRETS_SECTION);
+        }
       }
-    }
 
-    return {
-      sectionsImported,
-      sectionsSkipped,
-      needsRestart: sectionsImported.length > 0,
-    };
+      if (incomingSecrets) {
+        const bindings = incomingBindings ?? validateStagedHosts(this.hostsPath);
+        validateCredentialBindings(bindings, incomingSecrets, 'Host 凭据 section');
+      } else if (incomingBindings) {
+        const existingSecrets = await readSecretNamespace(this.secretStore, HOST_SECRET_PREFIX);
+        const referencedExisting = new Map([...existingSecrets].filter(([reference]) => (
+          incomingBindings!.has(reference)
+        )));
+        validateCredentialBindings(incomingBindings, referencedExisting, 'Host 元数据');
+      }
+
+      transaction.commit();
+      if (expectedHosts) {
+        verifyFileBytes(this.hostsPath, expectedHosts);
+        validateStagedHosts(this.hostsPath);
+      }
+      if (incomingSecrets) {
+        await replaceSecretNamespace(this.secretStore, HOST_SECRET_PREFIX, incomingSecrets);
+      }
+      transaction.finalize();
+      return {
+        sectionsImported,
+        sectionsSkipped,
+        needsRestart: sectionsImported.length > 0,
+      };
+    } catch (error) {
+      try {
+        transaction.rollback();
+      } catch (rollbackError) {
+        throw new AggregateError([error, rollbackError], 'Host 备份导入失败且文件回滚未能完整完成。');
+      }
+      throw error;
+    }
   }
 
   private async readHostSecrets(): Promise<SecretEntry[]> {
     const entries = await this.secretStore.entries?.() ?? [];
     return entries.filter((entry) => entry.reference.startsWith(HOST_SECRET_PREFIX));
   }
+}
 
-  private async replaceHostSecrets(data: unknown): Promise<void> {
-    const incoming = data as Record<string, unknown> | undefined;
-    const map = new Map<string, string>();
-    if (incoming && typeof incoming === 'object' && !Array.isArray(incoming)) {
-      for (const [reference, secret] of Object.entries(incoming)) {
-        if (
-          typeof secret === 'string'
-          && secret
-          && reference.startsWith(HOST_SECRET_PREFIX)
-        ) map.set(reference, secret);
-      }
-    }
-    const existing = await this.secretStore.entries?.() ?? [];
-    for (const entry of existing) {
-      if (
-        entry.reference.startsWith(HOST_SECRET_PREFIX)
-        && !map.has(entry.reference)
-      ) await this.secretStore.remove(entry.reference);
-    }
-    for (const [reference, secret] of map) {
-      await this.secretStore.set(reference, secret);
-    }
+function parsePortableManifest(path: string): unknown {
+  const raw = portableJsonBytes(path);
+  try {
+    return JSON.parse(raw.toString('utf8')) as unknown;
+  } catch {
+    throw new Error('Host 备份文件不是有效 JSON。');
   }
 }
 
-function parseManifest(manifest: unknown): BackupManifest {
-  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
-    throw new Error('备份文件格式无效。');
+function validateStagedHosts(path: string): ReadonlyMap<string, boolean> {
+  const store = new HostStore(path);
+  const profiles = store.list();
+  const bindings = new Map<string, boolean>();
+  for (const profile of profiles) {
+    const reference = store.credentialReference(profile.id);
+    if (!reference) {
+      if (profile.credentialConfigured) {
+        throw new Error(`Host ${profile.id} 声明已配置凭据但缺少引用。`);
+      }
+      continue;
+    }
+    if (
+      !reference.startsWith(HOST_SECRET_PREFIX)
+      || !isAllowedCredentialReference(reference)
+    ) throw new Error(`Host ${profile.id} 的凭据引用无效。`);
+    if (bindings.has(reference)) throw new Error(`Host 元数据重复使用凭据引用：${reference}`);
+    bindings.set(reference, profile.credentialConfigured);
   }
-  const candidate = manifest as Partial<BackupManifest>;
-  if (candidate.formatVersion !== BACKUP_FORMAT_VERSION) {
-    throw new Error(`不支持的备份格式版本：${String(candidate.formatVersion)}`);
-  }
-  if (!candidate.sections || typeof candidate.sections !== 'object') {
-    throw new Error('备份文件缺少 sections。');
-  }
-  return candidate as BackupManifest;
+  return bindings;
 }
 
 function readJson(path: string): unknown | undefined {
@@ -146,11 +199,4 @@ function readJson(path: string): unknown | undefined {
     throw error;
   }
   return JSON.parse(raw) as unknown;
-}
-
-function writeJson(path: string, data: unknown): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const temporary = `${path}.tmp`;
-  writeFileSync(temporary, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
-  renameSync(temporary, path);
 }

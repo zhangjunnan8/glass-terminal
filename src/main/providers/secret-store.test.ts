@@ -78,6 +78,30 @@ describe('FileSecretStore', () => {
     ]));
   });
 
+  it('atomically replaces one credential namespace without touching the other', async () => {
+    const path = fixture();
+    const store = new FileSecretStore(path);
+    await store.set('AI Terminal/provider/00000000-0000-4000-8000-000000000001', 'old-provider');
+    await store.set('AI Terminal/provider/00000000-0000-4000-8000-000000000002', 'stale-provider');
+    await store.set('AI Terminal/ssh/00000000-0000-4000-8000-000000000003', 'host-secret');
+
+    await store.replaceNamespace!('AI Terminal/provider/', [{
+      reference: 'AI Terminal/provider/00000000-0000-4000-8000-000000000001',
+      secret: 'new-provider',
+    }]);
+
+    const reloaded = new FileSecretStore(path);
+    expect(await reloaded.get(
+      'AI Terminal/provider/00000000-0000-4000-8000-000000000001',
+    )).toBe('new-provider');
+    expect(await reloaded.get(
+      'AI Terminal/provider/00000000-0000-4000-8000-000000000002',
+    )).toBeUndefined();
+    expect(await reloaded.get(
+      'AI Terminal/ssh/00000000-0000-4000-8000-000000000003',
+    )).toBe('host-secret');
+  });
+
   it('encrypts secrets at rest and never writes plaintext', async () => {
     const path = fixture();
     const store = new FileSecretStore(path);

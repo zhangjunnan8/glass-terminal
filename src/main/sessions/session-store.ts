@@ -209,6 +209,11 @@ function parseSession(value: unknown, source: string): SessionRecord {
   return record;
 }
 
+/** Strict, side-effect-free Session metadata validation for staged backups. */
+export function validateSessionBackupMetadata(value: unknown, source: string): SessionRecord {
+  return parseSession(value, source);
+}
+
 function validateWorkspaceBinding(
   session: Pick<SessionRecord, 'transport' | 'hostId'>,
   value: unknown,

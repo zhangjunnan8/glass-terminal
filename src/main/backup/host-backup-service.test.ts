@@ -1,4 +1,11 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -20,7 +27,49 @@ function hostsPath(root: string) {
 function seedHosts(root: string) {
   const path = hostsPath(root);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify([{ id: 'host-1', name: 'Test' }]), 'utf8');
+  writeFileSync(path, JSON.stringify({
+    version: 3,
+    folders: [],
+    hosts: [{
+      id: '00000000-0000-4000-8000-000000000001',
+      protocol: 'ssh',
+      name: 'Test',
+      hostname: '192.0.2.10',
+      port: 22,
+      username: 'tester',
+      authMethod: 'password',
+      favorite: false,
+      shellKind: 'posix',
+      credentialConfigured: true,
+      credentialReference: 'AI Terminal/ssh/00000000-0000-4000-8000-000000000001',
+      fullTakeoverPreference: false,
+      sortOrder: 0,
+      revision: 1,
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    }],
+  }), 'utf8');
+}
+
+class FailOnceSecretStore extends MemorySecretStore {
+  failNextSet = false;
+
+  override async set(reference: string, secret: string): Promise<void> {
+    if (this.failNextSet) {
+      this.failNextSet = false;
+      throw new Error('injected host secret failure');
+    }
+    await super.set(reference, secret);
+  }
+}
+
+function portableManifest(sections: Record<string, { schemaVersion: number; data: unknown }>) {
+  return {
+    formatVersion: 1,
+    appVersion: '1.0.0',
+    exportedAt: new Date(0).toISOString(),
+    sections,
+  };
 }
 
 afterEach(() => {
@@ -61,9 +110,11 @@ describe('HostBackupService', () => {
     ).importFromFile(bundlePath);
 
     expect(imported.sectionsImported).toEqual(['hosts', 'hostSecrets']);
-    expect(JSON.parse(readFileSync(hostsPath(target), 'utf8'))).toEqual([
-      { id: 'host-1', name: 'Test' },
-    ]);
+    expect(JSON.parse(readFileSync(hostsPath(target), 'utf8')).hosts[0]).toMatchObject({
+      id: '00000000-0000-4000-8000-000000000001',
+      name: 'Test',
+      credentialConfigured: true,
+    });
     expect(await targetSecrets.get(
       'AI Terminal/ssh/00000000-0000-4000-8000-000000000001',
     )).toBe('host-pass');
@@ -95,5 +146,120 @@ describe('HostBackupService', () => {
     expect(await targetSecrets.get(
       'AI Terminal/provider/00000000-0000-4000-8000-000000000004',
     )).toBe('api-key');
+  });
+
+  it('rejects malformed Host data and credential-reference mismatches before commit', async () => {
+    const target = fixture();
+    seedHosts(target);
+    const before = readFileSync(hostsPath(target));
+    const secrets = new MemorySecretStore();
+    await secrets.set('AI Terminal/ssh/00000000-0000-4000-8000-000000000001', 'old-pass');
+
+    const malformedPath = join(fixture(), 'malformed.aithosts');
+    writeFileSync(malformedPath, JSON.stringify(portableManifest({
+      hosts: { schemaVersion: 1, data: [{ id: 'broken' }] },
+      hostSecrets: { schemaVersion: 1, data: {} },
+    })));
+    await expect(new HostBackupService(hostsPath(target), secrets, '1.0.0')
+      .importFromFile(malformedPath)).rejects.toThrow('Host store');
+    expect(readFileSync(hostsPath(target))).toEqual(before);
+
+    const source = fixture();
+    seedHosts(source);
+    const sourceManifest = portableManifest({
+      hosts: {
+        schemaVersion: 1,
+        data: JSON.parse(readFileSync(hostsPath(source), 'utf8')) as unknown,
+      },
+      hostSecrets: { schemaVersion: 1, data: {} },
+    });
+    const missingSecretPath = join(fixture(), 'missing-secret.aithosts');
+    writeFileSync(missingSecretPath, JSON.stringify(sourceManifest));
+    await expect(new HostBackupService(hostsPath(target), secrets, '1.0.0')
+      .importFromFile(missingSecretPath)).rejects.toThrow('缺少元数据声明为已配置的凭据');
+    expect(readFileSync(hostsPath(target))).toEqual(before);
+    expect(await secrets.get(
+      'AI Terminal/ssh/00000000-0000-4000-8000-000000000001',
+    )).toBe('old-pass');
+  });
+
+  it('rolls back Host metadata and secrets when the SecretStore write fails', async () => {
+    const source = fixture();
+    seedHosts(source);
+    const sourceSecrets = new MemorySecretStore();
+    await sourceSecrets.set(
+      'AI Terminal/ssh/00000000-0000-4000-8000-000000000001',
+      'new-pass',
+    );
+    const bundlePath = join(source, 'hosts.aithosts');
+    await new HostBackupService(hostsPath(source), sourceSecrets, '1.0.0')
+      .exportToFile(bundlePath);
+
+    const target = fixture();
+    seedHosts(target);
+    const original = JSON.parse(readFileSync(hostsPath(target), 'utf8')) as {
+      hosts: Array<Record<string, unknown>>;
+    };
+    original.hosts[0].name = 'Original target';
+    writeFileSync(hostsPath(target), JSON.stringify(original));
+    const before = readFileSync(hostsPath(target));
+    const targetSecrets = new FailOnceSecretStore();
+    await targetSecrets.set(
+      'AI Terminal/ssh/00000000-0000-4000-8000-000000000001',
+      'old-pass',
+    );
+    targetSecrets.failNextSet = true;
+
+    await expect(new HostBackupService(hostsPath(target), targetSecrets, '1.0.0')
+      .importFromFile(bundlePath)).rejects.toThrow('host secret failure');
+    expect(readFileSync(hostsPath(target))).toEqual(before);
+    expect(await targetSecrets.get(
+      'AI Terminal/ssh/00000000-0000-4000-8000-000000000001',
+    )).toBe('old-pass');
+    expect(readdirSync(dirname(hostsPath(target))).filter((name) => name.includes('.backup-import-')))
+      .toEqual([]);
+  });
+
+  it('imports a valid legacy Host array through staging and migrates it safely', async () => {
+    const timestamp = new Date(0).toISOString();
+    const bundlePath = join(fixture(), 'legacy.aithosts');
+    writeFileSync(bundlePath, JSON.stringify(portableManifest({
+      hosts: {
+        schemaVersion: 1,
+        data: [{
+          id: 'legacy-host',
+          protocol: 'ssh',
+          name: 'Legacy Host',
+          hostname: '192.0.2.20',
+          port: 22,
+          username: 'tester',
+          authMethod: 'password',
+          favorite: false,
+          credentialConfigured: false,
+          fullTakeover: true,
+          createdAt: timestamp,
+          updatedAt: timestamp,
+        }],
+      },
+      hostSecrets: { schemaVersion: 1, data: {} },
+    })));
+    const target = fixture();
+
+    await new HostBackupService(
+      hostsPath(target),
+      new MemorySecretStore(),
+      '1.0.0',
+    ).importFromFile(bundlePath);
+
+    const migrated = JSON.parse(readFileSync(hostsPath(target), 'utf8')) as {
+      version: number;
+      hosts: Array<Record<string, unknown>>;
+    };
+    expect(migrated.version).toBe(3);
+    expect(migrated.hosts[0]).toMatchObject({
+      id: 'legacy-host',
+      fullTakeoverPreference: true,
+    });
+    expect(migrated.hosts[0]).not.toHaveProperty('fullTakeover');
   });
 });

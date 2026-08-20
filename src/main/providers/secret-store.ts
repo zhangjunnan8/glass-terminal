@@ -12,6 +12,8 @@ export interface SecretStore {
   remove(reference: string): Promise<void>;
   /** Optional: enumerate every stored entry for portable export/import. */
   entries?(): Promise<SecretEntry[]>;
+  /** Optional atomic namespace replacement used by transactional backup import. */
+  replaceNamespace?(prefix: string, entries: readonly SecretEntry[]): Promise<void>;
 }
 
 export class MemorySecretStore implements SecretStore {

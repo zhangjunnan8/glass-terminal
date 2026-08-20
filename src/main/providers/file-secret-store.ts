@@ -1,4 +1,15 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import {
+  closeSync,
+  constants as fsConstants,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname } from 'node:path';
 import type { SecretEntry, SecretStore } from './secret-store';
 import { loadOrCreateSecretKey, SecretCipher } from './secret-cipher';
@@ -72,11 +83,46 @@ export class FileSecretStore implements SecretStore {
     return [...this.values.entries()].map(([reference, secret]) => ({ reference, secret }));
   }
 
-  private persist(): void {
+  async replaceNamespace(prefix: string, entries: readonly SecretEntry[]): Promise<void> {
+    const next = new Map(this.values);
+    for (const reference of next.keys()) {
+      if (reference.startsWith(prefix)) next.delete(reference);
+    }
+    for (const entry of entries) {
+      if (!entry.reference.startsWith(prefix) || !entry.secret) {
+        throw new Error('Invalid credential namespace replacement.');
+      }
+      next.set(entry.reference, entry.secret);
+    }
+    this.persist(next);
+    this.values.clear();
+    for (const [reference, secret] of next) this.values.set(reference, secret);
+  }
+
+  private persist(values: ReadonlyMap<string, string> = this.values): void {
     mkdirSync(dirname(this.path), { recursive: true });
-    const temporary = `${this.path}.tmp`;
-    const encrypted = this.cipher.encrypt(JSON.stringify(Object.fromEntries(this.values)));
-    writeFileSync(temporary, encrypted, 'utf8');
-    renameSync(temporary, this.path);
+    const temporary = `${this.path}.tmp-${process.pid}-${randomUUID()}`;
+    const encrypted = this.cipher.encrypt(JSON.stringify(Object.fromEntries(values)));
+    try {
+      writeFileSync(temporary, encrypted, { encoding: 'utf8', mode: 0o600 });
+      const descriptor = openSync(temporary, fsConstants.O_RDWR);
+      try {
+        fsyncSync(descriptor);
+      } finally {
+        closeSync(descriptor);
+      }
+      renameSync(temporary, this.path);
+      if (process.platform !== 'win32') {
+        const directory = openSync(dirname(this.path), fsConstants.O_RDONLY);
+        try {
+          fsyncSync(directory);
+        } finally {
+          closeSync(directory);
+        }
+      }
+    } catch (error) {
+      try { unlinkSync(temporary); } catch { /* best-effort failed-write cleanup */ }
+      throw error;
+    }
   }
 }

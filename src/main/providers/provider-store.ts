@@ -23,7 +23,8 @@ import {
   MIN_CONTEXT_WINDOW_TOKENS,
   normalizedContextWindowTokens,
 } from '../../shared/context-window';
-import type { SecretStore } from './secret-store';
+import { PROVIDER_SECRET_PREFIX } from '../../shared/backup';
+import { isAllowedCredentialReference, type SecretStore } from './secret-store';
 
 type FetchImplementation = typeof fetch;
 const MAX_MODELS_RESPONSE_BYTES = 1024 * 1024;
@@ -187,6 +188,36 @@ function parseProfiles(value: unknown): StoredProviderProfile[] {
       updatedAt: typeof profile.updatedAt === 'string' ? profile.updatedAt : new Date(0).toISOString(),
     };
   });
+}
+
+/** Strict validation used before a portable backup may replace live metadata. */
+export function validateProviderBackupMetadata(value: unknown): ReadonlyMap<string, boolean> {
+  const profiles = parseProfiles(value);
+  const ids = new Set<string>();
+  const references = new Map<string, boolean>();
+  let defaults = 0;
+  for (const profile of profiles) {
+    requiredText(profile.id, 'Provider ID');
+    requiredText(profile.name, 'Provider 名称');
+    requiredText(profile.modelId, '模型 ID');
+    normalizedBaseUrl(profile.baseUrl);
+    if (ids.has(profile.id)) throw new Error(`Provider 元数据包含重复 id：${profile.id}`);
+    ids.add(profile.id);
+    if (
+      profile.apiKeyReference !== `${PROVIDER_SECRET_PREFIX}${profile.id}`
+      || !isAllowedCredentialReference(profile.apiKeyReference)
+    ) throw new Error(`Provider ${profile.id} 的凭据引用无效。`);
+    if (references.has(profile.apiKeyReference)) {
+      throw new Error(`Provider 元数据重复使用凭据引用：${profile.apiKeyReference}`);
+    }
+    if (profile.recipientTransitionPending) {
+      throw new Error(`Provider ${profile.id} 的凭据仍处于未完成的迁移状态。`);
+    }
+    references.set(profile.apiKeyReference, profile.apiKeyConfigured);
+    if (profile.isDefault) defaults += 1;
+  }
+  if (defaults > 1) throw new Error('Provider 元数据包含多个默认 Provider。');
+  return references;
 }
 
 export class ProviderStore {
