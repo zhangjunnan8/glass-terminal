@@ -44,6 +44,17 @@ yarn-debug.log
 yarn-error.log
 *.tsbuildinfo
 
+# local handoff prompt — never commit or push
+docs/AI_HANDOFF_PROMPT.md
+
+# AI-internal handoff / progress docs — never commit or push
+docs/AI_PROJECT_GUIDE.md
+docs/agent-file-tools.md
+docs/progress/
+
+# user-local scripts — never commit or push
+enable-ssh.ps1
+
 # editor / OS noise
 .vscode/
 .idea/
