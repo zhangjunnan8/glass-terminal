@@ -8,6 +8,11 @@ export interface ProviderProfile {
   baseUrl: string;
   modelId: string;
   /**
+   * Provider/model input context window. Existing profiles default to 64K.
+   * Automatic compression triggers before this hard ceiling.
+   */
+  contextWindowTokens?: number;
+  /**
    * Opaque, non-secret identity revision for endpoint/model/credential changes.
    * Routine status tests, display-name edits, and default selection preserve it.
    */
@@ -27,6 +32,7 @@ export interface ProviderInput {
   kind?: ProviderKind;
   baseUrl: string;
   modelId: string;
+  contextWindowTokens?: number;
   apiKey?: string;
   makeDefault?: boolean;
 }

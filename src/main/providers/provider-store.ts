@@ -18,6 +18,11 @@ import type {
   ProviderModelDiscoveryResult,
   ProviderProfile,
 } from '../../shared/provider';
+import {
+  MAX_CONTEXT_WINDOW_TOKENS,
+  MIN_CONTEXT_WINDOW_TOKENS,
+  normalizedContextWindowTokens,
+} from '../../shared/context-window';
 import type { SecretStore } from './secret-store';
 
 type FetchImplementation = typeof fetch;
@@ -161,6 +166,7 @@ function parseProfiles(value: unknown): StoredProviderProfile[] {
       kind: 'generic-openai-compatible',
       baseUrl: profile.baseUrl,
       modelId: profile.modelId,
+      contextWindowTokens: normalizedContextWindowTokens(profile.contextWindowTokens),
       apiKeyReference: profile.apiKeyReference,
       recipientTransitionPending,
       recipientRevision: typeof profile.recipientRevision === 'string'
@@ -263,6 +269,17 @@ export class ProviderStore {
     const id = existing?.id ?? randomUUID();
     const baseUrl = normalizedBaseUrl(input.baseUrl);
     const modelId = requiredText(input.modelId, '模型 ID');
+    if (
+      input.contextWindowTokens !== undefined
+      && normalizedContextWindowTokens(input.contextWindowTokens) !== input.contextWindowTokens
+    ) {
+      throw new Error(
+        `上下文窗口必须是 ${MIN_CONTEXT_WINDOW_TOKENS}-${MAX_CONTEXT_WINDOW_TOKENS} 之间的整数。`,
+      );
+    }
+    const contextWindowTokens = normalizedContextWindowTokens(
+      input.contextWindowTokens ?? existing?.contextWindowTokens,
+    );
     const apiKeyReference = existing?.apiKeyReference ?? `AI Terminal/provider/${id}`;
     const suppliedKey = input.apiKey && input.apiKey.trim() ? input.apiKey : undefined;
     const keyReplaced = Boolean(suppliedKey);
@@ -278,6 +295,7 @@ export class ProviderStore {
       kind: 'generic-openai-compatible',
       baseUrl,
       modelId,
+      contextWindowTokens,
       apiKeyReference,
       recipientTransitionPending: suppliedKey
         ? true

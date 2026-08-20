@@ -402,6 +402,21 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .agent-header .agent-controls .take-control { color: #77d6b8; border-color: #31574e; }
 .agent-header .agent-controls .full-takeover-enabled { color: #ffd1d5; border-color: #8f3d49; background: #3a171d; }
 .agent-header .agent-controls .takeover-badge { width: 100%; margin: 0 0 2px; color: #ff9ca4; text-align: right; font-size: 14px; font-weight: 900; letter-spacing: .03em; }
+.agent-context-meter { display: flex; width: 100%; min-height: 58px; align-items: center; gap: 10px; margin-bottom: 2px; padding: 7px 10px; color: #b8c6d8; border: 1px solid #29394c; border-radius: 5px; background: #0b121b; }
+.agent-context-ring { display: grid; width: 44px; height: 44px; position: relative; flex: 0 0 44px; place-items: center; }
+.agent-context-ring svg { width: 44px; height: 44px; overflow: visible; transform: rotate(-90deg); }
+.agent-context-ring circle { fill: none; stroke-width: 4; }
+.agent-context-ring-track { stroke: #263548; }
+.agent-context-ring-value { stroke: #59c8a7; stroke-linecap: round; transition: stroke-dasharray 240ms ease, stroke 160ms ease; }
+.agent-header .agent-context-ring strong { display: block; position: absolute; color: #9fe2cd; font: 700 10px/1 "Cascadia Mono", Consolas, monospace; }
+.agent-header .agent-context-copy { display: flex; min-width: 0; flex: 1; flex-direction: column; gap: 3px; margin: 0; overflow: visible; text-overflow: clip; white-space: normal; }
+.agent-context-copy b { color: #c9d5e4; font-size: 13px; }
+.agent-context-copy small { color: #75879d; font: 11px/1.25 "Cascadia Mono", Consolas, monospace; }
+.agent-context-meter.warning .agent-context-ring-value { stroke: #d7a24c; }
+.agent-context-meter.warning .agent-context-ring strong { color: #e7ba6e; }
+.agent-context-meter.compressing { border-color: #3d7c6c; background: #10251f; }
+.agent-context-meter.compressing .agent-context-ring-value { stroke: #77ddbd; animation: context-ring-pulse 900ms ease-in-out infinite alternate; }
+@keyframes context-ring-pulse { from { opacity: .5; } to { opacity: 1; filter: drop-shadow(0 0 3px #59c8a7aa); } }
 .agent-body-shell { position: relative; min-height: 0; flex: 1; }
 .agent-body { height: 100%; min-height: 0; overflow-y: auto; }
 .agent-empty { display: flex; align-items: center; flex: 1; flex-direction: column; justify-content: center; padding: 36px 28px; text-align: center; }
@@ -1224,6 +1239,14 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
   background: #b93449;
 }
 .app-shell[data-theme="light"] .agent-header .agent-controls .takeover-badge { color: #a11f35; }
+.app-shell[data-theme="light"] .agent-context-meter { color: #334158; border-color: #c9d3de; background: #f6f9fb; }
+.app-shell[data-theme="light"] .agent-context-ring-track { stroke: #d7e0e8; }
+.app-shell[data-theme="light"] .agent-context-ring-value { stroke: #188b70; }
+.app-shell[data-theme="light"] .agent-header .agent-context-ring strong { color: #116e5b; }
+.app-shell[data-theme="light"] .agent-context-copy b { color: #2c394e; }
+.app-shell[data-theme="light"] .agent-context-copy small { color: #65758a; }
+.app-shell[data-theme="light"] .agent-context-meter.warning .agent-context-ring-value { stroke: #a96800; }
+.app-shell[data-theme="light"] .agent-context-meter.compressing { border-color: #89bfae; background: #edf8f4; }
 .app-shell[data-theme="light"] .agent-backend-notice.blocked {
   color: #861f31;
   border-color: #d995a0;

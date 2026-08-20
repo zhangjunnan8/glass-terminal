@@ -795,11 +795,13 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
       const { LangChainBackend, LangChainProviderModelFactory } = await import(
         './agent/langchain-backend'
       );
+      const provider = requireProviderStore().get(providerId);
       return new LangChainBackend({
         modelFactory: () => new LangChainProviderModelFactory(
           providerId,
           requireProviderStore(),
         ).build(),
+        contextWindowTokens: provider.contextWindowTokens,
       });
     },
   );

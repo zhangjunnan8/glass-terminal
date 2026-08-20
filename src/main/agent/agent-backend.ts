@@ -1,4 +1,4 @@
-import type { AgentFileAccessMode } from '../../shared/agent';
+import type { AgentContextUsage, AgentFileAccessMode } from '../../shared/agent';
 import type { ToolGateway } from '../../shared/tools';
 
 export type AgentMessage =
@@ -7,6 +7,8 @@ export type AgentMessage =
     role: 'assistant';
     content: string | null;
     toolCalls?: AgentToolCall[];
+    /** Generated context checkpoint; never rendered as a user-visible chat item. */
+    contextSummary?: boolean;
   }
   | { role: 'tool'; content: string; toolCallId: string };
 
@@ -17,10 +19,12 @@ export interface AgentToolCall {
 }
 
 export interface AgentBackendEvent {
-  type: 'assistant_delta' | 'assistant_text' | 'tool_started' | 'tool_completed';
+  type: 'assistant_delta' | 'assistant_text' | 'tool_started' | 'tool_completed' | 'context_status';
   text?: string;
   toolCall?: AgentToolCall;
   result?: string;
+  contextUsage?: AgentContextUsage;
+  compression?: { beforeTokens: number; afterTokens: number };
 }
 
 export interface AgentBackendResult {
@@ -28,6 +32,11 @@ export interface AgentBackendResult {
   messages: AgentMessage[];
   finalText: string;
   rounds: number;
+  contextUsage?: AgentContextUsage;
+  contextPersistence?: {
+    mode: 'delta' | 'checkpoint';
+    messages: AgentMessage[];
+  };
 }
 
 /** Opaque, backend-owned handle for one Glass Terminal conversation thread. */

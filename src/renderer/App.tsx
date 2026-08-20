@@ -37,6 +37,7 @@ import { mergeAgentState } from './agent-state';
 import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
 import { AgentActivityCard } from './components/AgentActivityCard';
+import { AgentContextMeter } from './components/AgentContextMeter';
 import { ToolActivityList } from './components/ToolActivityList';
 import {
   isAgentOutputNearBottom,
@@ -2087,6 +2088,12 @@ export function App() {
           </div>
           {agentControlsExpanded && !codexBackendSelected && (
             <div className="agent-controls">
+              <AgentContextMeter
+                usage={selectedGenericBackendMatchesActive
+                  ? activeAgent?.contextUsage
+                  : undefined}
+                contextWindowTokens={selectedGenericProvider?.contextWindowTokens}
+              />
               <label
                 className="agent-file-access-picker"
                 title={activeWorkspaceRoot

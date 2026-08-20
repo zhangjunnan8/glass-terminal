@@ -11,7 +11,7 @@
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178c6?logo=typescript&logoColor=white)
 ![Version](https://img.shields.io/badge/version-0.1.0--alpha.2-orange)
-![Tests](https://img.shields.io/badge/tests-485%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-499%20passed-brightgreen)
 ![Status](https://img.shields.io/badge/status-alpha-important)
 
 </div>
@@ -24,6 +24,7 @@
 |---|---|
 | 🖥️ **共享可见终端** | AI 与人类共用同一个终端；AI 命令通过命令信封注入，输出实时回显，无隐藏进程 |
 | 🤖 **双 Agent 后端** | Generic Provider（LangChain，兼容 DeepSeek / OpenAI 等）与原生 Codex App Server 两种模式 |
+| 🧠 **自动上下文压缩** | Generic Provider 按模型窗口估算上下文；圆形进度显示安全预算，达到阈值自动总结旧历史并保留最近完整工具调用 |
 | ✅ **命令审批** | AI 请求执行命令需你确认；支持编辑后执行、拒绝 |
 | 🎮 **AI 全接管 / 人工接管** | 显式确认后 Full Takeover 可连续执行命令，Take Control 可随时抢回当前终端；SSH Host 当前会记住该偏好 |
 | 🌐 **SSH 远程主机** | 密码 / 键盘交互 / 私钥 / Windows OpenSSH 代理认证；多主机、文件夹分组、收藏 |
@@ -55,7 +56,7 @@ npm run dev
 
 ```bash
 npm run typecheck   # TypeScript 类型检查
-npm test            # Vitest 全量测试（61 个测试文件；485 通过、13 跳过）
+npm test            # Vitest 全量测试（63 个测试文件；499 通过、13 跳过）
 npm run build       # 编译 renderer + Electron main/preload
 ```
 

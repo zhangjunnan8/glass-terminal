@@ -3,6 +3,11 @@ import type { FormEvent } from 'react';
 import type { CodexAppServerSnapshot, CodexModelInfo } from '../shared/codex-app-server';
 import type { ProviderInput, ProviderProfile } from '../shared/provider';
 import {
+  DEFAULT_CONTEXT_WINDOW_TOKENS,
+  MAX_CONTEXT_WINDOW_TOKENS,
+  MIN_CONTEXT_WINDOW_TOKENS,
+} from '../shared/context-window';
+import {
   PROVIDER_TEMPLATES,
   providerTemplateForBaseUrl,
 } from '../shared/provider-templates';
@@ -241,6 +246,7 @@ export function AiServiceSettings() {
     const nameInput = form.elements.namedItem('name') as HTMLInputElement;
     const baseUrlInput = form.elements.namedItem('baseUrl') as HTMLInputElement;
     const modelInput = form.elements.namedItem('modelId') as HTMLInputElement;
+    const contextWindowInput = form.elements.namedItem('contextWindowTokens') as HTMLInputElement;
     const apiKeyInput = form.elements.namedItem('apiKey') as HTMLInputElement;
     const makeDefaultInput = form.elements.namedItem('makeDefault') as HTMLInputElement;
     const input: ProviderInput = {
@@ -248,6 +254,7 @@ export function AiServiceSettings() {
       name: nameInput.value,
       baseUrl: baseUrlInput.value,
       modelId: modelInput.value,
+      contextWindowTokens: Number(contextWindowInput.value),
       makeDefault: makeDefaultInput.checked,
     };
     if (apiKeyInput.value) input.apiKey = apiKeyInput.value;
@@ -881,6 +888,23 @@ export function AiServiceSettings() {
                   >检索模型</button>
                 </div>
               </label>
+              <label>
+                上下文窗口（tokens）
+                <input
+                  name="contextWindowTokens"
+                  type="number"
+                  min={MIN_CONTEXT_WINDOW_TOKENS}
+                  max={MAX_CONTEXT_WINDOW_TOKENS}
+                  step={1_024}
+                  required
+                  defaultValue={editingProvider?.contextWindowTokens
+                    ?? DEFAULT_CONTEXT_WINDOW_TOKENS}
+                  aria-describedby="provider-context-window-note"
+                />
+              </label>
+              <small id="provider-context-window-note" className="provider-field-note">
+                请填写该模型的输入窗口；到达 85% 安全阈值时会自动压缩旧上下文。
+              </small>
               <label>
                 API Key
                 <input

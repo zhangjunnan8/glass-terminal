@@ -59,6 +59,35 @@ describe('ProviderStore', () => {
     expect(reference).toMatch(/^AI Terminal\/provider\//);
     expect(await secrets.get(reference)).toBe('super-secret-provider-key');
     expect(profile.baseUrl).toBe('https://provider.example/v1');
+    expect(profile.contextWindowTokens).toBe(64_000);
+  });
+
+  it('persists a validated model context window without changing recipient identity', async () => {
+    const { store } = fixture();
+    const profile = await store.save({
+      name: 'Context Provider',
+      baseUrl: 'https://provider.example/v1',
+      modelId: 'model-1',
+      contextWindowTokens: 128_000,
+      apiKey: 'context-key',
+    });
+    const updated = await store.save({
+      id: profile.id,
+      name: profile.name,
+      baseUrl: profile.baseUrl,
+      modelId: profile.modelId,
+      contextWindowTokens: 256_000,
+    });
+
+    expect(updated.contextWindowTokens).toBe(256_000);
+    expect(updated.recipientRevision).toBe(profile.recipientRevision);
+    await expect(store.save({
+      id: profile.id,
+      name: profile.name,
+      baseUrl: profile.baseUrl,
+      modelId: profile.modelId,
+      contextWindowTokens: 1_000,
+    })).rejects.toThrow('上下文窗口必须是');
   });
 
   it('becomes Ready only after a successful authenticated connection test', async () => {

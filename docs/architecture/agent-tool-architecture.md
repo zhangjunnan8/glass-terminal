@@ -144,11 +144,25 @@ It replaces the in-house `AgentLoop` while keeping every boundary below it intac
 - Responses stream over SSE (`assistant_delta` → `assistant_text`), preserving the
   renderer streaming contract and the smoke tests. Tool calls are aggregated from
   streamed chunks via `collapseToolCallChunks`.
+- Each Provider records its model input window (64K default). The renderer shows
+  estimated working-context use as a circular meter. Its 100% mark is the safe
+  compression threshold (85% of the configured model window), leaving output and
+  tool-call headroom rather than waiting for a Provider overflow.
+- At that threshold, the selected Provider model summarizes older working history
+  under a separate prompt that treats the transcript as untrusted data. The latest
+  user request and recent complete assistant-tool-result groups remain verbatim.
+  If semantic summarization fails, a bounded deterministic fallback keeps the turn
+  usable; cancellation is never swallowed by that fallback. Visible chat and the
+  append-only audit/history remain intact.
+- Completed `workspace_*` tool bodies are reduced to stable metadata after the next
+  reasoning step. Normal turns persist only a context delta; a compression or tool
+  history rewrite persists a bounded checkpoint. Legacy full-checkpoint events are
+  still replayed as checkpoints, so existing conversations remain readable.
 - The harness owns no PTY, SSH, SFTP, or filesystem client; those remain under
   `TerminalService` and `AgentFileService`, reachable only through `ToolGateway`.
-- One Generic harness turn is bounded to 40 rounds by default (configurable
-  1–64 in the Settings window, hard cap 64), replacing the older 12-round
-  in-house `AgentLoop` cap.
+- One Generic harness turn is bounded to 40 rounds by default (constructor range
+  1–64, hard cap 64), replacing the older 12-round in-house `AgentLoop` cap. The
+  similarly named Settings value is persisted but is not yet wired to production.
 
 ## Known large-workspace limits
 
@@ -168,10 +182,16 @@ reduce risk, but cannot provide a universal no-replace guarantee across all
 servers. An iterative remote directory API and stronger server-specific
 primitives are future hardening work.
 
-The LangChain migration has not yet restored the former completed-workspace-tool
-history compaction. Tool arguments/results and cumulative turn checkpoints can
-therefore enlarge Provider context and `ai/*.jsonl` over long conversations.
-The Session API also has callers that read the complete terminal history before
-applying a tail limit. Both are current long-session performance limits and
-should be fixed before treating the documented byte bounds as end-to-end
-conversation bounds.
+Generic Provider working context is now bounded prospectively by completed-tool
+compaction, automatic summaries, and delta/checkpoint persistence. Existing
+`ai/*.jsonl` files are append-only: legacy cumulative checkpoints already on disk
+are not physically rewritten, and replay still reads the complete thread event
+file to rebuild visible chat and support retract/replace. A future indexed context
+snapshot or safe log compactor is needed to remove that historical disk/read cost.
+
+The token count is a conservative provider-agnostic estimate (ASCII roughly four
+characters per token; non-ASCII at least one token per code point), not the exact
+tokenizer for every custom endpoint. Providers with unusual tokenization should be
+configured with a smaller effective window. The Session API also has callers that
+read the complete terminal history before applying a tail limit. These remain
+long-session performance limits outside the bounded model working context.

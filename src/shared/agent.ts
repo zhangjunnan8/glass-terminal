@@ -106,6 +106,19 @@ export interface AgentToolActivity {
   turnId?: string;
 }
 
+export interface AgentContextUsage {
+  /** Conservative, provider-agnostic estimate of the active model context. */
+  estimatedTokens: number;
+  /** Configured hard model input window for the selected Provider. */
+  contextWindowTokens: number;
+  /** Safe threshold at which Glass Terminal automatically compacts context. */
+  compressionThresholdTokens: number;
+  /** Usage against the compression threshold, clamped to 0-100 for the UI. */
+  percentage: number;
+  status: 'ready' | 'compressing';
+  lastCompressedAt?: string;
+}
+
 export interface AgentSessionView {
   revision: number;
   terminalId: string;
@@ -126,6 +139,8 @@ export interface AgentSessionView {
   messages: AgentChatItem[];
   /** Bounded, metadata-only summaries of recent tool use. */
   activities: AgentToolActivity[];
+  /** Present for Generic Provider sessions; Codex owns its context internally. */
+  contextUsage?: AgentContextUsage;
   streamingMessageId?: string;
   /** App Server interrupt is still draining; terminal input is human-owned but a new turn is unsafe. */
   backendTurnDraining?: boolean;

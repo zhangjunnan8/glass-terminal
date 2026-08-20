@@ -1263,6 +1263,62 @@ describe('AgentService shared-terminal controls', () => {
     service.close();
   });
 
+  it('publishes context compression progress and records a metadata-only audit', async () => {
+    const backend = new DeferredActivityBackend();
+    const sessions = new FakeSessions();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      () => backend,
+    );
+    const owner = browserOwner();
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Compress when needed.' });
+    await waitFor(() => backend.sendInputs.length === 1);
+
+    backend.emit({
+      type: 'context_status',
+      contextUsage: {
+        estimatedTokens: 54_400,
+        contextWindowTokens: 64_000,
+        compressionThresholdTokens: 54_400,
+        percentage: 100,
+        status: 'compressing',
+      },
+    });
+    expect(service.getState(owner, 'terminal')?.contextUsage).toMatchObject({
+      percentage: 100,
+      status: 'compressing',
+    });
+
+    backend.emit({
+      type: 'context_status',
+      contextUsage: {
+        estimatedTokens: 8_000,
+        contextWindowTokens: 64_000,
+        compressionThresholdTokens: 54_400,
+        percentage: 15,
+        status: 'ready',
+        lastCompressedAt: '2026-08-20T00:00:00.000Z',
+      },
+      compression: { beforeTokens: 54_400, afterTokens: 8_000 },
+    });
+    expect(service.getState(owner, 'terminal')?.contextUsage).toMatchObject({
+      percentage: 15,
+      status: 'ready',
+    });
+    expect(sessions.audits.filter(({ type }) => type === 'context_compressed')).toEqual([
+      expect.objectContaining({
+        details: expect.objectContaining({ beforeTokens: 54_400, afterTokens: 8_000 }),
+      }),
+    ]);
+    backend.finish();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    service.close();
+  });
+
   it('settles a running activity as failed when the backend rejects', async () => {
     const { backend, owner, service } = await startActivityHarness();
     backend.emit({
@@ -1541,6 +1597,45 @@ describe('AgentService shared-terminal controls', () => {
       priorMessages: persistedMessages,
     }]);
     expect(backend.priorMessagesAtSend[0]).toEqual(persistedMessages);
+  });
+
+  it('replays bounded context checkpoints plus later deltas without duplicating full turns', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      providerId: 'provider',
+      agentBackend: { kind: 'generic-provider', providerId: 'provider' },
+      agentBackendFingerprint: recipientFingerprint(),
+      aiThreadId: 'persisted-thread',
+    };
+    const checkpoint: AgentMessage[] = [
+      { role: 'assistant', content: '[Glass Terminal automatic context summary]\nEarlier work.' },
+      { role: 'user', content: 'First retained prompt.' },
+      { role: 'assistant', content: 'First retained answer.' },
+    ];
+    const delta: AgentMessage[] = [
+      { role: 'user', content: 'Second prompt.' },
+      { role: 'assistant', content: 'Second answer.' },
+    ];
+    sessions.persistedThreadEvents = [
+      { type: 'turn', contextMode: 'checkpoint', messages: checkpoint },
+      { type: 'turn', contextMode: 'delta', messages: delta },
+    ];
+    const backend = new RecordingBackend();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      () => backend,
+    );
+
+    service.sendPrompt(browserOwner(), { terminalId: 'terminal', prompt: 'Continue.' });
+    await waitFor(() => backend.sendInputs.length === 1);
+
+    expect(backend.resumeInputs[0]?.priorMessages).toEqual([...checkpoint, ...delta]);
+    service.close();
   });
 
   it('discards a Generic backend thread after replacing persisted conversation history', async () => {
@@ -2289,6 +2384,42 @@ describe('AgentService shared-terminal controls', () => {
       fileAccessMode: 'read-only',
     });
     expect(backendAdapter.priorMessagesAtSend[1]).not.toEqual([]);
+  });
+
+  it('rebuilds the Generic backend for a changed context window without losing history', async () => {
+    let profile = readyProviderProfile('provider', { contextWindowTokens: 64_000 });
+    const providers = {
+      get: () => profile,
+      list: () => [profile],
+    } as unknown as ProviderStore;
+    const sessions = new FakeSessions();
+    const backends = [new RecordingBackend(), new RecordingBackend()];
+    const factory = vi.fn(() => backends[factory.mock.calls.length - 1]!);
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providers,
+      undefined,
+      undefined,
+      factory,
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'first turn', backend });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    const threadId = service.getState(owner, 'terminal')!.threadId;
+
+    profile = { ...profile, contextWindowTokens: 128_000 };
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'second turn', backend });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(backends[1]!.resumeInputs[0]?.priorMessages).not.toEqual([]);
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      threadId,
+      contextUsage: { contextWindowTokens: 128_000 },
+    });
   });
 
   it('does not resume persisted Generic history when its recipient fingerprint changed offline', async () => {

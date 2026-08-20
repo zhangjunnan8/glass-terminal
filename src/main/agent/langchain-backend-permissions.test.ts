@@ -1,9 +1,10 @@
 // @vitest-environment node
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { ChatOpenAICompletions } from '@langchain/openai';
 import type { AgentFileAccessMode } from '../../shared/agent';
+import type { AgentBackendEvent, AgentMessage } from './agent-backend';
 import type { TerminalTool, ToolGateway, WorkspaceTool } from '../../shared/tools';
 import { LangChainBackend } from './langchain-backend';
 
@@ -169,5 +170,55 @@ describe('LangChainBackend workspace tool gating', () => {
     expect(tools).toContain('workspace_mkdir');
     expect(tools).toContain('workspace_rename');
     expect(tools).toContain('workspace_delete');
+  });
+
+  it('compresses a full resumed context before dispatch and persists a bounded checkpoint', async () => {
+    const capture = await startToolCaptureServer();
+    try {
+      const model = new ChatOpenAICompletions({
+        model: 'context-test',
+        apiKey: 'fake',
+        temperature: 0,
+        maxRetries: 0,
+        configuration: { baseURL: capture.baseUrl },
+      });
+      const summarize = vi.fn(async () => '- Goal: continue the retained coding task.');
+      const backend = new LangChainBackend({
+        modelFactory: () => Promise.resolve(model),
+        contextWindowTokens: 8_192,
+        summarize,
+      });
+      const priorMessages: AgentMessage[] = [];
+      for (let turn = 1; turn <= 5; turn += 1) {
+        priorMessages.push({ role: 'user', content: `old-turn-${turn}:` + '汉'.repeat(1_700) });
+        priorMessages.push({ role: 'assistant', content: `old-answer-${turn}` });
+      }
+      const thread = await backend.resume({ id: 'context-resume', priorMessages });
+      const events: AgentBackendEvent[] = [];
+
+      const result = await backend.sendMessage({
+        thread,
+        prompt: 'Current request.',
+        systemPrompt: 'System policy.',
+        terminalContext: '',
+        fileAccessMode: 'off',
+        gateway: buildGateway('off'),
+        signal: new AbortController().signal,
+        onEvent: (event) => events.push(event),
+      });
+
+      expect(summarize).toHaveBeenCalledOnce();
+      expect(events.some((event) => (
+        event.type === 'context_status' && event.contextUsage?.status === 'compressing'
+      ))).toBe(true);
+      expect(events.some((event) => Boolean(event.compression))).toBe(true);
+      expect(result.contextUsage?.percentage).toBeLessThan(100);
+      expect(result.contextPersistence?.mode).toBe('checkpoint');
+      expect(JSON.stringify(result.contextPersistence?.messages)).not.toContain('old-turn-1:');
+      expect(JSON.stringify(result.contextPersistence?.messages)).toContain('automatic context summary');
+      expect(JSON.stringify(result.contextPersistence?.messages)).toContain('Current request.');
+    } finally {
+      await new Promise<void>((resolve) => capture.server.close(() => resolve()));
+    }
   });
 });

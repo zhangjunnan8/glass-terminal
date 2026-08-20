@@ -8,6 +8,7 @@ import {
 import type {
   AgentBackendRef,
   AgentChatItem,
+  AgentContextUsage,
   AgentFileAccessMode,
   AgentFileAccessPolicy,
   AgentRuntimeState,
@@ -27,6 +28,7 @@ import type {
   TerminalInputMode,
 } from '../../shared/agent';
 import type { ProviderProfile } from '../../shared/provider';
+import { DEFAULT_CONTEXT_WINDOW_TOKENS } from '../../shared/context-window';
 import type { CodexVisibleTerminalContext } from '../../shared/codex-app-server';
 import type { SessionAuditEvent, SessionRecord } from '../../shared/session';
 import { SESSION_CHANNELS } from '../../shared/session';
@@ -53,6 +55,7 @@ import {
   workspacePermissions,
 } from '../tools/session-tool-context';
 import { AgentFileWorkspaceAdapter } from '../tools/agent-file-workspace-adapter';
+import { agentContextUsage } from './context-window';
 
 interface ApprovalResolution {
   decision: 'execute' | 'edit' | 'reject';
@@ -319,6 +322,7 @@ function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
     fileAccessRoot: runtime.fileAccessRoot,
     messages: runtime.messages.map((message) => ({ ...message })),
     activities: runtime.activities.map((activity) => ({ ...activity })),
+    contextUsage: runtime.contextUsage ? { ...runtime.contextUsage } : undefined,
     streamingMessageId: runtime.streamingMessageId,
     backendTurnDraining: runtime.backendTurnDraining,
     pendingApproval: runtime.pendingApproval ? { ...runtime.pendingApproval } : undefined,
@@ -420,7 +424,11 @@ function replayConversation(
   fallbackProviderThreadId?: string,
 ): ReplayedConversation {
   let chats: Array<{ item: AgentChatItem; eventIndex: number }> = [];
-  let turns: Array<{ messages: AgentMessage[]; eventIndex: number }> = [];
+  let turns: Array<{
+    messages: AgentMessage[];
+    eventIndex: number;
+    mode: 'delta' | 'checkpoint';
+  }> = [];
   let providerThreadId = fallbackProviderThreadId;
 
   events.forEach((event, eventIndex) => {
@@ -430,7 +438,11 @@ function replayConversation(
       return;
     }
     if (event.type === 'turn') {
-      turns.push({ messages: safePriorMessages(event.messages), eventIndex });
+      turns.push({
+        messages: safePriorMessages(event.messages),
+        eventIndex,
+        mode: event.contextMode === 'delta' ? 'delta' : 'checkpoint',
+      });
       return;
     }
     if (event.type === 'codex_app_server_turn' && typeof event.providerThreadId === 'string') {
@@ -458,9 +470,15 @@ function replayConversation(
     providerThreadId = undefined;
   });
 
+  let priorMessages: AgentMessage[] = [];
+  for (const turn of turns) {
+    priorMessages = turn.mode === 'checkpoint'
+      ? turn.messages
+      : [...priorMessages, ...turn.messages];
+  }
   return {
     messages: chats.map(({ item }) => item),
-    priorMessages: turns.at(-1)?.messages ?? [],
+    priorMessages,
     providerThreadId,
   };
 }
@@ -671,6 +689,7 @@ export class AgentService {
     );
     runtime.messages = replayed.messages;
     runtime.priorMessages = replayed.priorMessages;
+    runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
     runtime.activities = [];
     if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
       runtime.providerThreadId = replayed.providerThreadId;
@@ -1245,6 +1264,26 @@ export class AgentService {
     };
     const onEvent = (event: AgentBackendEvent): void => {
       if (!acceptBackendEvents || !this.isCurrentTurn(runtime, token)) return;
+      if (event.type === 'context_status' && event.contextUsage) {
+        const previous = runtime.contextUsage;
+        runtime.contextUsage = { ...event.contextUsage };
+        if (event.compression) {
+          this.sessions.appendAudit(runtime.sessionId, 'context_compressed', 'system', {
+            beforeTokens: event.compression.beforeTokens,
+            afterTokens: event.compression.afterTokens,
+            contextWindowTokens: event.contextUsage.contextWindowTokens,
+            compressionThresholdTokens: event.contextUsage.compressionThresholdTokens,
+          });
+        }
+        if (
+          event.compression
+          || !previous
+          || previous.percentage !== event.contextUsage.percentage
+          || previous.status !== event.contextUsage.status
+          || previous.lastCompressedAt !== event.contextUsage.lastCompressedAt
+        ) this.emit(runtime);
+        return;
+      }
       if (event.type === 'tool_started' || event.type === 'tool_completed') {
         runtime.activities = reduceAgentToolActivities(
           runtime.activities,
@@ -1442,11 +1481,19 @@ export class AgentService {
       await closeTurnTools();
       if (!this.isCurrentTurn(runtime, token)) return;
       runtime.priorMessages = result.messages.filter((message) => message.role !== 'system');
+      runtime.contextUsage = result.contextUsage
+        ? { ...result.contextUsage }
+        : this.contextUsageFor(runtime, runtime.priorMessages);
+      const contextPersistence = result.contextPersistence ?? {
+        mode: 'checkpoint' as const,
+        messages: runtime.priorMessages,
+      };
       this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
         type: 'turn',
         id: result.id,
         timestamp: new Date().toISOString(),
-        messages: runtime.priorMessages,
+        contextMode: contextPersistence.mode,
+        messages: contextPersistence.messages,
       });
       runtime.pendingApproval = undefined;
       runtime.activeExecution = undefined;
@@ -1997,6 +2044,12 @@ export class AgentService {
       messages: replayed.messages,
       activities: [],
       priorMessages: replayed.priorMessages,
+      contextUsage: backend.kind === 'generic-provider'
+        ? agentContextUsage(
+          replayed.priorMessages,
+          currentProvider?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+        )
+        : undefined,
       providerThreadId: canReuseThread && backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
         ? replayed.providerThreadId
         : undefined,
@@ -2023,16 +2076,33 @@ export class AgentService {
   private providerSecurityState(providerId: string): {
     fingerprint?: string;
     ready: boolean;
+    contextWindowTokens?: number;
   } {
     try {
       const profile = this.providers.get(providerId);
       return {
         fingerprint: providerFingerprint(profile),
         ready: profile.status === 'ready',
+        contextWindowTokens: profile.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
       };
     } catch {
       return { ready: false };
     }
+  }
+
+  private contextUsageFor(
+    runtime: Pick<AgentRuntimeRecord, 'backend'>,
+    messages: readonly AgentMessage[],
+  ): AgentContextUsage | undefined {
+    if (runtime.backend.kind !== 'generic-provider') return undefined;
+    let contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS;
+    try {
+      contextWindowTokens = this.providers.get(runtime.backend.providerId).contextWindowTokens
+        ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
+    } catch {
+      // A deleted/unready Provider retains a bounded display estimate only.
+    }
+    return agentContextUsage(messages, contextWindowTokens);
   }
 
   /**
@@ -2045,6 +2115,19 @@ export class AgentService {
     const currentFingerprint = currentProvider.fingerprint;
     const fingerprintChanged = currentFingerprint !== runtime.providerFingerprint;
     const readinessLost = runtime.providerReady === true && !currentProvider.ready;
+    const currentContextWindow = currentProvider.contextWindowTokens
+      ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
+    if (
+      !fingerprintChanged
+      && currentProvider.ready
+      && runtime.contextUsage?.contextWindowTokens !== currentContextWindow
+    ) {
+      // Context-window tuning is harmless Provider metadata: preserve history and
+      // file grants, but rebuild the backend so its next turn uses the new budget.
+      runtime.harnessBackend = undefined;
+      runtime.harnessThread = undefined;
+      runtime.contextUsage = agentContextUsage(runtime.priorMessages, currentContextWindow);
+    }
     if (!fingerprintChanged && !runtime.providerConversationResetPending && !readinessLost) {
       runtime.providerReady = currentProvider.ready;
       return false;
@@ -2059,6 +2142,7 @@ export class AgentService {
       runtime.threadId = randomUUID();
       runtime.providerThreadId = undefined;
       runtime.priorMessages = [];
+      runtime.contextUsage = this.contextUsageFor(runtime, []);
       runtime.messages = [];
       runtime.activities = [];
       runtime.error = 'Provider 接收端、模型或凭据已变化；文件访问权限与旧对话绑定已撤销。';
