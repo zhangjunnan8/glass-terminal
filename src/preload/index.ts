@@ -73,6 +73,10 @@ const sessionBridge: DesktopBridge['sessions'] = {
   list: (hostId) => ipcRenderer.invoke(SESSION_CHANNELS.list, hostId),
   upgrade: (request) => ipcRenderer.invoke(SESSION_CHANNELS.upgrade, request),
   setWorkspace: (request) => ipcRenderer.invoke(SESSION_CHANNELS.setWorkspace, request),
+  remoteWorkspaceAtomicity: (terminalId) => ipcRenderer.invoke(
+    SESSION_CHANNELS.remoteWorkspaceAtomicity,
+    terminalId,
+  ),
   clearWorkspace: (request) => ipcRenderer.invoke(SESSION_CHANNELS.clearWorkspace, request),
   chooseLocalWorkspace: (request) => ipcRenderer.invoke(
     SESSION_CHANNELS.chooseLocalWorkspace,

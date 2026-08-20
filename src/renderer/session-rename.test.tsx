@@ -128,6 +128,7 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       list: vi.fn().mockResolvedValue([session]),
       upgrade: vi.fn(),
       setWorkspace: vi.fn().mockResolvedValue(session),
+      remoteWorkspaceAtomicity: vi.fn(),
       clearWorkspace: vi.fn().mockResolvedValue(session),
       chooseLocalWorkspace: vi.fn().mockResolvedValue(null),
       rename,

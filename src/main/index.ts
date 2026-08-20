@@ -645,6 +645,12 @@ handleTrusted(
   },
 );
 handleTrusted(
+  SESSION_CHANNELS.remoteWorkspaceAtomicity,
+  (event, terminalId: string) => (
+    requireSessionManager().remoteWorkspaceAtomicity(event.sender, terminalId)
+  ),
+);
+handleTrusted(
   SESSION_CHANNELS.clearWorkspace,
   (event, request: ClearWorkspaceRequest) => {
     requireAgentService().assertWorkspaceChangeAllowed(event.sender, request.terminalId);

@@ -229,12 +229,18 @@ function validateWorkspaceBinding(
     || typeof workspace.root !== 'string'
     || !workspace.root
     || (workspace.hostId !== undefined && typeof workspace.hostId !== 'string')
+    || (
+      workspace.remoteWritePolicy !== undefined
+      && workspace.remoteWritePolicy !== 'strict'
+      && workspace.remoteWritePolicy !== 'compatible'
+    )
   ) throw new Error(`Invalid workspace binding in ${source}.`);
 
   if (session.transport === 'local') {
     if (
       workspace.backend !== 'local'
       || workspace.hostId !== undefined
+      || workspace.remoteWritePolicy !== undefined
       || !isAbsolute(workspace.root)
     ) {
       throw new Error('Local Session requires a local workspace without a host binding.');
@@ -251,6 +257,9 @@ function validateWorkspaceBinding(
     backend: workspace.backend,
     root: workspace.root,
     ...(workspace.hostId === undefined ? {} : { hostId: workspace.hostId }),
+    ...(workspace.remoteWritePolicy === undefined
+      ? {}
+      : { remoteWritePolicy: workspace.remoteWritePolicy }),
   };
 }
 
@@ -431,6 +440,7 @@ export class SessionStore {
       current.workspace?.backend === validatedWorkspace?.backend
       && current.workspace?.root === validatedWorkspace?.root
       && current.workspace?.hostId === validatedWorkspace?.hostId
+      && current.workspace?.remoteWritePolicy === validatedWorkspace?.remoteWritePolicy
     ) return current;
 
     const updated: SessionRecord = {

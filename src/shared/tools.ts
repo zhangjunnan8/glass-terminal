@@ -1,12 +1,53 @@
 import type { AgentFileAccessMode } from './agent';
 
 export type WorkspaceBackendKind = 'local' | 'sftp';
+export type RemoteWritePolicy = 'strict' | 'compatible';
+
+export interface RemoteServerCapabilities {
+  detection: 'advertised' | 'unknown';
+  hardlink: boolean;
+  fsync: boolean;
+  posixRename: boolean;
+  detectedAt: string;
+}
+
+export type RemotePublishMode =
+  | 'rejected'
+  | 'hardlink-no-replace'
+  | 'direct-exclusive'
+  | 'posix-rename'
+  | 'standard-rename';
+
+export type RemoteConcurrencyGuarantee =
+  | 'strict CAS unsupported'
+  | 'strict no-replace; atomic publish'
+  | 'exclusive no-overwrite; interrupted write may leave a partial file'
+  | 'atomic publish; best-effort hash recheck; strict CAS unsupported'
+  | 'best-effort hash recheck; atomic replace and strict CAS unsupported';
+
+export interface RemotePublicationSemantics {
+  policy: RemoteWritePolicy;
+  publishMode: RemotePublishMode;
+  serverCapabilities: Pick<
+    RemoteServerCapabilities,
+    'detection' | 'hardlink' | 'fsync' | 'posixRename'
+  >;
+  concurrencyGuarantee: RemoteConcurrencyGuarantee;
+  durability: 'fsync' | 'close-only';
+}
+
+export interface RemoteWorkspaceAtomicity {
+  policy: RemoteWritePolicy;
+  capabilities: RemoteServerCapabilities;
+}
 
 export interface WorkspaceBinding {
   backend: WorkspaceBackendKind;
   root: string;
   /** Required for SFTP and intentionally absent for a local workspace. */
   hostId?: string;
+  /** SFTP publication policy. Missing legacy values are treated as strict. */
+  remoteWritePolicy?: RemoteWritePolicy;
 }
 
 export interface TerminalToolPermissions {
@@ -116,6 +157,8 @@ export interface WorkspaceFileWriteResult {
   deletions?: number;
   /** True when the diff body or complexity-bounded summary is incomplete. */
   diffTruncated?: boolean;
+  /** Present for SFTP mutations; names the actual publication guarantee. */
+  publication?: RemotePublicationSemantics;
 }
 
 export interface WorkspacePatchOperation {

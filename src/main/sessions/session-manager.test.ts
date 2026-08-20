@@ -138,6 +138,13 @@ class FakeRemoteProvider {
     mode: 0o755,
     modifiedAt: new Date(0).toISOString(),
   }));
+  readonly inspectCapabilities = vi.fn(async () => ({
+    detection: 'advertised' as const,
+    hardlink: true,
+    fsync: true,
+    posixRename: false,
+    detectedAt: '2026-08-21T00:00:00.000Z',
+  }));
 
   async withFilesystem<T>(
     browser: WebContents,
@@ -502,7 +509,69 @@ describe('SessionManager workspace binding', () => {
       backend: 'sftp',
       root: '/srv/project',
       hostId: 'host',
+      remoteWritePolicy: 'strict',
     });
+    manager.close();
+  });
+
+  it('persists remote policy changes and reports the cached server publication capabilities', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-manager-ssh-atomicity-test-'));
+    roots.push(root);
+    const terminals = new FakeTerminals();
+    terminals.snapshots.set('ssh-terminal', snapshot('ssh-terminal', 'tester@ubuntu:~$ '));
+    const remote = new FakeRemoteProvider();
+    const manager = new SessionManager(
+      new SessionStore(join(root, 'sessions')),
+      terminals as unknown as TerminalService,
+      { get: vi.fn(() => ({
+        id: 'host',
+        name: 'Ubuntu',
+        hostname: '192.0.2.10',
+        port: 22,
+        username: 'tester',
+      })) } as unknown as HostStore,
+      remote as unknown as RemoteFilesystemProvider,
+    );
+    const browser = owner();
+
+    const updated = await manager.setWorkspace(browser, {
+      terminalId: 'ssh-terminal',
+      root: '/srv/project',
+      remoteWritePolicy: 'compatible',
+    });
+    expect(updated.workspace?.remoteWritePolicy).toBe('compatible');
+    await expect(manager.remoteWorkspaceAtomicity(browser, 'ssh-terminal')).resolves.toEqual({
+      policy: 'compatible',
+      capabilities: {
+        detection: 'advertised',
+        hardlink: true,
+        fsync: true,
+        posixRename: false,
+        detectedAt: '2026-08-21T00:00:00.000Z',
+      },
+    });
+    expect(remote.inspectCapabilities).toHaveBeenCalledWith(browser, 'ssh-terminal', 'host');
+    manager.close();
+  });
+
+  it('rejects a remote policy on a local Workspace request', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-manager-local-policy-test-'));
+    roots.push(root);
+    const terminals = new FakeTerminals();
+    terminals.snapshots.set('local-terminal', localSnapshot('local-terminal'));
+    const manager = new SessionManager(
+      new SessionStore(join(root, 'sessions')),
+      terminals as unknown as TerminalService,
+      { get: vi.fn() } as unknown as HostStore,
+      {} as RemoteFilesystemProvider,
+      new FakeLocalFilesystem() as unknown as LocalFilesystemBackend,
+    );
+
+    await expect(manager.setWorkspace(owner(), {
+      terminalId: 'local-terminal',
+      root: join(root, 'project'),
+      remoteWritePolicy: 'strict',
+    })).rejects.toThrow('valid only for an SSH workspace');
     manager.close();
   });
 

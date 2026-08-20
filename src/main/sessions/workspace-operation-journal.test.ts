@@ -67,6 +67,18 @@ describe('WorkspaceOperationJournal', () => {
         type: 'file',
         sha256: 'a'.repeat(64),
       },
+      publication: {
+        policy: 'strict',
+        publishMode: 'posix-rename',
+        serverCapabilities: {
+          detection: 'advertised',
+          hardlink: true,
+          fsync: true,
+          posixRename: true,
+        },
+        concurrencyGuarantee: 'atomic publish; best-effort hash recheck; strict CAS unsupported',
+        durability: 'fsync',
+      },
     }, {
       body: `--- a/src/app.ts\n+++ b/src/app.ts\n+${secret}\n`,
       additions: 1,
@@ -98,6 +110,15 @@ describe('WorkspaceOperationJournal', () => {
         operationId: handle.operationId,
         operation: 'patch',
         target: { path: { scope: 'workspace', path: 'src/app.ts' } },
+        publication: {
+          policy: 'strict',
+          publishMode: 'posix-rename',
+          serverCapabilities: {
+            detection: 'advertised', hardlink: true, fsync: true, posixRename: true,
+          },
+          concurrencyGuarantee: 'atomic publish; best-effort hash recheck; strict CAS unsupported',
+          durability: 'fsync',
+        },
         diff: { bytes: expect.any(Number), additions: 1, deletions: 0 },
       },
       {
@@ -173,6 +194,50 @@ describe('WorkspaceOperationJournal', () => {
       outcome: null,
       sideEffectCommitted: false,
     });
+  });
+
+  it('rejects malformed or inconsistent remote publication metadata', () => {
+    const data = fixture();
+    const journal = new WorkspaceOperationJournal(data.root);
+    const base = {
+      operation: 'write' as const,
+      backend: 'sftp' as const,
+      target: { path: { scope: 'workspace' as const, path: 'new.txt' } },
+      expected: { exists: false },
+    };
+    const compatibleDirect = {
+      policy: 'compatible' as const,
+      publishMode: 'direct-exclusive' as const,
+      serverCapabilities: {
+        detection: 'advertised' as const,
+        hardlink: false,
+        fsync: false,
+        posixRename: false,
+      },
+      concurrencyGuarantee: 'exclusive no-overwrite; interrupted write may leave a partial file' as const,
+      durability: 'close-only' as const,
+    };
+
+    expect(() => journal.begin(data.sessionId, {
+      ...base,
+      publication: { ...compatibleDirect, policy: 'strict' },
+    }, {
+      body: '--- a/new.txt\n+++ b/new.txt\n+new\n',
+      additions: 1,
+      deletions: 0,
+      truncated: false,
+    })).toThrow(/publication|policy|publish|capability/i);
+    expect(() => journal.begin(data.sessionId, {
+      operation: 'write',
+      backend: 'local',
+      target: { path: { scope: 'workspace', path: 'new.txt' } },
+      publication: compatibleDirect,
+    } as WorkspaceOperationIntent, {
+      body: '--- a/new.txt\n+++ b/new.txt\n+new\n',
+      additions: 1,
+      deletions: 0,
+      truncated: false,
+    })).toThrow(/publication|SFTP/i);
   });
 
   it('stores explicit external and rejected scopes without absolute roots or raw spellings', () => {

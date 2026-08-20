@@ -371,6 +371,63 @@ button { border: 0; }
   font: 11px system-ui, sans-serif;
 }
 .terminal-workspace-binding button:disabled { cursor: not-allowed; opacity: .45; }
+.remote-atomicity { position: relative; flex: 0 0 auto; }
+.remote-atomicity > summary {
+  padding: 3px 7px;
+  color: #7fcdb6;
+  border: 1px solid #31594f;
+  border-radius: 10px;
+  background: #10241f;
+  cursor: pointer;
+  font: 11px system-ui, sans-serif;
+  list-style: none;
+  white-space: nowrap;
+}
+.remote-atomicity > summary::-webkit-details-marker { display: none; }
+.remote-atomicity[open] > summary { border-color: #56a58e; background: #17372e; }
+.remote-atomicity-popover {
+  display: flex;
+  position: absolute;
+  z-index: 50;
+  bottom: 30px;
+  left: 0;
+  width: min(390px, 70vw);
+  padding: 12px;
+  flex-direction: column;
+  gap: 9px;
+  color: #aebccd;
+  border: 1px solid #33475b;
+  border-radius: 6px;
+  background: #111b27;
+  box-shadow: 0 12px 34px #000b;
+  font: 12px/1.5 system-ui, sans-serif;
+}
+.remote-atomicity-popover strong { color: #d5e0ec; font-size: 13px; }
+.remote-atomicity-popover label { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.remote-atomicity-popover select {
+  min-width: 205px;
+  padding: 5px 7px;
+  color: #d5dfeb;
+  border: 1px solid #34465a;
+  border-radius: 4px;
+  background: #0a111a;
+}
+.remote-capability-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.remote-capability-list span {
+  padding: 3px 6px;
+  color: #e39ba2;
+  border: 1px solid #65383e;
+  border-radius: 9px;
+  background: #2b171c;
+  font: 11px "Cascadia Mono", Consolas, monospace;
+}
+.remote-capability-list span[data-supported="true"] {
+  color: #7bd2b8;
+  border-color: #315b50;
+  background: #10251f;
+}
+.remote-atomicity-popover p { margin: 0; color: #95a6b9; }
+.remote-atomicity-popover p.risk { color: #e0b276; }
 
 .agent-panel { grid-area: agent; display: flex; min-width: 0; position: relative; flex-direction: column; border-left: 1px solid #202a38; background: #0f1620; }
 .agent-panel-resizer { position: absolute; z-index: 40; top: 0; bottom: 0; left: -5px; width: 10px; outline: 0; cursor: col-resize; touch-action: none; }
@@ -1055,6 +1112,25 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
   border-color: #c7d0db;
   background: #eef1f5;
 }
+.app-shell[data-theme="light"] .remote-atomicity > summary {
+  color: #276d5b;
+  border-color: #a9cec3;
+  background: #e8f5f1;
+}
+.app-shell[data-theme="light"] .remote-atomicity-popover {
+  color: #536176;
+  border-color: #c8d1dc;
+  background: #ffffff;
+  box-shadow: 0 12px 30px #26364a33;
+}
+.app-shell[data-theme="light"] .remote-atomicity-popover strong { color: #253248; }
+.app-shell[data-theme="light"] .remote-atomicity-popover select {
+  color: #263349;
+  border-color: #c8d0db;
+  background: #f7f9fb;
+}
+.app-shell[data-theme="light"] .remote-atomicity-popover p { color: #59687b; }
+.app-shell[data-theme="light"] .remote-atomicity-popover p.risk { color: #8b581d; }
 .app-shell[data-theme="light"] .terminal-placeholder { color: #465368; }
 .app-shell[data-theme="light"] .agent-panel { background: #f7f9fb; }
 .app-shell[data-theme="light"] .agent-header { border-color: #d4dae3; }

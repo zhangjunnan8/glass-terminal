@@ -39,6 +39,10 @@ import type {
 } from '../shared/agent';
 import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
+import type {
+  RemoteWorkspaceAtomicity,
+  RemoteWritePolicy,
+} from '../shared/tools';
 import { mergeAgentAssistantDelta, mergeAgentState } from './agent-state';
 import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
@@ -272,6 +276,7 @@ export function App() {
   const [startupError, setStartupError] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [workspaceActionError, setWorkspaceActionError] = useState<string | null>(null);
+  const [remoteAtomicity, setRemoteAtomicity] = useState<RemoteWorkspaceAtomicity | null>(null);
   const [sshConnectionPending, setSshConnectionPending] = useState(false);
   const [hostCredentialMessage, setHostCredentialMessage] = useState<HostCredentialMessage | null>(null);
   const [credentialActionPending, setCredentialActionPending] = useState(false);
@@ -456,6 +461,34 @@ export function App() {
   const activeHost = activeSession?.hostId
     ? hosts.find((host) => host.id === activeSession.hostId) ?? null
     : null;
+
+  useEffect(() => {
+    if (
+      !activeTab
+      || activeTab.transport !== 'ssh'
+      || activeTab.status !== 'connected'
+      || activeSession?.workspace?.backend !== 'sftp'
+    ) {
+      setRemoteAtomicity(null);
+      return undefined;
+    }
+    let cancelled = false;
+    setRemoteAtomicity(null);
+    void (async () => {
+      const atomicity = await window.aiTerminal.sessions.remoteWorkspaceAtomicity(activeTab.id);
+      if (!cancelled && atomicity) setRemoteAtomicity(atomicity);
+    })().catch(() => {
+      if (!cancelled) setRemoteAtomicity(null);
+    });
+    return () => { cancelled = true; };
+  }, [
+    activeTab?.id,
+    activeTab?.status,
+    activeTab?.transport,
+    activeSession?.workspace?.backend,
+    activeSession?.workspace?.root,
+    activeSession?.workspace?.remoteWritePolicy,
+  ]);
   const normalizedSidebarSearch = sidebarSearch.trim().toLocaleLowerCase('zh-CN');
   const filteredShells = normalizedSidebarSearch
     ? shells.filter((shell) => `${shell.label} ${shell.detail}`.toLocaleLowerCase('zh-CN')
@@ -1190,6 +1223,26 @@ export function App() {
       root: path,
     });
     upsertSessionBinding(session);
+  }
+
+  async function setRemoteWritePolicy(policy: RemoteWritePolicy) {
+    if (
+      !activeTab
+      || activeTab.transport !== 'ssh'
+      || activeSession?.workspace?.backend !== 'sftp'
+    ) return;
+    if (workspaceChangeDisabledReason) throw new Error(workspaceChangeDisabledReason);
+    setWorkspaceActionError(null);
+    try {
+      const session = await window.aiTerminal.sessions.setWorkspace({
+        terminalId: activeTab.id,
+        root: activeSession.workspace.root,
+        remoteWritePolicy: policy,
+      });
+      upsertSessionBinding(session);
+    } catch (error) {
+      setWorkspaceActionError(errorMessage(error));
+    }
   }
 
   async function clearWorkspace() {
@@ -2197,6 +2250,60 @@ export function App() {
                   title={workspaceChangeDisabledReason ?? '清除当前工作区'}
                   onClick={() => void clearWorkspace()}
                 >清除</button>
+              )}
+              {activeSession?.workspace?.backend === 'sftp' && (
+                <details className="remote-atomicity" data-testid="remote-atomicity">
+                  <summary>
+                    远程写入：{(activeSession.workspace.remoteWritePolicy ?? 'strict') === 'strict'
+                      ? '严格'
+                      : '兼容'}
+                  </summary>
+                  <div className="remote-atomicity-popover">
+                    <strong>远程发布策略</strong>
+                    <label>
+                      <span>当前策略</span>
+                      <select
+                        aria-label="远程写入策略"
+                        value={activeSession.workspace.remoteWritePolicy ?? 'strict'}
+                        disabled={Boolean(workspaceChangeDisabledReason)}
+                        onChange={(event) => void setRemoteWritePolicy(
+                          event.target.value as RemoteWritePolicy,
+                        )}
+                      >
+                        <option value="strict">严格（能力不足时拒绝）</option>
+                        <option value="compatible">兼容（接受降级风险）</option>
+                      </select>
+                    </label>
+                    <div className="remote-capability-list" aria-label="服务器远程发布能力">
+                      {([
+                        ['hardlink', 'hardlink'],
+                        ['fsync', 'fsync'],
+                        ['posixRename', 'posix-rename'],
+                      ] as const).map(([key, label]) => (
+                        <span
+                          key={key}
+                          data-supported={remoteAtomicity?.capabilities[key] ? 'true' : 'false'}
+                        >{label}: {remoteAtomicity
+                            ? remoteAtomicity.capabilities[key] ? '支持' : '不支持'
+                            : '检测中'}</span>
+                      ))}
+                    </div>
+                    {remoteAtomicity?.capabilities.detection === 'unknown' && (
+                      <p>能力探测未知；严格模式按“不支持”处理并拒绝不安全写入。</p>
+                    )}
+                    {(activeSession.workspace.remoteWritePolicy ?? 'strict') === 'strict' ? (
+                      <p>
+                        新建需要 hardlink 原子无覆盖发布；覆盖需要 posix-rename 原子替换。
+                        该策略不提供服务器端 CAS。
+                      </p>
+                    ) : (
+                      <p className="risk">
+                        降级新建仍禁止覆盖，但中断可能留下部分文件；普通 rename 不保证原子替换，
+                        且不提供服务器端 CAS。
+                      </p>
+                    )}
+                  </div>
+                </details>
               )}
             </div>
             <div className="terminal-status-meta">

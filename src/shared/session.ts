@@ -1,6 +1,6 @@
 import type { TerminalDescriptor } from './terminal';
 import type { AgentBackendRef, AgentChatItem } from './agent';
-import type { WorkspaceBinding } from './tools';
+import type { RemoteWritePolicy, WorkspaceBinding } from './tools';
 
 export type SessionNameSource = 'automatic' | 'manual';
 export type SessionConnectionState = 'connected' | 'disconnected';
@@ -110,6 +110,8 @@ export interface UpgradeSessionRequest {
 export interface SetWorkspaceRequest {
   terminalId: string;
   root: string;
+  /** SFTP only; omitted legacy/current values default to strict. */
+  remoteWritePolicy?: RemoteWritePolicy;
 }
 
 export interface ClearWorkspaceRequest {
@@ -149,6 +151,7 @@ export const SESSION_CHANNELS = {
   list: 'session:list',
   upgrade: 'session:upgrade-terminal',
   setWorkspace: 'session:set-workspace',
+  remoteWorkspaceAtomicity: 'session:remote-workspace-atomicity',
   clearWorkspace: 'session:clear-workspace',
   chooseLocalWorkspace: 'session:choose-local-workspace',
   rename: 'session:rename',

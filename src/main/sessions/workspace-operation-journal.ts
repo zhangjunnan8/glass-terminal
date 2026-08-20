@@ -18,6 +18,12 @@ import {
   writeSync,
 } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
+import type {
+  RemoteConcurrencyGuarantee,
+  RemotePublicationSemantics,
+  RemotePublishMode,
+  RemoteWritePolicy,
+} from '../../shared/tools';
 
 const JOURNAL_VERSION = 1 as const;
 const DEFAULT_MAX_RECORD_BYTES = 32 * 1024;
@@ -95,6 +101,7 @@ export interface WorkspaceOperationIntent {
   expected?: WorkspaceOperationExpectedState;
   recursive?: boolean;
   plan?: { items: number };
+  publication?: RemotePublicationSemantics;
 }
 
 export interface WorkspaceDiffArtifact {
@@ -135,6 +142,7 @@ export interface WorkspaceOperationFailure {
     | 'quota'
     | 'io'
     | 'remote_disconnected'
+    | 'atomicity_unsupported'
     | 'unknown';
   stage: 'prepare' | 'dispatch' | 'commit' | 'cleanup' | 'outcome';
   retrySafe: boolean;
@@ -244,6 +252,7 @@ const FAILURE_CODES = new Set<WorkspaceOperationFailure['code']>([
   'quota',
   'io',
   'remote_disconnected',
+  'atomicity_unsupported',
   'unknown',
 ]);
 const FAILURE_STAGES = new Set<WorkspaceOperationFailure['stage']>([
@@ -256,6 +265,21 @@ const FAILURE_STAGES = new Set<WorkspaceOperationFailure['stage']>([
 const OPERATION_SOURCES = new Set<WorkspaceOperationSource>([
   'agent_file_service',
   'policy_workspace_tool',
+]);
+const REMOTE_WRITE_POLICIES = new Set<RemoteWritePolicy>(['strict', 'compatible']);
+const REMOTE_PUBLISH_MODES = new Set<RemotePublishMode>([
+  'rejected',
+  'hardlink-no-replace',
+  'direct-exclusive',
+  'posix-rename',
+  'standard-rename',
+]);
+const REMOTE_CONCURRENCY_GUARANTEES = new Set<RemoteConcurrencyGuarantee>([
+  'strict CAS unsupported',
+  'strict no-replace; atomic publish',
+  'exclusive no-overwrite; interrupted write may leave a partial file',
+  'atomic publish; best-effort hash recheck; strict CAS unsupported',
+  'best-effort hash recheck; atomic replace and strict CAS unsupported',
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -381,11 +405,76 @@ function normalizeExpected(value: unknown): WorkspaceOperationExpectedState {
   };
 }
 
+function normalizePublication(value: unknown): RemotePublicationSemantics {
+  assertRecord(value, 'Workspace remote publication');
+  assertExactKeys(
+    value,
+    ['policy', 'publishMode', 'serverCapabilities', 'concurrencyGuarantee', 'durability'],
+    'Workspace remote publication',
+  );
+  if (
+    typeof value.policy !== 'string'
+    || !REMOTE_WRITE_POLICIES.has(value.policy as RemoteWritePolicy)
+    || typeof value.publishMode !== 'string'
+    || !REMOTE_PUBLISH_MODES.has(value.publishMode as RemotePublishMode)
+    || typeof value.concurrencyGuarantee !== 'string'
+    || !REMOTE_CONCURRENCY_GUARANTEES.has(
+      value.concurrencyGuarantee as RemoteConcurrencyGuarantee,
+    )
+    || (value.durability !== 'fsync' && value.durability !== 'close-only')
+  ) throw new Error('Workspace remote publication semantics are invalid.');
+  assertRecord(value.serverCapabilities, 'Workspace remote server capabilities');
+  assertExactKeys(
+    value.serverCapabilities,
+    ['detection', 'hardlink', 'fsync', 'posixRename'],
+    'Workspace remote server capabilities',
+  );
+  const capabilities = value.serverCapabilities;
+  const expectedGuarantee: Record<RemotePublishMode, RemoteConcurrencyGuarantee> = {
+    rejected: 'strict CAS unsupported',
+    'hardlink-no-replace': 'strict no-replace; atomic publish',
+    'direct-exclusive': 'exclusive no-overwrite; interrupted write may leave a partial file',
+    'posix-rename': 'atomic publish; best-effort hash recheck; strict CAS unsupported',
+    'standard-rename': 'best-effort hash recheck; atomic replace and strict CAS unsupported',
+  };
+  if (
+    (capabilities.detection !== 'advertised' && capabilities.detection !== 'unknown')
+    || typeof capabilities.hardlink !== 'boolean'
+    || typeof capabilities.fsync !== 'boolean'
+    || typeof capabilities.posixRename !== 'boolean'
+    || (
+      capabilities.detection === 'unknown'
+      && (capabilities.hardlink || capabilities.fsync || capabilities.posixRename)
+    )
+    || (value.durability === 'fsync' && !capabilities.fsync)
+    || (value.publishMode === 'hardlink-no-replace' && !capabilities.hardlink)
+    || (value.publishMode === 'posix-rename' && !capabilities.posixRename)
+    || (value.publishMode === 'direct-exclusive'
+      && (value.policy !== 'compatible' || capabilities.hardlink))
+    || (value.publishMode === 'standard-rename'
+      && (value.policy !== 'compatible' || capabilities.posixRename))
+    || (value.publishMode === 'rejected' && value.policy !== 'strict')
+    || value.concurrencyGuarantee !== expectedGuarantee[value.publishMode as RemotePublishMode]
+  ) throw new Error('Workspace remote server capability record is inconsistent.');
+  return {
+    policy: value.policy as RemoteWritePolicy,
+    publishMode: value.publishMode as RemotePublishMode,
+    serverCapabilities: {
+      detection: capabilities.detection,
+      hardlink: capabilities.hardlink,
+      fsync: capabilities.fsync,
+      posixRename: capabilities.posixRename,
+    },
+    concurrencyGuarantee: value.concurrencyGuarantee as RemoteConcurrencyGuarantee,
+    durability: value.durability,
+  };
+}
+
 function normalizeIntent(value: unknown): WorkspaceOperationIntent {
   assertRecord(value, 'Workspace operation intent');
   assertExactKeys(
     value,
-    ['operation', 'backend', 'target', 'expected', 'recursive', 'plan'],
+    ['operation', 'backend', 'target', 'expected', 'recursive', 'plan', 'publication'],
     'Workspace operation intent',
   );
   if (typeof value.operation !== 'string' || !OPERATIONS.has(value.operation as WorkspaceOperation)) {
@@ -444,6 +533,13 @@ function normalizeIntent(value: unknown): WorkspaceOperationIntent {
     assertSafeInteger(value.plan.items, 'Workspace delete plan items');
     plan = { items: value.plan.items };
   }
+  const publication = value.publication === undefined
+    ? undefined
+    : normalizePublication(value.publication);
+  if (
+    publication !== undefined
+    && (backend !== 'sftp' || (operation !== 'write' && operation !== 'patch'))
+  ) throw new Error('Remote publication semantics are valid only for SFTP write/patch operations.');
   return {
     operation,
     backend,
@@ -451,6 +547,7 @@ function normalizeIntent(value: unknown): WorkspaceOperationIntent {
     ...(expected === undefined ? {} : { expected }),
     ...(value.recursive === undefined ? {} : { recursive: value.recursive as boolean }),
     ...(plan === undefined ? {} : { plan }),
+    ...(publication === undefined ? {} : { publication }),
   };
 }
 

@@ -140,14 +140,23 @@ function fakeRemoteFilesystem(
   overrides: Partial<RemoteFilesystem> = {},
 ): RemoteFilesystem {
   return {
+    serverCapabilities: () => ({
+      detection: 'advertised',
+      hardlink: true,
+      fsync: true,
+      posixRename: true,
+      detectedAt: '2026-08-21T00:00:00.000Z',
+    }),
     realpath: vi.fn(async (path: string) => path),
     stat: vi.fn(async () => undefined),
     lstat: vi.fn(async () => undefined),
     readFile: vi.fn(async () => Buffer.alloc(0)),
     writeFile: vi.fn(async () => undefined),
+    writeFileDurable: vi.fn(async () => ({ fsynced: true })),
     listDirectory: vi.fn(async () => []),
     rename: vi.fn(async () => undefined),
     atomicReplace: vi.fn(async () => undefined),
+    hardlink: vi.fn(async () => undefined),
     unlink: vi.fn(async () => undefined),
     mkdir: vi.fn(async () => undefined),
     rmdir: vi.fn(async () => undefined),
@@ -155,7 +164,10 @@ function fakeRemoteFilesystem(
   };
 }
 
-function createSshService(filesystem: RemoteFilesystem) {
+function createSshService(
+  filesystem: RemoteFilesystem,
+  remoteWritePolicy: 'strict' | 'compatible' = 'strict',
+) {
   const withFilesystem = vi.fn(async <T>(
     _owner: WebContents,
     _terminalId: string,
@@ -171,7 +183,12 @@ function createSshService(filesystem: RemoteFilesystem) {
       transport: 'ssh',
       hostId: 'host-1',
       cwd: '/work',
-      workspace: { backend: 'sftp', root: '/work', hostId: 'host-1' },
+      workspace: {
+        backend: 'sftp',
+        root: '/work',
+        hostId: 'host-1',
+        remoteWritePolicy,
+      },
     }));
   return {
     service: new AgentFileService(
@@ -919,6 +936,8 @@ describe('AgentFileService local workspace boundary', () => {
     const current = Buffer.from('old\n');
     const standardRename = vi.fn(async () => undefined);
     const atomicRename = vi.fn(async () => undefined);
+    const hardlink = vi.fn(async () => undefined);
+    const unlink = vi.fn(async () => undefined);
     const filesystem = fakeRemoteFilesystem({
       lstat: vi.fn(async (path: string) => (
         path === '/work'
@@ -930,6 +949,8 @@ describe('AgentFileService local workspace boundary', () => {
       readFile: vi.fn(async () => current),
       rename: standardRename,
       atomicReplace: atomicRename,
+      hardlink,
+      unlink,
     });
     const { service, withFilesystem, openSftp } = createSshService(filesystem);
     const owner = { id: 1 } as WebContents;
@@ -943,7 +964,12 @@ describe('AgentFileService local workspace boundary', () => {
       expect.any(Function),
       'host-1',
     );
-    expect(standardRename).toHaveBeenCalledTimes(1);
+    expect(hardlink).toHaveBeenCalledWith(
+      expect.stringMatching(/^\/work\/\.ai-terminal-/u),
+      '/work/new.ts',
+    );
+    expect(unlink).toHaveBeenCalledWith(expect.stringMatching(/^\/work\/\.ai-terminal-/u));
+    expect(standardRename).not.toHaveBeenCalled();
     expect(atomicRename).not.toHaveBeenCalled();
 
     await expect(service.writeText(
@@ -963,6 +989,254 @@ describe('AgentFileService local workspace boundary', () => {
     );
     expect(atomicRename).toHaveBeenCalledTimes(1);
     expect(openSftp).not.toHaveBeenCalled();
+  });
+
+  it('fails a strict remote create closed when no hardlink publish is advertised', async () => {
+    const writeFileDurable = vi.fn(async () => ({ fsynced: false }));
+    const filesystem = fakeRemoteFilesystem({
+      serverCapabilities: () => ({
+        detection: 'advertised',
+        hardlink: false,
+        fsync: false,
+        posixRename: true,
+        detectedAt: '2026-08-21T00:00:00.000Z',
+      }),
+      lstat: vi.fn(async (path: string) => (
+        path === '/work' ? remoteStat('directory') : undefined
+      )),
+      writeFileDurable,
+    });
+    const { service, sessions } = createSshService(filesystem);
+
+    await expect(service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'new.txt',
+      'new',
+      null,
+    )).rejects.toThrow('hardlink@openssh.com');
+
+    expect(writeFileDurable).not.toHaveBeenCalled();
+    const intent = vi.mocked(sessions.beginWorkspaceOperation).mock.calls[0]![1];
+    expect(intent).toMatchObject({
+      publication: {
+        policy: 'strict',
+        publishMode: 'rejected',
+        serverCapabilities: {
+          detection: 'advertised', hardlink: false, fsync: false, posixRename: true,
+        },
+        concurrencyGuarantee: 'strict CAS unsupported',
+        durability: 'close-only',
+      },
+    });
+    expect(vi.mocked(sessions.finishWorkspaceOperation).mock.calls[0]![1]).toEqual({
+      outcome: 'failed',
+      sideEffectCommitted: false,
+      failure: { code: 'atomicity_unsupported', stage: 'prepare', retrySafe: true },
+    });
+  });
+
+  it('uses an exclusive direct write for compatible create and exposes its partial-file risk', async () => {
+    const writeFileDurable = vi.fn(async () => ({ fsynced: false }));
+    const filesystem = fakeRemoteFilesystem({
+      serverCapabilities: () => ({
+        detection: 'advertised',
+        hardlink: false,
+        fsync: false,
+        posixRename: false,
+        detectedAt: '2026-08-21T00:00:00.000Z',
+      }),
+      lstat: vi.fn(async (path: string) => (
+        path === '/work' ? remoteStat('directory') : undefined
+      )),
+      writeFileDurable,
+    });
+    const { service } = createSshService(filesystem, 'compatible');
+
+    await expect(service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'new.txt',
+      'new',
+      null,
+    )).resolves.toMatchObject({
+      created: true,
+      publication: {
+        policy: 'compatible',
+        publishMode: 'direct-exclusive',
+        concurrencyGuarantee: 'exclusive no-overwrite; interrupted write may leave a partial file',
+        durability: 'close-only',
+      },
+    });
+    expect(writeFileDurable).toHaveBeenCalledWith('/work/new.txt', Buffer.from('new'), undefined, true);
+  });
+
+  it('records a failed compatible direct create as possibly partial', async () => {
+    const interrupted = Object.assign(new Error('connection lost during write'), {
+      code: 'ECONNRESET',
+    });
+    const filesystem = fakeRemoteFilesystem({
+      serverCapabilities: () => ({
+        detection: 'advertised',
+        hardlink: false,
+        fsync: false,
+        posixRename: false,
+        detectedAt: '2026-08-21T00:00:00.000Z',
+      }),
+      lstat: vi.fn(async (path: string) => (
+        path === '/work' ? remoteStat('directory') : undefined
+      )),
+      writeFileDurable: vi.fn(async () => { throw interrupted; }),
+    });
+    const { service, sessions } = createSshService(filesystem, 'compatible');
+
+    await expect(service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'new.txt',
+      'new',
+      null,
+    )).rejects.toBe(interrupted);
+    expect(vi.mocked(sessions.finishWorkspaceOperation).mock.calls[0]![1]).toEqual({
+      outcome: 'failed',
+      sideEffectCommitted: null,
+      failure: { code: 'remote_disconnected', stage: 'commit', retrySafe: false },
+    });
+  });
+
+  it('fails a strict overwrite closed without posix rename and uses standard rename only in compatible mode', async () => {
+    const current = Buffer.from('old\n');
+    const rename = vi.fn(async () => undefined);
+    const writeFileDurable = vi.fn(async () => ({ fsynced: false }));
+    const filesystem = fakeRemoteFilesystem({
+      serverCapabilities: () => ({
+        detection: 'advertised',
+        hardlink: true,
+        fsync: false,
+        posixRename: false,
+        detectedAt: '2026-08-21T00:00:00.000Z',
+      }),
+      lstat: vi.fn(async (path: string) => (
+        path === '/work' ? remoteStat('directory') : remoteStat('file', current.length)
+      )),
+      readFile: vi.fn(async () => current),
+      writeFileDurable,
+      rename,
+    });
+    const expected = createHash('sha256').update(current).digest('hex');
+    const strict = createSshService(filesystem);
+
+    await expect(strict.service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'existing.txt',
+      'new\n',
+      expected,
+    )).rejects.toThrow('posix-rename@openssh.com');
+    expect(writeFileDurable).not.toHaveBeenCalled();
+    expect(rename).not.toHaveBeenCalled();
+
+    const compatible = createSshService(filesystem, 'compatible');
+    await expect(compatible.service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'existing.txt',
+      'new\n',
+      expected,
+    )).resolves.toMatchObject({
+      publication: {
+        policy: 'compatible',
+        publishMode: 'standard-rename',
+        concurrencyGuarantee: 'best-effort hash recheck; atomic replace and strict CAS unsupported',
+      },
+    });
+    expect(rename).toHaveBeenCalledWith(
+      expect.stringMatching(/^\/work\/\.ai-terminal-/u),
+      '/work/existing.txt',
+    );
+  });
+
+  it('treats a concurrent hardlink target as a clean create conflict and removes the temp', async () => {
+    const conflict = Object.assign(new Error('already exists'), { code: 'EEXIST' });
+    const unlink = vi.fn(async () => undefined);
+    const filesystem = fakeRemoteFilesystem({
+      lstat: vi.fn(async (path: string) => (
+        path === '/work' ? remoteStat('directory') : undefined
+      )),
+      hardlink: vi.fn(async () => { throw conflict; }),
+      unlink,
+    });
+    const { service, sessions } = createSshService(filesystem);
+
+    await expect(service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'new.txt',
+      'new',
+      null,
+    )).rejects.toBe(conflict);
+    expect(unlink).toHaveBeenCalledWith(expect.stringMatching(/^\/work\/\.ai-terminal-/u));
+    expect(vi.mocked(sessions.finishWorkspaceOperation).mock.calls[0]![1]).toEqual({
+      outcome: 'failed',
+      sideEffectCommitted: false,
+      failure: { code: 'conflict', stage: 'dispatch', retrySafe: true },
+    });
+  });
+
+  it('records a hardlink publish followed by failed temp cleanup as committed', async () => {
+    const cleanup = Object.assign(new Error('cleanup disconnected'), { code: 'ECONNRESET' });
+    const filesystem = fakeRemoteFilesystem({
+      lstat: vi.fn(async (path: string) => (
+        path === '/work' || path.includes('/.ai-terminal-')
+          ? remoteStat(path === '/work' ? 'directory' : 'file', 3)
+          : undefined
+      )),
+      unlink: vi.fn(async () => { throw cleanup; }),
+    });
+    const { service, sessions } = createSshService(filesystem);
+
+    await expect(service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'new.txt',
+      'new',
+      null,
+    )).rejects.toBe(cleanup);
+    expect(vi.mocked(sessions.finishWorkspaceOperation).mock.calls[0]![1]).toEqual({
+      outcome: 'failed',
+      sideEffectCommitted: true,
+      failure: { code: 'remote_disconnected', stage: 'cleanup', retrySafe: false },
+    });
+  });
+
+  it('revalidates the final remote path and rejects a symlink swapped in before publish', async () => {
+    let targetChecks = 0;
+    const hardlink = vi.fn(async () => undefined);
+    const unlink = vi.fn(async () => undefined);
+    const filesystem = fakeRemoteFilesystem({
+      lstat: vi.fn(async (path: string) => {
+        if (path === '/work') return remoteStat('directory');
+        if (path === '/work/new.txt') {
+          targetChecks += 1;
+          return targetChecks === 1 ? undefined : remoteStat('symlink');
+        }
+        if (path.includes('/.ai-terminal-')) return remoteStat('file', 3);
+        return undefined;
+      }),
+      hardlink,
+      unlink,
+    });
+    const { service } = createSshService(filesystem);
+
+    await expect(service.writeText(
+      { id: 1 } as WebContents,
+      'terminal',
+      'new.txt',
+      'new',
+      null,
+    )).rejects.toThrow('写入期间创建');
+    expect(hardlink).not.toHaveBeenCalled();
+    expect(unlink).toHaveBeenCalledWith(expect.stringMatching(/^\/work\/\.ai-terminal-/u));
   });
 
   it('rejects a remote final-component symlink before reading or replacing it', async () => {
@@ -1197,7 +1471,7 @@ describe('AgentFileService local workspace boundary', () => {
 
   it('applies a remote patch in one lease, publishes exclusively, and returns a relative diff', async () => {
     const current = Buffer.from('const value = 1;\n');
-    const writeFile = vi.fn(async () => undefined);
+    const writeFileDurable = vi.fn(async () => ({ fsynced: true }));
     const atomicReplace = vi.fn(async () => undefined);
     const unlink = vi.fn(async () => undefined);
     const filesystem = fakeRemoteFilesystem({
@@ -1208,7 +1482,7 @@ describe('AgentFileService local workspace boundary', () => {
       )),
       stat: vi.fn(async () => remoteStat('file', current.length)),
       readFile: vi.fn(async () => current),
-      writeFile,
+      writeFileDurable,
       atomicReplace,
       unlink,
     });
@@ -1226,7 +1500,7 @@ describe('AgentFileService local workspace boundary', () => {
     expect(result).toMatchObject({ additions: 1, deletions: 1, diffTruncated: false });
     expect(result.diff).toContain('--- a/workspace/src/demo.ts');
     expect(result.diff).not.toContain('/work/');
-    expect(writeFile).toHaveBeenCalledWith(
+    expect(writeFileDurable).toHaveBeenCalledWith(
       expect.stringMatching(/^\/work\/src\/\.ai-terminal-/u),
       Buffer.from('const value = 2;\n'),
       0o644,
@@ -1318,7 +1592,7 @@ describe('AgentFileService local workspace boundary', () => {
     const cleanupError = Object.assign(new Error('remote cleanup disconnected'), {
       code: 'ECONNRESET',
     });
-    const writeFile = vi.fn(async () => {
+    const writeFileDurable = vi.fn(async () => {
       throw writeError;
     });
     const unlink = vi.fn(async () => {
@@ -1330,7 +1604,7 @@ describe('AgentFileService local workspace boundary', () => {
         if (path.includes('/.ai-terminal-')) return remoteStat('file', 7);
         return undefined;
       }),
-      writeFile,
+      writeFileDurable,
       unlink,
     });
     const { service, sessions, withFilesystem } = createSshService(filesystem);
@@ -1344,7 +1618,7 @@ describe('AgentFileService local workspace boundary', () => {
     )).rejects.toBe(writeError);
 
     expect(withFilesystem).toHaveBeenCalledTimes(1);
-    expect(writeFile).toHaveBeenCalledOnce();
+    expect(writeFileDurable).toHaveBeenCalledOnce();
     expect(unlink).toHaveBeenCalledWith(expect.stringContaining('/.ai-terminal-'));
     expect(vi.mocked(sessions.finishWorkspaceOperation).mock.calls[0]![1]).toEqual({
       outcome: 'failed',

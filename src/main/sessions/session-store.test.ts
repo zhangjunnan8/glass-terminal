@@ -349,6 +349,32 @@ describe('SessionStore', () => {
       ]);
   });
 
+  it('persists an explicit compatible remote policy while accepting legacy strict-by-default bindings', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+
+    expect(store.setWorkspace(session.id, {
+      backend: 'sftp',
+      root: '/srv/legacy',
+      hostId: 'host-1',
+    }).workspace?.remoteWritePolicy).toBeUndefined();
+    const compatible = store.setWorkspace(session.id, {
+      backend: 'sftp',
+      root: '/srv/project',
+      hostId: 'host-1',
+      remoteWritePolicy: 'compatible',
+    });
+
+    expect(compatible.workspace).toEqual({
+      backend: 'sftp',
+      root: '/srv/project',
+      hostId: 'host-1',
+      remoteWritePolicy: 'compatible',
+    });
+    expect(new SessionStore(root).get(session.id).workspace).toEqual(compatible.workspace);
+  });
+
   it('persists typed Workspace operations without changing the terminal journal', () => {
     const root = temporaryRoot();
     const store = new SessionStore(root);
@@ -427,6 +453,17 @@ describe('SessionStore', () => {
       root: 'C:\\project',
       hostId: 'host-1',
     })).toThrow('without a host binding');
+    expect(() => store.setWorkspace(localSession.id, {
+      backend: 'local',
+      root: process.cwd(),
+      remoteWritePolicy: 'strict',
+    })).toThrow('without a host binding');
+    expect(() => store.setWorkspace(sshSession.id, {
+      backend: 'sftp',
+      root: '/srv/project',
+      hostId: 'host-1',
+      remoteWritePolicy: 'unsafe' as 'strict',
+    })).toThrow('Invalid workspace binding');
   });
 
   it('rejects malformed or cross-host workspace bindings while loading metadata', () => {
@@ -434,6 +471,7 @@ describe('SessionStore', () => {
       { backend: 'sftp', root: 42, hostId: 'host-1' },
       { backend: 'sftp', root: '/srv/project', hostId: 'another-host' },
       { backend: 'sftp', root: 'srv/project', hostId: 'host-1' },
+      { backend: 'sftp', root: '/srv/project', hostId: 'host-1', remoteWritePolicy: 'unsafe' },
     ];
 
     for (const workspace of invalidBindings) {

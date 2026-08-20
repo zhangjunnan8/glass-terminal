@@ -11,6 +11,7 @@ import type {
   SessionHistoryDetail,
   SessionRecord,
 } from '../../shared/session';
+import type { RemoteWorkspaceAtomicity } from '../../shared/tools';
 import type { SessionAuditEvent } from '../../shared/session';
 import type { AgentBackendRef } from '../../shared/agent';
 import type { TerminalDescriptor } from '../../shared/terminal';
@@ -175,6 +176,11 @@ export class SessionManager {
     request: SetWorkspaceRequest,
     beforeCommit?: () => void,
   ): Promise<SessionRecord> {
+    if (
+      request.remoteWritePolicy !== undefined
+      && request.remoteWritePolicy !== 'strict'
+      && request.remoteWritePolicy !== 'compatible'
+    ) throw new Error('Remote write policy is invalid.');
     const session = this.upgrade(owner, request.terminalId);
     const descriptor = this.terminals.descriptor(owner, request.terminalId);
     if (
@@ -183,6 +189,9 @@ export class SessionManager {
     ) throw new Error('Workspace target does not match the Session terminal.');
 
     if (session.transport === 'local') {
+      if (request.remoteWritePolicy !== undefined) {
+        throw new Error('Remote write policy is valid only for an SSH workspace.');
+      }
       if (process.platform === 'win32') assertSafeWindowsRequestedPath(request.root);
       if (!isAbsolute(request.root)) throw new Error('Local workspace root must be absolute.');
       const root = await this.localFilesystem.realpath(request.root);
@@ -221,7 +230,31 @@ export class SessionManager {
       backend: 'sftp',
       root,
       hostId: session.hostId,
+      remoteWritePolicy: request.remoteWritePolicy
+        ?? session.workspace?.remoteWritePolicy
+        ?? 'strict',
     });
+  }
+
+  async remoteWorkspaceAtomicity(
+    owner: WebContents,
+    terminalId: string,
+  ): Promise<RemoteWorkspaceAtomicity> {
+    const session = this.sessionForTerminal(owner, terminalId);
+    if (
+      !session
+      || session.transport !== 'ssh'
+      || !session.hostId
+      || session.workspace?.backend !== 'sftp'
+    ) throw new Error('当前终端没有可检测的 SFTP Workspace。');
+    return {
+      policy: session.workspace.remoteWritePolicy ?? 'strict',
+      capabilities: await this.remoteFilesystems.inspectCapabilities(
+        owner,
+        terminalId,
+        session.hostId,
+      ),
+    };
   }
 
   async clearWorkspace(

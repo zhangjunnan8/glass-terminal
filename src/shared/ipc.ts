@@ -69,6 +69,7 @@ import type {
   BackupImportResponse,
   HostBackupExportRequest,
 } from './backup';
+import type { RemoteWorkspaceAtomicity } from './tools';
 
 export interface RuntimeInfo {
   platform: NodeJS.Platform;
@@ -116,6 +117,7 @@ export interface DesktopBridge {
     list(hostId?: string): Promise<SessionRecord[]>;
     upgrade(request: UpgradeSessionRequest): Promise<SessionRecord>;
     setWorkspace(request: SetWorkspaceRequest): Promise<SessionRecord>;
+    remoteWorkspaceAtomicity(terminalId: string): Promise<RemoteWorkspaceAtomicity>;
     clearWorkspace(request: ClearWorkspaceRequest): Promise<SessionRecord>;
     chooseLocalWorkspace(request: UpgradeSessionRequest): Promise<SessionRecord | null>;
     rename(request: RenameSessionRequest): Promise<SessionRecord>;

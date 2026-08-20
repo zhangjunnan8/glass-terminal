@@ -1,6 +1,7 @@
 import { posix } from 'node:path';
 import type { WebContents } from 'electron';
 import type { FileEntryWithStats, SFTPWrapper, Stats } from 'ssh2';
+import type { RemoteServerCapabilities } from '../../shared/tools';
 import type { TerminalService } from '../terminal/terminal-service';
 
 export type RemoteEntryType = 'file' | 'directory' | 'symlink' | 'other';
@@ -43,7 +44,17 @@ export interface FilesystemBackend {
  * Compatibility name retained for SFTP consumers introduced before the local
  * Workspace backend. Remote and local backends share the same primitive API.
  */
-export interface RemoteFilesystem extends FilesystemBackend {}
+export interface RemoteFilesystem extends FilesystemBackend {
+  serverCapabilities(): RemoteServerCapabilities;
+  /** Writes through an explicit handle and fsyncs when the server advertises it. */
+  writeFileDurable(
+    path: string,
+    content: Buffer,
+    mode?: number,
+    exclusive?: boolean,
+  ): Promise<{ fsynced: boolean }>;
+  hardlink(source: string, destination: string): Promise<void>;
+}
 
 export class FilesystemReadLimitError extends Error {
   constructor(readonly maxBytes: number) {
@@ -84,8 +95,53 @@ function callbackOperation(
   });
 }
 
+function detectedCapabilities(
+  sftp: SFTPWrapper,
+  detectedAt: string,
+): RemoteServerCapabilities {
+  const extensions = (sftp as SFTPWrapper & { _extensions?: unknown })._extensions;
+  if (!extensions || typeof extensions !== 'object' || Array.isArray(extensions)) {
+    return {
+      detection: 'unknown',
+      hardlink: false,
+      fsync: false,
+      posixRename: false,
+      detectedAt,
+    };
+  }
+  const advertised = extensions as Record<string, unknown>;
+  return {
+    detection: 'advertised',
+    hardlink: advertised['hardlink@openssh.com'] === '1',
+    fsync: advertised['fsync@openssh.com'] === '1',
+    posixRename: advertised['posix-rename@openssh.com'] === '1',
+    detectedAt,
+  };
+}
+
+function unknownCapabilities(detectedAt = new Date().toISOString()): RemoteServerCapabilities {
+  return {
+    detection: 'unknown',
+    hardlink: false,
+    fsync: false,
+    posixRename: false,
+    detectedAt,
+  };
+}
+
 export class SftpRemoteFilesystem implements RemoteFilesystem {
-  constructor(private readonly sftp: SFTPWrapper) {}
+  private readonly capabilities: RemoteServerCapabilities;
+
+  constructor(
+    private readonly sftp: SFTPWrapper,
+    now = () => new Date().toISOString(),
+  ) {
+    this.capabilities = detectedCapabilities(sftp, now());
+  }
+
+  serverCapabilities(): RemoteServerCapabilities {
+    return { ...this.capabilities };
+  }
 
   realpath(path: string): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -125,6 +181,57 @@ export class SftpRemoteFilesystem implements RemoteFilesystem {
     });
   }
 
+  async writeFileDurable(
+    path: string,
+    content: Buffer,
+    mode = 0o600,
+    exclusive = false,
+  ): Promise<{ fsynced: boolean }> {
+    const handle = await new Promise<Buffer>((resolve, reject) => {
+      this.sftp.open(
+        path,
+        exclusive ? 'wx' : 'w',
+        mode & 0o777,
+        (error, openedHandle) => {
+          if (error) reject(error);
+          else resolve(openedHandle);
+        },
+      );
+    });
+    let operationError: unknown;
+    try {
+      const maximumChunkBytes = 32 * 1024;
+      for (let offset = 0; offset < content.length; offset += maximumChunkBytes) {
+        const length = Math.min(maximumChunkBytes, content.length - offset);
+        await callbackOperation((callback) => {
+          this.sftp.write(handle, content, offset, length, offset, callback);
+        });
+      }
+      if (this.capabilities.fsync) {
+        await callbackOperation((callback) => {
+          this.sftp.ext_openssh_fsync(handle, callback);
+        });
+      }
+    } catch (error) {
+      operationError = error;
+    }
+    let closeError: unknown;
+    try {
+      await callbackOperation((callback) => this.sftp.close(handle, callback));
+    } catch (error) {
+      closeError = error;
+    }
+    if (operationError !== undefined && closeError !== undefined) {
+      throw new AggregateError(
+        [operationError, closeError],
+        `SFTP write and handle close both failed for ${path}.`,
+      );
+    }
+    if (operationError !== undefined) throw operationError;
+    if (closeError !== undefined) throw closeError;
+    return { fsynced: this.capabilities.fsync };
+  }
+
   listDirectory(path: string): Promise<RemoteDirectoryEntry[]> {
     return new Promise((resolve, reject) => {
       this.sftp.readdir(path, (error, entries) => {
@@ -144,6 +251,11 @@ export class SftpRemoteFilesystem implements RemoteFilesystem {
   }
 
   atomicReplace(source: string, destination: string): Promise<void> {
+    if (!this.capabilities.posixRename) {
+      return Promise.reject(new Error(
+        'strict CAS unsupported: server did not advertise posix-rename@openssh.com.',
+      ));
+    }
     return new Promise((resolve, reject) => {
       this.sftp.ext_openssh_rename(source, destination, (error) => {
         if (error) {
@@ -155,6 +267,17 @@ export class SftpRemoteFilesystem implements RemoteFilesystem {
           resolve();
         }
       });
+    });
+  }
+
+  hardlink(source: string, destination: string): Promise<void> {
+    if (!this.capabilities.hardlink) {
+      return Promise.reject(new Error(
+        'strict no-replace unavailable: server did not advertise hardlink@openssh.com.',
+      ));
+    }
+    return callbackOperation((callback) => {
+      this.sftp.ext_openssh_hardlink(source, destination, callback);
     });
   }
 
@@ -235,7 +358,48 @@ export class SftpRemoteFilesystem implements RemoteFilesystem {
 }
 
 export class RemoteFilesystemProvider {
+  private readonly capabilityCache = new Map<string, RemoteServerCapabilities>();
+
   constructor(private readonly terminals: TerminalService) {}
+
+  cachedCapabilities(hostId: string): RemoteServerCapabilities | undefined {
+    const cached = this.capabilityCache.get(hostId);
+    return cached ? { ...cached } : undefined;
+  }
+
+  async inspectCapabilities(
+    owner: WebContents,
+    terminalId: string,
+    expectedHostId?: string,
+  ): Promise<RemoteServerCapabilities> {
+    const descriptor = this.terminals.descriptor(owner, terminalId);
+    if (descriptor.transport !== 'ssh' || !descriptor.hostId) {
+      throw new Error('Remote filesystem capabilities require an SSH terminal.');
+    }
+    if (expectedHostId !== undefined && descriptor.hostId !== expectedHostId) {
+      throw new Error(
+        `Remote filesystem host mismatch: expected ${expectedHostId}, received ${descriptor.hostId}.`,
+      );
+    }
+    const cached = this.cachedCapabilities(descriptor.hostId);
+    // A successfully parsed advertisement is stable for the Host profile.
+    // Unknown is fail-closed but retryable so a transient disconnect cannot
+    // leave the UI and strict policy permanently pinned to an old failure.
+    if (cached?.detection === 'advertised') return cached;
+    let sftp: SFTPWrapper | undefined;
+    try {
+      sftp = await this.terminals.openSftp(owner, terminalId);
+      const capabilities = new SftpRemoteFilesystem(sftp).serverCapabilities();
+      this.capabilityCache.set(descriptor.hostId, capabilities);
+      return { ...capabilities };
+    } catch {
+      const capabilities = unknownCapabilities();
+      this.capabilityCache.set(descriptor.hostId, capabilities);
+      return { ...capabilities };
+    } finally {
+      sftp?.end();
+    }
+  }
 
   async withFilesystem<T>(
     owner: WebContents,
@@ -255,7 +419,11 @@ export class RemoteFilesystemProvider {
 
     const sftp = await this.terminals.openSftp(owner, terminalId);
     try {
-      return await operation(new SftpRemoteFilesystem(sftp));
+      const filesystem = new SftpRemoteFilesystem(sftp);
+      if (descriptor.hostId) {
+        this.capabilityCache.set(descriptor.hostId, filesystem.serverCapabilities());
+      }
+      return await operation(filesystem);
     } finally {
       sftp.end();
     }

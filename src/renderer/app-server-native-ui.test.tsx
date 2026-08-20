@@ -64,6 +64,25 @@ function localSession(workspaceRoot?: string): SessionRecord {
   };
 }
 
+function sshSession(remoteWritePolicy: 'strict' | 'compatible' = 'strict'): SessionRecord {
+  return {
+    ...localSession(),
+    name: 'Ubuntu session',
+    transport: 'ssh',
+    hostId: 'host-1',
+    shellProfileId: 'ssh:host-1',
+    shellKind: 'posix',
+    targetSnapshot: { label: 'tester@ubuntu' },
+    runtimeTerminalId: 'terminal-1',
+    workspace: {
+      backend: 'sftp',
+      root: '/srv/project',
+      hostId: 'host-1',
+      remoteWritePolicy,
+    },
+  };
+}
+
 function agentView(state: AgentSessionView['state'] = 'COMPLETED'): AgentSessionView {
   return {
     revision: 1,
@@ -185,6 +204,7 @@ function bridgeForCodex(snapshot: CodexAppServerSnapshot): DesktopBridge {
       list: vi.fn().mockResolvedValue([]),
       upgrade: vi.fn(),
       setWorkspace: vi.fn(),
+      remoteWorkspaceAtomicity: vi.fn(),
       clearWorkspace: vi.fn(),
       chooseLocalWorkspace: vi.fn(),
       rename: vi.fn(),
@@ -362,6 +382,55 @@ describe('native Codex App Server renderer mode', () => {
     await act(async () => toggle.click());
     expect(toggle.textContent).toContain('深色');
     expect(bridge.settings.update).toHaveBeenCalledWith({ theme: 'dark' });
+  });
+
+  it('shows remote publication capabilities and persists a compatible policy choice', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    const strictSession = sshSession('strict');
+    vi.mocked(bridge.sessions.list).mockResolvedValue([strictSession]);
+    vi.mocked(bridge.terminal.create).mockResolvedValue({
+      id: 'terminal-1',
+      title: 'Ubuntu',
+      profileId: 'ssh:host-1',
+      shellKind: 'posix',
+      transport: 'ssh',
+      hostId: 'host-1',
+    });
+    vi.mocked(bridge.sessions.remoteWorkspaceAtomicity).mockResolvedValue({
+      policy: 'strict',
+      capabilities: {
+        detection: 'advertised',
+        hardlink: true,
+        fsync: false,
+        posixRename: false,
+        detectedAt: now,
+      },
+    });
+    vi.mocked(bridge.sessions.setWorkspace).mockResolvedValue(sshSession('compatible'));
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    const atomicity = container.querySelector<HTMLElement>('[data-testid="remote-atomicity"]')!;
+    expect(atomicity.textContent).toContain('远程写入：严格');
+    expect(atomicity.textContent).toContain('hardlink: 支持');
+    expect(atomicity.textContent).toContain('fsync: 不支持');
+    expect(atomicity.textContent).toContain('posix-rename: 不支持');
+    expect(atomicity.textContent).toContain('不提供服务器端 CAS');
+
+    const policy = atomicity.querySelector<HTMLSelectElement>('[aria-label="远程写入策略"]')!;
+    await act(async () => setSelectValue(policy, 'compatible'));
+    await settle();
+
+    expect(bridge.sessions.setWorkspace).toHaveBeenCalledWith({
+      terminalId: 'terminal-1',
+      root: '/srv/project',
+      remoteWritePolicy: 'compatible',
+    });
+    expect(atomicity.textContent).toContain('远程写入：兼容');
+    expect(atomicity.textContent).toContain('中断可能留下部分文件');
   });
 
   it('requires an explicit in-app confirmation before Generic Provider gains file write access', async () => {

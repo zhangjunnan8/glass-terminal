@@ -19,6 +19,8 @@ import {
 import { posix } from 'node:path';
 import type { WebContents } from 'electron';
 import type {
+  RemotePublicationSemantics,
+  RemoteWritePolicy,
   WorkspaceBinding,
   WorkspaceGlobResult,
   WorkspaceSearchResult,
@@ -87,6 +89,7 @@ export interface AgentFileWriteResult {
   additions: number;
   deletions: number;
   diffTruncated: boolean;
+  publication?: RemotePublicationSemantics;
 }
 
 export interface AgentFileListEntry {
@@ -134,6 +137,15 @@ export class WorkspaceOperationAuditPersistenceError extends Error {
   }
 }
 
+export class RemoteAtomicityPolicyError extends Error {
+  readonly code = 'REMOTE_ATOMICITY_UNAVAILABLE';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'RemoteAtomicityPolicyError';
+  }
+}
+
 /**
  * Canonical path grants captured when a WorkspaceTool is bound to a turn.
  *
@@ -177,6 +189,7 @@ type ResolvedTarget =
     workspaceRoot: string;
     requestedPath: string;
     hostId: string;
+    remoteWritePolicy: RemoteWritePolicy;
     authorization: NormalizedPathAuthorization;
   };
 
@@ -1161,6 +1174,12 @@ export class AgentFileService {
         this.assertMutationLive(target, tracker);
         this.beginOperationAudit(tracker);
         this.assertMutationLive(target, tracker);
+        const finalPrepared = await this.prepareMutationTarget(filesystem, target);
+        if (
+          !workspaceRootsMatch(prepared.path, finalPrepared.path, target.transport)
+          || finalPrepared.stat
+        ) throw new Error('目录目标已在创建前变化。');
+        this.assertMutationLive(target, tracker);
         tracker.filesystemMutationStarted = true;
         tracker.targetDispatched = true;
         await filesystem.mkdir(prepared.path, 0o700);
@@ -1241,6 +1260,24 @@ export class AgentFileService {
         this.beginOperationAudit(tracker);
         this.assertMutationLive(sourceTarget, tracker);
         this.assertMutationLive(destinationTarget, tracker);
+        const finalSource = await this.prepareMutationTarget(filesystem, sourceTarget);
+        const finalDestination = await this.prepareMutationTarget(filesystem, destinationTarget);
+        if (
+          !workspaceRootsMatch(
+            preparedSource.path,
+            finalSource.path,
+            sourceTarget.transport,
+          )
+          || !workspaceRootsMatch(
+            preparedDestination.path,
+            finalDestination.path,
+            destinationTarget.transport,
+          )
+          || finalSource.stat?.type !== preparedSource.stat.type
+          || finalDestination.stat
+        ) throw new Error('重命名路径已在提交前变化。');
+        this.assertMutationLive(sourceTarget, tracker);
+        this.assertMutationLive(destinationTarget, tracker);
         tracker.filesystemMutationStarted = true;
         tracker.targetDispatched = true;
         await filesystem.rename(preparedSource.path, preparedDestination.path);
@@ -1296,6 +1333,12 @@ export class AgentFileService {
           this.assertMutationLive(target, tracker);
           this.beginOperationAudit(tracker);
           this.assertMutationLive(target, tracker);
+          const finalPrepared = await this.prepareMutationTarget(filesystem, target);
+          if (
+            !workspaceRootsMatch(prepared.path, finalPrepared.path, target.transport)
+            || finalPrepared.stat?.type !== prepared.stat.type
+          ) throw new Error('删除目标已在提交前变化。');
+          this.assertMutationLive(target, tracker);
           tracker.filesystemMutationStarted = true;
           tracker.targetDispatched = true;
           await filesystem.unlink(prepared.path);
@@ -1306,6 +1349,12 @@ export class AgentFileService {
         if (!options.recursive) {
           this.assertMutationLive(target, tracker);
           this.beginOperationAudit(tracker);
+          this.assertMutationLive(target, tracker);
+          const finalPrepared = await this.prepareMutationTarget(filesystem, target);
+          if (
+            !workspaceRootsMatch(prepared.path, finalPrepared.path, target.transport)
+            || finalPrepared.stat?.type !== 'directory'
+          ) throw new Error('删除目录已在提交前变化。');
           this.assertMutationLive(target, tracker);
           tracker.filesystemMutationStarted = true;
           tracker.targetDispatched = true;
@@ -1430,6 +1479,56 @@ export class AgentFileService {
       ? encodeFileText(content, currentDecoded.encoding)
       : boundedContent(content);
     const diff = createWorkspaceDiff(this.safeDiffLabel(target, prepared.path), before, content);
+    const capabilities = filesystem.serverCapabilities();
+    const recordedCapabilities: RemotePublicationSemantics['serverCapabilities'] = {
+      detection: capabilities.detection,
+      hardlink: capabilities.hardlink,
+      fsync: capabilities.fsync,
+      posixRename: capabilities.posixRename,
+    };
+    const creating = current === undefined;
+    let publication: RemotePublicationSemantics;
+    if (creating && capabilities.hardlink) {
+      publication = {
+        policy: target.remoteWritePolicy,
+        publishMode: 'hardlink-no-replace',
+        serverCapabilities: recordedCapabilities,
+        concurrencyGuarantee: 'strict no-replace; atomic publish',
+        durability: capabilities.fsync ? 'fsync' : 'close-only',
+      };
+    } else if (creating && target.remoteWritePolicy === 'compatible') {
+      publication = {
+        policy: target.remoteWritePolicy,
+        publishMode: 'direct-exclusive',
+        serverCapabilities: recordedCapabilities,
+        concurrencyGuarantee: 'exclusive no-overwrite; interrupted write may leave a partial file',
+        durability: capabilities.fsync ? 'fsync' : 'close-only',
+      };
+    } else if (!creating && capabilities.posixRename) {
+      publication = {
+        policy: target.remoteWritePolicy,
+        publishMode: 'posix-rename',
+        serverCapabilities: recordedCapabilities,
+        concurrencyGuarantee: 'atomic publish; best-effort hash recheck; strict CAS unsupported',
+        durability: capabilities.fsync ? 'fsync' : 'close-only',
+      };
+    } else if (!creating && target.remoteWritePolicy === 'compatible') {
+      publication = {
+        policy: target.remoteWritePolicy,
+        publishMode: 'standard-rename',
+        serverCapabilities: recordedCapabilities,
+        concurrencyGuarantee: 'best-effort hash recheck; atomic replace and strict CAS unsupported',
+        durability: capabilities.fsync ? 'fsync' : 'close-only',
+      };
+    } else {
+      publication = {
+        policy: target.remoteWritePolicy,
+        publishMode: 'rejected',
+        serverCapabilities: recordedCapabilities,
+        concurrencyGuarantee: 'strict CAS unsupported',
+        durability: 'close-only',
+      };
+    }
     tracker.intent = {
       ...tracker.intent,
       target: { path: this.auditPathForTarget(target, prepared.path) },
@@ -1438,7 +1537,17 @@ export class AgentFileService {
         type: 'file',
         ...(expectedSha256 === null ? {} : { sha256: expectedSha256.toLowerCase() }),
       },
+      publication,
     };
+    if (publication.publishMode === 'rejected') {
+      throw new RemoteAtomicityPolicyError(
+        creating
+          ? '严格远程写入已拒绝：服务器未提供 hardlink@openssh.com，strict no-replace 不可用。'
+            + '如接受异常中断可能留下部分文件，可将当前 Workspace 切换为兼容模式。'
+          : '严格远程写入已拒绝：服务器未提供 posix-rename@openssh.com，atomic publish 不可用；'
+            + 'strict CAS unsupported。可在理解风险后切换当前 Workspace 为兼容模式。',
+      );
+    }
     this.assertMutationLive(target, tracker);
     this.beginOperationAudit(tracker, {
       body: diff.diff,
@@ -1452,37 +1561,75 @@ export class AgentFileService {
     try {
       this.assertMutationLive(target, tracker);
       tracker.filesystemMutationStarted = true;
-      await filesystem.writeFile(temporary, bytes, attributes?.mode, true);
-      temporaryCreated = true;
-      if (attributes) {
-        const latestStat = await filesystem.lstat(prepared.path);
-        if (latestStat?.type !== 'file' || latestStat.size > MAX_AGENT_FILE_BYTES) {
-          throw new Error('文件已在写入期间变化；请重新读取。');
+      if (publication.publishMode === 'direct-exclusive') {
+        const latestPrepared = await this.prepareMutationTarget(filesystem, target);
+        if (!workspaceRootsMatch(prepared.path, latestPrepared.path, 'ssh')) {
+          throw new Error('远程目标父目录已在写入前变化。');
         }
-        const latest = await filesystem.readFile(prepared.path, MAX_AGENT_FILE_BYTES);
-        this.assertExpectedHash(prepared.path, latest, expectedSha256);
-        // SFTP has no portable compare-and-swap rename. This second hash check
-        // narrows (but cannot eliminate) the remaining check-to-rename race.
+        if (latestPrepared.stat) throw new Error('文件已在写入期间创建；请重新读取。');
         this.assertMutationLive(target, tracker);
         tracker.targetDispatched = true;
-        await filesystem.atomicReplace(temporary, prepared.path);
+        await filesystem.writeFileDurable(prepared.path, bytes, attributes?.mode, true);
         tracker.targetCommitted = true;
         tracker.confirmedCommits = 1;
       } else {
-        // Recheck absence immediately before rename. Standard SFTP rename can
-        // still race another creator because no no-replace extension is portable.
-        if (await filesystem.lstat(prepared.path)) {
+        await filesystem.writeFileDurable(temporary, bytes, attributes?.mode, true);
+        temporaryCreated = true;
+        const latestPrepared = await this.prepareMutationTarget(filesystem, target);
+        if (!workspaceRootsMatch(prepared.path, latestPrepared.path, 'ssh')) {
+          throw new Error('远程目标父目录已在写入期间变化。');
+        }
+        if (attributes && (
+          latestPrepared.stat?.type !== 'file'
+          || latestPrepared.stat.size > MAX_AGENT_FILE_BYTES
+        )) {
+          throw new Error('文件已在写入期间变化；请重新读取。');
+        }
+        if (attributes) {
+          const latest = await filesystem.readFile(prepared.path, MAX_AGENT_FILE_BYTES);
+          this.assertExpectedHash(prepared.path, latest, expectedSha256);
+        } else if (latestPrepared.stat) {
           throw new Error('文件已在写入期间创建；请重新读取。');
         }
         this.assertMutationLive(target, tracker);
         tracker.targetDispatched = true;
-        await filesystem.rename(temporary, prepared.path);
+        if (publication.publishMode === 'hardlink-no-replace') {
+          try {
+            await filesystem.hardlink(temporary, prepared.path);
+          } catch (error) {
+            const code = (error as { code?: string | number } | undefined)?.code;
+            // OpenSSH hardlink is a no-replace publish primitive. EEXIST is a
+            // definitive conflict, not an ambiguous target-side mutation.
+            if (code === 'EEXIST' || code === 11) {
+              tracker.targetDispatched = false;
+            }
+            throw error;
+          }
+        } else if (publication.publishMode === 'posix-rename') {
+          await filesystem.atomicReplace(temporary, prepared.path);
+          temporaryCreated = false;
+        } else {
+          await filesystem.rename(temporary, prepared.path);
+          temporaryCreated = false;
+        }
         tracker.targetCommitted = true;
         tracker.confirmedCommits = 1;
+        if (publication.publishMode === 'hardlink-no-replace') {
+          try {
+            await filesystem.unlink(temporary);
+            temporaryCreated = false;
+          } catch (error) {
+            tracker.cleanupFailed = true;
+            throw error;
+          }
+        }
       }
     } catch (error) {
       try {
-        if (temporaryCreated || await filesystem.lstat(temporary)) {
+        if (
+          publication.publishMode !== 'direct-exclusive'
+          && (temporaryCreated || await filesystem.lstat(temporary))
+        ) {
           await filesystem.unlink(temporary);
         }
       } catch {
@@ -1495,6 +1642,7 @@ export class AgentFileService {
       bytes: bytes.length,
       sha256: sha256(bytes),
       created: current === undefined,
+      publication,
       ...diff,
     };
   }
@@ -1876,7 +2024,8 @@ export class AgentFileService {
       : undefined;
     if (code === 'EACCES' || code === 'EPERM') return 'permission';
     if (code === 'ENOENT') return 'not_found';
-    if (code === 'EEXIST') return 'conflict';
+    if (code === 'EEXIST' || code === 11) return 'conflict';
+    if (code === 'REMOTE_ATOMICITY_UNAVAILABLE') return 'atomicity_unsupported';
     if (
       code === 'ECONNABORTED'
       || code === 'ECONNRESET'
@@ -2186,6 +2335,7 @@ export class AgentFileService {
         workspaceRoot: workspacePath,
         requestedPath: path,
         hostId: workspace.hostId!,
+        remoteWritePolicy: workspace.remoteWritePolicy ?? 'strict',
         authorization: normalizedAuthorization,
       };
     }
