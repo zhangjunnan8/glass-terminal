@@ -26,6 +26,8 @@ import {
 import { conversationPreview, plainTerminalPreview } from './session-history';
 import {
   SessionStore,
+  type TerminalHistoryCursor,
+  type TerminalHistorySlice,
   type SessionStorageProtection,
 } from './session-store';
 import type {
@@ -242,6 +244,18 @@ export class SessionManager {
 
   readTerminalHistory(sessionId: string): string {
     return this.store.readTerminalHistory(sessionId);
+  }
+
+  readTerminalHistorySince(
+    sessionId: string,
+    cursor?: TerminalHistoryCursor,
+    maxCharacters?: number,
+  ): TerminalHistorySlice {
+    return this.store.readTerminalHistorySince(sessionId, cursor, maxCharacters);
+  }
+
+  currentTerminalHistoryCursor(sessionId: string): TerminalHistoryCursor {
+    return this.store.currentTerminalHistoryCursor(sessionId);
   }
 
   readHistoryDetail(request: ReadSessionHistoryDetailRequest): SessionHistoryDetail {

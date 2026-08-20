@@ -112,7 +112,14 @@ function setup(options: {
   };
   const sessionMock = {
     sessionForTerminal: vi.fn(() => currentSession),
-    readTerminalHistory: vi.fn(() => options.history ?? 'terminal history'),
+    readTerminalHistorySince: vi.fn((_sessionId, _cursor, maxChars: number) => {
+      const history = options.history ?? 'terminal history';
+      return {
+        content: history.slice(-maxChars),
+        nextCursor: { version: 1, position: history.length },
+        truncated: history.length > maxChars,
+      };
+    }),
   };
   const execute = options.execute ?? vi.fn(async () => ({
     commandId: 'command-1',
@@ -197,7 +204,7 @@ describe('SharedTerminalTool', () => {
     expect(fixture.execute).not.toHaveBeenCalled();
     expect(sendInput).not.toHaveBeenCalled();
     expect(interrupt).not.toHaveBeenCalled();
-    expect(fixture.sessionMock.readTerminalHistory).not.toHaveBeenCalled();
+    expect(fixture.sessionMock.readTerminalHistorySince).not.toHaveBeenCalled();
     expect(fixture.terminalMock.state).not.toHaveBeenCalled();
   });
 
@@ -226,7 +233,7 @@ describe('SharedTerminalTool', () => {
     expect(fixture.execute).not.toHaveBeenCalled();
     expect(sendInput).not.toHaveBeenCalled();
     expect(interrupt).not.toHaveBeenCalled();
-    expect(fixture.sessionMock.readTerminalHistory).not.toHaveBeenCalled();
+    expect(fixture.sessionMock.readTerminalHistorySince).not.toHaveBeenCalled();
     expect(fixture.terminalMock.state).not.toHaveBeenCalled();
   });
 
@@ -246,7 +253,11 @@ describe('SharedTerminalTool', () => {
     await expect(tool.readVisible({ maxChars: 5 })).resolves.toBe('aaEND');
     await expect(tool.readVisible({ maxChars: 999_999 })).resolves.toHaveLength(30_000);
     await expect(tool.readHistory({ maxChars: 999_999 })).resolves.toHaveLength(120_000);
-    expect(sessionMock.readTerminalHistory).toHaveBeenCalledWith('session-1');
+    expect(sessionMock.readTerminalHistorySince).toHaveBeenCalledWith(
+      'session-1',
+      undefined,
+      5,
+    );
   });
 
   it('merges live TerminalService state with current Session cwd and effective user', async () => {

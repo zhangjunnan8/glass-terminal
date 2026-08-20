@@ -88,7 +88,9 @@ export class SharedTerminalTool implements TerminalTool {
       DEFAULT_VISIBLE_CHARACTERS,
       MAX_VISIBLE_CHARACTERS,
     );
-    return this.options.sessions.readTerminalHistory(session.id).slice(-maxChars);
+    return this.options.sessions
+      .readTerminalHistorySince(session.id, undefined, maxChars)
+      .content;
   }
 
   async readHistory(options: { maxChars?: number } = {}): Promise<string> {
@@ -100,7 +102,9 @@ export class SharedTerminalTool implements TerminalTool {
       DEFAULT_HISTORY_CHARACTERS,
       MAX_HISTORY_CHARACTERS,
     );
-    return this.options.sessions.readTerminalHistory(session.id).slice(-maxChars);
+    return this.options.sessions
+      .readTerminalHistorySince(session.id, undefined, maxChars)
+      .content;
   }
 
   async getState(): Promise<TerminalToolState> {

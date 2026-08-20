@@ -35,6 +35,7 @@ import { SESSION_CHANNELS } from '../../shared/session';
 import type { TerminalCommandResult, WorkspaceBinding } from '../../shared/tools';
 import type { ProviderStore } from '../providers/provider-store';
 import type { SessionManager } from '../sessions/session-manager';
+import type { TerminalHistoryCursor } from '../sessions/session-store';
 import type { TerminalService } from '../terminal/terminal-service';
 import type {
   AgentBackend,
@@ -83,12 +84,12 @@ interface AgentRuntimeRecord extends AgentSessionView {
   resolveApproval?: (resolution: ApprovalResolution) => void;
   streamEmitTimer?: ReturnType<typeof setTimeout>;
   /**
-   * Character offset into the terminal journal where the previous turn ended.
+   * Durable journal cursor where the previous turn ended.
    * The next turn's ambient context is only the terminal text produced after
    * this offset (human input + background output), not the AI's own command
    * echo that is already carried by structured tool results.
    */
-  terminalContextOffset?: number;
+  terminalContextCursor?: TerminalHistoryCursor;
 }
 
 type GenericBackendFactory = (providerId: string) => AgentBackend | Promise<AgentBackend>;
@@ -1448,11 +1449,12 @@ export class AgentService {
       }
       if (!this.isCurrentTurn(runtime, token)) return;
 
-      const fullTerminalHistory = this.sessions.readTerminalHistory(runtime.sessionId);
       const terminalContext = stripAnsiSequences(
-        fullTerminalHistory
-          .slice(runtime.terminalContextOffset ?? 0)
-          .slice(-MAX_TURN_TERMINAL_CONTEXT_CHARS),
+        this.sessions.readTerminalHistorySince(
+          runtime.sessionId,
+          runtime.terminalContextCursor,
+          MAX_TURN_TERMINAL_CONTEXT_CHARS,
+        ).content,
       );
       const fileAccessModeLabel = runtime.fileAccessMode === 'read-only'
         ? '只读'
@@ -1529,8 +1531,8 @@ export class AgentService {
       await closeTurnTools();
       // Advance the ambient-context watermark past this turn's terminal output so
       // the next turn only carries new human input and background output.
-      runtime.terminalContextOffset = this.sessions
-        .readTerminalHistory(runtime.sessionId).length;
+      runtime.terminalContextCursor = this.sessions
+        .currentTerminalHistoryCursor(runtime.sessionId);
     }
   }
 
@@ -1578,9 +1580,9 @@ export class AgentService {
         signal,
         terminalContextAccess: snapshot.terminalContextAccess.enabled,
         tools: {
-          readTerminal: async ({ maxChars }) => (
-            this.sessions.readTerminalHistory(runtime.sessionId).slice(-maxChars)
-          ),
+          readTerminal: async ({ maxChars }) => this.sessions
+            .readTerminalHistorySince(runtime.sessionId, undefined, maxChars)
+            .content,
           getTerminalState: async () => {
             try {
               const latestSession = this.sessions.sessionForTerminal(

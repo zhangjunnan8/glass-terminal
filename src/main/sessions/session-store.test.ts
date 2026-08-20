@@ -75,6 +75,67 @@ describe('SessionStore', () => {
       .toHaveLength(chunks.length);
   });
 
+  it('reads only terminal history after a durable cursor across chunk boundaries', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    const cursor = store.currentTerminalHistoryCursor(session.id);
+
+    store.appendTerminalEvents(session.id, [output(2, 'second chunk\r\n')]);
+    store.flushAll();
+
+    expect(store.readTerminalHistorySince(session.id, cursor, 1_000)).toEqual({
+      content: 'second chunk\r\n',
+      nextCursor: {
+        version: 1,
+        position: cursor.position + 'second chunk\r\n'.length,
+      },
+      truncated: false,
+    });
+  });
+
+  it('uses chunk offsets to skip unrelated compressed history', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    const cursor = store.currentTerminalHistoryCursor(session.id);
+    store.appendTerminalEvents(session.id, [output(2, 'readable tail')]);
+    store.flushAll();
+
+    const terminalPath = join(root, session.id, 'terminal');
+    const index = JSON.parse(readFileSync(join(terminalPath, 'index.json'), 'utf8'));
+    writeFileSync(join(terminalPath, index.chunks[0].file), 'not gzip data');
+
+    expect(store.readTerminalHistorySince(session.id, cursor, 1_000).content)
+      .toBe('readable tail');
+  });
+
+  it('migrates a version-one terminal index once and preserves readable history', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    store.appendTerminalEvents(session.id, [output(2, 'legacy tail')]);
+    store.flushAll();
+    const indexPath = join(root, session.id, 'terminal', 'index.json');
+    const current = JSON.parse(readFileSync(indexPath, 'utf8'));
+    writeFileSync(indexPath, JSON.stringify({
+      version: 1,
+      chunks: current.chunks.map(({
+        historyStart: _historyStart,
+        historyEnd: _historyEnd,
+        ...chunk
+      }: Record<string, unknown>) => chunk),
+    }));
+
+    const reloaded = new SessionStore(root);
+    expect(reloaded.readTerminalHistorySince(session.id, undefined, 1_000).content)
+      .toBe('pre-promotion output\r\nlegacy tail');
+    expect(JSON.parse(readFileSync(indexPath, 'utf8'))).toMatchObject({
+      version: 2,
+      nextHistoryPosition: 'pre-promotion output\r\nlegacy tail'.length,
+    });
+  });
+
   it('reloads durable metadata, marks interrupted sessions, and keeps audit history', () => {
     const root = temporaryRoot();
     const initialStore = new SessionStore(root);

@@ -619,6 +619,22 @@ class FakeSessions {
   hostFullTakeover(_hostId: string) { return this.fullTakeover; }
   setHostFullTakeover(_hostId: string, enabled: boolean) { this.fullTakeover = enabled; }
   readTerminalHistory() { return 'tester@host:~$ '; }
+  readTerminalHistorySince(
+    _sessionId: string,
+    cursor: { version: 1; position: number } | undefined,
+    maxCharacters = 120_000,
+  ) {
+    const history = this.readTerminalHistory();
+    const start = cursor?.position ?? Math.max(0, history.length - maxCharacters);
+    return {
+      content: history.slice(start).slice(-maxCharacters),
+      nextCursor: { version: 1 as const, position: history.length },
+      truncated: start > 0 && cursor === undefined,
+    };
+  }
+  currentTerminalHistoryCursor() {
+    return { version: 1 as const, position: this.readTerminalHistory().length };
+  }
   appendAudit(
     _sessionId: string,
     type: string,

@@ -38,7 +38,7 @@ import {
   type WorkspaceOperationSource,
 } from './workspace-operation-journal';
 
-const LOG_SCHEMA_VERSION = 1;
+const LOG_SCHEMA_VERSION = 2;
 const TARGET_CHUNK_BYTES = 64 * 1024;
 const FLUSH_DELAY_MS = 200;
 const RETENTION_MS = 90 * 24 * 60 * 60 * 1_000;
@@ -52,11 +52,36 @@ interface LogChunk {
   createdAt: string;
   compressedBytes: number;
   uncompressedBytes: number;
+  /** Absolute UTF-16 offsets in the user-visible terminal history. */
+  historyStart: number;
+  historyEnd: number;
 }
 
 interface LogIndex {
-  version: 1;
+  version: 2;
   chunks: LogChunk[];
+  /** Monotonic even when retention removes every currently indexed chunk. */
+  nextHistoryPosition: number;
+}
+
+type LegacyLogChunk = Omit<LogChunk, 'historyStart' | 'historyEnd'>;
+
+interface LegacyLogIndex {
+  version: 1;
+  chunks: LegacyLogChunk[];
+}
+
+export interface TerminalHistoryCursor {
+  version: 1;
+  /** Absolute UTF-16 position in the Session's visible terminal history. */
+  position: number;
+}
+
+export interface TerminalHistorySlice {
+  content: string;
+  nextCursor: TerminalHistoryCursor;
+  /** Some requested history was unavailable or omitted to honor maxCharacters. */
+  truncated: boolean;
 }
 
 interface PendingLog {
@@ -68,6 +93,14 @@ interface PendingLog {
 interface FileTail {
   text: string;
   truncated: boolean;
+}
+
+function terminalEventText(event: TerminalJournalEvent): string {
+  if (event.kind === 'output') return event.data;
+  if (event.kind === 'gap') {
+    return `\r\n[Earlier terminal output truncated: ${event.droppedBytes} bytes]\r\n`;
+  }
+  return '';
 }
 
 function readUtf8FileTail(path: string, maxBytes: number): FileTail {
@@ -257,9 +290,15 @@ export class SessionStore {
     mkdirSync(join(creatingPath, 'terminal'), { recursive: true });
     try {
       atomicWriteJson(join(creatingPath, 'session.json'), record);
-      const index: LogIndex = { version: LOG_SCHEMA_VERSION, chunks: [] };
+      const index: LogIndex = {
+        version: LOG_SCHEMA_VERSION,
+        chunks: [],
+        nextHistoryPosition: 0,
+      };
       if (input.history.length) {
-        index.chunks.push(this.writeChunkAt(creatingPath, 1, input.history));
+        const chunk = this.writeChunkAt(creatingPath, 1, input.history, 0);
+        index.chunks.push(chunk);
+        index.nextHistoryPosition = chunk.historyEnd;
       }
       atomicWriteJson(join(creatingPath, 'terminal', 'index.json'), index);
       const createdAudit: SessionAuditEvent = {
@@ -420,7 +459,14 @@ export class SessionStore {
 
     const index = this.readLogIndex(sessionId);
     const sequence = (index.chunks.at(-1)?.sequence ?? 0) + 1;
-    index.chunks.push(this.writeChunkAt(this.sessionPath(sessionId), sequence, pending.events));
+    const chunk = this.writeChunkAt(
+      this.sessionPath(sessionId),
+      sequence,
+      pending.events,
+      index.nextHistoryPosition,
+    );
+    index.chunks.push(chunk);
+    index.nextHistoryPosition = chunk.historyEnd;
     this.applyRetention(this.get(sessionId), index);
     atomicWriteJson(this.logIndexPath(sessionId), index);
   }
@@ -449,63 +495,79 @@ export class SessionStore {
   }
 
   readTerminalHistory(sessionId: string): string {
-    return this.readTerminalEvents(sessionId).map((event) => {
-      if (event.kind === 'output') return event.data;
-      if (event.kind === 'gap') {
-        return `\r\n[Earlier terminal output truncated: ${event.droppedBytes} bytes]\r\n`;
-      }
-      return '';
-    }).join('');
+    return this.readTerminalEvents(sessionId).map(terminalEventText).join('');
   }
 
   readRecentTerminalHistory(
     sessionId: string,
     maxCharacters = 120_000,
   ): { content: string; truncated: boolean } {
+    const result = this.readTerminalHistorySince(sessionId, undefined, maxCharacters);
+    return { content: result.content, truncated: result.truncated };
+  }
+
+  currentTerminalHistoryCursor(sessionId: string): TerminalHistoryCursor {
+    this.get(sessionId);
+    this.flush(sessionId);
+    const index = this.readLogIndex(sessionId);
+    return { version: 1, position: index.nextHistoryPosition };
+  }
+
+  readTerminalHistorySince(
+    sessionId: string,
+    cursor?: TerminalHistoryCursor,
+    maxCharacters = 120_000,
+  ): TerminalHistorySlice {
     this.get(sessionId);
     if (!Number.isSafeInteger(maxCharacters) || maxCharacters < 1) {
       throw new Error('Invalid terminal history preview limit.');
     }
+    if (
+      cursor !== undefined
+      && (
+        cursor.version !== 1
+        || !Number.isSafeInteger(cursor.position)
+        || cursor.position < 0
+      )
+    ) throw new Error('Invalid terminal history cursor.');
+
     this.flush(sessionId);
     const index = this.readLogIndex(sessionId);
-    const pieces: string[] = [];
-    let remaining = maxCharacters;
-    let truncated = false;
-
-    for (let chunkIndex = index.chunks.length - 1; chunkIndex >= 0; chunkIndex -= 1) {
-      const chunk = index.chunks[chunkIndex]!;
-      const compressed = readFileSync(this.safeChunkPath(sessionId, chunk.file));
-      const events: TerminalJournalEvent[] = [];
-      for (const line of gunzipSync(compressed).toString('utf8').split('\n')) {
-        if (!line) continue;
-        try {
-          events.push(JSON.parse(line) as TerminalJournalEvent);
-        } catch {
-          // A corrupt partial line does not make the rest of the preview unreadable.
-        }
-      }
-      const text = events.map((event) => {
-        if (event.kind === 'output') return event.data;
-        if (event.kind === 'gap') {
-          return `\r\n[Earlier terminal output truncated: ${event.droppedBytes} bytes]\r\n`;
-        }
-        return '';
-      }).join('');
-      if (text.length > remaining) {
-        pieces.unshift(text.slice(-remaining));
-        truncated = true;
-        remaining = 0;
-        break;
-      }
-      pieces.unshift(text);
-      remaining -= text.length;
-      if (remaining === 0 && chunkIndex > 0) {
-        truncated = true;
-        break;
-      }
+    const end = index.nextHistoryPosition;
+    if (cursor && cursor.position > end) {
+      throw new Error('Terminal history cursor is ahead of the current Session history.');
     }
 
-    return { content: pieces.join(''), truncated };
+    const earliest = index.chunks[0]?.historyStart ?? end;
+    let start = cursor?.position ?? Math.max(earliest, end - maxCharacters);
+    let truncated = false;
+    if (start < earliest) {
+      start = earliest;
+      truncated = true;
+    }
+    if (end - start > maxCharacters) {
+      start = end - maxCharacters;
+      truncated = true;
+    }
+    if (!cursor && start > earliest) truncated = true;
+
+    const pieces: string[] = [];
+    for (const chunk of index.chunks) {
+      if (chunk.historyEnd <= start || chunk.historyStart >= end) continue;
+      const text = this.readChunkText(sessionId, chunk);
+      if (text.length !== chunk.historyEnd - chunk.historyStart) {
+        throw new Error(`Terminal history index metadata mismatch for chunk ${chunk.sequence}.`);
+      }
+      const localStart = Math.max(0, start - chunk.historyStart);
+      const localEnd = Math.min(text.length, end - chunk.historyStart);
+      if (localEnd > localStart) pieces.push(text.slice(localStart, localEnd));
+    }
+
+    return {
+      content: pieces.join(''),
+      nextCursor: { version: 1, position: end },
+      truncated,
+    };
   }
 
   readAudit(sessionId: string): SessionAuditEvent[] {
@@ -839,28 +901,95 @@ export class SessionStore {
     sessionPath: string,
     sequence: number,
     events: TerminalJournalEvent[],
+    historyStart: number,
   ): LogChunk {
     const raw = Buffer.from(jsonLines(events), 'utf8');
     const compressed = gzipSync(raw);
     const file = `${String(sequence).padStart(8, '0')}-${randomUUID()}.jsonl.gz`;
     const path = join(sessionPath, 'terminal', file);
     writeFileSync(path, compressed, { mode: 0o600 });
+    const historyCharacters = events.reduce(
+      (total, event) => total + terminalEventText(event).length,
+      0,
+    );
     return {
       sequence,
       file,
       createdAt: new Date().toISOString(),
       compressedBytes: compressed.length,
       uncompressedBytes: raw.length,
+      historyStart,
+      historyEnd: historyStart + historyCharacters,
     };
   }
 
   private readLogIndex(sessionId: string): LogIndex {
     const path = this.logIndexPath(sessionId);
-    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<LogIndex>;
-    if (parsed.version !== LOG_SCHEMA_VERSION || !Array.isArray(parsed.chunks)) {
+    const parsed = JSON.parse(readFileSync(path, 'utf8')) as Partial<LogIndex | LegacyLogIndex>;
+    if (!Array.isArray(parsed.chunks)) {
       throw new Error(`Unsupported terminal log index for Session ${sessionId}.`);
     }
-    return parsed as LogIndex;
+    if (parsed.version === LOG_SCHEMA_VERSION) {
+      const index = parsed as LogIndex;
+      if (!Number.isSafeInteger(index.nextHistoryPosition) || index.nextHistoryPosition < 0) {
+        throw new Error(`Invalid terminal history position for Session ${sessionId}.`);
+      }
+      let previousEnd = index.chunks[0]?.historyStart ?? index.nextHistoryPosition;
+      for (const chunk of index.chunks) {
+        if (
+          !Number.isSafeInteger(chunk.historyStart)
+          || !Number.isSafeInteger(chunk.historyEnd)
+          || chunk.historyStart !== previousEnd
+          || chunk.historyEnd < chunk.historyStart
+          || chunk.historyEnd > index.nextHistoryPosition
+        ) throw new Error(`Invalid terminal chunk history metadata for Session ${sessionId}.`);
+        previousEnd = chunk.historyEnd;
+      }
+      if (previousEnd !== index.nextHistoryPosition) {
+        throw new Error(`Invalid terminal history extent for Session ${sessionId}.`);
+      }
+      return index;
+    }
+    if (parsed.version !== 1) {
+      throw new Error(`Unsupported terminal log index for Session ${sessionId}.`);
+    }
+
+    let position = 0;
+    const chunks = (parsed as LegacyLogIndex).chunks.map((legacy): LogChunk => {
+      const text = this.readLegacyChunkText(sessionId, legacy);
+      const chunk: LogChunk = {
+        ...legacy,
+        historyStart: position,
+        historyEnd: position + text.length,
+      };
+      position = chunk.historyEnd;
+      return chunk;
+    });
+    const migrated: LogIndex = {
+      version: LOG_SCHEMA_VERSION,
+      chunks,
+      nextHistoryPosition: position,
+    };
+    atomicWriteJson(path, migrated);
+    return migrated;
+  }
+
+  private readChunkText(sessionId: string, chunk: LogChunk): string {
+    return this.readLegacyChunkText(sessionId, chunk);
+  }
+
+  private readLegacyChunkText(sessionId: string, chunk: LegacyLogChunk): string {
+    const compressed = readFileSync(this.safeChunkPath(sessionId, chunk.file));
+    const pieces: string[] = [];
+    for (const line of gunzipSync(compressed).toString('utf8').split('\n')) {
+      if (!line) continue;
+      try {
+        pieces.push(terminalEventText(JSON.parse(line) as TerminalJournalEvent));
+      } catch {
+        // A corrupt partial final record does not make earlier history unreadable.
+      }
+    }
+    return pieces.join('');
   }
 
   private applyRetention(session: SessionRecord, index: LogIndex): void {
