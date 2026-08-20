@@ -9,6 +9,7 @@ import { SFTP_CHANNELS } from '../shared/sftp';
 import type { TransferJobSnapshot } from '../shared/sftp';
 import { PROVIDER_CHANNELS } from '../shared/provider';
 import { AGENT_CHANNELS } from '../shared/agent';
+import { containsObviousAgentSecret } from '../shared/agent-memory';
 import type { AgentAssistantDelta, AgentSessionView } from '../shared/agent';
 import { CODEX_APP_SERVER_CHANNELS } from '../shared/codex-app-server';
 import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
@@ -165,6 +166,13 @@ const agentBridge: DesktopBridge['agent'] = {
   sendPrompt: (request) => ipcRenderer.invoke(AGENT_CHANNELS.sendPrompt, request),
   interruptTurn: (request) => ipcRenderer.invoke(AGENT_CHANNELS.interruptTurn, request),
   revisePrompt: (request) => ipcRenderer.invoke(AGENT_CHANNELS.revisePrompt, request),
+  saveMemory: (request) => {
+    if (containsObviousAgentSecret(request.content)) {
+      return Promise.reject(new Error('检测到明显凭据；上下文记忆请求未通过 IPC 发送。'));
+    }
+    return ipcRenderer.invoke(AGENT_CHANNELS.saveMemory, request);
+  },
+  removeMemory: (request) => ipcRenderer.invoke(AGENT_CHANNELS.removeMemory, request),
   getState: (terminalId) => ipcRenderer.invoke(AGENT_CHANNELS.getState, terminalId),
   setFileAccess: (request) => ipcRenderer.invoke(AGENT_CHANNELS.setFileAccess, request),
   resolveApproval: (request) => ipcRenderer.invoke(AGENT_CHANNELS.resolveApproval, request),

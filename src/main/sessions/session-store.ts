@@ -801,6 +801,31 @@ export class SessionStore {
     });
   }
 
+  readThreadMemories(sessionId: string, threadId: string): unknown {
+    this.get(sessionId);
+    const path = this.threadMemoryPath(sessionId, threadId);
+    if (!existsSync(path)) return [];
+    return JSON.parse(readFileSync(path, 'utf8')) as unknown;
+  }
+
+  writeThreadMemories(sessionId: string, threadId: string, memories: unknown): void {
+    this.get(sessionId);
+    const serialized = JSON.stringify(memories);
+    if (Buffer.byteLength(serialized, 'utf8') > 64 * 1024) {
+      throw new Error('Agent context memory snapshot exceeds 64 KiB.');
+    }
+    const path = this.threadMemoryPath(sessionId, threadId);
+    mkdirSync(dirname(path), { recursive: true });
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temporary, serialized, { encoding: 'utf8', mode: 0o600 });
+      renameSync(temporary, path);
+    } catch (error) {
+      try { if (existsSync(temporary)) unlinkSync(temporary); } catch { /* preserve original */ }
+      throw error;
+    }
+  }
+
   readRecentThreadEvents(
     sessionId: string,
     threadId: string,
@@ -1156,5 +1181,10 @@ export class SessionStore {
   private threadPath(sessionId: string, threadId: string): string {
     if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error('Invalid AI Thread identifier.');
     return join(this.sessionPath(sessionId), 'ai', `${threadId}.jsonl`);
+  }
+
+  private threadMemoryPath(sessionId: string, threadId: string): string {
+    if (!/^[0-9a-f-]{36}$/i.test(threadId)) throw new Error('Invalid AI Thread identifier.');
+    return join(this.sessionPath(sessionId), 'ai', `${threadId}.memory.json`);
   }
 }

@@ -228,6 +228,14 @@ class FakeSessions {
     return [];
   }
 
+  readThreadMemories(): unknown {
+    return [];
+  }
+
+  writeThreadMemories(): void {
+    throw new Error('Codex App Server sessions do not persist Generic context memories.');
+  }
+
   appendThreadEvent(
     sessionId: string,
     localThreadId: string,

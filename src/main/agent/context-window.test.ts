@@ -12,6 +12,25 @@ import {
   estimateTextTokens,
 } from './context-window';
 import { agentToolDefinitionsForAccess } from './agent-tool-definitions';
+import {
+  STRUCTURED_SUMMARY_PREFIX,
+  parseStructuredContextSummary,
+} from './structured-context-summary';
+
+function structuredSummary(overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    version: 1,
+    goal: 'Continue the retained coding task.',
+    constraints: [],
+    decisions: [],
+    completed: [],
+    artifacts: [],
+    failures: [],
+    pending: ['Continue the current request.'],
+    nextSteps: ['Continue the current request.'],
+    ...overrides,
+  });
+}
 
 describe('Agent context window', () => {
   it('keeps an explicit output reserve out of the Provider input budget', () => {
@@ -142,11 +161,12 @@ describe('Agent context window', () => {
       messages.push({ role: 'user', content: `turn-${turn}:` + '汉'.repeat(1_700) });
       messages.push({ role: 'assistant', content: `answer-${turn}` });
     }
-    const summarize = vi.fn(async (_serializedHistory: string) => [
-      '- Goal: preserve the earlier task.',
-      '- Completed: turns 1-4.',
-      '- Continue from turn 5.',
-    ].join('\n'));
+    const summarize = vi.fn(async (_serializedHistory: string) => structuredSummary({
+      goal: 'Preserve the earlier task.',
+      completed: ['Turns 1-4 are complete.'],
+      pending: ['Continue from turn 5.'],
+      nextSteps: ['Continue from turn 5.'],
+    }));
 
     const result = await compressContextIfNeeded(messages, 8_192, summarize, {
       now: () => '2026-08-20T00:00:00.000Z',
@@ -173,7 +193,9 @@ describe('Agent context window', () => {
       { role: 'user', content: 'CURRENT-REQUEST' },
       { role: 'assistant', content: 'CURRENT-ANSWER' },
     ];
-    const summarize = vi.fn(async (_serializedHistory: string) => 'ordered summary');
+    const summarize = vi.fn(async (_serializedHistory: string) => structuredSummary({
+      goal: 'Preserve the ordered history.',
+    }));
 
     const result = await compressContextIfNeeded(messages, 8_192, summarize);
 
@@ -210,11 +232,55 @@ describe('Agent context window', () => {
     });
 
     expect(result.compressed).toBe(true);
-    expect(result.messages).toContainEqual(expect.objectContaining({
-      role: 'assistant',
-      contextSummary: true,
-      content: expect.stringContaining('semantic summarization was unavailable'),
-    }));
+    const summaryMessage = result.messages.find((message) => (
+      message.role === 'assistant' && message.contextSummary
+    ));
+    expect(summaryMessage?.content).toContain(STRUCTURED_SUMMARY_PREFIX);
+    const parsed = parseStructuredContextSummary(summaryMessage?.content ?? '');
+    expect(parsed.goal).toBeTruthy();
+    expect(parsed.pending).not.toHaveLength(0);
+    expect(JSON.stringify(result.messages)).toContain('当前请求');
+  });
+
+  it('preserves durable constraint, decision, and pending fields across repeated compression', async () => {
+    const messages: AgentMessage[] = [];
+    for (let turn = 1; turn <= 5; turn += 1) {
+      messages.push({ role: 'user', content: `initial-${turn}:` + '汉'.repeat(1_700) });
+      messages.push({ role: 'assistant', content: `initial-answer-${turn}` });
+    }
+    const summarize = vi.fn()
+      .mockResolvedValueOnce(structuredSummary({
+        constraints: ['Never push this repository.'],
+        decisions: ['Use one commit per issue.'],
+        pending: ['Finish issue 11.'],
+      }))
+      .mockResolvedValueOnce(structuredSummary({
+        goal: 'Continue after another compression.',
+        constraints: [],
+        decisions: [],
+        pending: ['Run the final tests.'],
+      }));
+
+    const first = await compressContextIfNeeded(messages, 8_192, summarize);
+    const continued = [...first.messages];
+    for (let turn = 1; turn <= 4; turn += 1) {
+      continued.push({ role: 'user', content: `continued-${turn}:` + '新'.repeat(1_700) });
+      continued.push({ role: 'assistant', content: `continued-answer-${turn}` });
+    }
+    const second = await compressContextIfNeeded(continued, 8_192, summarize);
+    const finalSummary = second.messages.find((message) => (
+      message.role === 'assistant' && message.contextSummary
+    ));
+    const parsed = parseStructuredContextSummary(finalSummary?.content ?? '');
+
+    expect(second.compressed).toBe(true);
+    expect(summarize).toHaveBeenCalledTimes(2);
+    expect(parsed.constraints).toContain('Never push this repository.');
+    expect(parsed.decisions).toContain('Use one commit per issue.');
+    expect(parsed.pending).toEqual(expect.arrayContaining([
+      'Finish issue 11.',
+      'Run the final tests.',
+    ]));
   });
 
   it('does not swallow cancellation errors while generating a summary', async () => {

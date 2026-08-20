@@ -57,6 +57,27 @@ describe('SessionStore', () => {
     expect(existsSync(root)).toBe(false);
   });
 
+  it('persists context memory snapshots atomically and restores them after restart', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    const threadId = '00000000-0000-4000-8000-000000000011';
+    const memories = [{
+      id: '00000000-0000-4000-8000-000000000012',
+      category: 'constraint',
+      content: 'Do not push.',
+      sourceMessageIds: ['source-message'],
+      pinSource: 'user-message',
+      createdAt: '2026-08-21T00:00:00.000Z',
+      updatedAt: '2026-08-21T00:00:00.000Z',
+    }];
+
+    store.writeThreadMemories(session.id, threadId, memories);
+
+    expect(new SessionStore(root).readThreadMemories(session.id, threadId)).toEqual(memories);
+    expect(readdirSync(join(root, session.id, 'ai'))).toEqual([`${threadId}.memory.json`]);
+  });
+
   it('persists pre-promotion and live output in compressed indexed chunks', () => {
     const root = temporaryRoot();
     const store = new SessionStore(root);

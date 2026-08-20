@@ -7,10 +7,15 @@ import {
 } from '../../shared/context-window';
 import type { AgentMessage } from './agent-backend';
 import type { AgentFunctionToolDefinition } from './agent-tool-definitions';
+import {
+  STRUCTURED_SUMMARY_PREFIX,
+  deterministicStructuredContextSummary,
+  mergeStructuredContextSummaries,
+  parseStructuredContextSummary,
+  serializeStructuredContextSummary,
+  structuredSummariesFromMessages,
+} from './structured-context-summary';
 
-const MAX_SUMMARY_TOKENS = 4_096;
-const MIN_SUMMARY_TOKENS = 512;
-const SUMMARY_MESSAGE_PREFIX = '[Glass Terminal automatic context summary]\n';
 const FIXED_REQUEST_OVERHEAD_TOKENS = 16;
 const PER_TOOL_WRAPPER_TOKENS = 8;
 
@@ -373,32 +378,6 @@ function serializedMessagesForSummary(messages: readonly AgentMessage[]): string
   }).join('\n\n');
 }
 
-function truncateToEstimatedTokens(text: string, maxTokens: number): string {
-  let used = 0;
-  let result = '';
-  for (const character of text) {
-    const cost = character.codePointAt(0)! <= 0x7f ? 0.25 : character.length > 1 ? 2 : 1;
-    if (used + cost > maxTokens) break;
-    result += character;
-    used += cost;
-  }
-  return result.trim();
-}
-
-function deterministicFallbackSummary(messages: readonly AgentMessage[]): string {
-  const snippets = messages.flatMap((message) => {
-    if (message.role === 'tool') return [];
-    const content = (message.content ?? '').replace(/\s+/g, ' ').trim();
-    if (!content) return [];
-    const role = message.role === 'user' ? 'User' : message.role === 'assistant' ? 'Assistant' : 'System';
-    return [`- ${role}: ${content.slice(0, 700)}`];
-  });
-  return [
-    'Automatic semantic summarization was unavailable. The following bounded excerpts preserve earlier intent; full history remains in the local conversation log.',
-    ...snippets,
-  ].join('\n');
-}
-
 export async function compressContextIfNeeded(
   inputMessages: readonly AgentMessage[],
   contextWindowTokens: number,
@@ -431,27 +410,26 @@ export async function compressContextIfNeeded(
     return { messages, beforeTokens, afterTokens: beforeTokens, compressed: false, rewritten };
   }
 
-  let summary: string;
+  const previousSummaries = structuredSummariesFromMessages(older);
+  let structuredSummary;
   try {
-    summary = (await summarize(serializedMessagesForSummary(older))).trim();
+    const candidate = parseStructuredContextSummary(
+      (await summarize(serializedMessagesForSummary(older))).trim(),
+    );
+    structuredSummary = mergeStructuredContextSummaries(candidate, previousSummaries);
   } catch (error) {
     if (options.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
       throw error;
     }
-    summary = deterministicFallbackSummary(older);
+    structuredSummary = deterministicStructuredContextSummary(older);
   }
-  if (!summary) summary = deterministicFallbackSummary(older);
-  const maxSummaryTokens = Math.max(
-    MIN_SUMMARY_TOKENS,
-    Math.min(MAX_SUMMARY_TOKENS, Math.floor(normalizedWindow * 0.06)),
-  );
-  summary = truncateToEstimatedTokens(summary, maxSummaryTokens);
+  const summary = serializeStructuredContextSummary(structuredSummary);
   const lastCompressedAt = options.now?.() ?? new Date().toISOString();
   const compacted: AgentMessage[] = [
     ...systemMessages,
     {
       role: 'assistant',
-      content: `${SUMMARY_MESSAGE_PREFIX}${summary}`,
+      content: `${STRUCTURED_SUMMARY_PREFIX}${summary}`,
       contextSummary: true,
     },
     ...recent,

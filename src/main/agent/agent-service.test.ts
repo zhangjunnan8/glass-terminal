@@ -542,6 +542,7 @@ class FakeSessions {
   readonly audits: Array<{ type: string; details?: Record<string, unknown> }> = [];
   readonly threadEvents: Array<Record<string, unknown>> = [];
   persistedThreadEvents: Array<Record<string, unknown>> = [];
+  persistedMemories: unknown = [];
   readonly failAuditTypes = new Set<string>();
   failThreadEvents = false;
   persistedThreadId?: string;
@@ -611,6 +612,17 @@ class FakeSessions {
     return this.persistedThreadId && this.persistedThreadId !== threadId
       ? []
       : this.persistedThreadEvents;
+  }
+  readThreadMemories(_sessionId: string, threadId: string) {
+    return this.persistedThreadId && this.persistedThreadId !== threadId
+      ? []
+      : structuredClone(this.persistedMemories);
+  }
+  writeThreadMemories(_sessionId: string, threadId: string, memories: unknown) {
+    if (this.persistedThreadId && this.persistedThreadId !== threadId) {
+      throw new Error('stale memory thread');
+    }
+    this.persistedMemories = structuredClone(memories);
   }
   appendThreadEvent(_sessionId: string, _threadId: string, event: Record<string, unknown>) {
     if (this.failThreadEvents) throw new Error('thread persistence failed');
@@ -1027,6 +1039,65 @@ async function startActivityHarness(prompt = 'Inspect the workspace.') {
 }
 
 describe('AgentService shared-terminal controls', () => {
+  it('persists reviewed memories, restores them, and injects them independently on later turns', async () => {
+    const backend = new RecordingBackend();
+    const terminals = new FakeTerminals();
+    const sessions = new FakeSessions();
+    const owner = browserOwner();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      () => backend,
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Never push this repository.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    const sourceId = service.getState(owner, 'terminal')!.messages
+      .find((message) => message.role === 'user')!.id;
+    const saved = service.saveMemory(owner, {
+      terminalId: 'terminal',
+      category: 'constraint',
+      content: 'Never push this repository.',
+      sourceMessageIds: [sourceId],
+    });
+
+    expect(saved.memories).toHaveLength(1);
+    expect(sessions.persistedMemories).toEqual(saved.memories);
+    expect(() => service.saveMemory(owner, {
+      terminalId: 'terminal',
+      category: 'artifact',
+      content: 'api_key=super-secret-value',
+    })).toThrow(/不能 Pin/u);
+    expect(JSON.stringify(sessions.persistedMemories)).not.toContain('super-secret-value');
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Continue.' });
+    await waitFor(() => backend.sendInputs.length === 2);
+    expect(backend.sendInputs[1]!.persistentMemories).toEqual(saved.memories);
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    const restoredService = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      () => new RecordingBackend(),
+    );
+    expect(restoredService.getState(owner, 'terminal')?.memories).toEqual(saved.memories);
+
+    const removed = service.removeMemory(owner, {
+      terminalId: 'terminal',
+      memoryId: saved.memories![0]!.id,
+    });
+    expect(removed.memories).toEqual([]);
+    expect(sessions.persistedMemories).toEqual([]);
+    restoredService.close();
+    service.close();
+  });
+
   it('does not let a stale create resolution replace the backend selected after takeover', async () => {
     const backendA = new DeferredCreateBackend();
     const backendB = new DeferredCreateBackend();

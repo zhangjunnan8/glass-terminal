@@ -362,6 +362,14 @@ export class SessionManager {
     return this.store.readThreadEvents(sessionId, threadId);
   }
 
+  readThreadMemories(sessionId: string, threadId: string): unknown {
+    return this.store.readThreadMemories(sessionId, threadId);
+  }
+
+  writeThreadMemories(sessionId: string, threadId: string, memories: unknown): void {
+    this.store.writeThreadMemories(sessionId, threadId, memories);
+  }
+
   appendAudit(
     sessionId: string,
     type: SessionAuditEvent['type'],

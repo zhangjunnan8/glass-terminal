@@ -26,6 +26,8 @@ import type {
   SetFullTakeoverRequest,
   SetFullTakeoverPreferenceRequest,
   SetAgentFileAccessRequest,
+  SaveAgentMemoryRequest,
+  RemoveAgentMemoryRequest,
   TakeoverRequest,
   TerminalInputMode,
 } from '../../shared/agent';
@@ -63,6 +65,13 @@ import {
 import { AgentFileWorkspaceAdapter } from '../tools/agent-file-workspace-adapter';
 import { agentContextUsage } from './context-window';
 import { agentToolDefinitionsForAccess } from './agent-tool-definitions';
+import type { AgentMemoryCard } from '../../shared/agent-memory';
+import {
+  agentMemorySystemMessage,
+  parseAgentMemoryCards,
+  removeAgentMemoryCard,
+  saveAgentMemoryCard,
+} from './agent-memory';
 
 interface ApprovalResolution {
   decision: 'execute' | 'edit' | 'reject';
@@ -77,6 +86,7 @@ interface AgentRuntimeRecord extends AgentSessionView {
   providerFingerprint?: string;
   providerReady?: boolean;
   providerConversationResetPending?: boolean;
+  memories: AgentMemoryCard[];
   priorMessages: AgentMessage[];
   harnessBackend?: AgentBackend;
   harnessThread?: AgentBackendThread;
@@ -332,6 +342,10 @@ function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
     fileAccessPolicy: cloneFileAccessPolicy(runtime.fileAccessPolicy),
     fileAccessRoot: runtime.fileAccessRoot,
     messages: runtime.messages.map((message) => ({ ...message })),
+    memories: runtime.memories.map((memory) => ({
+      ...memory,
+      sourceMessageIds: [...memory.sourceMessageIds],
+    })),
     activities: runtime.activities.map((activity) => ({ ...activity })),
     contextUsage: runtime.contextUsage ? { ...runtime.contextUsage } : undefined,
     streamingMessageId: runtime.streamingMessageId,
@@ -745,6 +759,44 @@ export class AgentService {
       runtime = this.ensureRuntime(owner, terminalId, persistedBackend);
     }
     if (runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
+    return this.cloneRuntime(runtime);
+  }
+
+  saveMemory(owner: WebContents, request: SaveAgentMemoryRequest): AgentSessionView {
+    const runtime = this.requireOwned(owner, request.terminalId);
+    if (runtime.backend.kind !== 'generic-provider') {
+      throw new Error('上下文记忆卡片仅用于 Generic Provider 会话。');
+    }
+    if (BUSY_STATES.has(runtime.state) || runtime.backendTurnDraining) {
+      throw new Error('智能体运行时不能修改上下文记忆。');
+    }
+    const next = saveAgentMemoryCard(
+      runtime.memories,
+      request,
+      new Set(runtime.messages.map((message) => message.id)),
+    );
+    this.sessions.writeThreadMemories(runtime.sessionId, runtime.threadId, next);
+    runtime.memories = next;
+    runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
+    runtime.error = undefined;
+    this.emit(runtime);
+    return this.cloneRuntime(runtime);
+  }
+
+  removeMemory(owner: WebContents, request: RemoveAgentMemoryRequest): AgentSessionView {
+    const runtime = this.requireOwned(owner, request.terminalId);
+    if (runtime.backend.kind !== 'generic-provider') {
+      throw new Error('上下文记忆卡片仅用于 Generic Provider 会话。');
+    }
+    if (BUSY_STATES.has(runtime.state) || runtime.backendTurnDraining) {
+      throw new Error('智能体运行时不能修改上下文记忆。');
+    }
+    const next = removeAgentMemoryCard(runtime.memories, request.memoryId);
+    this.sessions.writeThreadMemories(runtime.sessionId, runtime.threadId, next);
+    runtime.memories = next;
+    runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
+    runtime.error = undefined;
+    this.emit(runtime);
     return this.cloneRuntime(runtime);
   }
 
@@ -1530,6 +1582,10 @@ export class AgentService {
         prompt,
         systemPrompt,
         terminalContext,
+        persistentMemories: runtime.memories.map((memory) => ({
+          ...memory,
+          sourceMessageIds: [...memory.sourceMessageIds],
+        })),
         fileAccessMode: runtime.fileAccessMode,
         gateway,
         maxRounds,
@@ -2086,6 +2142,10 @@ export class AgentService {
     }
     const persisted = this.sessions.readThreadEvents(session.id, threadId);
     const replayed = replayConversation(persisted, session.providerThreadId);
+    const memories = parseAgentMemoryCards(
+      this.sessions.readThreadMemories(session.id, threadId),
+    );
+    const memoryMessage = agentMemorySystemMessage(memories);
     const runtime: AgentRuntimeRecord = {
       revision: this.revisionCounters.get(terminalId) ?? 0,
       owner,
@@ -2112,11 +2172,12 @@ export class AgentService {
       providerConversationResetPending: backend.kind === 'generic-provider'
         && currentProvider?.fingerprint === undefined,
       messages: replayed.messages,
+      memories,
       activities: [],
       priorMessages: replayed.priorMessages,
       contextUsage: backend.kind === 'generic-provider'
         ? agentContextUsage(
-          replayed.priorMessages,
+          memoryMessage ? [memoryMessage, ...replayed.priorMessages] : replayed.priorMessages,
           currentProvider?.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
           'ready',
           undefined,
@@ -2177,7 +2238,7 @@ export class AgentService {
   private contextUsageFor(
     runtime: Pick<
       AgentRuntimeRecord,
-      'backend' | 'fileAccessMode' | 'fileAccessPolicy' | 'fileAccessRoot' | 'contextUsage'
+      'backend' | 'fileAccessMode' | 'fileAccessPolicy' | 'fileAccessRoot' | 'contextUsage' | 'memories'
     >,
     messages: readonly AgentMessage[],
   ): AgentContextUsage | undefined {
@@ -2193,8 +2254,9 @@ export class AgentService {
       // A deleted/unready Provider retains a bounded display estimate only.
     }
     const workspaceEnabled = runtime.fileAccessMode !== 'off' && Boolean(runtime.fileAccessRoot);
+    const memoryMessage = agentMemorySystemMessage(runtime.memories);
     return agentContextUsage(
-      messages,
+      memoryMessage ? [memoryMessage, ...messages] : messages,
       contextWindowTokens,
       'ready',
       runtime.contextUsage?.lastCompressedAt,

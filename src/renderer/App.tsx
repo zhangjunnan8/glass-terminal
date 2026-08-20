@@ -26,6 +26,10 @@ import {
   CODEX_APP_SERVER_AGENT_BACKEND,
   CODEX_APP_SERVER_AGENT_POLICY_VERSION,
 } from '../shared/agent';
+import {
+  containsObviousAgentSecret,
+  type AgentMemoryCategory,
+} from '../shared/agent-memory';
 import type {
   AgentAssistantDelta,
   AgentBackendRef,
@@ -40,6 +44,10 @@ import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
 import { AgentActivityCard } from './components/AgentActivityCard';
 import { AgentContextMeter } from './components/AgentContextMeter';
+import {
+  AgentMemoryPanel,
+  type AgentMemoryDraftSource,
+} from './components/AgentMemoryPanel';
 import { ToolActivityList } from './components/ToolActivityList';
 import {
   isAgentOutputNearBottom,
@@ -244,6 +252,7 @@ export function App() {
   const [editingAgentMessageId, setEditingAgentMessageId] = useState<string | null>(null);
   const [editingAgentTerminalId, setEditingAgentTerminalId] = useState<string | null>(null);
   const [agentMessageActionPending, setAgentMessageActionPending] = useState<string | null>(null);
+  const [agentMemoryDraftSource, setAgentMemoryDraftSource] = useState<AgentMemoryDraftSource | null>(null);
   const [editedApprovalCommand, setEditedApprovalCommand] = useState('');
   const [editingHost, setEditingHost] = useState<HostProfile | null | undefined>(undefined);
   const [editingHostProtocol, setEditingHostProtocol] = useState<HostProtocol>('ssh');
@@ -965,6 +974,41 @@ export function App() {
       composer?.focus();
       composer?.setSelectionRange(composer.value.length, composer.value.length);
     });
+  }
+
+  async function saveAgentMemory(input: {
+    memoryId?: string;
+    category: AgentMemoryCategory;
+    content: string;
+    sourceMessageIds: string[];
+    mergeMemoryIds: string[];
+  }): Promise<void> {
+    if (!activeTab) throw new Error('当前没有可用终端。');
+    if (containsObviousAgentSecret(input.content)) {
+      throw new Error('检测到明显凭据；上下文记忆未发送。');
+    }
+    const state = await window.aiTerminal.agent.saveMemory({
+      terminalId: activeTab.id,
+      ...input,
+    });
+    installAgentSnapshot(state);
+  }
+
+  async function removeAgentMemory(memoryId: string): Promise<void> {
+    if (!activeTab) throw new Error('当前没有可用终端。');
+    const state = await window.aiTerminal.agent.removeMemory({
+      terminalId: activeTab.id,
+      memoryId,
+    });
+    installAgentSnapshot(state);
+  }
+
+  function locateAgentMemorySource(sourceMessageId: string): void {
+    const source = [...(agentBodyRef.current?.querySelectorAll<HTMLElement>(
+      '[data-agent-message-id]',
+    ) ?? [])].find((element) => element.dataset.agentMessageId === sourceMessageId);
+    source?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    source?.focus({ preventScroll: true });
   }
 
   async function resolveAgentApproval(decision: 'execute' | 'edit' | 'reject') {
@@ -2261,12 +2305,28 @@ export function App() {
           </div>
           {agentControlsExpanded && !codexBackendSelected && (
             <div className="agent-controls">
-              <AgentContextMeter
-                usage={selectedGenericBackendMatchesActive
-                  ? activeAgent?.contextUsage
-                  : undefined}
-                contextWindowTokens={selectedGenericProvider?.contextWindowTokens}
-              />
+              <div className="agent-context-and-memory">
+                <AgentContextMeter
+                  usage={selectedGenericBackendMatchesActive
+                    ? activeAgent?.contextUsage
+                    : undefined}
+                  contextWindowTokens={selectedGenericProvider?.contextWindowTokens}
+                />
+                <AgentMemoryPanel
+                  memories={selectedGenericBackendMatchesActive
+                    ? activeAgent?.memories ?? []
+                    : []}
+                  messages={selectedGenericBackendMatchesActive
+                    ? activeAgent?.messages ?? []
+                    : []}
+                  disabled={!activeTab || composerBlocked || !selectedGenericBackendMatchesActive}
+                  draftSource={agentMemoryDraftSource}
+                  onDraftConsumed={() => setAgentMemoryDraftSource(null)}
+                  onSave={saveAgentMemory}
+                  onRemove={removeAgentMemory}
+                  onLocate={locateAgentMemorySource}
+                />
+              </div>
               <label
                 className="agent-file-access-picker"
                 title={activeWorkspaceRoot
@@ -2469,7 +2529,12 @@ export function App() {
               ? activeActivities.filter((activity) => activity.turnId === message.id)
               : [];
             return (
-            <article className={`agent-message ${message.role}`} key={message.id}>
+            <article
+              className={`agent-message ${message.role}`}
+              key={message.id}
+              data-agent-message-id={message.id}
+              tabIndex={-1}
+            >
               <span className="agent-message-role">
                 {roleLabel(message.role)}
                 <time className="agent-message-time">{formatClock(message.createdAt)}</time>
@@ -2484,6 +2549,25 @@ export function App() {
                   streaming={activeAgent.streamingMessageId === message.id}
                 />
               </Suspense>
+              {!codexBackendSelected && (
+                <div className="agent-message-memory-action">
+                  <button
+                    type="button"
+                    data-action="pin-agent-memory"
+                    disabled={
+                      composerBlocked
+                      || containsObviousAgentSecret(message.content)
+                    }
+                    title={containsObviousAgentSecret(message.content)
+                      ? '检测到明显凭据，不能 Pin 到上下文记忆'
+                      : '提炼为一张有界上下文记忆卡片'}
+                    onClick={() => setAgentMemoryDraftSource({
+                      id: message.id,
+                      content: message.content,
+                    })}
+                  >记住</button>
+                </div>
+              )}
               {turnActivities.length > 0 && (
                 <ToolActivityList
                   activities={turnActivities}

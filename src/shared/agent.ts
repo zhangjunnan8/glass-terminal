@@ -1,3 +1,9 @@
+import type {
+  AgentMemoryCard,
+  RemoveAgentMemoryRequest,
+  SaveAgentMemoryRequest,
+} from './agent-memory';
+
 export type AgentRuntimeState =
   | 'USER_CONTROL'
   | 'THINKING'
@@ -152,6 +158,8 @@ export interface AgentSessionView {
   /** Canonical explicit Session Workspace Root captured when file access was enabled. */
   fileAccessRoot?: string;
   messages: AgentChatItem[];
+  /** User-reviewed, bounded memories injected independently of summaries. */
+  memories?: AgentMemoryCard[];
   /** Bounded, metadata-only summaries of recent tool use. */
   activities: AgentToolActivity[];
   /** Present for Generic Provider sessions; Codex owns its context internally. */
@@ -265,6 +273,8 @@ export const AGENT_CHANNELS = {
   sendPrompt: 'agent:send-prompt',
   interruptTurn: 'agent:interrupt-turn',
   revisePrompt: 'agent:revise-prompt',
+  saveMemory: 'agent:save-memory',
+  removeMemory: 'agent:remove-memory',
   getState: 'agent:get-state',
   resolveApproval: 'agent:resolve-approval',
   setFullTakeover: 'agent:set-full-takeover',
@@ -276,3 +286,5 @@ export const AGENT_CHANNELS = {
   stateChanged: 'agent:state-changed',
   assistantDelta: 'agent:assistant-delta',
 } as const;
+
+export type { AgentMemoryCard, RemoveAgentMemoryRequest, SaveAgentMemoryRequest };

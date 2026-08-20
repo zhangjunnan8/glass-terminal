@@ -43,8 +43,10 @@ import type {
   InterruptAgentTurnRequest,
   ResolveApprovalRequest,
   ResolveTakeoverRequest,
+  RemoveAgentMemoryRequest,
   ReviseAgentPromptRequest,
   SendAgentPromptRequest,
+  SaveAgentMemoryRequest,
   SetAgentFileAccessRequest,
   SetFullTakeoverRequest,
   SetFullTakeoverPreferenceRequest,
@@ -821,6 +823,14 @@ handleTrusted(AGENT_CHANNELS.interruptTurn, (event, request: InterruptAgentTurnR
 handleTrusted(AGENT_CHANNELS.revisePrompt, (event, request: ReviseAgentPromptRequest) => {
   if (!agentService) throw new Error('Agent service is not ready.');
   return agentService.revisePrompt(event.sender, request);
+});
+handleTrusted(AGENT_CHANNELS.saveMemory, (event, request: SaveAgentMemoryRequest) => {
+  if (!agentService) throw new Error('Agent service is not ready.');
+  return agentService.saveMemory(event.sender, request);
+});
+handleTrusted(AGENT_CHANNELS.removeMemory, (event, request: RemoveAgentMemoryRequest) => {
+  if (!agentService) throw new Error('Agent service is not ready.');
+  return agentService.removeMemory(event.sender, request);
 });
 handleTrusted(AGENT_CHANNELS.getState, (event, terminalId: string) => {
   if (!agentService) throw new Error('Agent service is not ready.');

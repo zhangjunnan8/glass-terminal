@@ -164,6 +164,8 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       sendPrompt: vi.fn(),
       interruptTurn: vi.fn(),
       revisePrompt: vi.fn(),
+      saveMemory: vi.fn(),
+      removeMemory: vi.fn(),
       getState: vi.fn().mockResolvedValue(undefined),
       setFileAccess: vi.fn(),
       resolveApproval: vi.fn(),

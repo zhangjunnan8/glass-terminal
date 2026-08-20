@@ -92,15 +92,21 @@ async function startToolCaptureServer(): Promise<{
   server: Server;
   getTools: () => string[];
   getDefinitions: () => AgentFunctionToolDefinition[];
+  getMessages: () => unknown[];
 }> {
   let capturedDefinitions: AgentFunctionToolDefinition[] = [];
+  let capturedMessages: unknown[] = [];
   const server = createServer((request, response) => {
     let body = '';
     request.setEncoding('utf8');
     request.on('data', (chunk) => { body += chunk; });
     request.on('end', () => {
-      const parsed = JSON.parse(body) as { tools?: AgentFunctionToolDefinition[] };
+      const parsed = JSON.parse(body) as {
+        tools?: AgentFunctionToolDefinition[];
+        messages?: unknown[];
+      };
       capturedDefinitions = parsed.tools ?? [];
+      capturedMessages = parsed.messages ?? [];
       response.writeHead(200, { 'content-type': 'text/event-stream; charset=utf-8' });
       response.write(`data: ${JSON.stringify({
         choices: [{ index: 0, delta: { content: 'done' }, finish_reason: null }],
@@ -122,6 +128,7 @@ async function startToolCaptureServer(): Promise<{
     server,
     getTools: () => capturedDefinitions.map((entry) => entry.function.name),
     getDefinitions: () => structuredClone(capturedDefinitions),
+    getMessages: () => structuredClone(capturedMessages),
   };
 }
 
@@ -219,15 +226,17 @@ describe('LangChainBackend workspace tool gating', () => {
         maxRetries: 0,
         configuration: { baseURL: capture.baseUrl },
       });
-      const summarize = vi.fn(async () => '- Goal: continue the retained coding task.');
+      const summarize = vi.fn()
+        .mockResolvedValueOnce('invalid summary')
+        .mockRejectedValueOnce(new Error('provider summary unavailable'));
       const backend = new LangChainBackend({
         modelFactory: () => Promise.resolve(model),
         contextWindowTokens: 8_192,
         summarize,
       });
       const priorMessages: AgentMessage[] = [];
-      for (let turn = 1; turn <= 5; turn += 1) {
-        priorMessages.push({ role: 'user', content: `old-turn-${turn}:` + '汉'.repeat(1_700) });
+      for (let turn = 1; turn <= 7; turn += 1) {
+        priorMessages.push({ role: 'user', content: `old-turn-${turn}:` + '汉'.repeat(900) });
         priorMessages.push({ role: 'assistant', content: `old-answer-${turn}` });
       }
       const thread = await backend.resume({ id: 'context-resume', priorMessages });
@@ -238,13 +247,22 @@ describe('LangChainBackend workspace tool gating', () => {
         prompt: 'Current request.',
         systemPrompt: 'System policy.',
         terminalContext: '',
+        persistentMemories: [{
+          id: '00000000-0000-4000-8000-000000000011',
+          category: 'constraint',
+          content: 'PINNED-MEMORY-CANARY: never push.',
+          sourceMessageIds: [],
+          pinSource: 'user-created',
+          createdAt: '2026-08-21T00:00:00.000Z',
+          updatedAt: '2026-08-21T00:00:00.000Z',
+        }],
         fileAccessMode: 'off',
         gateway: buildGateway('off'),
         signal: new AbortController().signal,
         onEvent: (event) => events.push(event),
       });
 
-      expect(summarize).toHaveBeenCalledOnce();
+      expect(summarize).toHaveBeenCalledTimes(2);
       expect(events.some((event) => (
         event.type === 'context_status' && event.contextUsage?.status === 'compressing'
       ))).toBe(true);
@@ -254,6 +272,8 @@ describe('LangChainBackend workspace tool gating', () => {
       expect(JSON.stringify(result.contextPersistence?.messages)).not.toContain('old-turn-1:');
       expect(JSON.stringify(result.contextPersistence?.messages)).toContain('automatic context summary');
       expect(JSON.stringify(result.contextPersistence?.messages)).toContain('Current request.');
+      expect(JSON.stringify(capture.getMessages())).toContain('PINNED-MEMORY-CANARY');
+      expect(JSON.stringify(result.contextPersistence?.messages)).not.toContain('PINNED-MEMORY-CANARY');
     } finally {
       await new Promise<void>((resolve) => capture.server.close(() => resolve()));
     }

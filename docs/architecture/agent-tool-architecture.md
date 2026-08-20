@@ -149,11 +149,20 @@ It replaces the in-house `AgentLoop` while keeping every boundary below it intac
   compression threshold (85% of the configured model window), leaving output and
   tool-call headroom rather than waiting for a Provider overflow.
 - At that threshold, the selected Provider model summarizes older working history
-  under a separate prompt that treats the transcript as untrusted data. The latest
-  user request and recent complete assistant-tool-result groups remain verbatim.
-  If semantic summarization fails, a bounded deterministic fallback keeps the turn
-  usable; cancellation is never swallowed by that fallback. Visible chat and the
-  append-only audit/history remain intact.
+  into a fixed JSON schema under a separate prompt that treats the transcript as
+  untrusted data. Schema, field sizes, apparent credentials, and durable-field
+  preservation are checked locally. Invalid output is retried exactly once, then
+  a bounded deterministic fallback keeps the turn usable; cancellation is never
+  swallowed. Later summaries merge constraints, decisions, and pending work so a
+  model omission alone cannot delete them. The latest user request and recent
+  complete assistant-tool-result groups remain verbatim.
+- User-reviewed context memory cards are persisted separately from transcript
+  checkpoints and injected as a dedicated system data block on every Generic turn.
+  Cards retain category, source message IDs, timestamps, and pin provenance; the UI
+  supports review, source location, edit/merge, and unpin. Limits of 32 cards,
+  800 characters per card, and 4,096 estimated tokens keep this memory bounded.
+  Apparent credentials are rejected before IPC and again before persistence.
+  Visible chat and append-only audit/history remain intact.
 - The same conservative estimate is a hard Provider-request gate. It explicitly
   reserves the final 15% of the model window for output, rejects an
   incompressible current prompt locally with estimated/allowed token counts, and
@@ -172,9 +181,9 @@ It replaces the in-house `AgentLoop` while keeping every boundary below it intac
   still replayed as checkpoints, so existing conversations remain readable.
 - The harness owns no PTY, SSH, SFTP, or filesystem client; those remain under
   `TerminalService` and `AgentFileService`, reachable only through `ToolGateway`.
-- One Generic harness turn is bounded to 40 rounds by default (constructor range
-  1–64, hard cap 64), replacing the older 12-round in-house `AgentLoop` cap. The
-  similarly named Settings value is persisted but is not yet wired to production.
+- One Generic harness turn freezes the current Settings round limit when it starts
+  (default 40, range 1–64, hard cap 64). A Settings change affects the next turn
+  without rebuilding or clearing the existing backend thread.
 
 ## Known large-workspace limits
 

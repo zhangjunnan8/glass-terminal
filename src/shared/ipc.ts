@@ -46,8 +46,10 @@ import type {
   InterruptAgentTurnRequest,
   ResolveApprovalRequest,
   ResolveTakeoverRequest,
+  RemoveAgentMemoryRequest,
   ReviseAgentPromptRequest,
   SendAgentPromptRequest,
+  SaveAgentMemoryRequest,
   SetAgentFileAccessRequest,
   SetFullTakeoverRequest,
   SetFullTakeoverPreferenceRequest,
@@ -166,6 +168,8 @@ export interface DesktopBridge {
     sendPrompt(request: SendAgentPromptRequest): Promise<AgentSessionView>;
     interruptTurn(request: InterruptAgentTurnRequest): Promise<AgentSessionView>;
     revisePrompt(request: ReviseAgentPromptRequest): Promise<AgentSessionView>;
+    saveMemory(request: SaveAgentMemoryRequest): Promise<AgentSessionView>;
+    removeMemory(request: RemoveAgentMemoryRequest): Promise<AgentSessionView>;
     getState(terminalId: string): Promise<AgentSessionView | null>;
     setFileAccess(request: SetAgentFileAccessRequest): Promise<AgentSessionView>;
     resolveApproval(request: ResolveApprovalRequest): Promise<AgentSessionView>;

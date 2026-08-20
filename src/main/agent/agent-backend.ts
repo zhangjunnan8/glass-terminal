@@ -1,4 +1,5 @@
 import type { AgentContextUsage, AgentFileAccessMode } from '../../shared/agent';
+import type { AgentMemoryCard } from '../../shared/agent-memory';
 import type { ToolGateway } from '../../shared/tools';
 
 export type AgentMessage =
@@ -64,6 +65,8 @@ export interface SendAgentBackendMessageInput {
   prompt: string;
   systemPrompt: string;
   terminalContext: string;
+  /** Frozen user-reviewed memories for this turn. */
+  persistentMemories?: readonly AgentMemoryCard[];
   fileAccessMode: AgentFileAccessMode;
   /** Frozen per turn by AgentService; changing settings affects the next turn only. */
   maxRounds?: number;
