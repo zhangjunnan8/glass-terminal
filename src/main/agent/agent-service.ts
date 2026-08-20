@@ -41,6 +41,7 @@ import type { CodexVisibleTerminalContext } from '../../shared/codex-app-server'
 import type { SessionAuditEvent, SessionRecord } from '../../shared/session';
 import { SESSION_CHANNELS } from '../../shared/session';
 import type { TerminalCommandResult, WorkspaceBinding } from '../../shared/tools';
+import type { ShellProfile, TerminalDescriptor } from '../../shared/terminal';
 import type { ProviderStore } from '../providers/provider-store';
 import type { SessionManager } from '../sessions/session-manager';
 import type { TerminalHistoryCursor } from '../sessions/session-store';
@@ -74,10 +75,30 @@ import {
   removeAgentMemoryCard,
   saveAgentMemoryCard,
 } from './agent-memory';
+import {
+  classifyAiFileCommand,
+  fileCommandHash,
+  WorkspaceToolPolicyError,
+} from './ai-file-command-policy';
 
 interface ApprovalResolution {
   decision: 'execute' | 'edit' | 'reject';
   command: string;
+}
+
+interface FileCommandExceptionBinding {
+  approvalId: string;
+  commandHash: string;
+  shellKind: ShellProfile['kind'];
+  sessionId: string;
+  threadId: string;
+  terminalId: string;
+  hostId?: string;
+  workspaceRoot?: string;
+  sessionWorkspaceRoot?: string;
+  fileAccessGeneration: number;
+  providerRecipient: string;
+  turnToken: number;
 }
 
 interface AgentRuntimeRecord extends AgentSessionView {
@@ -100,6 +121,8 @@ interface AgentRuntimeRecord extends AgentSessionView {
   authHandoff?: Promise<void>;
   resolveAuthHandoff?: () => void;
   resolveApproval?: (resolution: ApprovalResolution) => void;
+  fileCommandException?: FileCommandExceptionBinding;
+  fileCommandViolationCounts: Map<string, number>;
   streamEmitTimer?: ReturnType<typeof setTimeout>;
   pendingStreamDelta?: string;
   streamingTurnId?: string;
@@ -391,6 +414,23 @@ Every command must use terminal_execute so it appears in the visible terminal. W
 Do not ask the user to send passwords, API keys, passphrases, OTPs, or other credentials through chat. Authentication is entered by the user directly in the visible terminal.
 Commands require explicit user approval unless the UI reports that Full Takeover is active.`;
 
+function shellFilePolicySystemPrompt(
+  shellKind: ShellProfile['kind'],
+  workspaceToolsEnabled: boolean,
+): string {
+  const examples = shellKind === 'powershell'
+    ? 'Get-Content/gc/cat/type, Select-String/sls, Get-ChildItem/gci/dir/ls, Get-Item, or Test-Path'
+    : shellKind === 'cmd'
+      ? 'type/more, find/findstr, dir, or IF EXIST'
+      : 'cat/head/tail/more/less, grep/rg, ls/find, stat, or test';
+  return `Current visible shell: ${shellKind}. `
+    + (workspaceToolsEnabled
+      ? `Do not use ${examples} for filesystem discovery or reading; use the matching authorized workspace_* tool. `
+      : `Workspace file tools are currently unavailable; filesystem commands such as ${examples} require an exact one-time bypass approval. `)
+    + 'Glass enforces this routing before normal command approval and Full Takeover. '
+    + 'Full Takeover never bypasses it. Do not retry a rejected file command; call the suggested workspace tool instead.';
+}
+
 const SESSION_TITLE_SYSTEM_PROMPT = '你是会话命名助手。根据用户的第一个请求，生成一个简短的中文会话标题（不超过 12 个字符）。只输出标题本身，不要引号、标点、前缀或解释。';
 
 function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
@@ -419,7 +459,16 @@ function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
     streamingTurnId: runtime.streamingTurnId,
     streamingSequence: runtime.streamingSequence,
     backendTurnDraining: runtime.backendTurnDraining,
-    pendingApproval: runtime.pendingApproval ? { ...runtime.pendingApproval } : undefined,
+    pendingApproval: runtime.pendingApproval ? {
+      ...runtime.pendingApproval,
+      ...(runtime.pendingApproval.fileCommandPolicy ? {
+        fileCommandPolicy: {
+          ...runtime.pendingApproval.fileCommandPolicy,
+          categories: [...runtime.pendingApproval.fileCommandPolicy.categories],
+          suggestedTools: [...runtime.pendingApproval.fileCommandPolicy.suggestedTools],
+        },
+      } : {}),
+    } : undefined,
     authRequest: runtime.authRequest ? { ...runtime.authRequest } : undefined,
     pendingTakeover: runtime.pendingTakeover ? { ...runtime.pendingTakeover } : undefined,
     activeExecution: runtime.activeExecution ? { ...runtime.activeExecution } : undefined,
@@ -1054,6 +1103,37 @@ export class AgentService {
     if (!approval || approval.id !== request.approvalId || !runtime.resolveApproval) {
       throw new Error('Command approval is no longer pending.');
     }
+    const exceptionBinding = approval.kind === 'workspace-tool-bypass'
+      ? runtime.fileCommandException
+      : undefined;
+    if (
+      approval.kind === 'workspace-tool-bypass'
+      && request.decision !== 'reject'
+      && (
+        !exceptionBinding
+        || !this.fileCommandExceptionIsLive(runtime, exceptionBinding)
+        || (request.decision === 'execute'
+          && fileCommandHash(approval.command) !== exceptionBinding.commandHash)
+      )
+    ) {
+      const resolve = runtime.resolveApproval;
+      runtime.resolveApproval = undefined;
+      runtime.fileCommandException = undefined;
+      runtime.pendingApproval = {
+        ...approval,
+        status: 'rejected',
+        resolvedAt: new Date().toISOString(),
+      };
+      this.appendControlAudit(runtime, 'file_command_policy', 'system', {
+        action: 'exception_approval_invalidated',
+        approvalId: approval.id,
+        reason: 'authority_binding_changed',
+      });
+      this.setLockedState(runtime, 'THINKING');
+      this.emit(runtime);
+      resolve({ decision: 'reject', command: '' });
+      throw new Error('文件工具绕过审批的终端、权限或 Provider 绑定已变化，请重新请求。');
+    }
     const command = request.decision === 'edit'
       ? request.editedCommand?.trim() ?? ''
       : approval.command;
@@ -1067,6 +1147,17 @@ export class AgentService {
         : request.decision === 'edit' ? 'edited' : 'approved',
       resolvedAt,
     };
+    if (approval.kind === 'workspace-tool-bypass') {
+      this.sessions.appendAudit(runtime.sessionId, 'file_command_policy', 'user', {
+        action: request.decision === 'reject'
+          ? 'exception_rejected'
+          : request.decision === 'edit' ? 'exception_edited_and_approved' : 'exception_approved',
+        approvalId: approval.id,
+        originalCommandHash: exceptionBinding?.commandHash ?? fileCommandHash(approval.command),
+        ...(request.decision === 'edit' ? { editedCommandHash: fileCommandHash(command) } : {}),
+        exactOneTime: true,
+      });
+    }
     if (request.decision === 'reject') {
       this.sessions.appendAudit(runtime.sessionId, 'command_rejected', 'user', {
         approvalId: approval.id,
@@ -1089,6 +1180,7 @@ export class AgentService {
     }
     const resolve = runtime.resolveApproval;
     runtime.resolveApproval = undefined;
+    runtime.fileCommandException = undefined;
     this.emit(runtime);
     resolve({ decision: request.decision, command });
     return this.cloneRuntime(runtime);
@@ -1134,6 +1226,9 @@ export class AgentService {
         || !runtime.resolveApproval
       ) {
         throw new Error('Full Takeover approval is no longer pending.');
+      }
+      if (approval.kind === 'workspace-tool-bypass') {
+        throw new Error('文件工具绕过只能逐次明确批准，不能通过 Full Takeover 执行。');
       }
       const editedCommand = request.editedCommand?.trim();
       const decision = request.editedCommand === undefined || editedCommand === approval.command
@@ -1281,6 +1376,7 @@ export class AgentService {
     const resolveApproval = runtime.resolveApproval;
     runtime.resolveApproval = undefined;
     runtime.pendingApproval = undefined;
+    runtime.fileCommandException = undefined;
     resolveApproval?.({ decision: 'reject', command: '' });
     this.resolveAuth(runtime);
 
@@ -1568,9 +1664,10 @@ export class AgentService {
         workspace,
         runtime.fileAccessPolicy,
       );
+      const terminalDescriptor = this.terminals.descriptor(runtime.owner, runtime.terminalId);
       const toolContext = buildSessionToolContext(
         { ...boundSession, ...(workspace ? { workspace } : {}) },
-        this.terminals.descriptor(runtime.owner, runtime.terminalId),
+        terminalDescriptor,
         { workspacePermissions: fileToolPermissions },
       );
       const terminalTool = new SharedTerminalTool({
@@ -1637,15 +1734,19 @@ export class AgentService {
         : runtime.fileAccessMode === 'read-write'
           ? '读写'
           : '完全访问';
+      const shellPolicyPrompt = shellFilePolicySystemPrompt(
+        terminalDescriptor.shellKind,
+        fileToolPermissions.enabled && fileToolPermissions.read,
+      );
       const systemPrompt = workspace && runtime.fileAccessMode !== 'off'
-        ? `${SYSTEM_PROMPT}\n\n当前会话工作区（每轮注入）：\n`
+        ? `${SYSTEM_PROMPT}\n\n${shellPolicyPrompt}\n\n当前会话工作区（每轮注入）：\n`
           + `- Workspace Root: ${workspace.root}\n`
           + `- 文件访问模式: ${fileAccessModeLabel}\n`
           + 'workspace_* 工具的 path 参数是相对该根的相对路径；'
           + (runtime.fileAccessMode === 'full-access'
             ? '完全访问模式也允许使用绝对路径读取根外文件。'
             : '只有该根内的文件才能用文件工具读写，根外的内容只能经终端命令（仍需审批）。')
-        : SYSTEM_PROMPT;
+        : `${SYSTEM_PROMPT}\n\n${shellPolicyPrompt}`;
       const result = await backend.sendMessage({
         thread,
         prompt,
@@ -1679,6 +1780,7 @@ export class AgentService {
         messages: contextPersistence.messages,
       });
       runtime.pendingApproval = undefined;
+      runtime.fileCommandException = undefined;
       runtime.activeExecution = undefined;
       runtime.streamingMessageId = undefined;
       runtime.activities = settleRunningToolActivities(
@@ -1704,6 +1806,7 @@ export class AgentService {
       runtime.streamingMessageId = undefined;
       this.cancelStreamEmit(runtime);
       runtime.pendingApproval = undefined;
+      runtime.fileCommandException = undefined;
       runtime.activeExecution = undefined;
       runtime.activities = settleRunningToolActivities(
         runtime.activities,
@@ -1867,6 +1970,7 @@ export class AgentService {
         policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
       });
       runtime.pendingApproval = undefined;
+      runtime.fileCommandException = undefined;
       runtime.activeExecution = undefined;
       this.setIndependentCodexState(runtime, 'COMPLETED');
       this.emit(runtime);
@@ -1894,6 +1998,7 @@ export class AgentService {
       const resolveApproval = runtime.resolveApproval;
       runtime.resolveApproval = undefined;
       runtime.pendingApproval = undefined;
+      runtime.fileCommandException = undefined;
       resolveApproval?.({ decision: 'reject', command: '' });
       this.resolveAuth(runtime);
       runtime.error = error instanceof Error ? error.message : String(error);
@@ -1905,12 +2010,97 @@ export class AgentService {
     }
   }
 
+  private fileCommandProviderRecipient(runtime: AgentRuntimeRecord): string {
+    if (runtime.backend.kind !== 'generic-provider') {
+      return `${runtime.backend.kind}:${runtime.backend.policyVersion}`;
+    }
+    const current = this.providerSecurityState(runtime.backend.providerId);
+    return `${runtime.backend.providerId}:${current.fingerprint ?? 'unavailable'}`;
+  }
+
+  private fileCommandExceptionIsLive(
+    runtime: AgentRuntimeRecord,
+    binding: FileCommandExceptionBinding,
+  ): boolean {
+    let descriptor: TerminalDescriptor;
+    let session: SessionRecord | undefined;
+    try {
+      descriptor = this.terminals.descriptor(runtime.owner, runtime.terminalId);
+      session = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
+    } catch {
+      return false;
+    }
+    return Boolean(
+      runtime.pendingApproval?.id === binding.approvalId
+      && runtime.turnToken === binding.turnToken
+      && runtime.sessionId === binding.sessionId
+      && runtime.threadId === binding.threadId
+      && runtime.terminalId === binding.terminalId
+      && descriptor.id === binding.terminalId
+      && descriptor.shellKind === binding.shellKind
+      && descriptor.hostId === binding.hostId
+      && session?.id === binding.sessionId
+      && session.runtimeTerminalId === binding.terminalId
+      && session.workspace?.root === binding.sessionWorkspaceRoot
+      && runtime.fileAccessRoot === binding.workspaceRoot
+      && runtime.fileAccessGeneration === binding.fileAccessGeneration
+      && this.fileCommandProviderRecipient(runtime) === binding.providerRecipient
+    );
+  }
+
   private async requestCommand(
     runtime: AgentRuntimeRecord,
     token: number,
     request: { command: string; reason?: string },
   ): Promise<TerminalCommandResult> {
     if (!this.isCurrentTurn(runtime, token)) throw new Error('Agent turn is no longer active.');
+    const descriptor = this.terminals.descriptor(runtime.owner, runtime.terminalId);
+    const session = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
+    const workspace = runtime.fileAccessRoot
+      ? {
+        backend: descriptor.transport === 'ssh' ? 'sftp' as const : 'local' as const,
+        root: runtime.fileAccessRoot,
+        ...(descriptor.hostId ? { hostId: descriptor.hostId } : {}),
+      }
+      : session?.workspace;
+    const permissions = workspacePermissions(
+      runtime.fileAccessMode,
+      workspace,
+      runtime.fileAccessPolicy,
+    );
+    const filePolicy = classifyAiFileCommand({
+      command: request.command,
+      shellKind: descriptor.shellKind,
+      workspace: permissions,
+    });
+    const commandHash = fileCommandHash(request.command);
+    if (filePolicy.disposition === 'workspace-tool-required') {
+      const violationKey = `${descriptor.shellKind}:${commandHash}`;
+      const retryCount = (runtime.fileCommandViolationCounts.get(violationKey) ?? 0) + 1;
+      runtime.fileCommandViolationCounts.set(violationKey, retryCount);
+      const halted = retryCount >= 3;
+      this.sessions.appendAudit(runtime.sessionId, 'file_command_policy', 'system', {
+        action: 'workspace_tool_required',
+        commandHash,
+        shellKind: descriptor.shellKind,
+        categories: filePolicy.categories,
+        commandNames: filePolicy.commandNames,
+        suggestedTools: filePolicy.suggestedTools,
+        retryCount,
+        halted,
+      });
+      throw new WorkspaceToolPolicyError({
+        ok: false,
+        code: 'WORKSPACE_TOOL_REQUIRED',
+        error: halted
+          ? 'Repeated file-tool bypass attempts stopped this turn.'
+          : 'Use the suggested authorized Workspace tool instead of a terminal filesystem command.',
+        categories: filePolicy.categories,
+        suggestedTools: filePolicy.suggestedTools,
+        retryCount,
+        halted,
+      });
+    }
     const approval: CommandApproval = {
       id: randomUUID(),
       sessionId: runtime.sessionId,
@@ -1919,7 +2109,43 @@ export class AgentService {
       reason: request.reason,
       status: 'waiting',
       requestedAt: new Date().toISOString(),
+      ...(filePolicy.disposition === 'exception-approval' ? {
+        kind: 'workspace-tool-bypass' as const,
+        fileCommandPolicy: {
+          categories: filePolicy.categories,
+          suggestedTools: filePolicy.suggestedTools,
+          reasonCode: filePolicy.reasonCode ?? 'NON_EQUIVALENT_TERMINAL_SEMANTICS',
+        },
+      } : {}),
     };
+    if (filePolicy.disposition === 'exception-approval') {
+      runtime.fileCommandException = {
+        approvalId: approval.id,
+        commandHash,
+        shellKind: descriptor.shellKind,
+        sessionId: runtime.sessionId,
+        threadId: runtime.threadId,
+        terminalId: runtime.terminalId,
+        hostId: descriptor.hostId,
+        workspaceRoot: runtime.fileAccessRoot,
+        sessionWorkspaceRoot: session?.workspace?.root,
+        fileAccessGeneration: runtime.fileAccessGeneration,
+        providerRecipient: this.fileCommandProviderRecipient(runtime),
+        turnToken: token,
+      };
+      this.sessions.appendAudit(runtime.sessionId, 'file_command_policy', 'system', {
+        action: 'exception_approval_requested',
+        approvalId: approval.id,
+        commandHash,
+        shellKind: descriptor.shellKind,
+        categories: filePolicy.categories,
+        commandNames: filePolicy.commandNames,
+        suggestedTools: filePolicy.suggestedTools,
+        reasonCode: filePolicy.reasonCode,
+        fullTakeoverActive: runtime.fullTakeover,
+        exactOneTime: true,
+      });
+    }
     this.sessions.appendAudit(runtime.sessionId, 'command_requested', 'ai', {
       approvalId: approval.id,
       command: approval.command,
@@ -1927,7 +2153,7 @@ export class AgentService {
     });
 
     let resolution: ApprovalResolution;
-    if (runtime.fullTakeover) {
+    if (runtime.fullTakeover && approval.kind !== 'workspace-tool-bypass') {
       resolution = { decision: 'execute', command: approval.command };
       this.sessions.appendAudit(runtime.sessionId, 'command_approved', 'system', {
         approvalId: approval.id,
@@ -1944,6 +2170,7 @@ export class AgentService {
         runtime.resolveApproval = resolve;
       });
       runtime.pendingApproval = undefined;
+      runtime.fileCommandException = undefined;
       if (!this.isCurrentTurn(runtime, token)) throw new Error('Agent turn is no longer active.');
       if (resolution.decision === 'reject') {
         const finishedAt = Date.now();
@@ -2266,6 +2493,7 @@ export class AgentService {
               workspaceAvailable: false,
               workspaceEnabled: false,
               workspaceRead: false,
+              shellKind: session.shellKind,
             }),
             safetyFactor: currentProvider?.contextEstimateSafetyFactor,
           },
@@ -2275,6 +2503,7 @@ export class AgentService {
         ? replayed.providerThreadId
         : undefined,
       turnToken: 0,
+      fileCommandViolationCounts: new Map(),
     };
     this.runtimes.set(terminalId, runtime);
     return runtime;
@@ -2317,7 +2546,8 @@ export class AgentService {
   private contextUsageFor(
     runtime: Pick<
       AgentRuntimeRecord,
-      'backend' | 'fileAccessMode' | 'fileAccessPolicy' | 'fileAccessRoot' | 'contextUsage' | 'memories'
+      'backend' | 'fileAccessMode' | 'fileAccessPolicy' | 'fileAccessRoot' | 'contextUsage'
+      | 'memories' | 'owner' | 'terminalId'
     >,
     messages: readonly AgentMessage[],
   ): AgentContextUsage | undefined {
@@ -2333,6 +2563,12 @@ export class AgentService {
       // A deleted/unready Provider retains a bounded display estimate only.
     }
     const workspaceEnabled = runtime.fileAccessMode !== 'off' && Boolean(runtime.fileAccessRoot);
+    let shellKind: ShellProfile['kind'] | undefined;
+    try {
+      shellKind = this.terminals.descriptor(runtime.owner, runtime.terminalId).shellKind;
+    } catch {
+      // A disconnected terminal has no bound tools; retain a conservative estimate.
+    }
     const memoryMessage = agentMemorySystemMessage(runtime.memories);
     return agentContextUsage(
       memoryMessage ? [memoryMessage, ...messages] : messages,
@@ -2346,6 +2582,7 @@ export class AgentService {
           workspaceAvailable: Boolean(runtime.fileAccessRoot),
           workspaceEnabled,
           workspaceRead: workspaceEnabled && runtime.fileAccessPolicy.read,
+          shellKind,
         }),
         providerReportedInputTokens: runtime.contextUsage?.providerReportedInputTokens,
       },
@@ -2585,6 +2822,7 @@ export class AgentService {
     runtime.resolveApproval?.({ decision: 'reject', command: '' });
     runtime.resolveApproval = undefined;
     runtime.pendingApproval = undefined;
+    runtime.fileCommandException = undefined;
     this.resolveAuth(runtime);
     if (
       runtime.sensitiveLeaseId
@@ -2876,6 +3114,8 @@ export class AgentService {
     prompt: string,
   ): AgentSessionView {
     runtime.turnToken += 1;
+    runtime.fileCommandViolationCounts.clear();
+    runtime.fileCommandException = undefined;
     const token = runtime.turnToken;
     const maxRounds = runtime.backend.kind === 'generic-provider'
       ? this.genericMaxRounds()

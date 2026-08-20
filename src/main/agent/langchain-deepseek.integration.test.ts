@@ -97,7 +97,7 @@ function buildGateway(terminal: TerminalTool, workspace?: WorkspaceTool): ToolGa
   return {
     context: {
       sessionId: 's1',
-      terminal: { type: 'local', terminalId: 't1' },
+      terminal: { type: 'local', terminalId: 't1', shellKind: 'posix' },
       ...(workspaceEnabled ? { workspace: { backend: 'local' as const, root: '/' } } : {}),
       permissions: {
         terminal: { read: true, execute: true, sendInput: false, interrupt: true },

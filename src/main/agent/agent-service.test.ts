@@ -186,7 +186,11 @@ class ScriptedLoopBackend implements AgentBackend {
             result = await this.executeTool(input.gateway, call, input.fileAccessMode);
           } catch (error) {
             throwIfScriptedTurnCancelled(controller.signal);
-            result = JSON.stringify({ ok: false, error: (error as Error).message });
+            result = JSON.stringify(
+              error && typeof error === 'object' && 'toolResult' in error
+                ? (error as { toolResult: unknown }).toolResult
+                : { ok: false, error: (error as Error).message },
+            );
           }
           throwIfScriptedTurnCancelled(controller.signal);
           messages.push({ role: 'tool', toolCallId: call.id, content: result });
@@ -3665,6 +3669,174 @@ describe('AgentService shared-terminal controls', () => {
     expect(sessions.audits.map((audit) => audit.type)).toContain('command_rejected');
     const toolResult = provider.requests[1].messages.find((message) => message.role === 'tool');
     expect(toolResult?.content).toContain('User rejected');
+  });
+
+  it('rejects an equivalent AI file command before approval and returns a structured correction', async () => {
+    const provider = new FakeProvider([
+      toolCall('call-file-read', 'cat README.md'),
+      { message: { role: 'assistant', content: 'I will use the Workspace tool.' } },
+    ]);
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const terminals = new FakeTerminals();
+    const owner = browserOwner();
+    const fileService = {
+      bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
+      canonicalizeAccessRoot: vi.fn(async (_owner, _terminalId, accessRoot) => accessRoot),
+    } as unknown as AgentFileService;
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      fileService,
+      () => new ScriptedLoopBackend(provider),
+    );
+    await service.setFileAccess(owner, {
+      terminalId: 'terminal',
+      mode: 'read-only',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+    });
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Read README.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(terminals.executions).toEqual([]);
+    expect(service.getState(owner, 'terminal')?.pendingApproval).toBeUndefined();
+    const result = provider.requests[1]!.messages.find((message) => message.role === 'tool');
+    expect(JSON.parse(result!.content)).toMatchObject({
+      ok: false,
+      code: 'WORKSPACE_TOOL_REQUIRED',
+      categories: ['read'],
+      suggestedTools: ['workspace_read_file'],
+      retryCount: 1,
+      halted: false,
+    });
+    expect(sessions.audits.find((audit) => audit.type === 'file_command_policy')?.details)
+      .not.toHaveProperty('command');
+  });
+
+  it('requires an exact file-tool bypass approval even while Full Takeover is active', async () => {
+    const provider = new FakeProvider([
+      toolCall('call-bypass', 'cat /var/log/app.log'),
+      { message: { role: 'assistant', content: 'Read the log.' } },
+    ]);
+    const sessions = new FakeSessions();
+    const terminals = new FakeTerminals();
+    const owner = browserOwner();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
+    );
+    service.setFullTakeover(owner, {
+      terminalId: 'terminal', enabled: true, providerId: 'provider',
+    });
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Read the log.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
+    const approval = service.getState(owner, 'terminal')!.pendingApproval!;
+    expect(approval).toMatchObject({ kind: 'workspace-tool-bypass', status: 'waiting' });
+    expect(() => service.setFullTakeover(owner, {
+      terminalId: 'terminal',
+      enabled: true,
+      providerId: 'provider',
+      approvalId: approval.id,
+    })).toThrow(/逐次明确批准/u);
+    service.resolveApproval(owner, {
+      terminalId: 'terminal', approvalId: approval.id, decision: 'execute',
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(terminals.executions).toEqual([{ command: 'cat /var/log/app.log', actor: 'ai' }]);
+    expect(service.getState(owner, 'terminal')?.fullTakeover).toBe(true);
+    expect(sessions.audits.some((audit) => (
+      audit.type === 'file_command_policy'
+      && audit.details?.action === 'exception_approved'
+    ))).toBe(true);
+  });
+
+  it('keeps explicitly edited bypass commands attributable to the user', async () => {
+    const provider = new FakeProvider([
+      toolCall('call-edited-bypass', 'cat README.md'),
+      { message: { role: 'assistant', content: 'Used the edited command.' } },
+    ]);
+    const sessions = new FakeSessions();
+    const terminals = new FakeTerminals();
+    const owner = browserOwner();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Read a file.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
+    const approval = service.getState(owner, 'terminal')!.pendingApproval!;
+    service.resolveApproval(owner, {
+      terminalId: 'terminal',
+      approvalId: approval.id,
+      decision: 'edit',
+      editedCommand: 'printf reviewed',
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(terminals.executions).toEqual([{
+      command: 'printf reviewed', actor: 'user_modified_ai_command',
+    }]);
+    expect(sessions.audits.some((audit) => (
+      audit.type === 'file_command_policy'
+      && audit.details?.action === 'exception_edited_and_approved'
+    ))).toBe(true);
+  });
+
+  it('invalidates a file-tool bypass approval when its Workspace binding changes', async () => {
+    const provider = new FakeProvider([
+      toolCall('call-stale-bypass', 'cat README.md'),
+      { message: { role: 'assistant', content: 'The stale approval was rejected.' } },
+    ]);
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const terminals = new FakeTerminals();
+    const owner = browserOwner();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Read a file.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
+    const approval = service.getState(owner, 'terminal')!.pendingApproval!;
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/replacement', hostId: 'host' },
+    };
+    expect(() => service.resolveApproval(owner, {
+      terminalId: 'terminal', approvalId: approval.id, decision: 'execute',
+    })).toThrow(/绑定已变化/u);
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(terminals.executions).toEqual([]);
+    expect(sessions.audits.some((audit) => (
+      audit.type === 'file_command_policy'
+      && audit.details?.action === 'exception_approval_invalidated'
+    ))).toBe(true);
   });
 
   it('runs multiple commands without approval only after explicit Full Takeover', async () => {

@@ -9,7 +9,7 @@ import { SessionToolGateway } from './tool-gateway';
 function context(workspaceEnabled: boolean): SessionToolContext {
   return {
     sessionId: 'session-1',
-    terminal: { type: 'local', terminalId: 'terminal-1' },
+    terminal: { type: 'local', terminalId: 'terminal-1', shellKind: 'powershell' },
     ...(workspaceEnabled
       ? { workspace: { backend: 'local' as const, root: 'C:\\project' } }
       : {}),

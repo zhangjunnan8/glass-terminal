@@ -88,6 +88,7 @@ export interface SessionAuditEvent {
     | 'command_edited'
     | 'command_rejected'
     | 'command_completed'
+    | 'file_command_policy'
     | 'file_modified'
     | 'file_permission_changed'
     | 'agent_paused'

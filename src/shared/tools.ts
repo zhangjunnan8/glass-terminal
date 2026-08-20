@@ -1,4 +1,5 @@
 import type { AgentFileAccessMode } from './agent';
+import type { ShellProfile } from './terminal';
 
 export type WorkspaceBackendKind = 'local' | 'sftp';
 export type RemoteWritePolicy = 'strict' | 'compatible';
@@ -77,6 +78,7 @@ export interface SessionToolContext {
   terminal: {
     type: 'local' | 'ssh';
     terminalId: string;
+    shellKind: ShellProfile['kind'];
     hostId?: string;
   };
   workspace?: WorkspaceBinding;

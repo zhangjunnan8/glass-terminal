@@ -2750,9 +2750,16 @@ export function App() {
             && activeAgent.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND && (
             <section className="approval-card">
               <div>
-                <strong>命令审批</strong>
+                <strong>{activeAgent.pendingApproval.kind === 'workspace-tool-bypass'
+                  ? '文件工具绕过例外'
+                  : '命令审批'}</strong>
                 <span>{activeAgent.pendingApproval.reason ?? '智能体请求在终端中执行命令'}</span>
               </div>
+              {activeAgent.pendingApproval.kind === 'workspace-tool-bypass' && (
+                <p className="approval-policy-warning" data-testid="file-tool-bypass-warning">
+                  此命令无法由当前授权的 Workspace 文件工具等价完成。批准将仅对当前终端、当前会话轮次和这条命令生效；AI 全接管不会跳过此限制。
+                </p>
+              )}
               <textarea
                 aria-label="待审批命令"
                 value={editedApprovalCommand}
@@ -2762,19 +2769,23 @@ export function App() {
               <div className="approval-actions">
                 <button data-action="reject-command" onClick={() => void resolveAgentApproval('reject')}>拒绝</button>
                 <button data-action="edit-command" onClick={() => void resolveAgentApproval('edit')}>编辑并执行</button>
-                <button onClick={() => {
-                  if (!activeTab || !activeAgent.pendingApproval) return;
-                  setFullTakeoverChallenge({
-                    terminalId: activeTab.id,
-                    target: activeTab.title,
-                    backend: activeAgent.backend,
-                    approvalId: activeAgent.pendingApproval.id,
-                    command: activeAgent.pendingApproval.command,
-                    editedCommand: editedApprovalCommand,
-                    hostPreference: activeAgent.fullTakeoverPreference,
-                  });
-                }} data-action="switch-full-takeover">切换为 AI 全接管…</button>
-                <button className="execute" data-action="execute-command" onClick={() => void resolveAgentApproval('execute')}>执行</button>
+                {activeAgent.pendingApproval.kind !== 'workspace-tool-bypass' && (
+                  <button onClick={() => {
+                    if (!activeTab || !activeAgent.pendingApproval) return;
+                    setFullTakeoverChallenge({
+                      terminalId: activeTab.id,
+                      target: activeTab.title,
+                      backend: activeAgent.backend,
+                      approvalId: activeAgent.pendingApproval.id,
+                      command: activeAgent.pendingApproval.command,
+                      editedCommand: editedApprovalCommand,
+                      hostPreference: activeAgent.fullTakeoverPreference,
+                    });
+                  }} data-action="switch-full-takeover">切换为 AI 全接管…</button>
+                )}
+                <button className="execute" data-action="execute-command" onClick={() => void resolveAgentApproval('execute')}>
+                  {activeAgent.pendingApproval.kind === 'workspace-tool-bypass' ? '仅批准本次执行' : '执行'}
+                </button>
               </div>
             </section>
           )}
@@ -3419,6 +3430,9 @@ export function App() {
                 ? '此主机已保存全接管偏好，但它没有授权当前终端。'
                 : '确认后会为此主机保存全接管偏好。'}
               本次确认只授权当前终端；新建、重连或重启后的终端仍会重新询问。
+            </p>
+            <p className="risk-note" data-testid="full-takeover-file-policy-note">
+              AI 全接管不会绕过 Workspace 文件工具路由策略；相关文件命令仍会被纠正，或要求逐次批准例外。
             </p>
             <p className="risk-note">
               {fullTakeoverChallenge.approvalId

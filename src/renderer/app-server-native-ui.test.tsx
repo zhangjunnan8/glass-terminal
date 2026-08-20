@@ -647,6 +647,8 @@ describe('native Codex App Server renderer mode', () => {
     await act(async () => enable.click());
     expect(container.querySelector('[data-testid="full-takeover-scope-note"]')?.textContent)
       .toContain('没有授权当前终端');
+    expect(container.querySelector('[data-testid="full-takeover-file-policy-note"]')?.textContent)
+      .toContain('不会绕过 Workspace 文件工具路由策略');
 
     await act(async () => container.querySelector<HTMLButtonElement>(
       '[data-action="forget-full-takeover-preference"]',
@@ -655,6 +657,52 @@ describe('native Codex App Server renderer mode', () => {
     expect(bridge.agent.setFullTakeoverPreference).toHaveBeenCalledWith({
       terminalId: 'terminal-1',
       enabled: false,
+    });
+  });
+
+  it('renders a file-tool bypass as an exact one-time approval without a takeover shortcut', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    const waiting: AgentSessionView = {
+      ...agentView('WAITING_APPROVAL'),
+      terminalInputMode: 'locked',
+      pendingApproval: {
+        id: 'approval-file-bypass',
+        sessionId: 'session-1',
+        terminalId: 'terminal-1',
+        command: 'Get-Content app.log -Wait',
+        kind: 'workspace-tool-bypass',
+        fileCommandPolicy: {
+          categories: ['read'],
+          suggestedTools: ['workspace_read_file'],
+          reasonCode: 'NON_EQUIVALENT_TERMINAL_SEMANTICS',
+        },
+        status: 'waiting',
+        requestedAt: now,
+      },
+    };
+    bridge.agent.getState = vi.fn().mockResolvedValue(waiting);
+    bridge.agent.resolveApproval = vi.fn().mockResolvedValue({
+      ...waiting,
+      revision: 2,
+      state: 'THINKING',
+      pendingApproval: undefined,
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    expect(container.textContent).toContain('文件工具绕过例外');
+    expect(container.querySelector('[data-testid="file-tool-bypass-warning"]')?.textContent)
+      .toContain('仅对当前终端、当前会话轮次和这条命令生效');
+    expect(container.querySelector('[data-action="switch-full-takeover"]')).toBeNull();
+    const execute = container.querySelector<HTMLButtonElement>('[data-action="execute-command"]')!;
+    expect(execute.textContent).toContain('仅批准本次执行');
+    await act(async () => execute.click());
+    expect(bridge.agent.resolveApproval).toHaveBeenCalledWith({
+      terminalId: 'terminal-1',
+      approvalId: 'approval-file-bypass',
+      decision: 'execute',
     });
   });
 

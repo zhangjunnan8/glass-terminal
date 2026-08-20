@@ -610,6 +610,7 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .approval-card > div:first-child { display: flex; flex-direction: column; gap: 4px; }
 .approval-card strong { color: #e0bd76; font-size: 14px; }
 .approval-card > div:first-child span { color: #b59d73; font-size: 12px; text-align: left; }
+.approval-policy-warning { margin: 8px 0 0; padding: 8px; color: #d9c69c; border-left: 2px solid #c99b4a; background: #2a2112; font-size: 12px; line-height: 1.5; }
 .approval-card textarea { width: 100%; min-height: 88px; margin-top: 9px; padding: 9px; resize: vertical; color: #d7dfeb; border: 1px solid #55462d; border-radius: 3px; outline: 0; background: #0c1017; font: 13px/1.5 "Cascadia Mono", Consolas, monospace; }
 .approval-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 5px; margin-top: 7px; }
 .approval-actions button { min-height: 32px; padding: 6px 8px; color: #bdc7d4; border: 1px solid #39475a; border-radius: 3px; background: #17212d; cursor: pointer; font-size: 13px; }

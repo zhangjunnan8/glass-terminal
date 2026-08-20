@@ -259,6 +259,9 @@ function toAgentMessage(message: BaseMessage): AgentMessage {
 }
 
 function errorResult(error: unknown): string {
+  if (error && typeof error === 'object' && 'toolResult' in error) {
+    return JSON.stringify((error as { toolResult: unknown }).toolResult);
+  }
   return JSON.stringify({
     ok: false,
     error: error instanceof Error ? error.message : String(error),
@@ -660,6 +663,16 @@ export class LangChainBackend implements AgentBackend {
             } catch (error) {
               throwIfCancelled(controller.signal);
               result = errorResult(error);
+              if (
+                error
+                && typeof error === 'object'
+                && (error as { haltAgentTurn?: unknown }).haltAgentTurn === true
+              ) {
+                haltedError = error instanceof Error
+                  ? error.message
+                  : 'Repeated Workspace file-tool policy violation.';
+                rejectRemainingTools = true;
+              }
             }
           }
           throwIfCancelled(controller.signal);
@@ -681,6 +694,7 @@ export class LangChainBackend implements AgentBackend {
           }
         }
         rounds += 1;
+        if (haltedError) break;
       }
 
       throwIfCancelled(controller.signal);

@@ -96,6 +96,7 @@ export function buildSessionToolContext(
     terminal: {
       type: terminal.transport,
       terminalId: terminal.id,
+      shellKind: terminal.shellKind,
       ...(terminal.hostId ? { hostId: terminal.hostId } : {}),
     },
     ...(workspace ? { workspace } : {}),

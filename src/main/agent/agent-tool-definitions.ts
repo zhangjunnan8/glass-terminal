@@ -1,4 +1,5 @@
 import type { AgentFileAccessMode } from '../../shared/agent';
+import type { ShellProfile } from '../../shared/terminal';
 import type { ToolGateway } from '../../shared/tools';
 
 export interface AgentFunctionToolDefinition {
@@ -15,6 +16,7 @@ export interface AgentToolExposure {
   workspaceAvailable: boolean;
   workspaceEnabled: boolean;
   workspaceRead: boolean;
+  shellKind?: ShellProfile['kind'];
 }
 
 const string = (
@@ -45,11 +47,15 @@ const path = string({ minLength: 1, maxLength: 4_096 });
 const optionalPath = string({ maxLength: 4_096 });
 const sha256 = string({ pattern: '^[a-fA-F0-9]{64}$' });
 
-const TERMINAL_TOOLS: readonly AgentFunctionToolDefinition[] = [
+function terminalTools(shellKind?: ShellProfile['kind']): AgentFunctionToolDefinition[] {
+  const shellLabel = shellKind ?? 'current';
+  return [
   tool(
     'terminal_execute',
-    'Request execution of one command in the same visible terminal. '
-      + 'User approval is required unless Full Takeover is explicitly active.',
+    `Request execution of one command in the same visible ${shellLabel} terminal. `
+      + 'User approval is required unless Full Takeover is explicitly active. '
+      + 'Filesystem reads, searches, listings, and stat checks must use authorized workspace_* tools; '
+      + 'Full Takeover does not bypass this policy, and a non-equivalent exception requires exact one-time approval.',
     object({
       command: string({ minLength: 1, description: 'The single shell command to execute.' }),
       reason: string({ description: 'Optional one-line justification.' }),
@@ -68,7 +74,8 @@ const TERMINAL_TOOLS: readonly AgentFunctionToolDefinition[] = [
     'Get the current terminal transport, shell, cwd/user, and control state.',
     object({}),
   ),
-];
+  ];
+}
 
 const WORKSPACE_READ_TOOLS: readonly AgentFunctionToolDefinition[] = [
   tool(
@@ -172,7 +179,7 @@ const WORKSPACE_WRITE_TOOLS: readonly AgentFunctionToolDefinition[] = [
 export function agentToolDefinitionsForAccess(
   exposure: AgentToolExposure,
 ): AgentFunctionToolDefinition[] {
-  const tools = [...TERMINAL_TOOLS];
+  const tools = terminalTools(exposure.shellKind);
   if (
     !exposure.workspaceAvailable
     || !exposure.workspaceEnabled
@@ -196,5 +203,6 @@ export function boundAgentToolDefinitions(
     workspaceAvailable: Boolean(gateway.workspace),
     workspaceEnabled: permissions.enabled,
     workspaceRead: permissions.read,
+    shellKind: gateway.context.terminal.shellKind,
   });
 }

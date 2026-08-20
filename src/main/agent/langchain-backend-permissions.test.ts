@@ -65,7 +65,7 @@ function buildGateway(mode: AgentFileAccessMode): ToolGateway {
   return {
     context: {
       sessionId: 's',
-      terminal: { type: 'local', terminalId: 't' },
+      terminal: { type: 'local', terminalId: 't', shellKind: 'posix' },
       ...(enabled ? { workspace: { backend: 'local', root: '/' } } : {}),
       permissions: {
         terminal: { read: true, execute: true, sendInput: false, interrupt: true },
@@ -204,6 +204,7 @@ describe('LangChainBackend workspace tool gating', () => {
       workspaceAvailable: true,
       workspaceEnabled: true,
       workspaceRead: true,
+      shellKind: 'posix',
     });
 
     expect(result.definitions).toEqual(expected);

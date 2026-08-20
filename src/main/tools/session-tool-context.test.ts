@@ -136,7 +136,7 @@ describe('Session tool context', () => {
     });
 
     expect(context.terminal).toEqual({
-      type: 'ssh', terminalId: 'terminal-1', hostId: 'host-1',
+      type: 'ssh', terminalId: 'terminal-1', shellKind: 'posix', hostId: 'host-1',
     });
     expect(context.workspace).toEqual(bound.workspace);
     expect(context.permissions.workspace).toMatchObject({

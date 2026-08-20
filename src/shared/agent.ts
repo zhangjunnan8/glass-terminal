@@ -80,6 +80,13 @@ export interface CommandApproval {
   terminalId: string;
   command: string;
   reason?: string;
+  /** File-tool bypasses are always exact, one-time approvals, even in Full Takeover. */
+  kind?: 'standard' | 'workspace-tool-bypass';
+  fileCommandPolicy?: {
+    categories: Array<'read' | 'search' | 'list' | 'stat'>;
+    suggestedTools: string[];
+    reasonCode: string;
+  };
   status: 'waiting' | 'approved' | 'edited' | 'rejected';
   requestedAt: string;
   resolvedAt?: string;

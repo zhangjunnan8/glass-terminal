@@ -56,7 +56,12 @@ function makeContext(
 ): SessionToolContext {
   return {
     sessionId: 'session-1',
-    terminal: { type: 'ssh', terminalId: 'terminal-1', hostId: 'host-1' },
+    terminal: {
+      type: 'ssh',
+      terminalId: 'terminal-1',
+      shellKind: 'posix',
+      hostId: 'host-1',
+    },
     permissions: {
       terminal: {
         read: true,

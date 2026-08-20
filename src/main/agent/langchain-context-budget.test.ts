@@ -6,6 +6,7 @@ import { ChatOpenAICompletions } from '@langchain/openai';
 import type { AgentBackendEvent } from './agent-backend';
 import type { TerminalTool, ToolGateway, WorkspaceTool } from '../../shared/tools';
 import { LangChainBackend } from './langchain-backend';
+import { WorkspaceToolPolicyError } from './ai-file-command-policy';
 
 interface ProviderRequest {
   messages?: Array<{ role?: string; content?: string }>;
@@ -129,7 +130,7 @@ function gateway(mode: 'off' | 'read-only' | 'read-write', files?: WorkspaceTool
   return {
     context: {
       sessionId: 'session',
-      terminal: { type: 'local', terminalId: 'terminal' },
+      terminal: { type: 'local', terminalId: 'terminal', shellKind: 'posix' },
       ...(enabled ? { workspace: { backend: 'local', root: '/work' } } : {}),
       permissions: {
         terminal: { read: true, execute: true, sendInput: false, interrupt: true },
@@ -315,5 +316,54 @@ describe('LangChain dynamic context budget', () => {
     const completed = events.find((event) => event.type === 'tool_completed');
     expect(completed?.result).toContain('CONTEXT_BUDGET_EXCEEDED');
     expect(JSON.stringify(result.contextPersistence?.messages)).toContain(hugeContent);
+  });
+
+  it('stops the turn after the bounded repeated Workspace-tool policy violation', async () => {
+    const provider = await providerServer((index) => ({
+      toolCalls: [{
+        id: `file-policy-${index}`,
+        name: 'terminal_execute',
+        args: { command: 'cat README.md' },
+      }],
+    }));
+    let retryCount = 0;
+    const policyTerminal = terminal();
+    policyTerminal.execute = vi.fn(async () => {
+      retryCount += 1;
+      const halted = retryCount >= 3;
+      throw new WorkspaceToolPolicyError({
+        ok: false,
+        code: 'WORKSPACE_TOOL_REQUIRED',
+        error: halted ? 'Repeated attempts stopped.' : 'Use workspace_read_file.',
+        categories: ['read'],
+        suggestedTools: ['workspace_read_file'],
+        retryCount,
+        halted,
+      });
+    });
+    const policyGateway: ToolGateway = {
+      ...gateway('read-only'),
+      terminal: policyTerminal,
+    };
+    const harness = backend(provider.baseUrl);
+    const thread = await harness.createThread({ id: 'repeated-file-policy' });
+    const events: AgentBackendEvent[] = [];
+    const result = await harness.sendMessage({
+      thread,
+      prompt: 'keep reading with the terminal',
+      systemPrompt: 'system',
+      terminalContext: '',
+      fileAccessMode: 'read-only',
+      gateway: policyGateway,
+      signal: new AbortController().signal,
+      onEvent: (event) => events.push(event),
+    });
+
+    expect(provider.requests).toHaveLength(3);
+    expect(policyTerminal.execute).toHaveBeenCalledTimes(3);
+    expect(result.haltedError).toMatch(/repeatedly attempted to bypass/i);
+    const completed = events.filter((event) => event.type === 'tool_completed');
+    expect(completed).toHaveLength(3);
+    expect(completed.at(-1)?.result).toContain('"halted":true');
   });
 });
