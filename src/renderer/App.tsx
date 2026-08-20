@@ -111,6 +111,7 @@ interface FullTakeoverChallenge {
   approvalId?: string;
   command?: string;
   editedCommand?: string;
+  hostPreference: boolean;
 }
 
 interface FileAccessChallenge {
@@ -429,6 +430,9 @@ export function App() {
       ))
       ?? null;
   }, [activeTab, sessions]);
+  const activeHost = activeSession?.hostId
+    ? hosts.find((host) => host.id === activeSession.hostId) ?? null
+    : null;
   const normalizedSidebarSearch = sidebarSearch.trim().toLocaleLowerCase('zh-CN');
   const filteredShells = normalizedSidebarSearch
     ? shells.filter((shell) => `${shell.label} ${shell.detail}`.toLocaleLowerCase('zh-CN')
@@ -457,6 +461,9 @@ export function App() {
     : sessions;
   const defaultProvider = providers.find((provider) => provider.isDefault) ?? null;
   const activeAgent = activeTab ? agentStates[activeTab.id] : undefined;
+  const activeFullTakeoverPreference = activeAgent?.fullTakeoverPreference
+    ?? activeHost?.fullTakeoverPreference
+    ?? false;
   const activeMessages = activeAgent?.messages ?? [];
   const activeActivities = activeAgent?.activities ?? [];
   const activeMessageIds = new Set(activeMessages.map((message) => message.id));
@@ -926,6 +933,21 @@ export function App() {
       )));
       setFullTakeoverChallenge(null);
       await refreshSessions();
+    } catch (error) {
+      setWorkspaceActionError(errorMessage(error));
+    }
+  }
+
+  async function setFullTakeoverPreference(enabled: boolean): Promise<void> {
+    if (!activeTab) return;
+    setWorkspaceActionError(null);
+    try {
+      const state = await window.aiTerminal.agent.setFullTakeoverPreference({
+        terminalId: activeTab.id,
+        enabled,
+      });
+      if (state) installAgentSnapshot(state);
+      await refreshHosts();
     } catch (error) {
       setWorkspaceActionError(errorMessage(error));
     }
@@ -2252,6 +2274,20 @@ export function App() {
                 </span>
               )}
               {activeAgent?.fullTakeover && <span className="takeover-badge">AI 全接管</span>}
+              {activeFullTakeoverPreference && (
+                <span
+                  className="takeover-preference"
+                  data-testid="full-takeover-host-preference"
+                  title="这是主机偏好，不会自动授权新的终端。"
+                >主机偏好：全接管</span>
+              )}
+              {activeFullTakeoverPreference && (
+                <button
+                  type="button"
+                  data-action="forget-full-takeover-preference"
+                  onClick={() => void setFullTakeoverPreference(false)}
+                >忘记偏好</button>
+              )}
               <button
                 className="take-control"
                 data-action="take-control"
@@ -2281,10 +2317,15 @@ export function App() {
                       terminalId: activeTab.id,
                       target: activeTab.title,
                       backend: selectedAgentBackend,
+                      hostPreference: activeFullTakeoverPreference,
                     });
                   }
                 }}
-              >{activeAgent?.fullTakeover ? '关闭全接管' : 'AI 全接管'}</button>
+              >{activeAgent?.fullTakeover
+                  ? '关闭当前终端全接管'
+                  : activeFullTakeoverPreference
+                    ? '为本次终端启用'
+                    : 'AI 全接管'}</button>
             </div>
           )}
         </div>
@@ -2447,6 +2488,7 @@ export function App() {
                     approvalId: activeAgent.pendingApproval.id,
                     command: activeAgent.pendingApproval.command,
                     editedCommand: editedApprovalCommand,
+                    hostPreference: activeAgent.fullTakeoverPreference,
                   });
                 }} data-action="switch-full-takeover">切换为 AI 全接管…</button>
                 <button className="execute" data-action="execute-command" onClick={() => void resolveAgentApproval('execute')}>执行</button>
@@ -2980,6 +3022,12 @@ export function App() {
             <div className="modal-header"><strong>启用 AI 全接管？</strong></div>
             <p>
               目标：<b>{fullTakeoverChallenge.target}</b>。智能体将可以连续运行命令，包括删除、磁盘、网络、服务或重启命令，不再逐条询问。你仍可随时点击“人工接管”立即暂停智能体。
+            </p>
+            <p className="risk-note" data-testid="full-takeover-scope-note">
+              {fullTakeoverChallenge.hostPreference
+                ? '此主机已保存全接管偏好，但它没有授权当前终端。'
+                : '确认后会为此主机保存全接管偏好。'}
+              本次确认只授权当前终端；新建、重连或重启后的终端仍会重新询问。
             </p>
             <p className="risk-note">
               {fullTakeoverChallenge.approvalId

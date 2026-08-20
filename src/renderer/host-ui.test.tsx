@@ -33,7 +33,7 @@ const groupedHost: HostProfile = {
   folderId: folder.id,
   sortOrder: 0,
   favorite: false,
-  fullTakeover: false,
+  fullTakeoverPreference: false,
   credentialConfigured: false,
   createdAt: now,
   updatedAt: now,
@@ -118,6 +118,7 @@ function hostBridge() {
     },
     agent: {
       getState: vi.fn().mockResolvedValue(undefined),
+      setFullTakeoverPreference: vi.fn(),
       onStateChanged: vi.fn(() => () => undefined),
       onAssistantDelta: vi.fn(() => () => undefined),
     },

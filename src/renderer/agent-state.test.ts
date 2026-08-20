@@ -14,6 +14,7 @@ function view(revision: number, state: AgentSessionView['state']): AgentSessionV
     state,
     terminalInputMode: state === 'PAUSED' ? 'human' : 'locked',
     fullTakeover: false,
+    fullTakeoverPreference: false,
     fileAccessMode: 'off',
     messages: [],
     activities: [],

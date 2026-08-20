@@ -149,11 +149,8 @@ export interface HostProfile {
   group?: string;
   favorite: boolean;
   credentialConfigured: boolean;
-  /**
-   * Persistent per-host approval preference. When true, every future terminal
-   * of this host defaults to Full Takeover instead of per-command approval.
-   */
-  fullTakeover: boolean;
+  /** Persistent hint only. Every new terminal still requires explicit runtime authorization. */
+  fullTakeoverPreference: boolean;
   /** Remote shell kind; defaults to POSIX for hosts created before this field. */
   shellKind?: SshShellKind;
   createdAt: string;
@@ -177,6 +174,8 @@ export interface HostInput {
   /** @deprecated Use folderId. A matching folder is created when necessary. */
   group?: string;
   favorite?: boolean;
+  fullTakeoverPreference?: boolean;
+  /** @deprecated Version-2 import alias; migrated to fullTakeoverPreference. */
   fullTakeover?: boolean;
   shellKind?: SshShellKind;
 }

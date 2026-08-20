@@ -13,7 +13,7 @@ import type {
   SshShellKind,
 } from '../../shared/host';
 
-const HOST_STORE_VERSION = 2;
+const HOST_STORE_VERSION = 3;
 const MAX_HOST_NAME_LENGTH = 160;
 const MAX_FOLDER_NAME_LENGTH = 120;
 const MAX_PERSISTED_FOLDER_NAME_LENGTH = 2_048;
@@ -44,7 +44,7 @@ interface StoredHostProfile extends Omit<HostProfile, 'group'> {
 }
 
 interface HostStoreDocument {
-  version: typeof HOST_STORE_VERSION;
+  version: number;
   folders: HostFolder[];
   hosts: StoredHostProfile[];
 }
@@ -52,6 +52,7 @@ interface HostStoreDocument {
 interface HostStoreState {
   folders: HostFolder[];
   hosts: StoredHostProfile[];
+  needsMigration?: boolean;
 }
 
 export interface HostSaveResult {
@@ -136,7 +137,10 @@ function parseHost(
   folderId?: string,
 ): StoredHostProfile {
   if (!value || typeof value !== 'object') throw new Error('Invalid Host profile.');
-  const candidate = value as Partial<StoredHostProfile> & { group?: unknown };
+  const candidate = value as Partial<StoredHostProfile> & {
+    group?: unknown;
+    fullTakeover?: unknown;
+  };
   const id = requiredText(candidate.id, 'Host id');
   const normalized = normalizeInput({
     name: candidate.name ?? '',
@@ -161,7 +165,8 @@ function parseHost(
     sortOrder: safeOrder(candidate.sortOrder, fallbackOrder),
     credentialConfigured: candidate.credentialConfigured === true && Boolean(credentialReference),
     credentialReference,
-    fullTakeover: candidate.fullTakeover === true,
+    fullTakeoverPreference: candidate.fullTakeoverPreference === true
+      || candidate.fullTakeover === true,
     revision: Number.isSafeInteger(candidate.revision) && Number(candidate.revision) > 0
       ? Number(candidate.revision)
       : 1,
@@ -236,6 +241,7 @@ export class HostStore {
     const state = this.read();
     this.hosts = state.hosts;
     this.folders = state.folders;
+    if (state.needsMigration) this.write(this.hosts, this.folders);
   }
 
   list(): HostProfile[] {
@@ -266,11 +272,11 @@ export class HostStore {
     return this.getStored(hostId).revision;
   }
 
-  setFullTakeover(hostId: string, enabled: boolean): HostProfile {
+  setFullTakeoverPreference(hostId: string, enabled: boolean): HostProfile {
     const existing = this.getStored(hostId);
     const updated: StoredHostProfile = {
       ...existing,
-      fullTakeover: enabled,
+      fullTakeoverPreference: enabled,
       revision: existing.revision + 1,
       updatedAt: new Date().toISOString(),
     };
@@ -315,7 +321,10 @@ export class HostStore {
         : this.nextHostOrder(folderSelection.folderId),
       credentialConfigured: connectionChanged ? false : existing?.credentialConfigured ?? false,
       credentialReference: connectionChanged ? undefined : existing?.credentialReference,
-      fullTakeover: existing?.fullTakeover ?? false,
+      fullTakeoverPreference: existing?.fullTakeoverPreference
+        ?? input.fullTakeoverPreference
+        ?? input.fullTakeover
+        ?? false,
       revision: (existing?.revision ?? 0) + 1,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -595,7 +604,7 @@ export class HostStore {
       if (Array.isArray(parsed)) return this.readLegacy(parsed);
       if (!parsed || typeof parsed !== 'object') return { folders: [], hosts: [] };
       const document = parsed as Partial<HostStoreDocument>;
-      if (document.version !== HOST_STORE_VERSION) {
+      if (document.version !== HOST_STORE_VERSION && document.version !== 2) {
         throw new Error(`Unsupported Host store version: ${String(document.version)}`);
       }
       if (!Array.isArray(document.folders) || !Array.isArray(document.hosts)) {
@@ -618,7 +627,11 @@ export class HostStore {
         return parseHost(value, index, folderId);
       });
       assertUnique(hosts, (host) => host.id, 'Host id');
-      return { folders, hosts };
+      return {
+        folders,
+        hosts,
+        ...(document.version === 2 ? { needsMigration: true } : {}),
+      };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return { folders: [], hosts: [] };
@@ -666,7 +679,7 @@ export class HostStore {
       return parseHost(value, sortOrder, folder?.id);
     });
     assertUnique(hosts, (host) => host.id, 'Host id');
-    return { folders, hosts };
+    return { folders, hosts, needsMigration: true };
   }
 
   private commit(hosts: StoredHostProfile[], folders: HostFolder[]): void {

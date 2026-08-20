@@ -75,6 +75,7 @@ function agentView(state: AgentSessionView['state'] = 'COMPLETED'): AgentSession
     state,
     terminalInputMode: state === 'THINKING' ? 'locked' : 'human',
     fullTakeover: false,
+    fullTakeoverPreference: false,
     fileAccessMode: 'off',
     activities: [],
     messages: [
@@ -224,6 +225,7 @@ function bridgeForCodex(snapshot: CodexAppServerSnapshot): DesktopBridge {
       setFileAccess: vi.fn(),
       resolveApproval: vi.fn(),
       setFullTakeover: vi.fn(),
+      setFullTakeoverPreference: vi.fn(),
       takeover: vi.fn(),
       resolveTakeover: vi.fn(),
       confirmShellReady: vi.fn(),
@@ -512,6 +514,45 @@ describe('native Codex App Server renderer mode', () => {
     expect(confirmation.dataset.accessMode).toBe('read-write');
     await act(async () => {
       confirmation.querySelector<HTMLButtonElement>('button')!.click();
+    });
+  });
+
+  it('shows Host takeover preference as a non-authorizing hint and can forget it', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    const preferred = {
+      ...agentView(),
+      fullTakeover: false,
+      fullTakeoverPreference: true,
+    };
+    bridge.agent.getState = vi.fn().mockResolvedValue(preferred);
+    bridge.agent.setFullTakeoverPreference = vi.fn().mockResolvedValue({
+      ...preferred,
+      revision: 2,
+      fullTakeoverPreference: false,
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    expect(container.querySelector('[data-testid="full-takeover-host-preference"]')?.textContent)
+      .toContain('主机偏好');
+    expect(container.querySelector<HTMLButtonElement>(
+      '.agent-controls button.full-takeover-enabled',
+    )).toBeNull();
+    const enable = [...container.querySelectorAll<HTMLButtonElement>('.agent-controls button')]
+      .find((button) => button.textContent === '为本次终端启用')!;
+    await act(async () => enable.click());
+    expect(container.querySelector('[data-testid="full-takeover-scope-note"]')?.textContent)
+      .toContain('没有授权当前终端');
+
+    await act(async () => container.querySelector<HTMLButtonElement>(
+      '[data-action="forget-full-takeover-preference"]',
+    )!.click());
+    await settle();
+    expect(bridge.agent.setFullTakeoverPreference).toHaveBeenCalledWith({
+      terminalId: 'terminal-1',
+      enabled: false,
     });
   });
 

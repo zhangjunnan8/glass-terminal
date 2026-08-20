@@ -92,7 +92,9 @@ export interface SessionAuditEvent {
     | 'file_permission_changed'
     | 'agent_paused'
     | 'context_compressed'
-    | 'full_takeover_changed'
+    | 'full_takeover_preference_changed'
+    | 'full_takeover_authority_enabled'
+    | 'full_takeover_authority_revoked'
     | 'interactive_auth'
     | 'interactive_response'
     | 'codex_native_approval';

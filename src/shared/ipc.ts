@@ -50,6 +50,7 @@ import type {
   SendAgentPromptRequest,
   SetAgentFileAccessRequest,
   SetFullTakeoverRequest,
+  SetFullTakeoverPreferenceRequest,
   TakeoverRequest,
 } from './agent';
 import type {
@@ -167,6 +168,9 @@ export interface DesktopBridge {
     setFileAccess(request: SetAgentFileAccessRequest): Promise<AgentSessionView>;
     resolveApproval(request: ResolveApprovalRequest): Promise<AgentSessionView>;
     setFullTakeover(request: SetFullTakeoverRequest): Promise<AgentSessionView>;
+    setFullTakeoverPreference(
+      request: SetFullTakeoverPreferenceRequest,
+    ): Promise<AgentSessionView | null>;
     takeover(request: TakeoverRequest): Promise<AgentSessionView>;
     resolveTakeover(request: ResolveTakeoverRequest): Promise<AgentSessionView>;
     confirmShellReady(request: ConfirmShellReadyRequest): Promise<AgentSessionView>;

@@ -545,7 +545,7 @@ class FakeSessions {
   readonly failAuditTypes = new Set<string>();
   failThreadEvents = false;
   persistedThreadId?: string;
-  fullTakeover = false;
+  fullTakeoverPreference = false;
   session: SessionRecord = {
     schemaVersion: 1,
     id: '11111111-1111-1111-1111-111111111111',
@@ -617,8 +617,10 @@ class FakeSessions {
     this.threadEvents.push(event);
     this.persistedThreadEvents.push(event);
   }
-  hostFullTakeover(_hostId: string) { return this.fullTakeover; }
-  setHostFullTakeover(_hostId: string, enabled: boolean) { this.fullTakeover = enabled; }
+  hostFullTakeoverPreference(_hostId: string) { return this.fullTakeoverPreference; }
+  setHostFullTakeoverPreference(_hostId: string, enabled: boolean) {
+    this.fullTakeoverPreference = enabled;
+  }
   readTerminalHistory() { return 'tester@host:~$ '; }
   readTerminalHistorySince(
     _sessionId: string,
@@ -3455,6 +3457,161 @@ describe('AgentService shared-terminal controls', () => {
       ));
   });
 
+  it('treats a persisted Host preference as a hint and starts every runtime unauthorized', async () => {
+    const provider = new FakeProvider([
+      toolCall('call-1', 'printf guarded'),
+      { message: { role: 'assistant', content: 'Not run.' } },
+    ]);
+    const sessions = new FakeSessions();
+    sessions.fullTakeoverPreference = true;
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
+    );
+
+    const started = service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Do not auto-run.',
+    });
+    expect(started).toMatchObject({
+      fullTakeover: false,
+      fullTakeoverPreference: true,
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
+    const approval = service.getState(owner, 'terminal')!.pendingApproval!;
+    service.resolveApproval(owner, {
+      terminalId: 'terminal',
+      approvalId: approval.id,
+      decision: 'reject',
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+  });
+
+  it('can forget a Host preference before an Agent runtime exists', () => {
+    const sessions = new FakeSessions();
+    sessions.fullTakeoverPreference = true;
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+    );
+
+    expect(service.setFullTakeoverPreference(owner, {
+      terminalId: 'terminal',
+      enabled: false,
+    })).toBeNull();
+    expect(sessions.fullTakeoverPreference).toBe(false);
+    expect(sessions.audits).toContainEqual(expect.objectContaining({
+      type: 'full_takeover_preference_changed',
+      details: expect.objectContaining({
+        enabled: false,
+        grantsRuntimeAuthority: false,
+      }),
+    }));
+  });
+
+  it('keeps Host preference separate when authority is forgotten or manually revoked', () => {
+    const sessions = new FakeSessions();
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+    );
+
+    const enabled = service.setFullTakeover(owner, {
+      terminalId: 'terminal',
+      enabled: true,
+      providerId: 'provider',
+    });
+    expect(enabled).toMatchObject({
+      fullTakeover: true,
+      fullTakeoverPreference: true,
+    });
+
+    const forgotten = service.setFullTakeoverPreference(owner, {
+      terminalId: 'terminal',
+      enabled: false,
+    });
+    expect(forgotten).toMatchObject({
+      fullTakeover: true,
+      fullTakeoverPreference: false,
+    });
+
+    const paused = service.takeover(owner, { terminalId: 'terminal' });
+    expect(paused).toMatchObject({
+      state: 'PAUSED',
+      fullTakeover: false,
+      fullTakeoverPreference: false,
+    });
+    expect(sessions.audits.map((audit) => audit.type)).toEqual(expect.arrayContaining([
+      'full_takeover_authority_enabled',
+      'full_takeover_preference_changed',
+      'full_takeover_authority_revoked',
+    ]));
+  });
+
+  it('revokes terminal authority on disconnect without erasing the Host preference', () => {
+    const sessions = new FakeSessions();
+    const terminals = new FakeTerminals();
+    const owner = browserOwner();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+    );
+    service.setFullTakeover(owner, {
+      terminalId: 'terminal',
+      enabled: true,
+      providerId: 'provider',
+    });
+
+    terminals.exit('terminal', owner.id);
+
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      state: 'FAILED',
+      fullTakeover: false,
+      fullTakeoverPreference: true,
+    });
+    expect(sessions.fullTakeoverPreference).toBe(true);
+    expect(sessions.audits).toContainEqual(expect.objectContaining({
+      type: 'full_takeover_authority_revoked',
+      details: expect.objectContaining({ reason: 'terminal_disconnected' }),
+    }));
+  });
+
+  it('starts an attached runtime unauthorized after the prior terminal is closed', () => {
+    const sessions = new FakeSessions();
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+    );
+    service.setFullTakeover(owner, {
+      terminalId: 'terminal',
+      enabled: true,
+      providerId: 'provider',
+    });
+
+    service.closeTerminal(owner, 'terminal');
+
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      fullTakeover: false,
+      fullTakeoverPreference: true,
+    });
+    expect(sessions.audits).toContainEqual(expect.objectContaining({
+      type: 'full_takeover_authority_revoked',
+      details: expect.objectContaining({ reason: 'terminal_closed' }),
+    }));
+  });
+
   it('atomically upgrades an exact pending approval to Full Takeover and preserves edits', async () => {
     const provider = new FakeProvider([
       toolCall('call-1', 'printf original'),
@@ -3493,7 +3650,9 @@ describe('AgentService shared-terminal controls', () => {
       { command: 'printf edited', actor: 'user_modified_ai_command' },
       { command: 'printf second', actor: 'ai' },
     ]);
-    expect(sessions.audits.filter((audit) => audit.type === 'full_takeover_changed'))
+    expect(sessions.audits.filter((audit) => audit.type === 'full_takeover_authority_enabled'))
+      .toHaveLength(1);
+    expect(sessions.audits.filter((audit) => audit.type === 'full_takeover_preference_changed'))
       .toHaveLength(1);
     expect(sessions.audits.map((audit) => audit.type)).toContain('command_edited');
   });
@@ -3532,7 +3691,10 @@ describe('AgentService shared-terminal controls', () => {
     expect(service.getState(owner, 'terminal')?.state).toBe('WAITING_APPROVAL');
     expect(service.getState(owner, 'terminal')?.fullTakeover).toBe(false);
     expect(terminals.executions).toEqual([]);
-    expect(sessions.audits.some((audit) => audit.type === 'full_takeover_changed')).toBe(false);
+    expect(sessions.audits.some((audit) => (
+      audit.type === 'full_takeover_authority_enabled'
+      || audit.type === 'full_takeover_preference_changed'
+    ))).toBe(false);
 
     service.resolveApproval(owner, {
       terminalId: 'terminal',

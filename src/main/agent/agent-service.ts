@@ -24,6 +24,7 @@ import type {
   ReviseAgentPromptRequest,
   SendAgentPromptRequest,
   SetFullTakeoverRequest,
+  SetFullTakeoverPreferenceRequest,
   SetAgentFileAccessRequest,
   TakeoverRequest,
   TerminalInputMode,
@@ -322,6 +323,7 @@ function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
     state: runtime.state,
     terminalInputMode: runtime.terminalInputMode,
     fullTakeover: runtime.fullTakeover,
+    fullTakeoverPreference: runtime.fullTakeoverPreference,
     fileAccessMode: runtime.fileAccessMode,
     fileAccessPolicy: cloneFileAccessPolicy(runtime.fileAccessPolicy),
     fileAccessRoot: runtime.fileAccessRoot,
@@ -1014,12 +1016,12 @@ export class AgentService {
         throw new Error('Edited command cannot be empty.');
       }
       if (!runtime.fullTakeover) {
-        this.sessions.appendAudit(runtime.sessionId, 'full_takeover_changed', 'user', {
-          enabled: true,
+        this.sessions.appendAudit(runtime.sessionId, 'full_takeover_authority_enabled', 'user', {
           approvalId: approval.id,
+          terminalScoped: true,
         });
         runtime.fullTakeover = true;
-        this.syncHostFullTakeover(runtime);
+        this.rememberFullTakeoverPreference(runtime);
       }
       try {
         return this.resolveApproval(owner, {
@@ -1030,11 +1032,10 @@ export class AgentService {
         });
       } catch (error) {
         runtime.fullTakeover = false;
-        this.syncHostFullTakeover(runtime);
-        this.appendControlAudit(runtime, 'full_takeover_changed', 'system', {
-          enabled: false,
+        this.appendControlAudit(runtime, 'full_takeover_authority_revoked', 'system', {
           reason: 'approval_resolution_failed',
           approvalId: approval.id,
+          terminalScoped: true,
         });
         throw error;
       }
@@ -1065,19 +1066,47 @@ export class AgentService {
     }
     if (runtime.fullTakeover === request.enabled) return this.cloneRuntime(runtime);
     if (request.enabled) {
-      this.sessions.appendAudit(runtime.sessionId, 'full_takeover_changed', 'user', {
-        enabled: true,
+      this.sessions.appendAudit(runtime.sessionId, 'full_takeover_authority_enabled', 'user', {
+        terminalScoped: true,
       });
       runtime.fullTakeover = true;
+      this.rememberFullTakeoverPreference(runtime);
     } else {
       runtime.fullTakeover = false;
-      this.appendControlAudit(runtime, 'full_takeover_changed', 'user', {
-        enabled: false,
+      this.appendControlAudit(runtime, 'full_takeover_authority_revoked', 'user', {
+        reason: 'user_disabled',
+        terminalScoped: true,
       });
     }
-    this.syncHostFullTakeover(runtime);
     this.emit(runtime);
     return this.cloneRuntime(runtime);
+  }
+
+  setFullTakeoverPreference(
+    owner: WebContents,
+    request: SetFullTakeoverPreferenceRequest,
+  ): AgentSessionView | null {
+    const runtime = this.runtimes.get(request.terminalId);
+    if (runtime && runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
+    if (runtime?.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
+      throw new Error('Codex App Server does not use a Host Full Takeover preference.');
+    }
+    if (runtime) {
+      this.persistFullTakeoverPreference(runtime, request.enabled);
+      this.emit(runtime);
+      return this.cloneRuntime(runtime);
+    }
+
+    const session = this.sessions.sessionForTerminal(owner, request.terminalId);
+    if (!session?.hostId) throw new Error('当前终端没有可用的 Host 偏好。');
+    if (this.sessions.hostFullTakeoverPreference(session.hostId) === request.enabled) return null;
+    this.sessions.setHostFullTakeoverPreference(session.hostId, request.enabled);
+    this.sessions.appendAudit(session.id, 'full_takeover_preference_changed', 'user', {
+      enabled: request.enabled,
+      hostId: session.hostId,
+      grantsRuntimeAuthority: false,
+    });
+    return null;
   }
 
   takeover(
@@ -1130,9 +1159,9 @@ export class AgentService {
 
     if (runtime.fullTakeover) {
       runtime.fullTakeover = false;
-      this.appendControlAudit(runtime, 'full_takeover_changed', 'user', {
-        enabled: false,
+      this.appendControlAudit(runtime, 'full_takeover_authority_revoked', 'user', {
         reason: 'manual_takeover',
+        terminalScoped: true,
       });
     }
 
@@ -2054,8 +2083,9 @@ export class AgentService {
         : CODEX_APP_SERVER_AGENT_BACKEND,
       state: 'USER_CONTROL',
       terminalInputMode: 'human',
-      fullTakeover: backend.kind === 'generic-provider' && session.hostId
-        ? this.sessions.hostFullTakeover(session.hostId)
+      fullTakeover: false,
+      fullTakeoverPreference: backend.kind === 'generic-provider' && session.hostId
+        ? this.sessions.hostFullTakeoverPreference(session.hostId)
         : false,
       fileAccessMode: 'off',
       fileAccessPolicy: disabledFileAccessPolicy(),
@@ -2421,26 +2451,44 @@ export class AgentService {
     if (!runtime.fullTakeover) return;
     runtime.fullTakeover = false;
     try {
-      this.sessions.appendAudit(runtime.sessionId, 'full_takeover_changed', 'system', {
-        enabled: false,
+      this.sessions.appendAudit(runtime.sessionId, 'full_takeover_authority_revoked', 'system', {
         reason,
+        terminalScoped: true,
       });
     } catch (error) {
       console.error('Unable to persist Full Takeover shutdown:', error);
     }
   }
 
-  /** Persist the runtime's Full Takeover preference to its bound Host. */
-  private syncHostFullTakeover(runtime: AgentRuntimeRecord): void {
-    if (runtime.backend.kind !== 'generic-provider') return;
+  private rememberFullTakeoverPreference(runtime: AgentRuntimeRecord): void {
     try {
       const session = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
-      if (session?.hostId) {
-        this.sessions.setHostFullTakeover(session.hostId, runtime.fullTakeover);
-      }
-    } catch {
-      // Full Takeover persistence is best-effort; the in-memory state remains authoritative.
+      if (!session?.hostId) return;
+      this.persistFullTakeoverPreference(runtime, true);
+    } catch (error) {
+      // Runtime authority remains terminal-scoped even if its optional Host hint cannot persist.
+      console.error('Unable to persist Full Takeover Host preference:', error);
     }
+  }
+
+  private persistFullTakeoverPreference(
+    runtime: AgentRuntimeRecord,
+    enabled: boolean,
+  ): void {
+    const session = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
+    if (!session?.hostId) {
+      if (enabled) throw new Error('Local terminals do not have a Host preference.');
+      runtime.fullTakeoverPreference = false;
+      return;
+    }
+    if (runtime.fullTakeoverPreference === enabled) return;
+    this.sessions.setHostFullTakeoverPreference(session.hostId, enabled);
+    runtime.fullTakeoverPreference = enabled;
+    this.appendControlAudit(runtime, 'full_takeover_preference_changed', 'user', {
+      enabled,
+      hostId: session.hostId,
+      grantsRuntimeAuthority: false,
+    });
   }
 
   private revokeFileAccess(runtime: AgentRuntimeRecord, reason: string): void {

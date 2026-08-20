@@ -402,6 +402,7 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
 .agent-header .agent-controls .take-control { color: #77d6b8; border-color: #31574e; }
 .agent-header .agent-controls .full-takeover-enabled { color: #ffd1d5; border-color: #8f3d49; background: #3a171d; }
 .agent-header .agent-controls .takeover-badge { width: 100%; margin: 0 0 2px; color: #ff9ca4; text-align: right; font-size: 14px; font-weight: 900; letter-spacing: .03em; }
+.agent-header .agent-controls .takeover-preference { display: inline-flex; min-height: 36px; align-items: center; padding: 7px 10px; border: 1px solid #5b4d30; border-radius: 3px; background: #292316; color: #e6c77d; font-size: 13px; }
 .agent-context-meter { display: flex; width: 100%; min-height: 58px; align-items: center; gap: 10px; margin-bottom: 2px; padding: 7px 10px; color: #b8c6d8; border: 1px solid #29394c; border-radius: 5px; background: #0b121b; }
 .agent-context-ring { display: grid; width: 44px; height: 44px; position: relative; flex: 0 0 44px; place-items: center; }
 .agent-context-ring svg { width: 44px; height: 44px; overflow: visible; transform: rotate(-90deg); }
@@ -1239,6 +1240,7 @@ body.agent-panel-resizing { cursor: col-resize; user-select: none; }
   background: #b93449;
 }
 .app-shell[data-theme="light"] .agent-header .agent-controls .takeover-badge { color: #a11f35; }
+.app-shell[data-theme="light"] .agent-header .agent-controls .takeover-preference { border-color: #cbb47c; background: #fff8e7; color: #765711; }
 .app-shell[data-theme="light"] .agent-context-meter { color: #334158; border-color: #c9d3de; background: #f6f9fb; }
 .app-shell[data-theme="light"] .agent-context-ring-track { stroke: #d7e0e8; }
 .app-shell[data-theme="light"] .agent-context-ring-value { stroke: #188b70; }

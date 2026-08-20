@@ -129,7 +129,10 @@ export interface AgentSessionView {
   providerId: string;
   state: AgentRuntimeState;
   terminalInputMode: TerminalInputMode;
+  /** Ephemeral authority bound to this exact terminal runtime. */
   fullTakeover: boolean;
+  /** Persistent Host hint only; never grants runtime authority. */
+  fullTakeoverPreference: boolean;
   /** Explicit, in-memory permission for Generic Provider file tools. Never persisted. */
   fileAccessMode: AgentFileAccessMode;
   /** Optional for compatibility with persisted Alpha sessions and older render fixtures. */
@@ -214,6 +217,11 @@ export interface SetFullTakeoverRequest {
   editedCommand?: string;
 }
 
+export interface SetFullTakeoverPreferenceRequest {
+  terminalId: string;
+  enabled: boolean;
+}
+
 export interface SetAgentFileAccessRequest {
   terminalId: string;
   mode: AgentFileAccessMode;
@@ -248,6 +256,7 @@ export const AGENT_CHANNELS = {
   getState: 'agent:get-state',
   resolveApproval: 'agent:resolve-approval',
   setFullTakeover: 'agent:set-full-takeover',
+  setFullTakeoverPreference: 'agent:set-full-takeover-preference',
   setFileAccess: 'agent:set-file-access',
   takeover: 'agent:takeover',
   resolveTakeover: 'agent:resolve-takeover',

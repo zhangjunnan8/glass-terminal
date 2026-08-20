@@ -45,6 +45,7 @@ import type {
   SendAgentPromptRequest,
   SetAgentFileAccessRequest,
   SetFullTakeoverRequest,
+  SetFullTakeoverPreferenceRequest,
   TakeoverRequest,
 } from '../shared/agent';
 import { CODEX_APP_SERVER_CHANNELS } from '../shared/codex-app-server';
@@ -674,6 +675,13 @@ handleTrusted(
   (event, request: SetFullTakeoverRequest) => {
     if (!agentService) throw new Error('Agent service is not ready.');
     return agentService.setFullTakeover(event.sender, request);
+  },
+);
+handleTrusted(
+  AGENT_CHANNELS.setFullTakeoverPreference,
+  (event, request: SetFullTakeoverPreferenceRequest) => {
+    if (!agentService) throw new Error('Agent service is not ready.');
+    return agentService.setFullTakeoverPreference(event.sender, request);
   },
 );
 handleTrusted(AGENT_CHANNELS.takeover, (event, request: TakeoverRequest) => {
