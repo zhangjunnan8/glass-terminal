@@ -42,6 +42,7 @@ function basicSftp() {
   const directory = attributes('directory', 4_096, 0o040750, 1_700_000_001);
   const symlink = attributes('symlink', 5, 0o120777, 1_700_000_002);
   const handle = Buffer.from('handle');
+  let directoryReads = 0;
   return {
     _extensions: {
       'hardlink@openssh.com': '1',
@@ -79,14 +80,18 @@ function basicSftp() {
     ) => callback(undefined, handle)),
     write: vi.fn((...args: unknown[]) => successfulCallback(args)),
     close: vi.fn((...args: unknown[]) => successfulCallback(args)),
-    readdir: vi.fn((
+    opendir: vi.fn((
       _path: string,
+      callback: (error: Error | undefined, openedHandle: Buffer) => void,
+    ) => callback(undefined, handle)),
+    readdir: vi.fn((
+      _handle: Buffer,
       callback: (error: Error | undefined, entries: unknown[]) => void,
     ) => {
-      callback(undefined, [
+      callback(undefined, directoryReads++ === 0 ? [
         { filename: 'child.txt', longname: '', attrs: file },
         { filename: 'folder', longname: '', attrs: directory },
-      ]);
+      ] : []);
     }),
     rename: vi.fn((...args: unknown[]) => successfulCallback(args)),
     ext_openssh_rename: vi.fn((...args: unknown[]) => successfulCallback(args)),
@@ -117,7 +122,9 @@ describe('SftpRemoteFilesystem', () => {
       size: 5,
       mode: 0o120777,
     });
-    await expect(filesystem.listDirectory('/canonical')).resolves.toEqual([
+    const entries = [];
+    for await (const entry of filesystem.iterateDirectory('/canonical')) entries.push(entry);
+    expect(entries).toEqual([
       {
         name: 'child.txt',
         path: '/canonical/child.txt',
@@ -139,6 +146,62 @@ describe('SftpRemoteFilesystem', () => {
         },
       },
     ]);
+    expect(sftp.opendir).toHaveBeenCalledWith('/canonical', expect.any(Function));
+    expect(sftp.readdir).toHaveBeenCalledWith(Buffer.from('handle'), expect.any(Function));
+    expect(sftp.close).toHaveBeenCalledWith(Buffer.from('handle'), expect.any(Function));
+  });
+
+  it('closes the SFTP directory handle on an early consumer limit', async () => {
+    const sftp = basicSftp();
+    const filesystem = new SftpRemoteFilesystem(sftp as unknown as SFTPWrapper);
+    const iterator = filesystem.iterateDirectory('/many')[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toMatchObject({
+      done: false,
+      value: { name: 'child.txt' },
+    });
+    await iterator.return?.(undefined);
+    expect(sftp.readdir).toHaveBeenCalledTimes(1);
+    expect(sftp.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes after readdir failure and preserves the primary error over close failure', async () => {
+    const sftp = basicSftp();
+    const readError = new Error('directory read failed');
+    const closeError = new Error('directory close failed');
+    sftp.readdir.mockImplementation((...args: unknown[]) => {
+      const callback = args.at(-1) as (error?: Error, entries?: unknown[]) => void;
+      callback(readError, []);
+    });
+    sftp.close.mockImplementation((...args: unknown[]) => {
+      const callback = args.at(-1) as (error?: Error) => void;
+      callback(closeError);
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const filesystem = new SftpRemoteFilesystem(sftp as unknown as SFTPWrapper);
+
+    const iterator = filesystem.iterateDirectory('/broken')[Symbol.asyncIterator]();
+    await expect(iterator.next()).rejects.toBe(readError);
+    expect(sftp.close).toHaveBeenCalledTimes(1);
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining('after enumeration failed'),
+      closeError,
+    );
+    consoleError.mockRestore();
+  });
+
+  it('closes the SFTP directory handle when enumeration is cancelled', async () => {
+    const sftp = basicSftp();
+    const controller = new AbortController();
+    const filesystem = new SftpRemoteFilesystem(sftp as unknown as SFTPWrapper);
+    const iterator = filesystem.iterateDirectory('/cancelled', {
+      signal: controller.signal,
+    })[Symbol.asyncIterator]();
+    await iterator.next();
+    controller.abort();
+
+    await expect(iterator.next()).rejects.toMatchObject({ name: 'AbortError' });
+    expect(sftp.close).toHaveBeenCalledTimes(1);
   });
 
   it('maps string and numeric SFTP not-found codes to undefined', async () => {

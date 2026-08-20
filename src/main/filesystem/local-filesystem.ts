@@ -2,8 +2,8 @@ import {
   lstat as fsLstat,
   mkdir as fsMkdir,
   open as fsOpen,
+  opendir as fsOpendir,
   readFile as fsReadFile,
-  readdir as fsReaddir,
   realpath as fsRealpath,
   rename as fsRename,
   rmdir as fsRmdir,
@@ -16,6 +16,7 @@ import type { Stats } from 'node:fs';
 import { FilesystemReadLimitError } from './remote-filesystem';
 import type {
   FilesystemBackend,
+  DirectoryEnumerationOptions,
   RemoteDirectoryEntry,
   RemoteEntryType,
   RemoteFileStat,
@@ -94,22 +95,42 @@ export class LocalFilesystemBackend implements FilesystemBackend {
     await fsWriteFile(path, content, { mode: mode & 0o777, flag: exclusive ? 'wx' : 'w' });
   }
 
-  async listDirectory(path: string): Promise<RemoteDirectoryEntry[]> {
-    const entries = await fsReaddir(path, { withFileTypes: true });
-    entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
-    const result: RemoteDirectoryEntry[] = [];
-    // Keep metadata reads bounded in-flight. A huge directory may still be
-    // materialized by readdir, but it no longer creates one Promise per entry.
-    for (const entry of entries) {
-      const entryPath = join(path, entry.name);
-      result.push({
+  async *iterateDirectory(
+    path: string,
+    options: DirectoryEnumerationOptions = {},
+  ): AsyncGenerator<RemoteDirectoryEntry> {
+    if (options.signal?.aborted) throw this.abortError();
+    const directory = await fsOpendir(path);
+    let operationError: unknown;
+    try {
+      while (true) {
+        if (options.signal?.aborted) throw this.abortError();
+        const entry = await directory.read();
+        if (!entry) return;
+        if (options.signal?.aborted) throw this.abortError();
+        const entryPath = join(path, entry.name);
+        yield {
         name: entry.name,
         path: entryPath,
         // lstat is deliberate: listing a link must never inspect its target.
-        stat: fileStat(await fsLstat(entryPath)),
-      });
+        stat: fileStat(await this.readDirectoryEntryStat(entryPath)),
+        };
+      }
+    } catch (error) {
+      operationError = error;
+      throw error;
+    } finally {
+      try {
+        await directory.close();
+      } catch (closeError) {
+        console.error(
+          operationError === undefined
+            ? `Unable to close local directory handle for ${path}:`
+            : `Unable to close local directory handle after enumeration failed for ${path}:`,
+          closeError,
+        );
+      }
     }
-    return result;
   }
 
   async rename(source: string, destination: string): Promise<void> {
@@ -130,5 +151,16 @@ export class LocalFilesystemBackend implements FilesystemBackend {
 
   async rmdir(path: string): Promise<void> {
     await fsRmdir(path);
+  }
+
+  private abortError(): Error {
+    const error = new Error('Filesystem directory enumeration was cancelled.');
+    error.name = 'AbortError';
+    return error;
+  }
+
+  /** Separated for deterministic lazy-enumeration tests; still lstat in production. */
+  protected readDirectoryEntryStat(path: string): Promise<Stats> {
+    return fsLstat(path);
   }
 }

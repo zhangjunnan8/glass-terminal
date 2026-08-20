@@ -19,6 +19,10 @@ export interface RemoteDirectoryEntry {
   stat: RemoteFileStat;
 }
 
+export interface DirectoryEnumerationOptions {
+  signal?: AbortSignal;
+}
+
 /**
  * Transport-neutral filesystem primitives used by Workspace operations.
  *
@@ -32,7 +36,11 @@ export interface FilesystemBackend {
   /** Reads at most maxBytes, throwing before retaining an oversized payload. */
   readFile(path: string, maxBytes?: number): Promise<Buffer>;
   writeFile(path: string, content: Buffer, mode?: number, exclusive?: boolean): Promise<void>;
-  listDirectory(path: string): Promise<RemoteDirectoryEntry[]>;
+  /** Lazily enumerates one directory and closes its handle when iteration stops. */
+  iterateDirectory(
+    path: string,
+    options?: DirectoryEnumerationOptions,
+  ): AsyncIterable<RemoteDirectoryEntry>;
   rename(source: string, destination: string): Promise<void>;
   atomicReplace(source: string, destination: string): Promise<void>;
   unlink(path: string): Promise<void>;
@@ -93,6 +101,13 @@ function callbackOperation(
       else resolve();
     });
   });
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  const error = new Error('Filesystem directory enumeration was cancelled.');
+  error.name = 'AbortError';
+  throw error;
 }
 
 function detectedCapabilities(
@@ -232,16 +247,49 @@ export class SftpRemoteFilesystem implements RemoteFilesystem {
     return { fsynced: this.capabilities.fsync };
   }
 
-  listDirectory(path: string): Promise<RemoteDirectoryEntry[]> {
-    return new Promise((resolve, reject) => {
-      this.sftp.readdir(path, (error, entries) => {
-        if (error) {
-          reject(error);
-          return;
-        }
-        resolve(entries.map((entry) => this.directoryEntry(path, entry)));
+  async *iterateDirectory(
+    path: string,
+    options: DirectoryEnumerationOptions = {},
+  ): AsyncGenerator<RemoteDirectoryEntry> {
+    throwIfAborted(options.signal);
+    const handle = await new Promise<Buffer>((resolve, reject) => {
+      this.sftp.opendir(path, (error, openedHandle) => {
+        if (error) reject(error);
+        else resolve(openedHandle);
       });
     });
+    let operationError: unknown;
+    try {
+      while (true) {
+        throwIfAborted(options.signal);
+        const entries = await new Promise<FileEntryWithStats[] | false>((resolve, reject) => {
+          this.sftp.readdir(handle, (error, batch) => {
+            if (error) reject(error);
+            else resolve((batch as FileEntryWithStats[] | false) || false);
+          });
+        });
+        throwIfAborted(options.signal);
+        if (entries === false || entries.length === 0) return;
+        for (const entry of entries) {
+          throwIfAborted(options.signal);
+          yield this.directoryEntry(path, entry);
+        }
+      }
+    } catch (error) {
+      operationError = error;
+      throw error;
+    } finally {
+      try {
+        await callbackOperation((callback) => this.sftp.close(handle, callback));
+      } catch (closeError) {
+        console.error(
+          operationError === undefined
+            ? `Unable to close SFTP directory handle for ${path}:`
+            : `Unable to close SFTP directory handle after enumeration failed for ${path}:`,
+          closeError,
+        );
+      }
+    }
   }
 
   rename(source: string, destination: string): Promise<void> {

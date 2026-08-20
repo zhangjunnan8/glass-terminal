@@ -5,7 +5,11 @@ import type {
   RemoteFilesystem,
   RemoteFilesystemProvider,
 } from '../filesystem/remote-filesystem';
-import { remotePath, SftpService } from './sftp-service';
+import {
+  MAX_SFTP_DRAWER_DIRECTORY_ENTRIES,
+  remotePath,
+  SftpService,
+} from './sftp-service';
 
 function owner(id: number): WebContents {
   return { id } as unknown as WebContents;
@@ -15,15 +19,29 @@ class FakeRemoteFilesystem {
   resolvedPath = '/home/tester';
   entries: RemoteDirectoryEntry[] = [];
   channelActive = false;
+  yielded = 0;
+  iteratorClosed = false;
 
   readonly realpath = vi.fn(async (_path: string) => {
     expect(this.channelActive).toBe(true);
     return this.resolvedPath;
   });
 
-  readonly listDirectory = vi.fn(async (_path: string) => {
-    expect(this.channelActive).toBe(true);
-    return this.entries;
+  readonly iterateDirectory = vi.fn((_path: string) => {
+    const filesystem = this;
+    return {
+      async *[Symbol.asyncIterator](): AsyncGenerator<RemoteDirectoryEntry> {
+        expect(filesystem.channelActive).toBe(true);
+        try {
+          for (const entry of filesystem.entries) {
+            filesystem.yielded += 1;
+            yield entry;
+          }
+        } finally {
+          filesystem.iteratorClosed = true;
+        }
+      },
+    };
   });
 
   asRemoteFilesystem(): RemoteFilesystem {
@@ -121,7 +139,7 @@ describe('SftpService', () => {
 
     expect(provider.calls).toEqual([{ owner: browser, terminalId: 'terminal-ssh-1' }]);
     expect(filesystem.realpath).not.toHaveBeenCalled();
-    expect(filesystem.listDirectory).toHaveBeenCalledWith('/workspace');
+    expect(filesystem.iterateDirectory).toHaveBeenCalledWith('/workspace');
     expect(filesystem.channelActive).toBe(false);
     expect(listing).toEqual({
       terminalId: 'terminal-ssh-1',
@@ -160,6 +178,7 @@ describe('SftpService', () => {
           modifiedAt: '2026-08-16T08:00:00.000Z',
         },
       ],
+      truncated: false,
     });
   });
 
@@ -172,9 +191,33 @@ describe('SftpService', () => {
     const listing = await service.listDirectory(owner(42), 'terminal-ssh-2');
 
     expect(filesystem.realpath).toHaveBeenCalledWith('.');
-    expect(filesystem.listDirectory).toHaveBeenCalledWith('/home/tester');
+    expect(filesystem.iterateDirectory).toHaveBeenCalledWith('/home/tester');
     expect(listing.path).toBe('/home/tester');
     expect(filesystem.channelActive).toBe(false);
+  });
+
+  it('bounds the main-to-renderer directory payload and closes enumeration at N+1', async () => {
+    const filesystem = new FakeRemoteFilesystem();
+    filesystem.entries = Array.from(
+      { length: MAX_SFTP_DRAWER_DIRECTORY_ENTRIES + 50 },
+      (_, index) => ({
+        name: `file-${index}.txt`,
+        path: `/many/file-${index}.txt`,
+        stat: {
+          type: 'file' as const,
+          size: index,
+          mode: 0o644,
+          modifiedAt: '2026-08-16T00:00:00.000Z',
+        },
+      }),
+    );
+    const service = new SftpService(new FakeRemoteFilesystemProvider(filesystem).asProvider());
+
+    const listing = await service.listDirectory(owner(44), 'terminal-many', '/many');
+    expect(listing.entries).toHaveLength(MAX_SFTP_DRAWER_DIRECTORY_ENTRIES);
+    expect(listing.truncated).toBe(true);
+    expect(filesystem.yielded).toBe(MAX_SFTP_DRAWER_DIRECTORY_ENTRIES + 1);
+    expect(filesystem.iteratorClosed).toBe(true);
   });
 
   it('rejects a relative requested path before acquiring a provider channel', async () => {
@@ -188,6 +231,6 @@ describe('SftpService', () => {
 
     expect(provider.calls).toEqual([]);
     expect(filesystem.realpath).not.toHaveBeenCalled();
-    expect(filesystem.listDirectory).not.toHaveBeenCalled();
+    expect(filesystem.iterateDirectory).not.toHaveBeenCalled();
   });
 });

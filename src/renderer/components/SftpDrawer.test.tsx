@@ -27,6 +27,7 @@ function installSftpBridge() {
       terminalId: 'terminal-1',
       path: '/',
       entries: [],
+      truncated: false,
     }),
     chooseUpload: vi.fn().mockResolvedValue([]),
     chooseDownload: vi.fn().mockResolvedValue(null),
@@ -143,6 +144,31 @@ describe('SftpDrawer transfer queue', () => {
     expect(button.disabled).toBe(true);
   });
 
+  it('clearly marks a bounded partial directory listing', async () => {
+    vi.mocked(window.aiTerminal.sftp.listDirectory).mockResolvedValue({
+      terminalId: 'terminal-1',
+      path: '/many',
+      entries: [],
+      truncated: true,
+    });
+    await act(async () => root.render(
+      <SftpDrawer
+        terminal={{
+          id: 'terminal-1',
+          title: 'Ubuntu',
+          transport: 'ssh',
+          status: 'connected',
+        }}
+        onClose={() => undefined}
+      />,
+    ));
+    await settle();
+
+    expect(container.querySelector('[role="status"]')?.textContent)
+      .toBe('目录过大，仅显示部分内容');
+    expect(container.textContent).not.toContain('此目录为空');
+  });
+
   it('shows workspace callback failures in the existing drawer error area', async () => {
     const onSetWorkspace = vi.fn().mockRejectedValue(new Error('保存工作区失败'));
     await act(async () => root.render(
@@ -208,6 +234,7 @@ describe('SftpDrawer transfer queue', () => {
       terminalBListing.resolve({
         terminalId: 'terminal-b',
         path: '/srv/b',
+        truncated: false,
         entries: [{
           name: 'from-b.txt',
           path: '/srv/b/from-b.txt',
@@ -227,6 +254,7 @@ describe('SftpDrawer transfer queue', () => {
       terminalAListing.resolve({
         terminalId: 'terminal-a',
         path: '/srv/a',
+        truncated: false,
         entries: [{
           name: 'late-from-a.txt',
           path: '/srv/a/late-from-a.txt',

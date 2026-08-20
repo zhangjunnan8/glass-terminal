@@ -19,6 +19,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { WebContents } from 'electron';
 import type {
   FilesystemBackend,
+  RemoteDirectoryEntry,
   RemoteFilesystem,
   RemoteFilesystemProvider,
   RemoteFileStat,
@@ -137,8 +138,16 @@ function remoteStat(type: RemoteFileStat['type'], size = 0): RemoteFileStat {
 }
 
 function fakeRemoteFilesystem(
-  overrides: Partial<RemoteFilesystem> = {},
+  overrides: Partial<RemoteFilesystem> & {
+    listDirectory?: (path: string) => Promise<RemoteDirectoryEntry[]>;
+  } = {},
 ): RemoteFilesystem {
+  const { listDirectory, ...nativeOverrides } = overrides;
+  const iterateDirectory = nativeOverrides.iterateDirectory ?? vi.fn((path: string) => ({
+    async *[Symbol.asyncIterator]() {
+      for (const entry of await (listDirectory?.(path) ?? [])) yield entry;
+    },
+  }));
   return {
     serverCapabilities: () => ({
       detection: 'advertised',
@@ -153,14 +162,14 @@ function fakeRemoteFilesystem(
     readFile: vi.fn(async () => Buffer.alloc(0)),
     writeFile: vi.fn(async () => undefined),
     writeFileDurable: vi.fn(async () => ({ fsynced: true })),
-    listDirectory: vi.fn(async () => []),
+    iterateDirectory,
     rename: vi.fn(async () => undefined),
     atomicReplace: vi.fn(async () => undefined),
     hardlink: vi.fn(async () => undefined),
     unlink: vi.fn(async () => undefined),
     mkdir: vi.fn(async () => undefined),
     rmdir: vi.fn(async () => undefined),
-    ...overrides,
+    ...nativeOverrides,
   };
 }
 
@@ -928,8 +937,44 @@ describe('AgentFileService local workspace boundary', () => {
       ...remoteStat('file', 5),
     });
     expect(localFilesystem.readFile).toHaveBeenCalledWith(file, AGENT_FILE_LIMITS.maxBytes);
-    expect(localFilesystem.listDirectory).toHaveBeenCalledWith(root);
+    expect(localFilesystem.iterateDirectory).toHaveBeenCalledWith(root);
     expect(localFilesystem.lstat).toHaveBeenCalledWith(file);
+  });
+
+  it('bounds workspace_list at N+1 entries and closes a million-entry iterator', async () => {
+    let yielded = 0;
+    let closed = false;
+    const filesystem = fakeRemoteFilesystem({
+      stat: vi.fn(async (path: string) => (
+        path === '/work' ? remoteStat('directory') : remoteStat('file', 1)
+      )),
+      lstat: vi.fn(async (path: string) => (
+        path === '/work' ? remoteStat('directory') : remoteStat('file', 1)
+      )),
+      iterateDirectory: vi.fn((_path: string) => ({
+        async *[Symbol.asyncIterator](): AsyncGenerator<RemoteDirectoryEntry> {
+          try {
+            for (let index = 0; index < 1_000_000; index += 1) {
+              yielded += 1;
+              yield {
+                name: `file-${index}.txt`,
+                path: `/work/file-${index}.txt`,
+                stat: remoteStat('file', 1),
+              };
+            }
+          } finally {
+            closed = true;
+          }
+        },
+      })),
+    });
+    const { service } = createSshService(filesystem);
+
+    const result = await service.list({ id: 1 } as WebContents, 'terminal');
+    expect(result.entries).toHaveLength(AGENT_FILE_LIMITS.maxEntries);
+    expect(result.truncated).toBe(true);
+    expect(yielded).toBe(AGENT_FILE_LIMITS.maxEntries + 1);
+    expect(closed).toBe(true);
   });
 
   it('uses one RemoteFilesystem abstraction with the expected Host and atomic overwrite', async () => {
@@ -1807,6 +1852,50 @@ describe('AgentFileService local workspace boundary', () => {
       { recursive: true },
     )).rejects.toThrow('层限制');
     expect(withFilesystem).toHaveBeenCalledTimes(1);
+    expect(unlink).not.toHaveBeenCalled();
+    expect(rmdir).not.toHaveBeenCalled();
+  });
+
+  it('consumes only the recursive delete limit plus one sentinel and has zero side effects', async () => {
+    let yielded = 0;
+    let closed = false;
+    const unlink = vi.fn(async () => undefined);
+    const rmdir = vi.fn(async () => undefined);
+    const filesystem = fakeRemoteFilesystem({
+      lstat: vi.fn(async (path: string) => (
+        path === '/work' || path === '/work/tree'
+          ? remoteStat('directory')
+          : remoteStat('file', 1)
+      )),
+      iterateDirectory: vi.fn((_path: string) => ({
+        async *[Symbol.asyncIterator](): AsyncGenerator<RemoteDirectoryEntry> {
+          try {
+            for (let index = 0; index < 1_000_000; index += 1) {
+              yielded += 1;
+              yield {
+                name: `file-${index}.txt`,
+                path: `/work/tree/file-${index}.txt`,
+                stat: remoteStat('file', 1),
+              };
+            }
+          } finally {
+            closed = true;
+          }
+        },
+      })),
+      unlink,
+      rmdir,
+    });
+    const { service } = createSshService(filesystem);
+
+    await expect(service.deletePath(
+      { id: 1 } as WebContents,
+      'terminal',
+      'tree',
+      { recursive: true },
+    )).rejects.toThrow(`${AGENT_FILE_LIMITS.maxRecursiveDeleteEntries} 个条目限制`);
+    expect(yielded).toBe(AGENT_FILE_LIMITS.maxRecursiveDeleteEntries + 1);
+    expect(closed).toBe(true);
     expect(unlink).not.toHaveBeenCalled();
     expect(rmdir).not.toHaveBeenCalled();
   });

@@ -243,6 +243,9 @@ export function SftpDrawer({
           {error && <div className="sftp-error">{error}</div>}
           <div className="sftp-file-list" data-sftp-ready={listing ? 'true' : 'false'}>
             {loading && <div className="sftp-loading">正在加载…</div>}
+            {!loading && listing?.truncated && (
+              <div className="sftp-loading" role="status">目录过大，仅显示部分内容</div>
+            )}
             {!loading && listing?.entries.map((entry) => (
               <div className="sftp-entry" key={entry.path}>
                 <button
@@ -265,7 +268,7 @@ export function SftpDrawer({
                 )}
               </div>
             ))}
-            {!loading && listing?.entries.length === 0 && (
+            {!loading && listing?.entries.length === 0 && !listing.truncated && (
               <div className="sftp-loading">此目录为空。</div>
             )}
           </div>

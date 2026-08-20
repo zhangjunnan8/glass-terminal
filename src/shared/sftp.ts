@@ -13,6 +13,8 @@ export interface SftpDirectoryListing {
   terminalId: string;
   path: string;
   entries: SftpEntry[];
+  /** True when the directory contains more entries than the drawer hard limit. */
+  truncated: boolean;
 }
 
 export type TransferDirection = 'upload' | 'download';

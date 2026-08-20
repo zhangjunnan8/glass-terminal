@@ -30,6 +30,7 @@ import { LocalFilesystemBackend } from '../filesystem/local-filesystem';
 import {
   RemoteFilesystemProvider,
   type FilesystemBackend,
+  type RemoteDirectoryEntry,
   type RemoteFilesystem,
   type RemoteFileStat,
 } from '../filesystem/remote-filesystem';
@@ -629,30 +630,69 @@ export class AgentFileService {
       const { root } = await this.prepareAccessRoots(this.localFilesystem, target);
       const path = await this.localFilesystem.realpath(target.requestedPath);
       assertWithinRoot(root, path, 'local');
-      const entries = await this.localFilesystem.listDirectory(path);
-      const limited = entries.slice(0, MAX_AGENT_DIRECTORY_ENTRIES);
-      const mapped = limited.map((entry) => ({
+      const listed = await this.collectBoundedDirectory(
+        this.localFilesystem,
+        path,
+        target.authorization.assertLive,
+      );
+      const mapped = listed.entries.map((entry) => ({
         name: entry.name,
         type: entry.stat.type,
         size: entry.stat.size,
       }));
-      return { path, entries: mapped, truncated: entries.length > limited.length };
+      return { path, entries: mapped, truncated: listed.truncated };
     }
     return this.withRemoteFilesystem(owner, terminalId, target, async (filesystem) => {
       const { root } = await this.prepareAccessRoots(filesystem, target);
       const path = await filesystem.realpath(target.requestedPath);
       assertWithinRoot(root, path, 'ssh');
-      const entries = await filesystem.listDirectory(path);
+      const listed = await this.collectBoundedDirectory(
+        filesystem,
+        path,
+        target.authorization.assertLive,
+      );
       return {
         path,
-        entries: entries.slice(0, MAX_AGENT_DIRECTORY_ENTRIES).map((entry) => ({
+        entries: listed.entries.map((entry) => ({
           name: entry.name,
           type: entry.stat.type,
           size: entry.stat.size,
         })),
-        truncated: entries.length > MAX_AGENT_DIRECTORY_ENTRIES,
+        truncated: listed.truncated,
       };
     });
+  }
+
+  private async collectBoundedDirectory(
+    filesystem: FilesystemBackend,
+    path: string,
+    assertLive?: () => void,
+  ): Promise<{ entries: RemoteDirectoryEntry[]; truncated: boolean }> {
+    const entries: RemoteDirectoryEntry[] = [];
+    const iterator = filesystem.iterateDirectory(path)[Symbol.asyncIterator]();
+    let truncated = false;
+    try {
+      while (true) {
+        assertLive?.();
+        const next = await iterator.next();
+        if (next.done) break;
+        if (entries.length >= MAX_AGENT_DIRECTORY_ENTRIES) {
+          truncated = true;
+          break;
+        }
+        entries.push(next.value);
+      }
+    } finally {
+      try {
+        await iterator.return?.();
+      } catch (closeError) {
+        console.error(`Unable to stop bounded Workspace listing for ${path}:`, closeError);
+      }
+    }
+    entries.sort((left, right) => (
+      left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+    ));
+    return { entries, truncated };
   }
 
   async statPath(
@@ -1068,6 +1108,8 @@ export class AgentFileService {
         prepared.path,
         query,
         { maxResults: options.maxResults, resultOffset: options.resultOffset },
+        DEFAULT_WORKSPACE_TRAVERSAL_LIMITS,
+        { assertLive: target.authorization.assertLive },
       );
     });
   }
@@ -1135,6 +1177,8 @@ export class AgentFileService {
         prepared.path,
         pattern,
         { maxResults: options.maxResults, resultOffset: options.resultOffset },
+        DEFAULT_WORKSPACE_TRAVERSAL_LIMITS,
+        { assertLive: target.authorization.assertLive },
       );
     });
   }
@@ -2214,15 +2258,18 @@ export class AgentFileService {
       if (current?.type !== 'directory') {
         throw new Error('递归删除预检期间目录已变化，未删除任何内容。');
       }
-      const entries = await filesystem.listDirectory(directory);
-      this.assertRecursiveDeleteDeadline(deadline);
-      entries.sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
-      for (const entry of entries) {
-        this.assertRecursiveDeleteDeadline(deadline);
-        if (entriesVisited >= MAX_RECURSIVE_DELETE_ENTRIES) {
-          throw new Error(`递归删除超过 ${MAX_RECURSIVE_DELETE_ENTRIES} 个条目限制，未删除任何内容。`);
-        }
-        entriesVisited += 1;
+      const iterator = filesystem.iterateDirectory(directory)[Symbol.asyncIterator]();
+      try {
+        while (true) {
+          this.assertRecursiveDeleteDeadline(deadline);
+          const next = await iterator.next();
+          this.assertRecursiveDeleteDeadline(deadline);
+          if (next.done) break;
+          const entry = next.value;
+          if (entriesVisited >= MAX_RECURSIVE_DELETE_ENTRIES) {
+            throw new Error(`递归删除超过 ${MAX_RECURSIVE_DELETE_ENTRIES} 个条目限制，未删除任何内容。`);
+          }
+          entriesVisited += 1;
         if (
           !entry.name
           || entry.name === '.'
@@ -2244,6 +2291,13 @@ export class AgentFileService {
         } else {
           this.assertRecursiveDeleteDeadline(deadline);
           plan.push({ path, type: 'file' });
+        }
+        }
+      } finally {
+        try {
+          await iterator.return?.();
+        } catch (closeError) {
+          console.error(`Unable to stop recursive delete enumeration for ${directory}:`, closeError);
         }
       }
       this.assertRecursiveDeleteDeadline(deadline);

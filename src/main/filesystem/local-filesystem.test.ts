@@ -8,6 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
+import type { Stats } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { LocalFilesystemBackend } from './local-filesystem';
@@ -54,13 +55,39 @@ describe('LocalFilesystemBackend', () => {
     symlinkSync(outside, link, process.platform === 'win32' ? 'junction' : 'dir');
     const filesystem = new LocalFilesystemBackend();
 
-    await expect(filesystem.listDirectory(root)).resolves.toContainEqual(expect.objectContaining({
+    const entries = [];
+    for await (const entry of filesystem.iterateDirectory(root)) entries.push(entry);
+    expect(entries).toContainEqual(expect.objectContaining({
       name: 'linked-directory',
       path: link,
       stat: expect.objectContaining({ type: 'symlink' }),
     }));
     await expect(filesystem.lstat(link)).resolves.toMatchObject({ type: 'symlink' });
     await expect(filesystem.stat(link)).resolves.toMatchObject({ type: 'directory' });
+  });
+
+  it('does not stat local entries that the bounded consumer never requests', async () => {
+    const root = temporaryRoot();
+    for (let index = 0; index < 20; index += 1) {
+      writeFileSync(join(root, `entry-${index}.txt`), String(index), 'utf8');
+    }
+    class RecordingFilesystem extends LocalFilesystemBackend {
+      readonly entryStats: string[] = [];
+
+      protected override readDirectoryEntryStat(path: string): Promise<Stats> {
+        this.entryStats.push(path);
+        return super.readDirectoryEntryStat(path);
+      }
+    }
+    const filesystem = new RecordingFilesystem();
+    let consumed = 0;
+    for await (const _entry of filesystem.iterateDirectory(root)) {
+      consumed += 1;
+      if (consumed === 3) break;
+    }
+
+    expect(consumed).toBe(3);
+    expect(filesystem.entryStats).toHaveLength(3);
   });
 
   it('maps file and directory mutations, including atomic replacement', async () => {

@@ -54,6 +54,12 @@ export interface WorkspaceGlobOptions {
   resultOffset?: number;
 }
 
+export interface WorkspaceTraversalControl {
+  signal?: AbortSignal;
+  /** Turn-local capability/revocation check, invoked before every next entry request. */
+  assertLive?(): void;
+}
+
 interface WalkEntry {
   path: string;
   stat: RemoteFileStat;
@@ -136,6 +142,14 @@ function boundedResultOffset(
   return requested;
 }
 
+function assertTraversalLive(control: WorkspaceTraversalControl): void {
+  control.assertLive?.();
+  if (!control.signal?.aborted) return;
+  const error = new Error('Workspace traversal was cancelled.');
+  error.name = 'AbortError';
+  throw error;
+}
+
 async function walkWorkspace(
   filesystem: FilesystemBackend,
   flavor: WorkspacePathFlavor,
@@ -144,6 +158,7 @@ async function walkWorkspace(
   limits: Readonly<WorkspaceTraversalLimits>,
   deadline: number,
   visit: (entry: WalkEntry) => Promise<WalkDecision>,
+  control: WorkspaceTraversalControl,
 ): Promise<WalkState> {
   const state: WalkState = { entriesVisited: 0, truncated: false };
 
@@ -171,64 +186,89 @@ async function walkWorkspace(
       return true;
     }
 
-    let entries;
+    const iterator = filesystem.iterateDirectory(directory, {
+      signal: control.signal,
+    })[Symbol.asyncIterator]();
     try {
-      entries = await filesystem.listDirectory(directory);
-    } catch (error) {
-      if (depth === 0) throw error;
-      state.truncated = true;
-      return true;
-    }
-    if (Date.now() > deadline) {
-      state.truncated = true;
-      return false;
-    }
+      while (true) {
+        assertTraversalLive(control);
+        if (Date.now() > deadline) {
+          state.truncated = true;
+          return false;
+        }
+        // Read exactly one sentinel beyond the global entry budget so an
+        // exactly-full directory is not falsely labelled truncated.
+        if (state.entriesVisited >= limits.maxEntries) {
+          let extra;
+          try {
+            extra = await iterator.next();
+          } catch (error) {
+            if (depth === 0) throw error;
+            state.truncated = true;
+            return true;
+          }
+          if (!extra.done) state.truncated = true;
+          return extra.done === true;
+        }
+        let next;
+        try {
+          next = await iterator.next();
+        } catch (error) {
+          if (depth === 0) throw error;
+          state.truncated = true;
+          return true;
+        }
+        if (next.done) return true;
+        assertTraversalLive(control);
+        if (Date.now() > deadline) {
+          state.truncated = true;
+          return false;
+        }
+        const listedEntry = next.value;
+        state.entriesVisited += 1;
 
-    entries.sort((left, right) => compareNames(left.name, right.name));
-    for (const listedEntry of entries) {
-      if (Date.now() > deadline) {
-        state.truncated = true;
-        return false;
-      }
-      if (state.entriesVisited >= limits.maxEntries) {
-        state.truncated = true;
-        return false;
-      }
-      state.entriesVisited += 1;
+        if (!safeEntryName(listedEntry.name, flavor)) {
+          state.truncated = true;
+          continue;
+        }
+        const path = joinPath(flavor, directory, listedEntry.name);
+        assertWithinRoot(flavor, root, path);
 
-      if (!safeEntryName(listedEntry.name, flavor)) {
-        state.truncated = true;
-        continue;
-      }
-      const path = joinPath(flavor, directory, listedEntry.name);
-      assertWithinRoot(flavor, root, path);
+        // Do not trust cached/readdir attributes for a security decision. lstat
+        // observes the final path component without following a symlink.
+        let stat: RemoteFileStat | undefined;
+        try {
+          stat = await filesystem.lstat(path);
+        } catch {
+          state.truncated = true;
+          continue;
+        }
+        if (!stat) continue;
+        assertTraversalLive(control);
+        if (Date.now() > deadline) {
+          state.truncated = true;
+          return false;
+        }
 
-      // Do not trust cached/readdir attributes for a security decision. lstat
-      // observes the final path component without following a symlink.
-      let stat: RemoteFileStat | undefined;
+        if (await visit({ path, stat }) === 'stop') return false;
+        if (stat.type !== 'directory') continue;
+
+        const childDepth = depth + 1;
+        if (childDepth >= limits.maxDepth) {
+          state.truncated = true;
+          continue;
+        }
+        if (!await walkDirectory(path, childDepth)) return false;
+      }
+    } finally {
       try {
-        stat = await filesystem.lstat(path);
-      } catch {
-        state.truncated = true;
-        continue;
+        await iterator.return?.();
+      } catch (closeError) {
+        // Backend iterators already preserve primary errors; this is defense
+        // for third-party/test implementations of FilesystemBackend.
+        console.error(`Unable to stop directory enumeration for ${directory}:`, closeError);
       }
-      if (!stat) continue;
-      if (Date.now() > deadline) {
-        state.truncated = true;
-        return false;
-      }
-
-      if (await visit({ path, stat }) === 'stop') return false;
-      if (stat.type !== 'directory') continue;
-
-      const childDepth = depth + 1;
-      if (childDepth >= limits.maxDepth) {
-        state.truncated = true;
-        continue;
-      }
-      if (!await walkDirectory(path, childDepth)) return false;
     }
-    return true;
   };
 
   await walkDirectory(startDirectory, 0);
@@ -366,6 +406,7 @@ export async function searchWorkspace(
   query: string,
   options: WorkspaceSearchOptions = {},
   limits: Readonly<WorkspaceTraversalLimits> = DEFAULT_WORKSPACE_TRAVERSAL_LIMITS,
+  control: WorkspaceTraversalControl = {},
 ): Promise<WorkspaceSearchResult> {
   if (!query || query.includes('\0')) throw new Error('搜索文本不能为空或包含 NUL 字节。');
   if (Buffer.byteLength(query, 'utf8') > limits.maxQueryBytes) {
@@ -441,6 +482,7 @@ export async function searchWorkspace(
       limits,
       deadline,
       visit,
+      control,
     );
     truncated ||= walk.truncated;
   }
@@ -569,6 +611,7 @@ export async function globWorkspace(
   pattern: string,
   options: WorkspaceGlobOptions = {},
   limits: Readonly<WorkspaceTraversalLimits> = DEFAULT_WORKSPACE_TRAVERSAL_LIMITS,
+  control: WorkspaceTraversalControl = {},
 ): Promise<WorkspaceGlobResult> {
   const normalizedPattern = normalizedGlobPattern(flavor, pattern, limits);
   const tokens = globTokens(normalizedPattern);
@@ -616,6 +659,7 @@ export async function globWorkspace(
       seenMatches += 1;
       return 'continue';
     },
+    control,
   );
   paths.sort(compareNames);
   const truncated = overflow || walk.truncated;
