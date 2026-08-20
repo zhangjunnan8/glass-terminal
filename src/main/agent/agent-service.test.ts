@@ -2,6 +2,7 @@ import type { WebContents } from 'electron';
 import { createHash, randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import {
+  AGENT_CHANNELS,
   CODEX_APP_SERVER_AGENT_BACKEND,
   CODEX_APP_SERVER_AGENT_POLICY_VERSION,
 } from '../../shared/agent';
@@ -3053,13 +3054,27 @@ describe('AgentService shared-terminal controls', () => {
     codex.push('**部分');
     codex.push('输出');
     await waitFor(() => send.mock.calls.some((call) => {
-      const view = call[1] as {
-        streamingMessageId?: string;
-        messages?: Array<{ id: string; content: string }>;
-      };
-      return Boolean(view?.streamingMessageId)
-        && view.messages?.at(-1)?.content === '**部分输出';
+      const event = call[1] as { delta?: string };
+      return call[0] === AGENT_CHANNELS.assistantDelta
+        && event.delta === '**部分输出';
     }));
+    const deltaPayload = send.mock.calls.find(
+      (call) => call[0] === AGENT_CHANNELS.assistantDelta,
+    )?.[1] as Record<string, unknown>;
+    expect(deltaPayload).toMatchObject({
+      terminalId: 'terminal',
+      messageId: expect.any(String),
+      turnId: expect.any(String),
+      sequence: 1,
+      delta: '**部分输出',
+    });
+    expect(deltaPayload).not.toHaveProperty('messages');
+    expect(send.mock.calls.some((call) => {
+      if (call[0] !== AGENT_CHANNELS.stateChanged) return false;
+      const view = call[1] as AgentSessionView;
+      return Boolean(view.streamingMessageId)
+        && view.messages.at(-1)?.content === '';
+    })).toBe(true);
     const partial = service.getState(owner, 'terminal')!;
     const partialId = partial.streamingMessageId;
     expect(partial.messages.at(-1)?.id).toBe(partialId);
@@ -3173,10 +3188,17 @@ describe('AgentService shared-terminal controls', () => {
     provider.push('生成');
 
     await waitFor(() => send.mock.calls.some((call) => {
-      const view = call[1] as { streamingMessageId?: string; messages?: Array<{ content: string }> };
-      return Boolean(view?.streamingMessageId)
-        && view.messages?.at(-1)?.content === '**正在生成';
+      const event = call[1] as { delta?: string };
+      return call[0] === AGENT_CHANNELS.assistantDelta
+        && event.delta === '**正在生成';
     }));
+    const streamPayloads = send.mock.calls
+      .filter((call) => call[0] === AGENT_CHANNELS.assistantDelta)
+      .map((call) => call[1] as Record<string, unknown>);
+    expect(streamPayloads).toEqual([
+      expect.objectContaining({ sequence: 1, delta: '**正在生成' }),
+    ]);
+    expect(streamPayloads[0]).not.toHaveProperty('messages');
     expect(service.getState(owner, 'terminal')).toMatchObject({
       state: 'THINKING',
       messages: [

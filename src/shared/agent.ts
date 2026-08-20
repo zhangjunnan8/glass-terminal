@@ -142,6 +142,10 @@ export interface AgentSessionView {
   /** Present for Generic Provider sessions; Codex owns its context internally. */
   contextUsage?: AgentContextUsage;
   streamingMessageId?: string;
+  /** Stable local turn identity for validating Assistant delta events. */
+  streamingTurnId?: string;
+  /** Last Assistant delta sequence already represented by this snapshot. */
+  streamingSequence?: number;
   /** App Server interrupt is still draining; terminal input is human-owned but a new turn is unsafe. */
   backendTurnDraining?: boolean;
   pendingApproval?: CommandApproval;
@@ -149,6 +153,16 @@ export interface AgentSessionView {
   pendingTakeover?: PendingTakeover;
   activeExecution?: CommandExecution;
   error?: string;
+}
+
+export interface AgentAssistantDelta {
+  terminalId: string;
+  threadId: string;
+  messageId: string;
+  turnId: string;
+  /** Starts at one for each streaming message and increases without gaps. */
+  sequence: number;
+  delta: string;
 }
 
 export interface InteractiveAuthRequest {
@@ -239,4 +253,5 @@ export const AGENT_CHANNELS = {
   resolveTakeover: 'agent:resolve-takeover',
   confirmShellReady: 'agent:confirm-shell-ready',
   stateChanged: 'agent:state-changed',
+  assistantDelta: 'agent:assistant-delta',
 } as const;

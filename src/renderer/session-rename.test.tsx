@@ -172,6 +172,7 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       resolveTakeover: vi.fn(),
       confirmShellReady: vi.fn(),
       onStateChanged: vi.fn(() => () => undefined),
+      onAssistantDelta: vi.fn(() => () => undefined),
     },
     sftp: {} as DesktopBridge['sftp'],
     settings: {

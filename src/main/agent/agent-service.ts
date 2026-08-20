@@ -6,6 +6,7 @@ import {
   CODEX_APP_SERVER_AGENT_POLICY_VERSION,
 } from '../../shared/agent';
 import type {
+  AgentAssistantDelta,
   AgentBackendRef,
   AgentChatItem,
   AgentContextUsage,
@@ -83,6 +84,9 @@ interface AgentRuntimeRecord extends AgentSessionView {
   resolveAuthHandoff?: () => void;
   resolveApproval?: (resolution: ApprovalResolution) => void;
   streamEmitTimer?: ReturnType<typeof setTimeout>;
+  pendingStreamDelta?: string;
+  streamingTurnId?: string;
+  streamingSequence?: number;
   /**
    * Durable journal cursor where the previous turn ended.
    * The next turn's ambient context is only the terminal text produced after
@@ -325,6 +329,8 @@ function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
     activities: runtime.activities.map((activity) => ({ ...activity })),
     contextUsage: runtime.contextUsage ? { ...runtime.contextUsage } : undefined,
     streamingMessageId: runtime.streamingMessageId,
+    streamingTurnId: runtime.streamingTurnId,
+    streamingSequence: runtime.streamingSequence,
     backendTurnDraining: runtime.backendTurnDraining,
     pendingApproval: runtime.pendingApproval ? { ...runtime.pendingApproval } : undefined,
     authRequest: runtime.authRequest ? { ...runtime.authRequest } : undefined,
@@ -1304,9 +1310,14 @@ export class AgentService {
           };
           runtime.messages.push(streamedMessage);
           runtime.streamingMessageId = streamedMessage.id;
+          runtime.streamingTurnId = assistantTurnId;
+          runtime.streamingSequence = 0;
+          runtime.pendingStreamDelta = '';
+          // Establish the empty target message before any lightweight delta.
+          this.emit(runtime);
         }
         streamedMessage.content += event.text;
-        this.queueStreamEmit(runtime, token);
+        this.queueStreamEmit(runtime, token, event.text);
       } else if (event.type === 'assistant_text' && event.text) {
         if (streamedMessage) {
           streamedMessage.content = event.text;
@@ -1559,6 +1570,7 @@ export class AgentService {
       return;
     }
 
+    const assistantTurnId = randomUUID();
     let streamedMessage: AgentChatItem | undefined;
     try {
       const boundSession = this.sessions.sessionForTerminal(
@@ -1616,16 +1628,21 @@ export class AgentService {
           if (!delta || !this.isCurrentTurn(runtime, token)) return;
           if (!streamedMessage) {
             streamedMessage = {
-              id: randomUUID(),
+              id: assistantTurnId,
               role: 'assistant',
               content: '',
               createdAt: new Date().toISOString(),
             };
             runtime.messages.push(streamedMessage);
             runtime.streamingMessageId = streamedMessage.id;
+            runtime.streamingTurnId = assistantTurnId;
+            runtime.streamingSequence = 0;
+            runtime.pendingStreamDelta = '';
+            // Establish the empty target message before any lightweight delta.
+            this.emit(runtime);
           }
           streamedMessage.content += delta;
-          this.queueStreamEmit(runtime, token);
+          this.queueStreamEmit(runtime, token, delta);
         },
         onNativeApproval: (approval) => {
           if (!this.isCurrentTurn(runtime, token)) return;
@@ -2527,7 +2544,12 @@ export class AgentService {
     });
   }
 
-  private queueStreamEmit(runtime: AgentRuntimeRecord, token: number): void {
+  private queueStreamEmit(
+    runtime: AgentRuntimeRecord,
+    token: number,
+    delta: string,
+  ): void {
+    runtime.pendingStreamDelta = `${runtime.pendingStreamDelta ?? ''}${delta}`;
     if (runtime.streamEmitTimer) return;
     const streamingLength = runtime.streamingMessageId
       ? runtime.messages.find((item) => item.id === runtime.streamingMessageId)?.content.length ?? 0
@@ -2541,14 +2563,41 @@ export class AgentService {
           : 40;
     runtime.streamEmitTimer = setTimeout(() => {
       runtime.streamEmitTimer = undefined;
-      if (this.isCurrentTurn(runtime, token)) this.emit(runtime);
+      if (this.isCurrentTurn(runtime, token)) this.emitStreamDelta(runtime);
     }, delay);
   }
 
+  private emitStreamDelta(runtime: AgentRuntimeRecord): void {
+    const delta = runtime.pendingStreamDelta;
+    const messageId = runtime.streamingMessageId;
+    const turnId = runtime.streamingTurnId;
+    if (!delta || !messageId || !turnId) return;
+    runtime.pendingStreamDelta = '';
+    const sequence = (runtime.streamingSequence ?? 0) + 1;
+    runtime.streamingSequence = sequence;
+    const event: AgentAssistantDelta = {
+      terminalId: runtime.terminalId,
+      threadId: runtime.threadId,
+      messageId,
+      turnId,
+      sequence,
+      delta,
+    };
+    if (runtime.owner.isDestroyed()) return;
+    try {
+      runtime.owner.send(AGENT_CHANNELS.assistantDelta, event);
+    } catch (error) {
+      // A later sequence gap or the final snapshot makes the renderer resync.
+      console.error('Unable to stream Agent Assistant delta:', error);
+    }
+  }
+
   private cancelStreamEmit(runtime: AgentRuntimeRecord): void {
-    if (!runtime.streamEmitTimer) return;
-    clearTimeout(runtime.streamEmitTimer);
+    if (runtime.streamEmitTimer) clearTimeout(runtime.streamEmitTimer);
     runtime.streamEmitTimer = undefined;
+    runtime.pendingStreamDelta = undefined;
+    runtime.streamingTurnId = undefined;
+    runtime.streamingSequence = undefined;
   }
 
   private requireOwned(owner: WebContents, terminalId: string): AgentRuntimeRecord {
@@ -2607,6 +2656,11 @@ export class AgentService {
 
   private emit(runtime: AgentRuntimeRecord): void {
     this.revokeChangedProviderAuthority(runtime);
+    // A low-frequency authority snapshot must include every delta sequence it
+    // represents, so flush queued text first and let the snapshot correct it.
+    if (runtime.streamingMessageId && runtime.pendingStreamDelta) {
+      this.emitStreamDelta(runtime);
+    }
     runtime.revision = (this.revisionCounters.get(runtime.terminalId) ?? 0) + 1;
     this.revisionCounters.set(runtime.terminalId, runtime.revision);
     if (!runtime.owner.isDestroyed()) {

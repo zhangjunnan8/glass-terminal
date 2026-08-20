@@ -55,6 +55,7 @@ function providerBridge(discoverModels: DesktopBridge['providers']['discoverMode
     agent: {
       getState: vi.fn().mockResolvedValue(undefined),
       onStateChanged: vi.fn(() => () => undefined),
+      onAssistantDelta: vi.fn(() => () => undefined),
     },
     sftp: {},
   } as unknown as DesktopBridge;

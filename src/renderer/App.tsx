@@ -26,6 +26,7 @@ import {
   CODEX_APP_SERVER_AGENT_POLICY_VERSION,
 } from '../shared/agent';
 import type {
+  AgentAssistantDelta,
   AgentBackendRef,
   AgentFileAccessMode,
   AgentRuntimeState,
@@ -33,7 +34,7 @@ import type {
 } from '../shared/agent';
 import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
-import { mergeAgentState } from './agent-state';
+import { mergeAgentAssistantDelta, mergeAgentState } from './agent-state';
 import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
 import { AgentActivityCard } from './components/AgentActivityCard';
@@ -215,6 +216,10 @@ export function App() {
   const agentResizeCleanupRef = useRef<(() => void) | null>(null);
   const sshConnectionLock = useRef(false);
   const [agentStates, setAgentStates] = useState<Record<string, AgentSessionView>>({});
+  const agentStatesRef = useRef<Record<string, AgentSessionView>>({});
+  const agentDeltaQueueRef = useRef<AgentAssistantDelta[]>([]);
+  const agentDeltaFrameRef = useRef<number | null>(null);
+  const agentDeltaResyncRef = useRef<Set<string>>(new Set());
   const [agentBackendChoices, setAgentBackendChoices] = useState<Record<string, AgentBackendKind>>({});
   const [agentUpdatesBelow, setAgentUpdatesBelow] = useState(false);
   const [agentPanelVisible, setAgentPanelVisible] = useState(true);
@@ -292,10 +297,13 @@ export function App() {
       setStartupError(errorMessage(error));
     });
     const removeAgentListener = window.aiTerminal.agent.onStateChanged((state) => {
-      setAgentStates((current) => mergeAgentState(current, state));
+      installAgentSnapshot(state);
       setTabs((current) => current.map((tab) => (
         tab.id === state.terminalId ? { ...tab, sessionId: state.sessionId } : tab
       )));
+    });
+    const removeAgentDeltaListener = window.aiTerminal.agent.onAssistantDelta((event) => {
+      queueAgentAssistantDelta(event);
     });
     const removeCodexAppServerListener = window.aiTerminal.codexAppServer.onStateChanged((state) => {
       setCodexAppServer((current) => mergeCodexAppServerState(current, state));
@@ -321,9 +329,64 @@ export function App() {
     return () => {
       cancelled = true;
       removeAgentListener();
+      removeAgentDeltaListener();
       removeCodexAppServerListener();
+      if (agentDeltaFrameRef.current !== null) {
+        cancelAnimationFrame(agentDeltaFrameRef.current);
+        agentDeltaFrameRef.current = null;
+      }
+      agentDeltaQueueRef.current = [];
     };
   }, []);
+
+  function installAgentSnapshot(
+    state: AgentSessionView,
+    acceptEqualRevision = false,
+  ): void {
+    const prior = agentStatesRef.current[state.terminalId];
+    const merged = acceptEqualRevision && prior?.revision === state.revision
+      ? { ...agentStatesRef.current, [state.terminalId]: state }
+      : mergeAgentState(agentStatesRef.current, state);
+    if (merged === agentStatesRef.current) return;
+    agentStatesRef.current = merged;
+    setAgentStates(merged);
+  }
+
+  function resyncAgentSnapshot(terminalId: string): void {
+    if (agentDeltaResyncRef.current.has(terminalId)) return;
+    agentDeltaResyncRef.current.add(terminalId);
+    void window.aiTerminal.agent.getState(terminalId)
+      .then((state) => {
+        // Deltas intentionally do not advance snapshot revision. A sequence
+        // gap therefore accepts an equal-revision getState response, while an
+        // older response still cannot overwrite a newer authority snapshot.
+        if (state) installAgentSnapshot(state, true);
+      })
+      .catch(() => undefined)
+      .finally(() => agentDeltaResyncRef.current.delete(terminalId));
+  }
+
+  function queueAgentAssistantDelta(event: AgentAssistantDelta): void {
+    agentDeltaQueueRef.current.push(event);
+    if (agentDeltaFrameRef.current !== null) return;
+    agentDeltaFrameRef.current = requestAnimationFrame(() => {
+      agentDeltaFrameRef.current = null;
+      const batch = agentDeltaQueueRef.current.splice(0);
+      let next = agentStatesRef.current;
+      const resync = new Set<string>();
+      for (const delta of batch) {
+        if (resync.has(delta.terminalId)) continue;
+        const merged = mergeAgentAssistantDelta(next, delta);
+        next = merged.states;
+        if (merged.outcome === 'resync') resync.add(delta.terminalId);
+      }
+      if (next !== agentStatesRef.current) {
+        agentStatesRef.current = next;
+        setAgentStates(next);
+      }
+      for (const terminalId of resync) resyncAgentSnapshot(terminalId);
+    });
+  }
 
   const subscribedTerminalIds = tabs.map((tab) => tab.id).join('\0');
   useEffect(() => {
@@ -605,7 +668,7 @@ export function App() {
   useEffect(() => {
     if (!activeId) return;
     void window.aiTerminal.agent.getState(activeId).then((state) => {
-      if (state) setAgentStates((current) => mergeAgentState(current, state));
+      if (state) installAgentSnapshot(state);
     });
   }, [activeId]);
 
@@ -740,7 +803,7 @@ export function App() {
         });
       setEditingAgentMessageId(null);
       setEditingAgentTerminalId(null);
-      setAgentStates((current) => mergeAgentState(current, state));
+      installAgentSnapshot(state);
       setTabs((current) => current.map((tab) => (
         tab.id === state.terminalId ? { ...tab, sessionId: state.sessionId } : tab
       )));
@@ -755,7 +818,7 @@ export function App() {
         try {
           const current = await window.aiTerminal.agent.getState(requestTerminalId);
           if (current) {
-            setAgentStates((states) => mergeAgentState(states, current));
+            installAgentSnapshot(current);
             if (!current.messages.some((message) => message.id === replacementMessageId)) {
               setEditingAgentMessageId(null);
               setEditingAgentTerminalId(null);
@@ -779,7 +842,7 @@ export function App() {
         terminalId: activeTab.id,
         messageId,
       });
-      setAgentStates((current) => mergeAgentState(current, state));
+      installAgentSnapshot(state);
     } catch (error) {
       setWorkspaceActionError(errorMessage(error));
     } finally {
@@ -798,7 +861,7 @@ export function App() {
         messageId,
         action: 'retract',
       });
-      setAgentStates((current) => mergeAgentState(current, state));
+      installAgentSnapshot(state);
       if (activeIdRef.current === requestTerminalId) {
         setEditingAgentMessageId(null);
         setEditingAgentTerminalId(null);
@@ -834,7 +897,7 @@ export function App() {
         decision,
         editedCommand: decision === 'edit' ? editedApprovalCommand : undefined,
       });
-      setAgentStates((current) => mergeAgentState(current, state));
+      installAgentSnapshot(state);
     } catch (error) {
       setWorkspaceActionError(errorMessage(error));
     }
@@ -857,7 +920,7 @@ export function App() {
         approvalId,
         editedCommand,
       });
-      setAgentStates((current) => mergeAgentState(current, state));
+      installAgentSnapshot(state);
       setTabs((current) => current.map((tab) => (
         tab.id === terminalId ? { ...tab, sessionId: state.sessionId } : tab
       )));
@@ -915,7 +978,7 @@ export function App() {
         ...(mode === 'full-access' ? { fullAccessConfirmed } : {}),
         ...(expectedWorkspaceRoot !== undefined ? { expectedWorkspaceRoot } : {}),
       });
-      setAgentStates((current) => mergeAgentState(current, state));
+      installAgentSnapshot(state);
       setTabs((current) => current.map((tab) => (
         tab.id === terminalId ? { ...tab, sessionId: state.sessionId } : tab
       )));
@@ -930,7 +993,7 @@ export function App() {
     setWorkspaceActionError(null);
     try {
       const state = await window.aiTerminal.agent.takeover({ terminalId: activeTab.id });
-      setAgentStates((current) => mergeAgentState(current, state));
+      installAgentSnapshot(state);
     } catch (error) {
       setWorkspaceActionError(errorMessage(error));
     }
@@ -946,7 +1009,7 @@ export function App() {
         executionId: activeAgent.pendingTakeover.executionId,
         action,
       });
-      setAgentStates((current) => mergeAgentState(current, state));
+      installAgentSnapshot(state);
     } catch (error) {
       setWorkspaceActionError(errorMessage(error));
     }
@@ -959,7 +1022,7 @@ export function App() {
         terminalId,
         executionId,
       });
-      setAgentStates((current) => mergeAgentState(current, state));
+      installAgentSnapshot(state);
     } catch (error) {
       setWorkspaceActionError(errorMessage(error));
     }

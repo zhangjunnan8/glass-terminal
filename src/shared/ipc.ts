@@ -40,6 +40,7 @@ import type {
   ProviderProfile,
 } from './provider';
 import type {
+  AgentAssistantDelta,
   AgentSessionView,
   ConfirmShellReadyRequest,
   InterruptAgentTurnRequest,
@@ -170,6 +171,7 @@ export interface DesktopBridge {
     resolveTakeover(request: ResolveTakeoverRequest): Promise<AgentSessionView>;
     confirmShellReady(request: ConfirmShellReadyRequest): Promise<AgentSessionView>;
     onStateChanged(listener: (state: AgentSessionView) => void): () => void;
+    onAssistantDelta(listener: (event: AgentAssistantDelta) => void): () => void;
   };
   settings: {
     get(): Promise<AppSettings>;

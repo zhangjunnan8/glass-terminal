@@ -9,7 +9,7 @@ import { SFTP_CHANNELS } from '../shared/sftp';
 import type { TransferJobSnapshot } from '../shared/sftp';
 import { PROVIDER_CHANNELS } from '../shared/provider';
 import { AGENT_CHANNELS } from '../shared/agent';
-import type { AgentSessionView } from '../shared/agent';
+import type { AgentAssistantDelta, AgentSessionView } from '../shared/agent';
 import { CODEX_APP_SERVER_CHANNELS } from '../shared/codex-app-server';
 import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import { SETTINGS_CHANNELS, SETTINGS_WINDOW_CHANNELS } from '../shared/settings';
@@ -181,6 +181,13 @@ const agentBridge: DesktopBridge['agent'] = {
     };
     ipcRenderer.on(AGENT_CHANNELS.stateChanged, handler);
     return () => ipcRenderer.removeListener(AGENT_CHANNELS.stateChanged, handler);
+  },
+  onAssistantDelta: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, event: AgentAssistantDelta) => {
+      listener(event);
+    };
+    ipcRenderer.on(AGENT_CHANNELS.assistantDelta, handler);
+    return () => ipcRenderer.removeListener(AGENT_CHANNELS.assistantDelta, handler);
   },
 };
 

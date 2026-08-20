@@ -2,7 +2,11 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CODEX_APP_SERVER_AGENT_BACKEND } from '../shared/agent';
-import type { AgentSessionView, AgentToolActivity } from '../shared/agent';
+import type {
+  AgentAssistantDelta,
+  AgentSessionView,
+  AgentToolActivity,
+} from '../shared/agent';
 import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import type { DesktopBridge } from '../shared/ipc';
 import type { ProviderProfile } from '../shared/provider';
@@ -224,6 +228,7 @@ function bridgeForCodex(snapshot: CodexAppServerSnapshot): DesktopBridge {
       resolveTakeover: vi.fn(),
       confirmShellReady: vi.fn(),
       onStateChanged: vi.fn(() => () => undefined),
+      onAssistantDelta: vi.fn(() => () => undefined),
     },
     sftp: {} as DesktopBridge['sftp'],
     settings: {
@@ -867,6 +872,63 @@ describe('native Codex App Server renderer mode', () => {
     await act(async () => emitAgentState?.({ ...view, revision: 2, activities: [] }));
     expect(container.querySelector('[data-testid="tool-activity-list"]')).toBeNull();
     expect(container.querySelectorAll('.agent-message')).toHaveLength(0);
+  });
+
+  it('batches Assistant deltas into the target message and resyncs on a sequence gap', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    const streaming: AgentSessionView = {
+      ...agentView('THINKING'),
+      streamingMessageId: 'assistant-stream',
+      streamingTurnId: 'turn-stream',
+      streamingSequence: 0,
+      messages: [
+        ...agentView('THINKING').messages,
+        {
+          id: 'assistant-stream',
+          role: 'assistant',
+          content: '',
+          createdAt: now,
+        },
+      ],
+    };
+    let emitDelta: ((event: AgentAssistantDelta) => void) | undefined;
+    bridge.agent.getState = vi.fn().mockResolvedValue(streaming);
+    bridge.agent.onAssistantDelta = vi.fn((listener) => {
+      emitDelta = listener;
+      return () => undefined;
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+    vi.mocked(bridge.agent.getState).mockClear();
+
+    await act(async () => {
+      emitDelta!({
+        terminalId: 'terminal-1',
+        threadId: 'thread-1',
+        messageId: 'assistant-stream',
+        turnId: 'turn-stream',
+        sequence: 1,
+        delta: '分批输出',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+    expect([...container.querySelectorAll('.agent-message.assistant')]
+      .at(-1)?.textContent).toContain('分批输出');
+
+    await act(async () => {
+      emitDelta!({
+        terminalId: 'terminal-1',
+        threadId: 'thread-1',
+        messageId: 'assistant-stream',
+        turnId: 'turn-stream',
+        sequence: 3,
+        delta: '缺失第二段',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+    expect(bridge.agent.getState).toHaveBeenCalledWith('terminal-1');
   });
 
   it('shows an Agent action failure outside unrelated connection dialogs', async () => {
