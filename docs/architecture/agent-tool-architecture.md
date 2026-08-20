@@ -41,7 +41,8 @@ human keyboard -----------------------------------------+             v
 - `AgentBackend` is the replaceable Harness boundary. It owns provider-facing
   conversation execution, but not Session lifecycle, approval, takeover,
   permissions, persistence, terminal creation, or filesystem transport.
-  `GenericHarnessBackend` currently adapts `AgentLoop` to this contract.
+  `LangChainBackend` is the current Generic Provider implementation. The former
+  in-house `AgentLoop` and `GenericHarnessBackend` were removed.
 - `SessionToolContext` is an immutable snapshot of the Session identifier,
   terminal binding, optional explicit Workspace Root, Host identity, and
   granular capabilities. A Workspace Root is never inferred from terminal
@@ -72,6 +73,12 @@ Terminal permissions are independent `read`, `execute`, `sendInput`, and
 `interrupt` capabilities. Command execution remains owned by `AgentService`,
 including approval, command serialization, cancellation, and Full Takeover;
 arbitrary `sendInput` is disabled by default.
+
+The current SSH implementation persists the Full Takeover preference on the
+Host after the first explicit risk confirmation, so a later terminal for that
+Host can initialize with Full Takeover enabled. This is current behavior, not a
+turn-scoped permission guarantee; security-sensitive changes must review this
+Host-level persistence and its disable/take-control lifecycle together.
 
 Workspace access defaults to `off` and supports `read-only`, `read-write`, and
 explicitly confirmed `full-access` modes. The policy membrane checks
@@ -160,3 +167,11 @@ files, hash preconditions, repeated link checks, and OpenSSH atomic replacement
 reduce risk, but cannot provide a universal no-replace guarantee across all
 servers. An iterative remote directory API and stronger server-specific
 primitives are future hardening work.
+
+The LangChain migration has not yet restored the former completed-workspace-tool
+history compaction. Tool arguments/results and cumulative turn checkpoints can
+therefore enlarge Provider context and `ai/*.jsonl` over long conversations.
+The Session API also has callers that read the complete terminal history before
+applying a tail limit. Both are current long-session performance limits and
+should be fixed before treating the documented byte bounds as end-to-end
+conversation bounds.

@@ -5,7 +5,10 @@ Date: 2026-08-14
 ## Decision
 
 Use **Electron + React + TypeScript + xterm.js**, with platform-neutral core
-interfaces and Windows-specific adapters for ConPTY and Credential Manager.
+interfaces and Windows-specific adapters for ConPTY. Production Provider/SSH
+secrets currently use the app-owned AES-256-GCM file store behind `SecretStore`;
+the older Windows Credential Manager adapter remains available but is not wired
+by the composition root.
 
 This is the shortest route to a Windows-first demo without implementing a
 terminal emulator or SSH protocol:
@@ -45,16 +48,18 @@ Core dependencies are permissively licensed:
 | xterm.js | MIT | Terminal emulator |
 | node-pty | MIT | Local PTY / Windows ConPTY |
 | ssh2 | MIT | SSH/SFTP transport |
-| @openai/codex | Apache-2.0 | Official Codex CLI and App Server runtime |
 
 The project itself uses MIT. Chromium and transitive Electron components carry
 their own permissive notices and must be included in release attribution.
-No GPL/AGPL core dependency is intentionally introduced. Package versions and
+No GPL/AGPL core dependency is intentionally introduced. The current npm
+dependency graph does not include `@openai/codex`, and the green build does not
+bundle a Codex executable. Codex App Server integration detects an external
+official Codex CLI or accepts a user-selected executable. If a future release
+redistributes Codex, it must add the applicable Apache-2.0 license and NOTICE
+content. Package versions and
 licenses must be re-audited before a public binary release. A redistributed
-Codex CLI binary must be accompanied by the Apache-2.0 license and any upstream
-NOTICE content that applies; the release process must generate and verify the
-complete third-party attribution bundle rather than relying only on npm package
-metadata.
+Codex CLI binary must be accompanied by the complete third-party attribution
+bundle rather than relying only on npm package metadata.
 
 ## Architectural boundaries
 
@@ -76,8 +81,10 @@ The shared terminal transport is the single writer boundary. Both keyboard and
 agent commands are serialized into it; agent output is observed from that same
 transport.
 
-Platform-specific code lives behind interfaces: `LocalTerminalAdapter`,
-`SecretStore`, `NotificationAdapter`, and `ShellDiscovery`.
+Platform-specific code lives behind interfaces such as `SecretStore`; terminal,
+notification, and shell-discovery implementation details remain in the main
+process. Some adapter names in the original decision record were architectural
+targets and are not literal exported interfaces in the current source tree.
 
 ## Codex integration boundary
 

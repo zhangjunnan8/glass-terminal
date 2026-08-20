@@ -55,13 +55,14 @@
 - 模型使用分页 `model/list`，模型 ID 和推理强度由界面选择。
 - 每个请求有独立 ID 和超时；进程退出会拒绝未决请求并使 UI 状态失效。
 - 本地 Session Thread UUID 与上游 App Server thread ID 分开持久化；重连后使用 `thread/resume`。
-- 项目依赖官方 Apache-2.0 `@openai/codex` CLI，同时支持通过 UI 选择其他可执行文件。
+- 应用实现官方 App Server 协议并检测 PATH 中的官方 Codex CLI，也支持通过 UI 手动选择
+  `codex.exe`。当前 npm 依赖和绿色版均不内置 `@openai/codex` 或 Codex vendor 二进制。
 
 ## 构建与发布状态
 
 `npm run package` 已可产出 `release/win-unpacked/` 绿色版（electron-builder `--dir`、
-asar=false、afterPack 收尾），无需安装即可运行。仍待完成的发布工作：复制完整 Codex
-vendor 资源到包内（当前自动检测/手动选择外部 `codex.exe` 均可工作，但绿色版不自带）、
+asar=false、afterPack 收尾），无需安装即可运行。仍待完成的发布工作：决定是否引入并复制
+完整 Codex vendor 资源到包内（当前自动检测/手动选择外部 `codex.exe` 均可工作，但绿色版不自带）、
 代码签名/SmartScreen、第三方 NOTICE 收集，以及在干净 Windows 环境验收。
 
 ## 当前验证范围

@@ -10,8 +10,8 @@
 ![Electron](https://img.shields.io/badge/Electron-43-2b2e3a?logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178c6?logo=typescript&logoColor=white)
-![Version](https://img.shields.io/badge/version-0.1.0--alpha.0-orange)
-![Tests](https://img.shields.io/badge/tests-479%20passed-brightgreen)
+![Version](https://img.shields.io/badge/version-0.1.0--alpha.2-orange)
+![Tests](https://img.shields.io/badge/tests-485%20passed-brightgreen)
 ![Status](https://img.shields.io/badge/status-alpha-important)
 
 </div>
@@ -25,14 +25,14 @@
 | 🖥️ **共享可见终端** | AI 与人类共用同一个终端；AI 命令通过命令信封注入，输出实时回显，无隐藏进程 |
 | 🤖 **双 Agent 后端** | Generic Provider（LangChain，兼容 DeepSeek / OpenAI 等）与原生 Codex App Server 两种模式 |
 | ✅ **命令审批** | AI 请求执行命令需你确认；支持编辑后执行、拒绝 |
-| 🎮 **AI 全接管 / 人工接管** | Full Takeover 全自动执行，Take Control 随时抢回控制权 |
+| 🎮 **AI 全接管 / 人工接管** | 显式确认后 Full Takeover 可连续执行命令，Take Control 可随时抢回当前终端；SSH Host 当前会记住该偏好 |
 | 🌐 **SSH 远程主机** | 密码 / 键盘交互 / 私钥 / Windows OpenSSH 代理认证；多主机、文件夹分组、收藏 |
 | 🪟 **远程 Shell 适配** | 每台主机可指定远程 Shell：Linux/POSIX、PowerShell、cmd —— 命令信封自动匹配，Windows 远程主机不再"命令失灵" |
 | 📁 **Workspace 文件工具** | 只读 / 读写绑定根、FULL FILESYSTEM ACCESS 三种授权；`read / search / glob / apply_patch / write` 全程显示 diff |
 | 🔐 **安全优先** | 凭据不进模型上下文与明文日志；密钥库 AES-256-GCM 加密；敏感认证交接；无任何遥测 |
 | 💾 **持久化与会话** | 会话历史、审计日志（audit JSONL）、断线重连、终端回放 |
 | 🌗 **主题** | 暗色 / 亮色 / 跟随系统 三态循环 |
-| 📦 **设置与备份** | 设置窗口、密钥库加密、备份导出/导入（ZIP 含审计日志） |
+| 📦 **设置与备份** | 设置窗口、AES-256-GCM 文件密钥库、配置备份导出/导入；Session 与审计日志可选包含（导出包当前未加密） |
 | 🔗 **SFTP** | 与远程会话关联的文件传输队列 |
 
 ---
@@ -55,7 +55,7 @@ npm run dev
 
 ```bash
 npm run typecheck   # TypeScript 类型检查
-npm test            # Vitest 全量测试（61 个测试文件，479 用例）
+npm test            # Vitest 全量测试（61 个测试文件；485 通过、13 跳过）
 npm run build       # 编译 renderer + Electron main/preload
 ```
 
@@ -74,10 +74,16 @@ npm run package
 
 | 变量 | 说明 |
 |---|---|
-| `AI_TERMINAL_DEEPSEEK_API_KEY` | DeepSeek API Key（Generic Provider 默认模型） |
+| `AI_TERMINAL_DEEPSEEK_API_KEY` | 仅用于按环境启用的 DeepSeek 真实模型集成测试；应用内 Provider 请在设置窗口配置 |
 | `AI_TERMINAL_SSH_TEST_HOST` 等 `AI_TERMINAL_SSH_TEST_*` | SSH 集成测试环境变量 |
 
 > 用户数据（主机、Provider、加密密钥库、会话）保存在 `%APPDATA%\glass-terminal\`，与应用本体分离。
+>
+> 当前绿色版不内置 Codex CLI。Codex App Server 模式需要从界面自动检测 PATH 中的官方
+> `codex` 可执行文件，或由用户手动选择 `codex.exe`。
+>
+> ⚠️ 导出的 `.aitbak` 会包含可读的 Provider API Key，`.aithosts` 会包含可读的
+> SSH 凭据；当前两种备份都没有口令加密。请将它们视为密钥文件保管，不要提交到仓库或发送到不可信位置。
 
 ---
 
