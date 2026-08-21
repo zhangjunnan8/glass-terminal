@@ -885,6 +885,10 @@ describe('native Codex App Server renderer mode', () => {
     expect(container.querySelector('.agent-message-content')?.textContent).toContain('第一条');
     expect(container.querySelectorAll('[data-testid="latest-user-message-actions"]')).toHaveLength(1);
     expect(container.querySelector('[data-action="interrupt-agent-message"]')).toBeNull();
+    expect(container.querySelector('[data-action="retract-agent-message"]')?.classList)
+      .toContain('agent-message-icon-btn');
+    expect(container.querySelector('[data-action="edit-agent-message"]')?.getAttribute('title'))
+      .toBe('修改这条消息');
     const edit = container.querySelector<HTMLButtonElement>('[data-action="edit-agent-message"]')!;
     await act(async () => edit.click());
     const composer = container.querySelector<HTMLTextAreaElement>('[data-testid="agent-composer"]')!;

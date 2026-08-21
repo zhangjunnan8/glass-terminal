@@ -43,6 +43,12 @@ function button(container: HTMLElement, label: string): HTMLButtonElement {
   return found;
 }
 
+function labelledButton(container: HTMLElement, label: string): HTMLButtonElement {
+  const found = container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+  if (!found) throw new Error(`Missing labelled button: ${label}`);
+  return found;
+}
+
 function setValue(element: HTMLTextAreaElement | HTMLSelectElement, value: string): void {
   const prototype = element instanceof HTMLTextAreaElement
     ? HTMLTextAreaElement.prototype
@@ -80,17 +86,17 @@ describe('AgentMemoryPanel', () => {
       />,
     ));
 
-    expect(container.textContent).toContain('记忆 2');
-    await act(async () => button(container!, '记忆 2').click());
+    expect(labelledButton(container, '上下文记忆，2 条').title).toBe('上下文记忆：2 条');
+    await act(async () => labelledButton(container!, '上下文记忆，2 条').click());
     expect(container.textContent).toContain('当前 AI 对话专属');
     expect(container.textContent).toContain('不受自动摘要清理');
-    await act(async () => button(container!, '来源').click());
+    await act(async () => labelledButton(container!, '定位来源消息').click());
     expect(onLocate).toHaveBeenCalledWith('message-1');
 
     const firstCard = container.querySelector<HTMLElement>(
       '[data-memory-id="00000000-0000-4000-8000-000000000001"]',
     )!;
-    await act(async () => button(firstCard, '编辑/合并').click());
+    await act(async () => labelledButton(firstCard, '编辑或合并记忆').click());
     const merge = container.querySelector<HTMLInputElement>('fieldset input')!;
     await act(async () => merge.click());
     const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!;
@@ -104,7 +110,7 @@ describe('AgentMemoryPanel', () => {
       sourceMessageIds: ['message-1'],
       mergeMemoryIds: [memories[1]!.id],
     });
-    await act(async () => button(firstCard, '取消 Pin').click());
+    await act(async () => labelledButton(firstCard, '取消 Pin').click());
     expect(onRemove).toHaveBeenCalledWith(memories[0]!.id);
   });
 
@@ -157,8 +163,8 @@ describe('AgentMemoryPanel', () => {
       />,
     ));
 
-    await act(async () => button(container!, '记忆 0').click());
-    await act(async () => button(container!, '新建记忆').click());
+    await act(async () => labelledButton(container!, '上下文记忆，0 条').click());
+    await act(async () => labelledButton(container!, '新建记忆').click());
     const textarea = container.querySelector<HTMLTextAreaElement>('textarea')!;
     await act(async () => setValue(textarea, 'api_key=super-secret-value'));
     await act(async () => button(container!, '保存记忆').click());

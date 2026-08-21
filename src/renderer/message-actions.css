@@ -2,10 +2,8 @@
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 6px;
-  margin-top: 8px;
-  padding-top: 7px;
-  border-top: 1px solid #243348;
+  gap: 2px;
+  margin-top: 5px;
 }
 
 .agent-message-actions > small {
@@ -15,14 +13,16 @@
 }
 
 .agent-message-actions button {
-  min-height: 30px;
-  padding: 5px 9px;
+  width: 27px;
+  height: 27px;
+  min-height: 27px;
+  padding: 0;
   color: #aab8ca;
-  border: 1px solid #34445a;
+  border: 1px solid transparent;
   border-radius: 4px;
-  background: #17212e;
+  background: transparent;
   cursor: pointer;
-  font-size: 12px;
+  font-size: 14px;
   transition: border-color 130ms ease, background-color 130ms ease, transform 90ms ease;
 }
 
@@ -57,12 +57,11 @@
   font-size: 12px;
 }
 
-.app-shell[data-theme="light"] .agent-message-actions { border-color: #ced8d4; }
 .app-shell[data-theme="light"] .agent-message-actions > small { color: #68768a; }
 .app-shell[data-theme="light"] .agent-message-actions button {
   color: #405065;
-  border-color: #c3ccd8;
-  background: #f0f3f7;
+  border-color: transparent;
+  background: transparent;
 }
 .app-shell[data-theme="light"] .agent-message-actions button:hover:not(:disabled) {
   color: #214f43;

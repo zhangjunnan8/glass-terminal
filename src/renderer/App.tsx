@@ -1729,10 +1729,13 @@ export function App() {
               <span>{authMethodLabel(host.authMethod)} · {host.hostKeyFingerprint ? '已信任' : '未验证'}</span>
               <div className="host-card-actions">
                 <button
+                  className="icon-btn"
                   data-action="connect-host"
+                  title={sshConnectionPending ? '正在连接' : '连接主机'}
+                  aria-label={sshConnectionPending ? '正在连接' : `连接主机 ${host.name}`}
                   disabled={sshConnectionPending}
                   onClick={() => openSshConnection(host)}
-                >{sshConnectionPending ? '正在连接…' : '连接'}</button>
+                >{sshConnectionPending ? '…' : '↗'}</button>
                 <button
                   className="icon-btn"
                   title="编辑主机"
@@ -1994,8 +1997,19 @@ export function App() {
               <div className="section-label section-with-action">
                 <span>主机</span>
                 <span className="host-section-actions">
-                  <button data-action="create-host-folder" onClick={() => openHostFolderDialog('create')}>新建文件夹</button>
-                  <button onClick={() => openHostEditor(null)}>添加</button>
+                  <button
+                    className="icon-btn"
+                    data-action="create-host-folder"
+                    title="新建主机文件夹"
+                    aria-label="新建主机文件夹"
+                    onClick={() => openHostFolderDialog('create')}
+                  >▣</button>
+                  <button
+                    className="icon-btn"
+                    title="添加主机"
+                    aria-label="添加主机"
+                    onClick={() => openHostEditor(null)}
+                  >＋</button>
                 </span>
               </div>
               <div
@@ -2161,16 +2175,32 @@ export function App() {
                       </span>
                     </button>
                     <div className="history-session-actions">
-                      <button onClick={() => openSessionHistory(session)}>查看</button>
-                      <button onClick={() => openSessionRename(session)}>重命名</button>
+                      <button
+                        className="icon-btn"
+                        type="button"
+                        title="查看会话"
+                        aria-label={`查看会话 ${session.name}`}
+                        onClick={() => openSessionHistory(session)}
+                      >▤</button>
+                      <button
+                        className="icon-btn"
+                        type="button"
+                        title="重命名会话"
+                        aria-label={`重命名会话 ${session.name}`}
+                        onClick={() => openSessionRename(session)}
+                      >✎</button>
                       {host && (
                         <button
+                          className="icon-btn"
+                          type="button"
+                          title={runtimeTab ? '打开终端' : '重连会话'}
+                          aria-label={`${runtimeTab ? '打开终端' : '重连会话'} ${session.name}`}
                           disabled={sshConnectionPending}
                           onClick={() => {
                             if (runtimeTab) setActiveId(runtimeTab.id);
                             else openSshConnection(host, session.id);
                           }}
-                        >{runtimeTab ? '打开' : '重连'}</button>
+                        >{runtimeTab ? '↗' : '↻'}</button>
                       )}
                     </div>
                   </article>
@@ -2724,6 +2754,7 @@ export function App() {
                 <div className="agent-message-memory-action">
                   <button
                     type="button"
+                    className="agent-message-icon-btn"
                     data-action="pin-agent-memory"
                     disabled={
                       composerBlocked
@@ -2732,11 +2763,12 @@ export function App() {
                     title={containsObviousAgentSecret(message.content)
                       ? '检测到明显凭据，不能保存到上下文记忆'
                       : '提炼并保存为当前 AI 对话的持久上下文记忆卡片'}
+                    aria-label="存为记忆"
                     onClick={() => setAgentMemoryDraftSource({
                       id: message.id,
                       content: message.content,
                     })}
-                  >存为记忆</button>
+                  >◈</button>
                 </div>
               )}
               {turnActivities.length > 0 && (
@@ -2778,16 +2810,22 @@ export function App() {
                     <>
                       <button
                         type="button"
+                        className="agent-message-icon-btn"
                         data-action="retract-agent-message"
+                        title="撤回这条消息"
+                        aria-label="撤回这条消息"
                         disabled={Boolean(agentMessageActionPending)}
                         onClick={() => void retractLatestAgentMessage(message.id, message.content)}
-                      >撤回</button>
+                      >↶</button>
                       <button
                         type="button"
+                        className="agent-message-icon-btn"
                         data-action="edit-agent-message"
+                        title="修改这条消息"
+                        aria-label="修改这条消息"
                         disabled={Boolean(agentMessageActionPending)}
                         onClick={() => editLatestAgentMessage(message.id, message.content)}
-                      >修改</button>
+                      >✎</button>
                     </>
                   </div>
                 )

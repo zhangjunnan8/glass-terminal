@@ -328,7 +328,8 @@ describe('renderer host and session dialogs', () => {
     expect(container.querySelector('.history-sidebar-summary')?.textContent).toContain('1 个会话');
     expect(container.querySelector('.history-session-target')?.textContent).toContain(host.name);
     expect(container.querySelector('.history-session-meta')?.textContent).toContain('活动中');
-    expect(container.querySelector('.history-session-actions')?.textContent).toContain('查看');
+    expect(container.querySelector('.history-session-actions [title="查看会话"]')).not.toBeNull();
+    expect(container.querySelector('.history-session-actions [title="重命名会话"]')).not.toBeNull();
   });
 
   it('hides and restores the AI panel without destroying the terminal workspace', async () => {
@@ -432,9 +433,9 @@ describe('renderer host and session dialogs', () => {
     const bridge = bridgeWith(vi.fn());
     await renderSelectedHost(bridge);
 
-    const connectButton = [...container.querySelectorAll<HTMLButtonElement>(
-      '.selected-host-card button',
-    )].find((button) => button.textContent === '连接');
+    const connectButton = container.querySelector<HTMLButtonElement>(
+      '.selected-host-card [data-action="connect-host"]',
+    );
     expect(connectButton).toBeDefined();
     await act(async () => connectButton!.click());
 
@@ -462,9 +463,9 @@ describe('renderer host and session dialogs', () => {
     });
     await renderSelectedHost(bridge);
 
-    const connectButton = [...container.querySelectorAll<HTMLButtonElement>(
-      '.selected-host-card button',
-    )].find((button) => button.textContent === '连接')!;
+    const connectButton = container.querySelector<HTMLButtonElement>(
+      '.selected-host-card [data-action="connect-host"]',
+    )!;
     await act(async () => connectButton.click());
     const dialog = container.querySelector<HTMLFormElement>('[data-testid="ssh-connect-dialog"]')!;
     const password = dialog.elements.namedItem('password') as HTMLInputElement;
@@ -502,9 +503,9 @@ describe('renderer host and session dialogs', () => {
     });
     await renderSelectedHost(bridge);
 
-    const connectButton = [...container.querySelectorAll<HTMLButtonElement>(
-      '.selected-host-card button',
-    )].find((button) => button.textContent === '连接')!;
+    const connectButton = container.querySelector<HTMLButtonElement>(
+      '.selected-host-card [data-action="connect-host"]',
+    )!;
     await act(async () => connectButton.click());
     await settle();
 

@@ -144,10 +144,12 @@ export function AgentMemoryPanel({
         type="button"
         className="agent-memory-trigger"
         data-testid="agent-memory-trigger"
+        title={`上下文记忆：${memories.length} 条`}
+        aria-label={`上下文记忆，${memories.length} 条`}
         aria-expanded={open}
         disabled={disabled}
         onClick={() => setOpen((current) => !current)}
-      >记忆 {memories.length}</button>
+      ><span aria-hidden="true">◈</span><small aria-hidden="true">{memories.length}</small></button>
       {open && (
         <section className="agent-memory-panel" data-testid="agent-memory-panel">
           <header>
@@ -170,21 +172,40 @@ export function AgentMemoryPanel({
                     return (
                       <button
                         type="button"
+                        className="icon-btn"
                         key={sourceId}
                         disabled={!sourceExists}
                         title={sourceExists ? '定位来源消息' : '来源消息已不在当前可见对话中'}
+                        aria-label={sourceExists ? '定位来源消息' : '来源消息已不在当前可见对话中'}
                         onClick={() => onLocate(sourceId)}
-                      >来源</button>
+                      >⌖</button>
                     );
                   })}
-                  <button type="button" disabled={pending} onClick={() => setEditor(editorForCard(memory))}>编辑/合并</button>
-                  <button type="button" disabled={pending} onClick={() => void remove(memory.id)}>取消 Pin</button>
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    title="编辑或合并记忆"
+                    aria-label="编辑或合并记忆"
+                    disabled={pending}
+                    onClick={() => setEditor(editorForCard(memory))}
+                  >✎</button>
+                  <button
+                    type="button"
+                    className="icon-btn danger"
+                    title="取消 Pin"
+                    aria-label="取消 Pin"
+                    disabled={pending}
+                    onClick={() => void remove(memory.id)}
+                  >×</button>
                 </div>
               </article>
             ))}
           </div>
           <button
             type="button"
+            className="icon-btn agent-memory-add"
+            title="新建记忆"
+            aria-label="新建记忆"
             disabled={pending}
             onClick={() => {
               setEditor({
@@ -195,7 +216,7 @@ export function AgentMemoryPanel({
               });
               setError(null);
             }}
-          >新建记忆</button>
+          >＋</button>
           {editor && (
             <div className="agent-memory-editor">
               <label>分类
