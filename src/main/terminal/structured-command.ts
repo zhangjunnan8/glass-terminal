@@ -232,6 +232,8 @@ export class CommandDisplayFilter {
 }
 
 const ANSI_PATTERN = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g;
+const TERMINAL_LAYOUT_PATTERN = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))|\r|\n/g;
+const MIN_WRAPPED_ENVELOPE_CHARS = 24;
 
 function stripAnsi(value: string): string {
   return value.replace(ANSI_PATTERN, '');
@@ -253,6 +255,59 @@ export function envelopeInputLines(input: string): Set<string> {
   return lines;
 }
 
+interface NormalizedTerminalText {
+  text: string;
+  rawIndices: number[];
+}
+
+function normalizedTerminalText(value: string): NormalizedTerminalText {
+  let text = '';
+  const rawIndices: number[] = [];
+  let cursor = 0;
+  for (const match of value.matchAll(TERMINAL_LAYOUT_PATTERN)) {
+    const matchIndex = match.index;
+    for (let index = cursor; index < matchIndex; index += 1) {
+      text += value[index];
+      rawIndices.push(index);
+    }
+    cursor = matchIndex + match[0].length;
+  }
+  for (let index = cursor; index < value.length; index += 1) {
+    text += value[index];
+    rawIndices.push(index);
+  }
+  return { text, rawIndices };
+}
+
+function wrappedEnvelopeNeedles(
+  recentEnvelopes: ReadonlyArray<ReadonlySet<string>>,
+): string[] {
+  const needles = new Set<string>();
+  for (const envelope of recentEnvelopes) {
+    for (const line of envelope) {
+      if (
+        line.length >= MIN_WRAPPED_ENVELOPE_CHARS
+        && (line.includes('__ait_') || line.includes('__AI_TERMINAL_'))
+      ) needles.add(line);
+    }
+  }
+  return [...needles].sort((left, right) => right.length - left.length);
+}
+
+function stripWrappedEnvelope(value: string, needle: string): string {
+  let output = value;
+  while (output) {
+    const normalized = normalizedTerminalText(output);
+    const matchIndex = normalized.text.indexOf(needle);
+    if (matchIndex < 0) return output;
+    const rawStart = normalized.rawIndices[matchIndex];
+    const rawEndIndex = normalized.rawIndices[matchIndex + needle.length - 1];
+    if (rawStart === undefined || rawEndIndex === undefined) return output;
+    output = output.slice(0, rawStart) + output.slice(rawEndIndex + 1);
+  }
+  return output;
+}
+
 /**
  * Line-level fallback filter: drops whole lines whose ANSI-stripped content
  * exactly matches a line we injected as part of a recent command envelope.
@@ -264,11 +319,76 @@ export function stripEnvelopeEcho(
   recentEnvelopes: ReadonlyArray<ReadonlySet<string>>,
 ): string {
   if (!data || recentEnvelopes.length === 0) return data;
-  return data.replace(/[^\n]*\n|[^\n]*$/g, (line) => {
+  let output = data.replace(/[^\n]*\n|[^\n]*$/g, (line) => {
     const stripped = stripAnsi(line.replace(/\r?\n$/, '')).replace(/\r+$/, '');
     for (const envelope of recentEnvelopes) {
       if (envelope.has(stripped)) return '';
     }
     return line;
   });
+  for (const needle of wrappedEnvelopeNeedles(recentEnvelopes)) {
+    output = stripWrappedEnvelope(output, needle);
+  }
+  return output;
+}
+
+/**
+ * Stateful renderer-only suppressor for Windows full-screen redraws. ConPTY may
+ * split one echoed PowerShell envelope both at the new column width and across
+ * multiple data events. Normal terminal output is forwarded immediately; only
+ * a suffix that matches the start of a recent private envelope is held until it
+ * either completes (and is removed) or diverges (and is released unchanged).
+ */
+export class EnvelopeEchoFilter {
+  private readonly recentEnvelopes: Set<string>[] = [];
+  private pending = '';
+
+  remember(input: string): void {
+    this.recentEnvelopes.push(envelopeInputLines(input));
+    if (this.recentEnvelopes.length > 4) this.recentEnvelopes.shift();
+  }
+
+  push(data: string): string {
+    if (!data && !this.pending) return '';
+    const combined = this.pending + data;
+    this.pending = '';
+    const filtered = stripEnvelopeEcho(combined, this.recentEnvelopes);
+    const pendingStart = this.partialEnvelopeStart(filtered);
+    if (pendingStart === undefined) return filtered;
+    this.pending = filtered.slice(pendingStart);
+    return filtered.slice(0, pendingStart);
+  }
+
+  clear(): void {
+    this.recentEnvelopes.length = 0;
+    this.pending = '';
+  }
+
+  private partialEnvelopeStart(value: string): number | undefined {
+    if (!value) return undefined;
+    const normalized = normalizedTerminalText(value);
+    const needles = wrappedEnvelopeNeedles(this.recentEnvelopes);
+    for (const needle of needles) {
+      const prefix = needle.slice(0, MIN_WRAPPED_ENVELOPE_CHARS);
+      let searchFrom = 0;
+      while (searchFrom < normalized.text.length) {
+        const matchIndex = normalized.text.indexOf(prefix, searchFrom);
+        if (matchIndex < 0) break;
+        const remainder = normalized.text.slice(matchIndex);
+        if (remainder.length < needle.length && needle.startsWith(remainder)) {
+          return normalized.rawIndices[matchIndex];
+        }
+        searchFrom = matchIndex + 1;
+      }
+
+      const maxSuffix = Math.min(prefix.length - 1, normalized.text.length);
+      for (let length = maxSuffix; length >= 8; length -= 1) {
+        const suffix = normalized.text.slice(-length);
+        if (needle.startsWith(suffix)) {
+          return normalized.rawIndices[normalized.text.length - length];
+        }
+      }
+    }
+    return undefined;
+  }
 }

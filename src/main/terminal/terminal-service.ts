@@ -20,9 +20,8 @@ import { discoverShells } from './shell-discovery';
 import {
   buildCommandEnvelope,
   CommandDisplayFilter,
-  envelopeInputLines,
+  EnvelopeEchoFilter,
   SentinelCapture,
-  stripEnvelopeEcho,
 } from './structured-command';
 import { TerminalInteractionDetector } from './interaction-detector';
 
@@ -41,6 +40,7 @@ interface TerminalRecord {
   pendingOutput: string[];
   pendingOutputLength: number;
   status: 'connected' | 'exited';
+  envelopeEchoFilter: EnvelopeEchoFilter;
   startedAt: string;
   sequence: number;
   journal: TerminalJournalEvent[];
@@ -133,13 +133,6 @@ export class TerminalService {
   private readonly journalListeners = new Set<JournalListener>();
   private readonly exitListeners = new Set<ExitListener>();
   private readonly sensitiveSubmissionListeners = new Set<SensitiveSubmissionListener>();
-  /**
-   * ANSI-stripped input lines of the most recent command envelopes per
-   * terminal, used to hide envelope echoes resurfaced by later full-screen
-   * redraws (window resize / panel drag) after the execution filter is gone.
-   */
-  private readonly recentEnvelopeEchos = new Map<string, Set<string>[]>();
-
   listShells(): ShellProfile[] {
     return discoverShells();
   }
@@ -453,10 +446,7 @@ export class TerminalService {
     };
     const nonce = randomUUID().replaceAll('-', '');
     const envelope = buildCommandEnvelope(record.descriptor.shellKind, normalizedCommand, nonce);
-    const recent = this.recentEnvelopeEchos.get(terminalId) ?? [];
-    recent.push(envelopeInputLines(envelope.input));
-    if (recent.length > 4) recent.shift();
-    this.recentEnvelopeEchos.set(terminalId, recent);
+    record.envelopeEchoFilter.remember(envelope.input);
     return new Promise((resolve) => {
       record.activeExecution = {
         execution,
@@ -698,6 +688,7 @@ export class TerminalService {
       pendingOutput: [],
       pendingOutputLength: 0,
       status: 'connected',
+      envelopeEchoFilter: new EnvelopeEchoFilter(),
       startedAt: new Date().toISOString(),
       sequence: 0,
       journal: [],
@@ -737,10 +728,7 @@ export class TerminalService {
     // The journal keeps the raw stream; only the renderer-visible copy strips
     // the structured-command envelope and sentinels.
     const filtered = executionAtChunkStart?.displayFilter?.push(data) ?? data;
-    const displayData = stripEnvelopeEcho(
-      filtered,
-      this.recentEnvelopeEchos.get(terminalId) ?? [],
-    );
+    const displayData = record.envelopeEchoFilter.push(filtered);
     if (!record.attached) {
       record.pendingOutput.push(displayData);
       record.pendingOutputLength += displayData.length;
@@ -758,6 +746,7 @@ export class TerminalService {
     const record = this.terminals.get(terminalId);
     if (!record || record.status === 'exited') return;
     record.status = 'exited';
+    record.envelopeEchoFilter.clear();
     record.backend = undefined;
     if (record.activeExecution) {
       this.finishExecution(

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildCommandEnvelope,
   CommandDisplayFilter,
+  EnvelopeEchoFilter,
   envelopeInputLines,
   SentinelCapture,
   stripEnvelopeEcho,
@@ -136,6 +137,58 @@ describe('envelope echo redraw filtering', () => {
     const recent = [envelopeInputLines(buildCommandEnvelope('cmd', 'dir', '1122334455667788').input)];
     const data = 'C:\\work> echo hello\r\nhello\r\nC:\\work> ';
     expect(stripEnvelopeEcho(data, recent)).toBe(data);
+  });
+
+  it('hides a PowerShell envelope hard-wrapped to a narrower Windows PTY', () => {
+    const envelope = buildCommandEnvelope(
+      'powershell',
+      "Get-ChildItem 'C:\\Program Files' | Select-Object -First 5",
+      'aabbccddeeff0011',
+    );
+    const input = envelope.input.replace(/\r+$/u, '');
+    const wrapped = [...input.matchAll(/[\s\S]{1,31}/gu)].map((match) => match[0]).join('\r\n');
+    const recent = [envelopeInputLines(envelope.input)];
+    const redraw = [
+      '\x1b[2J\x1b[HPS C:\\Users\\tester> ',
+      `\x1b[92m${wrapped}\x1b[m\r\n`,
+      'command output stays visible\r\n',
+      'PS C:\\Users\\tester> ',
+    ].join('');
+
+    const output = stripEnvelopeEcho(redraw, recent);
+    expect(output).toContain('PS C:\\Users\\tester>');
+    expect(output).toContain('command output stays visible');
+    expect(output).not.toContain('__ait_');
+    expect(output).not.toContain('FromBase64String');
+  });
+
+  it('hides a wrapped envelope split across redraw data events', () => {
+    const envelope = buildCommandEnvelope('powershell', 'Get-Date', '1234567890abcdef');
+    const input = envelope.input.replace(/\r+$/u, '');
+    const wrapped = [...input.matchAll(/[\s\S]{1,27}/gu)].map((match) => match[0]).join('\r\n');
+    const redraw = `\x1b[HPS C:\\work> ${wrapped}\r\nPS C:\\work> `;
+    const splitAt = Math.floor(redraw.length / 2);
+    const filter = new EnvelopeEchoFilter();
+    filter.remember(envelope.input);
+
+    const first = filter.push(redraw.slice(0, splitAt));
+    const second = filter.push(redraw.slice(splitAt));
+    const output = first + second;
+
+    expect(first).toContain('PS C:\\work>');
+    expect(output).toContain('PS C:\\work>');
+    expect(output).not.toContain('__ait_');
+    expect(output).not.toContain('FromBase64String');
+  });
+
+  it('releases a partial private prefix unchanged when later data diverges', () => {
+    const envelope = buildCommandEnvelope('powershell', 'Get-Date', '0011223344556677');
+    const filter = new EnvelopeEchoFilter();
+    filter.remember(envelope.input);
+    const prefix = envelope.input.slice(0, 30);
+
+    expect(filter.push(`ordinary\r\n${prefix}`)).toBe('ordinary\r\n');
+    expect(filter.push('not-the-rest\r\n')).toBe(`${prefix}not-the-rest\r\n`);
   });
 
   it('collects every envelope input line including cmd multi-line envelopes', () => {

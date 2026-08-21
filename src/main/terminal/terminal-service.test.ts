@@ -30,7 +30,7 @@ function owner(): WebContents {
   } as unknown as WebContents;
 }
 
-function setup() {
+function setup(shellKind: TerminalDescriptor['shellKind'] = 'posix') {
   const service = new TerminalService();
   const testable = service as unknown as TestableTerminalService;
   const browser = owner();
@@ -45,7 +45,7 @@ function setup() {
     id: 'terminal',
     title: 'Test',
     profileId: 'test-posix',
-    shellKind: 'posix',
+    shellKind,
     transport: 'local',
   };
   testable.register(browser, descriptor, backend);
@@ -55,6 +55,12 @@ function setup() {
 function nonceFromPosixEnvelope(input: string): string {
   const match = input.match(/__ait_a='([^']+)';__ait_b='([^']+)'/);
   if (!match) throw new Error('Unable to recover the test sentinel nonce.');
+  return `${match[1]}${match[2]}`;
+}
+
+function nonceFromPowerShellEnvelope(input: string): string {
+  const match = input.match(/\$__ait_a='([^']+)'[^\r]*\$__ait_b='([^']+)'/u);
+  if (!match) throw new Error('Unable to recover the PowerShell test sentinel nonce.');
   return `${match[1]}${match[2]}`;
 }
 
@@ -305,6 +311,42 @@ describe('TerminalService control and redaction invariants', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('keeps a hard-wrapped PowerShell envelope out of renderer redraws after resize', async () => {
+    const { service, testable, browser, backend } = setup('powershell');
+    const journal: TerminalJournalEvent[] = [];
+    service.onJournal((_terminalId, _sessionId, event) => journal.push(event));
+    service.bindSession(browser, 'terminal', 'session');
+    service.attach(browser, 'terminal');
+    const executionPromise = service.executeStructured(
+      browser,
+      'terminal',
+      "Get-ChildItem 'C:\\Program Files' | Select-Object -First 5",
+      'ai',
+    );
+    const envelope = backend.writes[0];
+    const nonce = nonceFromPowerShellEnvelope(envelope);
+    testable.emitData('terminal', `__AI_TERMINAL_${nonce}_START__\r\n`);
+    testable.emitData('terminal', `result\r\n__AI_TERMINAL_${nonce}_END_0__\r\nPS C:\\work> `);
+    await executionPromise;
+    vi.mocked(browser.send).mockClear();
+
+    service.resize(browser, 'terminal', 31, 24);
+    const input = envelope.replace(/\r+$/u, '');
+    const wrapped = [...input.matchAll(/[\s\S]{1,31}/gu)].map((match) => match[0]).join('\r\n');
+    const redraw = `\x1b[2J\x1b[HPS C:\\work> ${wrapped}\r\nvisible-after-resize\r\nPS C:\\work> `;
+    testable.emitData('terminal', redraw.slice(0, Math.floor(redraw.length / 2)));
+    testable.emitData('terminal', redraw.slice(Math.floor(redraw.length / 2)));
+
+    const rendered = vi.mocked(browser.send).mock.calls.map(([, payload]) => (
+      (payload as { data?: string }).data ?? ''
+    )).join('');
+    expect(rendered).toContain('visible-after-resize');
+    expect(rendered).toContain('PS C:\\work>');
+    expect(rendered).not.toContain('__ait_');
+    expect(rendered).not.toContain('FromBase64String');
+    expect(journal.some((event) => event.kind === 'output' && event.data.includes('__ait_'))).toBe(true);
   });
 
   it('runs every exit listener even when persistence-oriented listeners throw', () => {
