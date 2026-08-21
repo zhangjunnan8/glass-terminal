@@ -82,6 +82,8 @@ describe('AgentMemoryPanel', () => {
 
     expect(container.textContent).toContain('记忆 2');
     await act(async () => button(container!, '记忆 2').click());
+    expect(container.textContent).toContain('当前 AI 对话专属');
+    expect(container.textContent).toContain('不受自动摘要清理');
     await act(async () => button(container!, '来源').click());
     expect(onLocate).toHaveBeenCalledWith('message-1');
 

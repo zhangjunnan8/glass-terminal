@@ -325,6 +325,10 @@ describe('renderer host and session dialogs', () => {
     await act(async () => historyActivity.click());
     expect(container.querySelector('[data-sidebar-view="history"]')).not.toBeNull();
     expect(container.querySelector('.history-sidebar-row strong')?.textContent).toBe(session.name);
+    expect(container.querySelector('.history-sidebar-summary')?.textContent).toContain('1 个会话');
+    expect(container.querySelector('.history-session-target')?.textContent).toContain(host.name);
+    expect(container.querySelector('.history-session-meta')?.textContent).toContain('活动中');
+    expect(container.querySelector('.history-session-actions')?.textContent).toContain('查看');
   });
 
   it('hides and restores the AI panel without destroying the terminal workspace', async () => {

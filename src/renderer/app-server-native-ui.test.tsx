@@ -879,6 +879,10 @@ describe('native Codex App Server renderer mode', () => {
     await settle();
     await settle();
 
+    expect(container.querySelectorAll('.agent-message-header')).toHaveLength(completed.messages.length);
+    expect(container.querySelector('.agent-message.user .agent-message-avatar')?.textContent).toBe('你');
+    expect(container.querySelector('.agent-message.assistant .agent-message-avatar')?.textContent).toBe('✦');
+    expect(container.querySelector('.agent-message-content')?.textContent).toContain('第一条');
     expect(container.querySelectorAll('[data-testid="latest-user-message-actions"]')).toHaveLength(1);
     expect(container.querySelector('[data-action="interrupt-agent-message"]')).toBeNull();
     const edit = container.querySelector<HTMLButtonElement>('[data-action="edit-agent-message"]')!;

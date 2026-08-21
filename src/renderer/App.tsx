@@ -204,6 +204,19 @@ function themeActionLabel(theme: AppSettings['theme']): string {
   return '切换到深色';
 }
 
+function sessionRecencyLabel(iso: string, now = new Date()): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '时间未知';
+  const time = date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  const sameYear = date.getFullYear() === now.getFullYear();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  const startOfDate = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+  const dayDifference = Math.round((startOfToday - startOfDate) / 86_400_000);
+  if (dayDifference === 0) return `今天 ${time}`;
+  if (dayDifference === 1) return `昨天 ${time}`;
+  return `${sameYear ? `${date.getMonth() + 1}月${date.getDate()}日` : `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`} ${time}`;
+}
+
 export function App() {
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [uiTheme, setUiTheme] = useState<UiTheme>(() => readUiTheme());
@@ -2099,6 +2112,10 @@ export function App() {
 
           {sidebarView === 'history' && (
             <div className="history-sidebar-list">
+              <div className="history-sidebar-summary">
+                <span>{filteredSessions.length} 个会话</span>
+                <small>按最近更新排列</small>
+              </div>
               {filteredSessions.map((session) => {
                 const host = session.hostId
                   ? hosts.find((candidate) => candidate.id === session.hostId)
@@ -2108,19 +2125,43 @@ export function App() {
                   && (tab.sessionId === session.id || tab.id === session.runtimeTerminalId)
                 ));
                 return (
-                  <article className="history-sidebar-row" key={session.id}>
+                  <article
+                    className={`history-sidebar-row ${runtimeTab ? 'live' : ''}`}
+                    data-session-status={session.status}
+                    key={session.id}
+                  >
                     <button
                       className="history-session-main"
                       data-action="view-session-history"
                       data-session-id={session.id}
+                      aria-label={`查看会话：${session.name}`}
                       onClick={() => openSessionHistory(session)}
                     >
-                      <strong>{session.name}</strong>
-                      <small>{host?.name ?? (session.transport === 'ssh' ? '主机' : '本地 Shell')}</small>
-                      <small>{sessionStatusLabel(session.status)} · {new Date(session.updatedAt).toLocaleString('zh-CN')}</small>
+                      <span className="history-session-heading">
+                        <span className="history-session-status-dot" aria-hidden="true" />
+                        <strong title={session.name}>{session.name}</strong>
+                        {runtimeTab && <em>已打开</em>}
+                      </span>
+                      <span className="history-session-target">
+                        <span aria-hidden="true">{session.transport === 'ssh' ? '◇' : '⌘'}</span>
+                        {host?.name ?? (session.transport === 'ssh' ? session.targetSnapshot.label : '本地 Shell')}
+                        {session.effectiveUser ? ` · ${session.effectiveUser}` : ''}
+                      </span>
+                      {(session.workspace?.root || session.cwd) && (
+                        <code title={session.workspace?.root ?? session.cwd}>
+                          {session.workspace?.root ?? session.cwd}
+                        </code>
+                      )}
+                      <span className="history-session-meta">
+                        <span>{sessionStatusLabel(session.status)}</span>
+                        <time
+                          dateTime={session.updatedAt}
+                          title={new Date(session.updatedAt).toLocaleString('zh-CN')}
+                        >{sessionRecencyLabel(session.updatedAt)}</time>
+                      </span>
                     </button>
                     <div className="history-session-actions">
-                      <button onClick={() => openSessionHistory(session)}>查看内容</button>
+                      <button onClick={() => openSessionHistory(session)}>查看</button>
                       <button onClick={() => openSessionRename(session)}>重命名</button>
                       {host && (
                         <button
@@ -2656,20 +2697,29 @@ export function App() {
               data-agent-message-id={message.id}
               tabIndex={-1}
             >
-              <span className="agent-message-role">
-                {roleLabel(message.role)}
-                <time className="agent-message-time">{formatClock(message.createdAt)}</time>
-                {turnDurationMs !== undefined && turnDurationMs >= 0 && (
-                  <small className="agent-message-duration">{formatDuration(turnDurationMs)}</small>
-                )}
-              </span>
-              <Suspense fallback={<p className="agent-plain-message">{message.content}</p>}>
-                <AgentMessageContent
-                  role={message.role}
-                  content={message.content}
-                  streaming={activeAgent.streamingMessageId === message.id}
-                />
-              </Suspense>
+              <header className="agent-message-header">
+                <span className="agent-message-avatar" aria-hidden="true">
+                  {message.role === 'user' ? '你' : message.role === 'assistant' ? '✦' : 'i'}
+                </span>
+                <span className="agent-message-role">
+                  <strong>{roleLabel(message.role)}</strong>
+                  <span className="agent-message-meta">
+                    <time className="agent-message-time">{formatClock(message.createdAt)}</time>
+                    {turnDurationMs !== undefined && turnDurationMs >= 0 && (
+                      <small className="agent-message-duration">耗时 {formatDuration(turnDurationMs)}</small>
+                    )}
+                  </span>
+                </span>
+              </header>
+              <div className="agent-message-content">
+                <Suspense fallback={<p className="agent-plain-message">{message.content}</p>}>
+                  <AgentMessageContent
+                    role={message.role}
+                    content={message.content}
+                    streaming={activeAgent.streamingMessageId === message.id}
+                  />
+                </Suspense>
+              </div>
               {!codexBackendSelected && (
                 <div className="agent-message-memory-action">
                   <button
@@ -2680,13 +2730,13 @@ export function App() {
                       || containsObviousAgentSecret(message.content)
                     }
                     title={containsObviousAgentSecret(message.content)
-                      ? '检测到明显凭据，不能 Pin 到上下文记忆'
-                      : '提炼为一张有界上下文记忆卡片'}
+                      ? '检测到明显凭据，不能保存到上下文记忆'
+                      : '提炼并保存为当前 AI 对话的持久上下文记忆卡片'}
                     onClick={() => setAgentMemoryDraftSource({
                       id: message.id,
                       content: message.content,
                     })}
-                  >记住</button>
+                  >存为记忆</button>
                 </div>
               )}
               {turnActivities.length > 0 && (

@@ -153,12 +153,12 @@ export function AgentMemoryPanel({
           <header>
             <div>
               <strong>上下文记忆</strong>
-              <small>用户 Pin · 独立于自动摘要 · 有界注入</small>
+              <small>当前 AI 对话专属 · 每轮注入 · 不受自动摘要清理</small>
             </div>
             <button type="button" aria-label="关闭上下文记忆" onClick={() => setOpen(false)}>×</button>
           </header>
           <div className="agent-memory-list">
-            {memories.length === 0 && <p>暂无记忆。可从消息中“记住”，或新建短卡片。</p>}
+            {memories.length === 0 && <p>暂无记忆。可从消息中“存为记忆”，或新建短卡片。</p>}
             {memories.map((memory) => (
               <article key={memory.id} data-memory-id={memory.id}>
                 <span>{CATEGORY_LABELS[memory.category]}</span>
