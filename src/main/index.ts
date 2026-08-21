@@ -270,7 +270,10 @@ function createMainWindow(): BrowserWindow {
     height: 900,
     minWidth: 980,
     minHeight: 640,
-    show: false,
+    // The renderer already uses the same dark background, so showing the native
+    // window immediately avoids a white flash without making visibility depend
+    // on Chromium's first-paint `ready-to-show` event. Smoke runners stay hidden.
+    show: !isSmokeTest,
     backgroundColor: '#0b1018',
     title: PRODUCT_NAME,
     webPreferences: {
@@ -279,10 +282,6 @@ function createMainWindow(): BrowserWindow {
       nodeIntegration: false,
       sandbox: true,
     },
-  });
-
-  window.once('ready-to-show', () => {
-    if (!isSmokeTest) window.show();
   });
 
   if (isSmokeTest) {
@@ -307,7 +306,9 @@ function createMainWindow(): BrowserWindow {
     terminalService.closeOwnedBy(contentsId);
   });
 
-  void window.loadURL(rendererEntryUrl);
+  void window.loadURL(rendererEntryUrl).catch((error) => {
+    console.error('Unable to load the main renderer:', error);
+  });
 
   return window;
 }
@@ -323,7 +324,7 @@ function showSettingsWindow(): void {
     height: 640,
     minWidth: 640,
     minHeight: 480,
-    show: false,
+    show: !isSmokeTest,
     backgroundColor: '#0b1018',
     title: `${PRODUCT_NAME} — 设置`,
     parent: BrowserWindow.getAllWindows()[0],
@@ -335,9 +336,6 @@ function showSettingsWindow(): void {
     },
   });
 
-  settingsWindow.once('ready-to-show', () => {
-    if (!isSmokeTest) settingsWindow?.show();
-  });
   settingsWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('https://')) void shell.openExternal(url);
     return { action: 'deny' };
@@ -359,7 +357,9 @@ function showSettingsWindow(): void {
     settingsWindow = null;
   });
 
-  void settingsWindow.loadURL(settingsEntryUrl);
+  void settingsWindow.loadURL(settingsEntryUrl).catch((error) => {
+    console.error('Unable to load the settings renderer:', error);
+  });
 }
 
 handleTrusted('runtime:get-info', () => ({
