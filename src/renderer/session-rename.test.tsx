@@ -354,6 +354,29 @@ describe('renderer host and session dialogs', () => {
     expect(container.querySelector('.agent-panel')).not.toBeNull();
   });
 
+  it('renders no AI surface without a terminal tab and restores the prior visibility preference', async () => {
+    const bridge = bridgeWith(vi.fn());
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    const shell = container.querySelector<HTMLElement>('.app-shell')!;
+    expect(container.querySelector('.agent-panel')).not.toBeNull();
+    await act(async () => container.querySelector<HTMLElement>('.tab-close')!.click());
+
+    expect(shell.dataset.agentPanelVisible).toBe('false');
+    expect(shell.classList).toContain('agent-panel-hidden');
+    expect(container.querySelector('.agent-panel')).toBeNull();
+    expect(container.querySelector('[data-action="show-agent-panel"]')).toBeNull();
+
+    await act(async () => container.querySelector<HTMLButtonElement>('.new-tab')!.click());
+    await act(async () => container.querySelector<HTMLButtonElement>('.shell-menu button')!.click());
+    await settle();
+
+    expect(shell.dataset.agentPanelVisible).toBe('true');
+    expect(container.querySelector('.agent-panel')).not.toBeNull();
+  });
+
   it('sets an SSH workspace from the SFTP drawer, upserts the Session binding, and clears it', async () => {
     const bridge = bridgeWith(vi.fn());
     const withWorkspace: SessionRecord = {

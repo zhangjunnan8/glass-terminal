@@ -462,6 +462,7 @@ export function App() {
     () => tabs.find((tab) => tab.id === activeId) ?? null,
     [activeId, tabs],
   );
+  const agentPanelRendered = agentPanelVisible && activeTab !== null;
   const activeSession = useMemo(() => {
     if (!activeTab) return null;
     return sessions.find((session) => session.id === activeTab.sessionId)
@@ -1834,10 +1835,10 @@ export function App() {
 
   return (
     <div
-      className={`app-shell ${agentPanelVisible ? '' : 'agent-panel-hidden'}`}
+      className={`app-shell ${agentPanelRendered ? '' : 'agent-panel-hidden'}`}
       data-locale={appSettings?.language ?? 'zh-CN'}
       data-theme={uiTheme}
-      data-agent-panel-visible={agentPanelVisible ? 'true' : 'false'}
+      data-agent-panel-visible={agentPanelRendered ? 'true' : 'false'}
       style={{ '--agent-panel-width': `${agentPanelWidth}px` } as CSSProperties}
     >
       <header className="titlebar">
@@ -2398,7 +2399,7 @@ export function App() {
             onClose={() => setSftpOpen(false)}
           />
         )}
-        {!agentPanelVisible && (
+        {activeTab && !agentPanelVisible && (
           <button
             className="show-agent-panel"
             data-action="show-agent-panel"
@@ -2407,7 +2408,7 @@ export function App() {
         )}
       </main>
 
-      {agentPanelVisible && (
+      {agentPanelRendered && (
       <aside className="agent-panel">
         <div
           className="agent-panel-resizer"
