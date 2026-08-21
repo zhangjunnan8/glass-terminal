@@ -2,33 +2,54 @@
 
 # 🖥️ Glass Terminal
 
-### 人与 AI 共享同一终端会话的 Windows 桌面应用
+### 面向远程设备的人机共享 AI 终端
 
-一个 **Windows-first** 的终端智能体：人类和 AI 智能体操作**同一个可见的终端会话**（本地 PTY 或 SSH 远程主机）。AI 执行的每一条命令都原样出现在你眼前的终端里，可审批、可接管、可追溯 —— 没有隐藏的后台 Shell。
+**不装远程 IDE，不使用隐藏 Shell，人与 AI 共用一个真实终端。**
+
+Glass Terminal 是一个 **Windows-first、终端优先、远程设备优先**的 Agent 工作台。对于 Jetson、树莓派、ARM 小电脑、边缘主机，以及连接着单片机/JTAG/串口设备的实验室主机，目标端通常只需已有的 SSH/SFTP：无需部署 VS Code Server、模型 SDK 或常驻 Agent。Generic Provider 模式下，人类和 AI 操作**同一个可见的本地 PTY 或 SSH Shell**，命令只执行一次，原始实时输出完整呈现，并且随时可以审批、Ctrl+C 或人工接管。
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
 ![Electron](https://img.shields.io/badge/Electron-43-2b2e3a?logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178c6?logo=typescript&logoColor=white)
 ![Version](https://img.shields.io/badge/version-0.1.0--alpha.2-orange)
-![Tests](https://img.shields.io/badge/tests-580%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-676%20passed-brightgreen)
 ![Status](https://img.shields.io/badge/status-alpha-important)
 
 </div>
 
 ---
 
+## 🎯 为什么 Glass Terminal
+
+Codex IDE、Remote IDE 和通用 Agent Harness 主要围绕代码工作区与 Agent 自有执行环境设计；Glass Terminal 首先解决的是另一类问题：**如何让 AI 安全、透明地进入已经存在的真实设备终端**。
+
+| | Glass Terminal | 常见 Remote IDE | 常见 Agent Harness |
+|---|---|---|---|
+| **远程准备** | 目标端通常只需 SSH；文件工具使用同一连接上的 SFTP | 经常需要部署远程 Server、扩展和索引环境 | 经常需要额外 Shell、运行时或工具服务 |
+| **执行位置** | AI 和人共用同一个真实 PTY/SSH Shell | IDE 任务或远程扩展环境 | Harness 创建的 Shell、容器或沙箱 |
+| **输出呈现** | xterm 直接显示原始实时流，包括进度、提示和控制序列 | 取决于 IDE 任务与终端集成 | 常见形态是截取后的工具结果或摘要 |
+| **人工干预** | 可直接输入、回答提示、发送 Ctrl+C，并随时接管 | 常需要切换到另一终端处理 | 通常只能批准、拒绝或终止工具调用 |
+| **模型选择** | DeepSeek、GLM、MiniMax、OpenAI 等兼容端点可替换 | 通常绑定对应 Agent 生态 | 取决于 Harness 实现 |
+
+典型场景包括：在低速网络下维护 Jetson；观察 CUDA、驱动、Docker 或编译过程；通过远程控制主机运行 OpenOCD、esptool、串口和烧录工具；以及处理必须看到实时进度、交互提示或设备异常的长任务。
+
+> Glass Terminal 不替代单片机本身的物理调试链路。对于不能运行 SSH 的 MCU，它连接的是挂载该设备、烧录器或串口的控制主机。
+
+> **当前模式边界：**共享终端执行是 Generic Provider（OpenAI-compatible API）模式的核心能力。Codex App Server 原生模式使用 Codex 自己的本地工作区与内建工具，可以按授权读取当前终端上下文，但目前不会控制远程公共终端。详见 [Codex App Server 使用与接入说明](docs/codex-app-server.md)。
+
 ## ✨ 核心特性
 
 | | 说明 |
 |---|---|
-| 🖥️ **共享可见终端** | AI 与人类共用同一个终端；AI 命令通过命令信封注入，输出实时回显，无隐藏进程 |
-| 🤖 **双 Agent 后端** | Generic Provider（LangChain，兼容 DeepSeek / OpenAI 等）与原生 Codex App Server 两种模式 |
+| 🖥️ **共享可见终端** | Generic Provider 与人类共用同一个真实 PTY/SSH Shell；命令只执行一次，输出实时可见，没有第二条隐藏执行通道 |
+| 🪶 **远程零侵入** | 目标主机无需安装 Glass Terminal、远程 IDE 或 Agent Runtime；会话集成不修改远端 PowerShell Profile、不落地脚本 |
+| 🤖 **双 Agent 后端** | Generic Provider（LangChain，兼容 DeepSeek / GLM / MiniMax / OpenAI 等）与原生 Codex App Server 两种模式 |
 | 🧠 **有界上下文记忆** | Generic Provider 按模型窗口保守估算；满阈值生成经校验的结构化摘要，用户还可审阅、编辑和合并独立的短记忆卡片 |
 | ✅ **命令审批** | AI 请求执行命令需你确认；支持编辑后执行、拒绝 |
 | 🎮 **AI 全接管 / 人工接管** | 显式确认后 Full Takeover 可连续执行命令，Take Control 可随时抢回当前终端；SSH Host 当前会记住该偏好 |
 | 🌐 **SSH 远程主机** | 密码 / 键盘交互 / 私钥 / Windows OpenSSH 代理认证；多主机、文件夹分组、收藏 |
-| 🪟 **远程 Shell 适配** | 每台主机可指定远程 Shell：Linux/POSIX、PowerShell、cmd —— 命令信封自动匹配，Windows 远程主机不再"命令失灵" |
+| 🪟 **远程 Shell 适配** | 每台主机可指定 Linux/POSIX、PowerShell 或 cmd；PowerShell 使用会话级 Shell Integration 获取命令边界、退出码和 cwd，可见 VT 流不做文本猜测或重绘过滤 |
 | 📁 **Workspace 文件工具** | 只读 / 读写绑定根、FULL FILESYSTEM ACCESS 三种授权；`read / search / glob / apply_patch / write` 全程显示 diff |
 | 🔐 **安全优先** | 凭据不进模型上下文与明文日志；密钥库 AES-256-GCM 加密；敏感认证交接；无任何遥测 |
 | 💾 **持久化与会话** | 会话历史、审计日志（audit JSONL）、断线重连、终端回放 |
@@ -56,14 +77,15 @@ npm run dev
 
 ```bash
 npm run typecheck   # TypeScript 类型检查
-npm test            # Vitest 全量测试（71 个测试文件；580 通过、13 跳过）
-npm run build       # 编译 renderer + Electron main/preload
+npm test            # Vitest 全量测试（70 个文件通过、4 个跳过；676 项通过、13 项跳过）
+npm run build       # 类型检查 + 全量测试 + renderer/Electron 生产编译
 ```
 
 ### 打包（绿色版，无需安装）
 
 ```bash
-npm run package
+npm run build
+npm run package:win
 # 产物：release/win-unpacked/Glass Terminal.exe
 ```
 
@@ -131,9 +153,8 @@ src/
   renderer/   React 界面（终端面板、Agent 面板、设置窗口）
   shared/     IPC 契约与共享类型
 docs/
-  AI_PROJECT_GUIDE.md        新 AI 窗口 / 开发者入口文档
+  codex-app-server.md        Codex 原生模式使用与能力边界
   architecture/              架构与技术选型
-  progress/                  里程碑记录
 ```
 
 ---
