@@ -338,6 +338,13 @@ function shellQuote(path: string, shellKind: string): string {
   return `'${path.replaceAll("'", "'\\''")}'`;
 }
 
+function terminalPlainText(value: string): string {
+  return value.replace(
+    /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/gu,
+    '',
+  );
+}
+
 describe('LangChain backend spike (DeepSeek-compatible transport)', () => {
   it('routes commands to the shared PTY and files to the Workspace backend, with no hidden shell', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ai-terminal-langchain-spike-'));
@@ -392,7 +399,22 @@ describe('LangChain backend spike (DeepSeek-compatible transport)', () => {
       });
       terminalId = descriptor.id;
       terminals.attach(owner, terminalId);
-      await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+      if (profile.kind === 'powershell') {
+        const integrationDeadline = Date.now() + 5_000;
+        while (Date.now() < integrationDeadline) {
+          const integration = terminals.state(owner, terminalId).shellIntegration as
+            | { status?: string; rich?: boolean }
+            | undefined;
+          if (integration?.status === 'ready' && integration.rich) break;
+          await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+        }
+        expect(terminals.state(owner, terminalId).shellIntegration).toMatchObject({
+          status: 'ready',
+          rich: true,
+        });
+      } else {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+      }
 
       const store = new SessionStore(join(root, 'sessions'));
       const localFilesystem = new LocalFilesystemBackend();
@@ -508,9 +530,11 @@ describe('LangChain backend spike (DeepSeek-compatible transport)', () => {
         .filter((event) => event.terminalId === terminalId)
         .map((event) => event.data ?? '')
         .join('');
-      expect(terminalHistory).toContain('node --version');
+      // PSReadLine syntax-highlights command input with CSI sequences. The
+      // shared xterm renders those bytes as one visible command line.
+      expect(terminalPlainText(terminalHistory)).toContain('node --version');
       expect(terminalHistory).toContain('SPIKE_TEST_PASS');
-      expect(visibleSnapshot).toContain('node --version');
+      expect(terminalPlainText(visibleSnapshot)).toContain('node --version');
       expect(visibleSnapshot).toContain('SPIKE_TEST_PASS');
       for (const hidden of ['cat ', 'sed ', 'grep ', 'echo ', 'Get-Content', 'Set-Content', MODE_OFF, MODE_ON]) {
         expect(terminalHistory).not.toContain(hidden);

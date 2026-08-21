@@ -25,6 +25,13 @@ import {
   SentinelCapture,
 } from './structured-command';
 import { TerminalInteractionDetector } from './interaction-detector';
+import {
+  type PowerShellShellIntegrationEvent,
+  type PowerShellShellIntegrationPart,
+  PowerShellShellIntegrationParser,
+  powerShellShellIntegrationArgs,
+  remotePowerShellShellIntegrationCommand,
+} from './powershell-shell-integration';
 
 interface TerminalBackend {
   write(data: string): void;
@@ -42,6 +49,15 @@ interface TerminalRecord {
   pendingOutputLength: number;
   status: 'connected' | 'exited';
   envelopeEchoFilter: EnvelopeEchoFilter;
+  powerShellIntegration?: {
+    parser: PowerShellShellIntegrationParser;
+    ready: boolean;
+    rich: boolean;
+    lastCommandId: number;
+    lastCommand?: { id: number; command: string };
+    powerShellVersion?: string;
+    cwd?: string;
+  };
   resizeTimer?: NodeJS.Timeout;
   pendingResize?: { cols: number; rows: number };
   startedAt: string;
@@ -65,11 +81,8 @@ interface TerminalRecord {
   sensitiveJournalRedacted: boolean;
 }
 
-interface ActiveExecution {
+interface ActiveExecutionBase {
   execution: CommandExecution;
-  envelope: CommandEnvelope;
-  capture: SentinelCapture;
-  displayFilter: CommandDisplayFilter;
   interactionDetector: TerminalInteractionDetector;
   outputBytes: number;
   hooks: StructuredExecutionHooks;
@@ -79,6 +92,20 @@ interface ActiveExecution {
   sensitiveOutputRedacted: boolean;
   interruptRequested: boolean;
 }
+
+type ActiveExecution = ActiveExecutionBase & (
+  | {
+    protocol: 'sentinel';
+    envelope: CommandEnvelope;
+    capture: SentinelCapture;
+    displayFilter: CommandDisplayFilter;
+  }
+  | {
+    protocol: 'powershell-shell-integration';
+    phase: 'awaiting-command' | 'awaiting-start' | 'running';
+    commandId?: number;
+  }
+);
 
 export interface StructuredExecutionHooks {
   onOutput?: (data: string) => void;
@@ -147,7 +174,13 @@ export class TerminalService {
     if (!profile) throw new Error(`Unknown shell profile: ${request.profileId}`);
 
     const terminalId = randomUUID();
-    const processHandle = pty.spawn(profile.command, profile.args, {
+    const powerShellIntegrationNonce = profile.kind === 'powershell'
+      ? randomUUID().replaceAll('-', '')
+      : undefined;
+    const args = powerShellIntegrationNonce
+      ? powerShellShellIntegrationArgs(profile.args, powerShellIntegrationNonce)
+      : profile.args;
+    const processHandle = pty.spawn(profile.command, args, {
       name: 'xterm-256color',
       cols: Math.max(2, request.cols ?? 80),
       rows: Math.max(1, request.rows ?? 24),
@@ -168,7 +201,7 @@ export class TerminalService {
       resize: (cols, rows) => processHandle.resize(cols, rows),
       close: () => processHandle.kill(),
     };
-    this.register(owner, descriptor, backend);
+    this.register(owner, descriptor, backend, undefined, powerShellIntegrationNonce);
 
     processHandle.onData((data) => this.emitData(terminalId, data));
     processHandle.onExit(({ exitCode, signal }) => {
@@ -225,6 +258,10 @@ export class TerminalService {
       client.on('error', fail);
       client.once('ready', () => {
         if (authTimeout) clearTimeout(authTimeout);
+        const shellKind = host.shellKind ?? 'posix';
+        const powerShellIntegrationNonce = shellKind === 'powershell'
+          ? randomUUID().replaceAll('-', '')
+          : undefined;
         const terminalOptions: PseudoTtyOptions = {
           term: 'xterm-256color',
           cols: Math.max(2, request.cols ?? 80),
@@ -232,7 +269,7 @@ export class TerminalService {
           width: 0,
           height: 0,
         };
-        client.shell(terminalOptions, (error, stream) => {
+        const channelReady = (error: Error | undefined, stream: ClientChannel) => {
           if (error) {
             fail(error);
             return;
@@ -245,11 +282,17 @@ export class TerminalService {
             id: terminalId,
             title: host.name,
             profileId: `ssh:${host.id}`,
-            shellKind: host.shellKind ?? 'posix',
+            shellKind,
             transport: 'ssh',
             hostId: host.id,
           };
-          this.register(owner, descriptor, backend, client);
+          this.register(
+            owner,
+            descriptor,
+            backend,
+            client,
+            powerShellIntegrationNonce,
+          );
           for (const banner of banners) this.emitData(terminalId, banner);
           stream.on('data', (data: Buffer) => this.emitData(terminalId, stdoutDecoder.write(data)));
           stream.stderr.on('data', (data: Buffer) => {
@@ -268,7 +311,16 @@ export class TerminalService {
           });
           settled = true;
           resolve({ descriptor, fingerprint: observedFingerprint });
-        });
+        };
+        if (powerShellIntegrationNonce) {
+          client.exec(
+            remotePowerShellShellIntegrationCommand(powerShellIntegrationNonce),
+            { pty: terminalOptions },
+            channelReady,
+          );
+        } else {
+          client.shell(terminalOptions, channelReady);
+        }
       });
 
       authTimeout = setTimeout(() => {
@@ -334,7 +386,6 @@ export class TerminalService {
     const record = this.requireConnected(owner, terminalId);
     const safeCols = Math.max(2, cols);
     const safeRows = Math.max(1, rows);
-    record.envelopeEchoFilter.noteResize();
     if (
       record.descriptor.transport === 'ssh'
       && record.descriptor.shellKind === 'powershell'
@@ -475,11 +526,55 @@ export class TerminalService {
       status: 'running',
       output: '',
     };
+    if (record.descriptor.shellKind === 'powershell') {
+      const integration = record.powerShellIntegration;
+      if (!integration?.ready) {
+        throw new Error(
+          'PowerShell Shell Integration is not ready; reconnect the terminal before AI execution.',
+        );
+      }
+      if (!integration.rich) {
+        throw new Error(
+          'PowerShell AI execution requires PSReadLine and FullLanguage shell integration.',
+        );
+      }
+      if (integration.cwd) execution.cwd = integration.cwd;
+      return new Promise((resolve) => {
+        record.activeExecution = {
+          protocol: 'powershell-shell-integration',
+          phase: 'awaiting-command',
+          execution,
+          interactionDetector: new TerminalInteractionDetector(),
+          outputBytes: 0,
+          hooks,
+          resolve,
+          sensitiveTainted: false,
+          sensitiveOutputRedacted: false,
+          interruptRequested: false,
+        };
+        this.armExecutionInactivityWatchdog(record);
+        hooks.onStarted?.({ ...execution });
+        try {
+          const input = normalizedCommand.includes('\n')
+            ? `\x1b[200~${normalizedCommand.replaceAll('\r\n', '\n')}\x1b[201~\r`
+            : `${normalizedCommand}\r`;
+          record.backend!.write(input);
+        } catch (error) {
+          this.finishExecution(
+            record,
+            'failed',
+            undefined,
+            `\r\n[Unable to write command: ${(error as Error).message}]\r\n`,
+          );
+        }
+      });
+    }
     const nonce = randomUUID().replaceAll('-', '');
     const envelope = buildCommandEnvelope(record.descriptor.shellKind, normalizedCommand, nonce);
-    record.envelopeEchoFilter.remember(envelope.input, envelope, normalizedCommand);
+    record.envelopeEchoFilter.remember(envelope.input);
     return new Promise((resolve) => {
       record.activeExecution = {
+        protocol: 'sentinel',
         execution,
         envelope,
         capture: new SentinelCapture(envelope),
@@ -591,6 +686,13 @@ export class TerminalService {
       status: record.status,
       activeExecutionId: record.activeExecution?.execution.id,
       terminalInputMode: record.controlLease?.inputMode ?? 'human',
+      ...(record.powerShellIntegration ? {
+        shellIntegration: {
+          status: record.powerShellIntegration.ready ? 'ready' : 'starting',
+          rich: record.powerShellIntegration.rich,
+          powerShellVersion: record.powerShellIntegration.powerShellVersion,
+        },
+      } : {}),
     };
   }
 
@@ -710,6 +812,7 @@ export class TerminalService {
     descriptor: TerminalDescriptor,
     backend: TerminalBackend,
     sshClient?: Client,
+    powerShellIntegrationNonce?: string,
   ): void {
     this.terminals.set(descriptor.id, {
       backend,
@@ -720,7 +823,15 @@ export class TerminalService {
       pendingOutput: [],
       pendingOutputLength: 0,
       status: 'connected',
-      envelopeEchoFilter: new EnvelopeEchoFilter(descriptor.shellKind),
+      envelopeEchoFilter: new EnvelopeEchoFilter(),
+      ...(powerShellIntegrationNonce ? {
+        powerShellIntegration: {
+          parser: new PowerShellShellIntegrationParser(powerShellIntegrationNonce),
+          ready: false,
+          rich: false,
+          lastCommandId: 0,
+        },
+      } : {}),
       startedAt: new Date().toISOString(),
       sequence: 0,
       journal: [],
@@ -736,9 +847,21 @@ export class TerminalService {
     if (!record || record.status === 'exited') return;
     if (!data) return;
     const executionAtChunkStart = record.activeExecution;
-    this.processExecutionOutput(record, data);
+    let terminalData = data;
+    if (record.powerShellIntegration) {
+      const parts = record.powerShellIntegration.parser.push(data);
+      this.processPowerShellIntegration(record, parts);
+      terminalData = parts
+        .filter((part): part is Extract<PowerShellShellIntegrationPart, { kind: 'data' }> => (
+          part.kind === 'data'
+        ))
+        .map((part) => part.data)
+        .join('');
+    } else {
+      this.processExecutionOutput(record, data);
+    }
     if (record.sensitiveLease || executionAtChunkStart?.sensitiveTainted) {
-      if (!record.sensitiveJournalRedacted) {
+      if (terminalData && !record.sensitiveJournalRedacted) {
         record.sensitiveJournalRedacted = true;
         this.appendJournal(record, {
           version: 1,
@@ -748,19 +871,25 @@ export class TerminalService {
           data: '\r\n[Sensitive interaction hidden]\r\n',
         });
       }
-    } else {
+    } else if (terminalData) {
       this.appendJournal(record, {
         version: 1,
         sequence: this.nextSequence(record),
         timestamp: new Date().toISOString(),
         kind: 'output',
-        data,
+        data: terminalData,
       });
     }
-    // The journal keeps the raw stream; only the renderer-visible copy strips
-    // the structured-command envelope and sentinels.
-    const filtered = executionAtChunkStart?.displayFilter?.push(data) ?? data;
-    const displayData = record.envelopeEchoFilter.push(filtered);
+    // PowerShell lifecycle OSC is parsed into structured events, while every
+    // visible VT byte passes through unchanged. Legacy shells still use their
+    // sentinel display filter until they gain native shell integration.
+    const displayData = record.powerShellIntegration
+      ? terminalData
+      : record.envelopeEchoFilter.push(
+        executionAtChunkStart?.protocol === 'sentinel'
+          ? executionAtChunkStart.displayFilter.push(data)
+          : data,
+      );
     if (!record.attached) {
       record.pendingOutput.push(displayData);
       record.pendingOutputLength += displayData.length;
@@ -782,13 +911,14 @@ export class TerminalService {
     record.resizeTimer = undefined;
     record.pendingResize = undefined;
     record.envelopeEchoFilter.clear();
+    record.powerShellIntegration?.parser.clear();
     record.backend = undefined;
     if (record.activeExecution) {
       this.finishExecution(
         record,
         record.activeExecution.interruptRequested ? 'cancelled' : 'failed',
         exitCode,
-        '\r\n[Terminal exited before the command sentinel completed.]\r\n',
+        '\r\n[Terminal exited before the active command completed.]\r\n',
       );
     }
     for (const listener of this.exitListeners) {
@@ -864,7 +994,7 @@ export class TerminalService {
 
   private processExecutionOutput(record: TerminalRecord, data: string): void {
     const active = record.activeExecution;
-    if (!active) return;
+    if (!active || active.protocol !== 'sentinel') return;
     this.armExecutionInactivityWatchdog(record);
     const update = active.capture.push(data);
     const interaction = active.interactionDetector.push(update.observed);
@@ -901,6 +1031,122 @@ export class TerminalService {
         update.exitCode,
       );
     }
+  }
+
+  private processPowerShellIntegration(
+    record: TerminalRecord,
+    parts: readonly PowerShellShellIntegrationPart[],
+  ): void {
+    const integration = record.powerShellIntegration;
+    if (!integration) return;
+    for (const part of parts) {
+      if (part.kind === 'data') {
+        const active = record.activeExecution;
+        if (
+          active?.protocol === 'powershell-shell-integration'
+          && active.phase === 'running'
+        ) this.processPowerShellExecutionData(record, active, part.data);
+        continue;
+      }
+      this.processPowerShellIntegrationEvent(record, integration, part.event);
+    }
+  }
+
+  private processPowerShellIntegrationEvent(
+    record: TerminalRecord,
+    integration: NonNullable<TerminalRecord['powerShellIntegration']>,
+    event: PowerShellShellIntegrationEvent,
+  ): void {
+    if (event.kind === 'ready') {
+      integration.ready = true;
+      integration.rich = event.rich;
+      integration.powerShellVersion = event.powerShellVersion;
+      return;
+    }
+    if (event.kind === 'cwd') {
+      integration.cwd = event.cwd;
+      const active = record.activeExecution;
+      if (active?.protocol === 'powershell-shell-integration') {
+        active.execution.cwd = event.cwd;
+      }
+      return;
+    }
+    if (event.kind === 'command') {
+      if (event.commandId <= integration.lastCommandId) return;
+      integration.lastCommandId = event.commandId;
+      integration.lastCommand = { id: event.commandId, command: event.command };
+      const active = record.activeExecution;
+      if (
+        active?.protocol === 'powershell-shell-integration'
+        && active.phase === 'awaiting-command'
+        && this.samePowerShellCommand(active.execution.command, event.command)
+      ) {
+        active.commandId = event.commandId;
+        active.phase = 'awaiting-start';
+      }
+      return;
+    }
+    const active = record.activeExecution;
+    if (active?.protocol !== 'powershell-shell-integration') return;
+    if (
+      event.kind === 'start'
+      && active.phase === 'awaiting-start'
+      && active.commandId === event.commandId
+    ) {
+      active.phase = 'running';
+      this.armExecutionInactivityWatchdog(record);
+      return;
+    }
+    if (
+      event.kind === 'end'
+      && active.phase === 'running'
+      && active.commandId === event.commandId
+    ) {
+      this.finishExecution(
+        record,
+        active.interruptRequested
+          ? 'cancelled'
+          : event.exitCode === 0 ? 'completed' : 'failed',
+        event.exitCode,
+      );
+    }
+  }
+
+  private samePowerShellCommand(expected: string, actual: string): boolean {
+    const normalize = (value: string) => value.replaceAll('\r\n', '\n').trim();
+    return normalize(expected) === normalize(actual);
+  }
+
+  private processPowerShellExecutionData(
+    record: TerminalRecord,
+    active: Extract<ActiveExecution, { protocol: 'powershell-shell-integration' }>,
+    data: string,
+  ): void {
+    if (!data) return;
+    this.armExecutionInactivityWatchdog(record);
+    const interaction = active.interactionDetector.push(data);
+    if (interaction?.kind === 'authentication') {
+      this.taintSensitiveExecution(record, active, false);
+      active.hooks.onAuthPrompt?.({ ...active.execution });
+    } else if (interaction?.kind === 'confirmation') {
+      const shouldAnswer = active.hooks.onConfirmation?.(
+        interaction.answer,
+        { ...active.execution },
+      ) ?? false;
+      if (shouldAnswer && record.activeExecution?.execution.id === active.execution.id) {
+        record.backend?.write(`${interaction.answer}\r`);
+        active.interactionDetector.rearm();
+      }
+    }
+    if (active.sensitiveTainted) {
+      if (!active.sensitiveOutputRedacted) {
+        active.sensitiveOutputRedacted = true;
+        this.appendExecutionOutput(active, '\r\n[Sensitive interaction hidden]\r\n');
+      }
+      return;
+    }
+    this.appendExecutionOutput(active, data);
+    active.hooks.onOutput?.(data);
   }
 
   private appendExecutionOutput(active: ActiveExecution, data: string): void {
@@ -941,7 +1187,6 @@ export class TerminalService {
       record.sensitiveLease = undefined;
       record.sensitiveJournalRedacted = false;
     }
-    record.envelopeEchoFilter.complete(active.envelope.startMarker);
     record.activeExecution = undefined;
     active.resolve({ ...active.execution });
   }

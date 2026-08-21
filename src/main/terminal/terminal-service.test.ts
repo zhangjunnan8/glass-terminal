@@ -2,7 +2,13 @@ import type { WebContents } from 'electron';
 import { describe, expect, it, vi } from 'vitest';
 import type { TerminalJournalEvent } from '../../shared/session';
 import type { TerminalDescriptor } from '../../shared/terminal';
+import {
+  encodePowerShellShellIntegrationValue,
+  powerShellShellIntegrationSequence,
+} from './powershell-shell-integration';
 import { TerminalService } from './terminal-service';
+
+const POWERSHELL_INTEGRATION_NONCE = '0123456789abcdef0123456789abcdef';
 
 interface FakeBackend {
   writes: string[];
@@ -18,6 +24,8 @@ interface TestableTerminalService {
     owner: WebContents,
     descriptor: TerminalDescriptor,
     backend: FakeBackend,
+    sshClient?: undefined,
+    powerShellIntegrationNonce?: string,
   ): void;
   emitData(terminalId: string, data: string): void;
   emitExit(terminalId: string, exitCode: number, signal?: number): void;
@@ -53,19 +61,31 @@ function setup(
     shellKind,
     transport,
   };
-  testable.register(browser, descriptor, backend);
+  const integrationNonce = shellKind === 'powershell'
+    ? POWERSHELL_INTEGRATION_NONCE
+    : undefined;
+  testable.register(browser, descriptor, backend, undefined, integrationNonce);
+  if (integrationNonce) {
+    testable.emitData('terminal', [
+      powerShellShellIntegrationSequence(
+        integrationNonce,
+        'R',
+        '1',
+        encodePowerShellShellIntegrationValue('5.1.22621.2506'),
+      ),
+      powerShellShellIntegrationSequence(
+        integrationNonce,
+        'P',
+        encodePowerShellShellIntegrationValue('C:\\Users\\tester'),
+      ),
+    ].join(''));
+  }
   return { service, testable, browser, backend };
 }
 
 function nonceFromPosixEnvelope(input: string): string {
   const match = input.match(/__ait_a='([^']+)';__ait_b='([^']+)'/);
   if (!match) throw new Error('Unable to recover the test sentinel nonce.');
-  return `${match[1]}${match[2]}`;
-}
-
-function nonceFromPowerShellEnvelope(input: string): string {
-  const match = input.match(/\$__ait_a='([^']+)'[^\r]*\$__ait_b='([^']+)'/u);
-  if (!match) throw new Error('Unable to recover the PowerShell test sentinel nonce.');
   return `${match[1]}${match[2]}`;
 }
 
@@ -318,43 +338,7 @@ describe('TerminalService control and redaction invariants', () => {
     }
   });
 
-  it('keeps a hard-wrapped PowerShell envelope out of renderer redraws after resize', async () => {
-    const { service, testable, browser, backend } = setup('powershell');
-    const journal: TerminalJournalEvent[] = [];
-    service.onJournal((_terminalId, _sessionId, event) => journal.push(event));
-    service.bindSession(browser, 'terminal', 'session');
-    service.attach(browser, 'terminal');
-    const executionPromise = service.executeStructured(
-      browser,
-      'terminal',
-      "Get-ChildItem 'C:\\Program Files' | Select-Object -First 5",
-      'ai',
-    );
-    const envelope = backend.writes[0];
-    const nonce = nonceFromPowerShellEnvelope(envelope);
-    testable.emitData('terminal', `__AI_TERMINAL_${nonce}_START__\r\n`);
-    testable.emitData('terminal', `result\r\n__AI_TERMINAL_${nonce}_END_0__\r\nPS C:\\work> `);
-    await executionPromise;
-    vi.mocked(browser.send).mockClear();
-
-    service.resize(browser, 'terminal', 31, 24);
-    const input = envelope.replace(/\r+$/u, '');
-    const wrapped = [...input.matchAll(/[\s\S]{1,31}/gu)].map((match) => match[0]).join('\r\n');
-    const redraw = `\x1b[2J\x1b[HPS C:\\work> ${wrapped}\r\nvisible-after-resize\r\nPS C:\\work> `;
-    testable.emitData('terminal', redraw.slice(0, Math.floor(redraw.length / 2)));
-    testable.emitData('terminal', redraw.slice(Math.floor(redraw.length / 2)));
-
-    const rendered = vi.mocked(browser.send).mock.calls.map(([, payload]) => (
-      (payload as { data?: string }).data ?? ''
-    )).join('');
-    expect(rendered).toContain('visible-after-resize');
-    expect(rendered).toContain('PS C:\\work>');
-    expect(rendered).not.toContain('__ait_');
-    expect(rendered).not.toContain('FromBase64String');
-    expect(journal.some((event) => event.kind === 'output' && event.data.includes('__ait_'))).toBe(true);
-  });
-
-  it('does not render repeated completed PowerShell transcript blocks after resize', async () => {
+  it('executes PowerShell commands once in the public PTY using OSC lifecycle events', async () => {
     const { service, testable, browser, backend } = setup('powershell');
     const journal: TerminalJournalEvent[] = [];
     const command = 'echo "Hello, Glass Terminal!"';
@@ -362,38 +346,212 @@ describe('TerminalService control and redaction invariants', () => {
     service.bindSession(browser, 'terminal', 'session');
     service.attach(browser, 'terminal');
     const executionPromise = service.executeStructured(browser, 'terminal', command, 'ai');
-    const nonce = nonceFromPowerShellEnvelope(backend.writes[0]);
-    testable.emitData('terminal', `__AI_TERMINAL_${nonce}_START__\r\n`);
-    testable.emitData(
-      'terminal',
-      `Hello, Glass Terminal!\r\n__AI_TERMINAL_${nonce}_END_0__\r\n(base) PS C:\\Users\\zjn> `,
-    );
-    await executionPromise;
-    vi.mocked(browser.send).mockClear();
+    expect(backend.writes).toEqual([`${command}\r`]);
+    expect(backend.writes[0]).not.toContain('__AI_TERMINAL_');
+    expect(backend.writes[0]).not.toContain('FromBase64String');
 
-    service.resize(browser, 'terminal', 43, 24);
-    const block = [
-      `$ ${command}\r\n`,
-      `__AI_TERMINAL_${nonce}_START__\r\n`,
-      'Hello, Glass Terminal!\r\n',
-      `__AI_TERMINAL_${nonce}_END_0__\r\n`,
-      '(base) PS C:\\Users\\zjn> ',
+    const lifecycle = [
+      powerShellShellIntegrationSequence(
+        POWERSHELL_INTEGRATION_NONCE,
+        'E',
+        '1',
+        encodePowerShellShellIntegrationValue(command),
+      ),
+      powerShellShellIntegrationSequence(POWERSHELL_INTEGRATION_NONCE, 'C', '1'),
+      '\x1b[32mHello, Glass Terminal!\x1b[0m\r\n',
+      powerShellShellIntegrationSequence(POWERSHELL_INTEGRATION_NONCE, 'D', '1', '0'),
+      '(base) PS C:\\Users\\tester> ',
     ].join('');
-    const redraw = `${block}\r\n$ ${command}\r\n      ERMINAL_${nonce}\r\n${block}`;
-    testable.emitData('terminal', redraw.slice(0, 117));
-    testable.emitData('terminal', redraw.slice(117, 301));
-    testable.emitData('terminal', redraw.slice(301));
+    for (let index = 0; index < lifecycle.length; index += 7) {
+      testable.emitData('terminal', lifecycle.slice(index, index + 7));
+    }
+    const execution = await executionPromise;
 
     const rendered = vi.mocked(browser.send).mock.calls.map(([, payload]) => (
       (payload as { data?: string }).data ?? ''
     )).join('');
-    expect(rendered).not.toContain(command);
-    expect(rendered).not.toContain('Hello, Glass Terminal!');
-    expect(rendered).not.toContain('__AI_TERMINAL_');
-    expect(rendered).not.toContain('(base) PS C:\\Users\\zjn>');
-    expect(journal.some((event) => (
-      event.kind === 'output' && event.data.includes(`__AI_TERMINAL_${nonce}_START__`)
-    ))).toBe(true);
+    expect(execution).toMatchObject({
+      status: 'completed',
+      exitCode: 0,
+      cwd: 'C:\\Users\\tester',
+      output: '\x1b[32mHello, Glass Terminal!\x1b[0m\r\n',
+    });
+    expect(rendered).toContain('Hello, Glass Terminal!');
+    expect(rendered).toContain('(base) PS C:\\Users\\tester>');
+    expect(rendered).not.toContain('633;GlassTerminal');
+    const persisted = journal.map((event) => event.kind === 'output' ? event.data : '').join('');
+    expect(persisted).toContain('Hello, Glass Terminal!');
+    expect(persisted).not.toContain('633;GlassTerminal');
+  });
+
+  it('passes a complete PowerShell resize redraw through without deleting paint operations', async () => {
+    const { service, testable, browser, backend } = setup('powershell');
+    const command = 'echo "Hello, Glass Terminal!"';
+    service.bindSession(browser, 'terminal', 'session');
+    service.attach(browser, 'terminal');
+    const executionPromise = service.executeStructured(browser, 'terminal', command, 'ai');
+    testable.emitData('terminal', [
+      powerShellShellIntegrationSequence(
+        POWERSHELL_INTEGRATION_NONCE,
+        'E',
+        '1',
+        encodePowerShellShellIntegrationValue(command),
+      ),
+      powerShellShellIntegrationSequence(POWERSHELL_INTEGRATION_NONCE, 'C', '1'),
+      'Hello, Glass Terminal!\r\n',
+      powerShellShellIntegrationSequence(POWERSHELL_INTEGRATION_NONCE, 'D', '1', '0'),
+    ].join(''));
+    await executionPromise;
+    vi.mocked(browser.send).mockClear();
+
+    service.resize(browser, 'terminal', 43, 24);
+    const redraw = [
+      '\x1b[6A\x1b[2K\r',
+      `(base) PS C:\\Users\\tester> ${command}\r\n`,
+      '\x1b[2K\rHello, Glass Terminal!\r\n',
+      '\x1b[2K\r(base) PS C:\\Users\\tester> ',
+    ].join('');
+    testable.emitData('terminal', redraw.slice(0, 31));
+    testable.emitData('terminal', redraw.slice(31));
+
+    const rendered = vi.mocked(browser.send).mock.calls.map(([, payload]) => (
+      (payload as { data?: string }).data ?? ''
+    )).join('');
+    expect(rendered).toBe(redraw);
+    expect(rendered).toContain(command);
+    expect(rendered).toContain('Hello, Glass Terminal!');
+    expect(backend.writes).toEqual([`${command}\r`]);
+  });
+
+  it('ignores replayed PowerShell lifecycle events and binds a repeated command to its new id', async () => {
+    const { service, testable, browser } = setup('powershell');
+    const command = 'Get-Date';
+    service.bindSession(browser, 'terminal', 'session');
+    const lifecycle = (commandId: number) => [
+      powerShellShellIntegrationSequence(
+        POWERSHELL_INTEGRATION_NONCE,
+        'E',
+        String(commandId),
+        encodePowerShellShellIntegrationValue(command),
+      ),
+      powerShellShellIntegrationSequence(
+        POWERSHELL_INTEGRATION_NONCE,
+        'C',
+        String(commandId),
+      ),
+      `result-${commandId}\r\n`,
+      powerShellShellIntegrationSequence(
+        POWERSHELL_INTEGRATION_NONCE,
+        'D',
+        String(commandId),
+        '0',
+      ),
+    ].join('');
+
+    const first = service.executeStructured(browser, 'terminal', command, 'ai');
+    testable.emitData('terminal', lifecycle(1));
+    await first;
+
+    const second = service.executeStructured(browser, 'terminal', command, 'ai');
+    testable.emitData('terminal', lifecycle(1));
+    expect(service.currentExecution(browser, 'terminal')?.status).toBe('running');
+    testable.emitData('terminal', lifecycle(2));
+    await expect(second).resolves.toMatchObject({
+      status: 'completed',
+      output: 'result-2\r\n',
+    });
+  });
+
+  it('routes Ctrl+C to the same public PowerShell command and completes it as cancelled', async () => {
+    const { service, testable, browser, backend } = setup('powershell');
+    const command = 'winget upgrade';
+    service.bindSession(browser, 'terminal', 'session');
+    const executionPromise = service.executeStructured(browser, 'terminal', command, 'ai');
+    testable.emitData('terminal', [
+      powerShellShellIntegrationSequence(
+        POWERSHELL_INTEGRATION_NONCE,
+        'E',
+        '1',
+        encodePowerShellShellIntegrationValue(command),
+      ),
+      powerShellShellIntegrationSequence(POWERSHELL_INTEGRATION_NONCE, 'C', '1'),
+      'Downloading 42%\r',
+    ].join(''));
+    const executionId = service.currentExecution(browser, 'terminal')!.id;
+
+    service.interruptExecution(browser, 'terminal', executionId);
+    expect(backend.writes).toEqual([`${command}\r`, '\x03']);
+    testable.emitData(
+      'terminal',
+      powerShellShellIntegrationSequence(POWERSHELL_INTEGRATION_NONCE, 'D', '1', '1'),
+    );
+    await expect(executionPromise).resolves.toMatchObject({
+      status: 'cancelled',
+      output: 'Downloading 42%\r',
+    });
+  });
+
+  it('uses bracketed paste for one multiline PowerShell command lifecycle', async () => {
+    const { service, testable, browser, backend } = setup('powershell');
+    const command = '1..2 | ForEach-Object {\n  Write-Output $_\n}';
+    service.bindSession(browser, 'terminal', 'session');
+    const executionPromise = service.executeStructured(browser, 'terminal', command, 'ai');
+
+    expect(backend.writes).toEqual([`\x1b[200~${command}\x1b[201~\r`]);
+    testable.emitData('terminal', [
+      powerShellShellIntegrationSequence(
+        POWERSHELL_INTEGRATION_NONCE,
+        'E',
+        '1',
+        encodePowerShellShellIntegrationValue(command),
+      ),
+      powerShellShellIntegrationSequence(POWERSHELL_INTEGRATION_NONCE, 'C', '1'),
+      '1\r\n2\r\n',
+      powerShellShellIntegrationSequence(POWERSHELL_INTEGRATION_NONCE, 'D', '1', '0'),
+    ].join(''));
+    await expect(executionPromise).resolves.toMatchObject({
+      status: 'completed',
+      output: '1\r\n2\r\n',
+    });
+  });
+
+  it('keeps a PowerShell terminal usable but refuses AI execution without rich integration', () => {
+    const fallback = new TerminalService();
+    const fallbackTestable = fallback as unknown as TestableTerminalService;
+    const fallbackBrowser = owner();
+    const backend: FakeBackend = {
+      writes: [],
+      resizes: [],
+      closes: 0,
+      write(data) { this.writes.push(data); },
+      resize(cols, rows) { this.resizes.push([cols, rows]); },
+      close() { this.closes += 1; },
+    };
+    fallbackTestable.register(fallbackBrowser, {
+      id: 'terminal',
+      title: 'Restricted PowerShell',
+      profileId: 'restricted',
+      shellKind: 'powershell',
+      transport: 'ssh',
+    }, backend, undefined, POWERSHELL_INTEGRATION_NONCE);
+    fallbackTestable.emitData('terminal', powerShellShellIntegrationSequence(
+      POWERSHELL_INTEGRATION_NONCE,
+      'R',
+      '0',
+      encodePowerShellShellIntegrationValue('5.1'),
+    ));
+    fallback.bindSession(fallbackBrowser, 'terminal', 'session');
+
+    expect(fallback.state(fallbackBrowser, 'terminal')).toMatchObject({
+      shellIntegration: { status: 'ready', rich: false },
+    });
+    expect(() => fallback.executeStructured(
+      fallbackBrowser,
+      'terminal',
+      'Get-Date',
+      'ai',
+    )).toThrow(/requires PSReadLine and FullLanguage/i);
+    expect(backend.writes).toEqual([]);
   });
 
   it('coalesces a Windows SSH PowerShell resize storm to the final dimensions', () => {
