@@ -3403,7 +3403,9 @@ export function App() {
             data-execution-id={activeAgent.pendingTakeover.executionId}
           >
             <div className="modal-header"><strong>人工接管终端</strong></div>
-            <p>智能体已暂停。请选择如何处理仍在前台运行的命令。</p>
+            <p>{activeAgent.pendingTakeover.reason === 'command-inactivity'
+              ? '前台命令已连续 5 分钟没有输出。智能体已暂停，终端仍保持连接。请选择如何处理该命令。'
+              : '智能体已暂停。请选择如何处理仍在前台运行的命令。'}</p>
             <code>{activeAgent.activeExecution?.command ?? '前台命令'}</code>
             <div className="modal-actions split-actions">
               <button data-action="keep-process" onClick={() => void resolveAgentTakeover('keep')}>保持进程运行</button>

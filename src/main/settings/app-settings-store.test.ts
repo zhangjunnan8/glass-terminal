@@ -44,7 +44,7 @@ describe('AppSettingsStore', () => {
     });
   });
 
-  it.each([1, 5, 40, 64])('accepts the supported %i-round runtime limit', (rounds) => {
+  it.each([1, 5, 40, 64])('accepts the supported %i-round checkpoint interval', (rounds) => {
     const store = new AppSettingsStore(fixture());
     expect(store.update({ defaultMaxRounds: rounds }).defaultMaxRounds).toBe(rounds);
   });

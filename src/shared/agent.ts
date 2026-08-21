@@ -70,6 +70,8 @@ export interface CommandExecution {
   exitCode?: number;
   output: string;
   outputRedacted?: boolean;
+  /** The structured command produced no output for the watchdog interval. */
+  inactivityTimedOutAt?: string;
   interruptRequestedAt?: string;
   durationMs?: number;
 }
@@ -236,6 +238,7 @@ export interface PendingTakeover {
   id: string;
   executionId: string;
   requestedAt: string;
+  reason?: 'manual' | 'command-inactivity';
 }
 
 export interface SendAgentPromptRequest {

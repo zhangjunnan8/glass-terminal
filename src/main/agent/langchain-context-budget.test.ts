@@ -152,7 +152,7 @@ function gateway(mode: 'off' | 'read-only' | 'read-write', files?: WorkspaceTool
   };
 }
 
-function backend(baseUrl: string): LangChainBackend {
+function backend(baseUrl: string, contextWindowTokens = 8_192): LangChainBackend {
   const model = new ChatOpenAICompletions({
     model: 'budget-test',
     apiKey: 'fake',
@@ -162,7 +162,7 @@ function backend(baseUrl: string): LangChainBackend {
   });
   return new LangChainBackend({
     modelFactory: () => Promise.resolve(model),
-    contextWindowTokens: 8_192,
+    contextWindowTokens,
   });
 }
 
@@ -365,5 +365,111 @@ describe('LangChain dynamic context budget', () => {
     const completed = events.filter((event) => event.type === 'tool_completed');
     expect(completed).toHaveLength(3);
     expect(completed.at(-1)?.result).toContain('"halted":true');
+  });
+
+  it('persists checkpoints at 40 and 80 rounds and completes the same turn after round 81', async () => {
+    const provider = await providerServer((index) => index < 81
+      ? {
+        toolCalls: [{
+          id: `long-turn-${index}`,
+          name: 'terminal_execute',
+          args: { command: `echo step-${index}` },
+        }],
+      }
+      : { content: 'long turn completed' });
+    const harness = backend(provider.baseUrl, 128_000);
+    const thread = await harness.createThread({ id: 'multi-checkpoint-turn' });
+    const events: AgentBackendEvent[] = [];
+
+    const result = await harness.sendMessage({
+      thread,
+      prompt: 'complete a long task',
+      systemPrompt: 'system',
+      terminalContext: '',
+      fileAccessMode: 'off',
+      gateway: gateway('off'),
+      maxRounds: 40,
+      signal: new AbortController().signal,
+      onEvent: (event) => events.push(event),
+    });
+
+    const checkpoints = events.filter((event) => event.type === 'checkpoint');
+    expect(provider.requests).toHaveLength(82);
+    expect(result).toMatchObject({
+      finalText: 'long turn completed',
+      rounds: 81,
+      contextPersistence: { mode: 'checkpoint' },
+    });
+    expect(result.haltedError).toBeUndefined();
+    expect(checkpoints.map((event) => event.checkpoint?.totalRounds)).toEqual([40, 80]);
+    expect(checkpoints.every((event) => event.checkpoint?.messages.some((message) => (
+      message.role === 'assistant' && message.toolResultsPending === true
+    )))).toBe(true);
+  });
+
+  it('persists a full checkpoint when an exact repeated tool/result loop pauses before the interval', async () => {
+    const provider = await providerServer((index) => ({
+      toolCalls: [{ id: `same-state-${index}`, name: 'terminal_state', args: {} }],
+    }));
+    const harness = backend(provider.baseUrl);
+    const thread = await harness.createThread({ id: 'repeated-tool-loop' });
+    const events: AgentBackendEvent[] = [];
+
+    const result = await harness.sendMessage({
+      thread,
+      prompt: 'repeat forever',
+      systemPrompt: 'system',
+      terminalContext: '',
+      fileAccessMode: 'off',
+      gateway: gateway('off'),
+      maxRounds: 40,
+      signal: new AbortController().signal,
+      onEvent: (event) => events.push(event),
+    });
+
+    expect(provider.requests).toHaveLength(3);
+    expect(events.filter((event) => event.type === 'checkpoint')).toHaveLength(0);
+    expect(result.haltedState).toBe('paused');
+    expect(result.haltedError).toMatch(/连续 3 轮.*完全相同/u);
+    expect(result.contextPersistence?.mode).toBe('checkpoint');
+  });
+
+  it('pauses after five consecutive failed tools even when each request is different', async () => {
+    const provider = await providerServer((index) => ({
+      toolCalls: [{
+        id: `failed-command-${index}`,
+        name: 'terminal_execute',
+        args: { command: `failing-command-${index}` },
+      }],
+    }));
+    const failedTerminal = terminal();
+    failedTerminal.execute = vi.fn(async (command: string) => ({
+      commandId: command,
+      command,
+      status: 'failed' as const,
+      exitCode: 1,
+      output: 'failed',
+      startedAt: 0,
+    }));
+    const failedGateway: ToolGateway = { ...gateway('off'), terminal: failedTerminal };
+    const harness = backend(provider.baseUrl);
+    const thread = await harness.createThread({ id: 'consecutive-tool-failures' });
+
+    const result = await harness.sendMessage({
+      thread,
+      prompt: 'keep trying different commands',
+      systemPrompt: 'system',
+      terminalContext: '',
+      fileAccessMode: 'off',
+      gateway: failedGateway,
+      maxRounds: 40,
+      signal: new AbortController().signal,
+    });
+
+    expect(provider.requests).toHaveLength(5);
+    expect(failedTerminal.execute).toHaveBeenCalledTimes(5);
+    expect(result.haltedState).toBe('paused');
+    expect(result.haltedError).toMatch(/连续 5 次工具调用失败/u);
+    expect(result.contextPersistence?.mode).toBe('checkpoint');
   });
 });

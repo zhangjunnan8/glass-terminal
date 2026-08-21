@@ -81,6 +81,8 @@ describe('SettingsWindow runtime settings', () => {
 
     expect(container.textContent).toContain('终端日志保留');
     expect(container.textContent).toContain('200 MiB');
+    expect(container.textContent).toContain('Agent 自动检查点间隔（1-64 轮）');
+    expect(container.textContent).toContain('不是任务总轮数上限');
     const retention = container.querySelectorAll<HTMLInputElement>('input[type="number"]')[0]!;
     await act(async () => setNumberInput(retention, '30'));
     const save = [...container.querySelectorAll('button')]

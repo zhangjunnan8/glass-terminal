@@ -22,12 +22,23 @@ export interface AgentToolCall {
 }
 
 export interface AgentBackendEvent {
-  type: 'assistant_delta' | 'assistant_text' | 'tool_started' | 'tool_completed' | 'context_status';
+  type:
+    | 'assistant_delta'
+    | 'assistant_text'
+    | 'tool_started'
+    | 'tool_completed'
+    | 'context_status'
+    | 'checkpoint';
   text?: string;
   toolCall?: AgentToolCall;
   result?: string;
   contextUsage?: AgentEstimatedContextUsage;
   compression?: { beforeTokens: number; afterTokens: number };
+  checkpoint?: {
+    sequence: number;
+    totalRounds: number;
+    messages: AgentMessage[];
+  };
 }
 
 export interface AgentBackendResult {
@@ -42,6 +53,8 @@ export interface AgentBackendResult {
   };
   /** Turn stopped locally after preserving protocol-complete partial history. */
   haltedError?: string;
+  /** Safety/watchdog stops pause for recovery; policy and context failures remain failed. */
+  haltedState?: 'paused' | 'failed';
 }
 
 /** Opaque, backend-owned handle for one Glass Terminal conversation thread. */
@@ -68,7 +81,7 @@ export interface SendAgentBackendMessageInput {
   /** Frozen user-reviewed memories for this turn. */
   persistentMemories?: readonly AgentMemoryCard[];
   fileAccessMode: AgentFileAccessMode;
-  /** Frozen per turn by AgentService; changing settings affects the next turn only. */
+  /** Frozen per turn checkpoint interval; changing settings affects the next turn only. */
   maxRounds?: number;
   /** Required for every turn. Backends must not retain or synthesize a default gateway. */
   gateway: ToolGateway;

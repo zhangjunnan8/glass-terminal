@@ -198,7 +198,7 @@ class ScriptedLoopBackend implements AgentBackend {
           throwIfScriptedTurnCancelled(controller.signal);
         }
       }
-      throw new Error('Scripted backend exceeded the round limit.');
+      throw new Error('Scripted backend exceeded its test-only loop limit.');
     } finally {
       input.signal.removeEventListener('abort', abortFromCaller);
       const active = this.activeTurns.get(input.thread.id);
@@ -3472,9 +3472,9 @@ describe('AgentService shared-terminal controls', () => {
     ))).toHaveLength(1);
   });
 
-  it('freezes the live max-round setting per turn without replacing the backend thread', async () => {
+  it('freezes the live checkpoint interval per turn without replacing the backend thread', async () => {
     const backend = new DeferredRecordingBackend();
-    let configuredMaxRounds = 5;
+    let configuredCheckpointInterval = 5;
     const owner = browserOwner();
     const service = new AgentService(
       new FakeTerminals() as unknown as TerminalService,
@@ -3483,12 +3483,12 @@ describe('AgentService shared-terminal controls', () => {
       undefined,
       undefined,
       () => backend,
-      () => configuredMaxRounds,
+      () => configuredCheckpointInterval,
     );
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'first turn' });
     await waitFor(() => backend.sendInputs.length === 1);
-    configuredMaxRounds = 1;
+    configuredCheckpointInterval = 1;
     expect(backend.sendInputs[0]?.maxRounds).toBe(5);
     backend.finish();
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
@@ -3499,6 +3499,79 @@ describe('AgentService shared-terminal controls', () => {
     expect(backend.createInputs).toHaveLength(1);
     backend.finish();
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+  });
+
+  it('persists intermediate checkpoints invisibly and resumes them after a service restart', async () => {
+    const backend = new DeferredActivityBackend();
+    const sessions = new FakeSessions();
+    const terminals = new FakeTerminals();
+    const owner = browserOwner();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      () => backend,
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'long turn' });
+    await waitFor(() => backend.sendInputs.length === 1);
+    const checkpointMessages: AgentMessage[] = [
+      { role: 'user', content: 'long turn' },
+      {
+        role: 'assistant',
+        content: null,
+        toolCalls: [{ id: 'tool-1', name: 'terminal_state', arguments: '{}' }],
+        toolResultsPending: true,
+      },
+      { role: 'tool', toolCallId: 'tool-1', content: '{"ok":true}' },
+    ];
+    backend.emit({
+      type: 'checkpoint',
+      checkpoint: { sequence: 1, totalRounds: 40, messages: checkpointMessages },
+    });
+
+    const checkpointEvent = sessions.threadEvents.find((event) => (
+      event.type === 'turn' && event.checkpointSequence === 1
+    ));
+    expect(checkpointEvent).toMatchObject({
+      contextMode: 'checkpoint',
+      totalRounds: 40,
+      messages: checkpointMessages,
+    });
+    expect(service.getState(owner, 'terminal')?.activities).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        toolName: 'agent_checkpoint',
+        label: expect.stringContaining('累计 40 轮'),
+        status: 'succeeded',
+      }),
+    ]));
+    expect(service.getState(owner, 'terminal')?.messages).toHaveLength(1);
+
+    service.takeover(owner, { terminalId: 'terminal' });
+    backend.fail(new Error('turn stopped after checkpoint'));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    service.close();
+
+    const resumedBackend = new RecordingBackend();
+    const resumedService = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      () => resumedBackend,
+    );
+    const restored = resumedService.getState(owner, 'terminal')!;
+    expect(restored.messages).toHaveLength(1);
+    expect(restored.messages[0]?.content).toBe('long turn');
+
+    resumedService.sendPrompt(owner, { terminalId: 'terminal', prompt: 'continue' });
+    await waitFor(() => resumedBackend.sendInputs.length === 1);
+    expect(resumedBackend.resumeInputs[0]?.priorMessages).toEqual(checkpointMessages);
+    await waitFor(() => resumedService.getState(owner, 'terminal')?.state === 'COMPLETED');
+    resumedService.close();
   });
 
   it('clears and persists partial streaming output before manual takeover', async () => {
@@ -4307,6 +4380,87 @@ describe('AgentService shared-terminal controls', () => {
     expect(service.getState(owner, 'terminal')?.state).toBe('PAUSED');
     expect(provider.requests).toHaveLength(1);
     expect(terminals.controlModes.at(-1)).toBe('human');
+  });
+
+  it('turns command inactivity into system-initiated Takeover without disconnecting the terminal', async () => {
+    let finish!: (execution: CommandExecution) => void;
+    let reportIdle!: () => void;
+    const deferred = new Promise<CommandExecution>((resolve) => { finish = resolve; });
+    const provider = new FakeProvider([
+      toolCall('call-idle', 'silent-long-running-command'),
+      { message: { role: 'assistant', content: 'must not be reached' } },
+    ]);
+    const sessions = new FakeSessions();
+    const terminals = new FakeTerminals((started, hooks) => {
+      reportIdle = () => {
+        const timedOutExecution = {
+          ...started,
+          inactivityTimedOutAt: new Date(5 * 60 * 1_000).toISOString(),
+        };
+        terminals.current = timedOutExecution;
+        hooks.onIdleTimeout?.(timedOutExecution);
+      };
+      return deferred;
+    });
+    const owner = browserOwner();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      undefined,
+      () => new ScriptedLoopBackend(provider),
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Start the silent command.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
+    const approval = service.getState(owner, 'terminal')!.pendingApproval!;
+    service.resolveApproval(owner, {
+      terminalId: 'terminal',
+      approvalId: approval.id,
+      decision: 'execute',
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'RUNNING');
+
+    reportIdle();
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'TAKEOVER_PENDING');
+    const timedOut = service.getState(owner, 'terminal')!;
+    expect(timedOut).toMatchObject({
+      state: 'TAKEOVER_PENDING',
+      terminalInputMode: 'locked',
+      pendingTakeover: { reason: 'command-inactivity' },
+      activeExecution: { inactivityTimedOutAt: expect.any(String) },
+    });
+    expect(timedOut.error).toMatch(/终端仍保持连接/u);
+    expect(terminals.state().status).toBe('connected');
+    expect(terminals.interruptCount).toBe(0);
+
+    const pending = timedOut.pendingTakeover!;
+    service.resolveTakeover(owner, {
+      terminalId: 'terminal',
+      takeoverId: pending.id,
+      executionId: pending.executionId,
+      action: 'keep',
+    });
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      state: 'PAUSED',
+      terminalInputMode: 'human',
+      error: undefined,
+    });
+    expect(terminals.keepCount).toBe(1);
+
+    const started = terminals.current!;
+    finish({
+      ...started,
+      status: 'completed',
+      exitCode: 0,
+      output: 'eventually done',
+      endedAt: new Date(6 * 60 * 1_000).toISOString(),
+      durationMs: 6 * 60 * 1_000,
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.activeExecution?.status === 'completed');
+    expect(service.getState(owner, 'terminal')?.state).toBe('PAUSED');
+    expect(provider.requests).toHaveLength(1);
   });
 
   it('publishes cancelled shell-ready state even when the control Audit write fails', async () => {

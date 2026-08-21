@@ -92,6 +92,7 @@ export interface SessionAuditEvent {
     | 'file_modified'
     | 'file_permission_changed'
     | 'agent_paused'
+    | 'agent_checkpoint'
     | 'context_compressed'
     | 'full_takeover_preference_changed'
     | 'full_takeover_authority_enabled'

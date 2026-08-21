@@ -1335,6 +1335,8 @@ export class AgentService {
     owner: WebContents,
     request: TakeoverRequest,
     interruptReason: 'user' | 'takeover' = 'takeover',
+    actor: 'user' | 'system' = 'user',
+    takeoverReason: 'manual' | 'command-inactivity' = 'manual',
   ): AgentSessionView {
     const runtime = this.requireOwned(owner, request.terminalId);
     if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
@@ -1367,10 +1369,10 @@ export class AgentService {
     );
     runtime.abortController = undefined;
     if (runtime.pendingApproval) {
-      this.appendControlAudit(runtime, 'command_rejected', 'user', {
+      this.appendControlAudit(runtime, 'command_rejected', actor, {
         approvalId: runtime.pendingApproval.id,
         command: runtime.pendingApproval.command,
-        reason: 'manual_takeover',
+        reason: takeoverReason === 'manual' ? 'manual_takeover' : 'command_inactivity',
       });
     }
     const resolveApproval = runtime.resolveApproval;
@@ -1382,8 +1384,8 @@ export class AgentService {
 
     if (runtime.fullTakeover) {
       runtime.fullTakeover = false;
-      this.appendControlAudit(runtime, 'full_takeover_authority_revoked', 'user', {
-        reason: 'manual_takeover',
+      this.appendControlAudit(runtime, 'full_takeover_authority_revoked', actor, {
+        reason: takeoverReason === 'manual' ? 'manual_takeover' : 'command_inactivity',
         terminalScoped: true,
       });
     }
@@ -1395,14 +1397,19 @@ export class AgentService {
         id: randomUUID(),
         executionId: execution.id,
         requestedAt: new Date().toISOString(),
+        reason: takeoverReason,
       };
       this.setLockedState(runtime, 'TAKEOVER_PENDING');
     } else {
       runtime.pendingTakeover = undefined;
       this.setHumanState(runtime, 'PAUSED');
-      this.appendControlAudit(runtime, 'agent_paused', 'user', {
+      this.appendControlAudit(runtime, 'agent_paused', actor, {
         processAction: 'none',
+        reason: takeoverReason,
       });
+    }
+    if (takeoverReason === 'command-inactivity') {
+      runtime.error = '前台命令已连续 5 分钟没有输出，智能体已暂停；终端仍保持连接，请选择保持运行或发送 Ctrl+C。';
     }
     this.emit(runtime);
     return this.cloneRuntime(runtime);
@@ -1433,6 +1440,7 @@ export class AgentService {
       applied = this.terminals.keepExecution(owner, request.terminalId, request.executionId);
     }
     runtime.pendingTakeover = undefined;
+    runtime.error = undefined;
     this.setHumanState(runtime, 'PAUSED');
     this.appendControlAudit(runtime, 'agent_paused', 'user', {
       processAction: request.action,
@@ -1505,7 +1513,7 @@ export class AgentService {
     token: number,
     prompt: string,
     controlLeaseId?: string,
-    maxRounds?: number,
+    checkpointIntervalRounds?: number,
   ): Promise<void> {
     if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
       await this.runCodexTurn(runtime, token, prompt, controlLeaseId);
@@ -1527,6 +1535,40 @@ export class AgentService {
     };
     const onEvent = (event: AgentBackendEvent): void => {
       if (!acceptBackendEvents || !this.isCurrentTurn(runtime, token)) return;
+      if (event.type === 'checkpoint' && event.checkpoint) {
+        const checkpointMessages = safePriorMessages(event.checkpoint.messages);
+        this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
+          type: 'turn',
+          id: `${assistantTurnId}:checkpoint:${event.checkpoint.sequence}`,
+          timestamp: new Date().toISOString(),
+          contextMode: 'checkpoint',
+          messages: checkpointMessages,
+          checkpointSequence: event.checkpoint.sequence,
+          totalRounds: event.checkpoint.totalRounds,
+        });
+        runtime.priorMessages = checkpointMessages;
+        if (event.contextUsage) runtime.contextUsage = { ...event.contextUsage };
+        runtime.activities = [
+          ...runtime.activities,
+          {
+            id: `${assistantTurnId}:checkpoint:${event.checkpoint.sequence}`,
+            toolName: 'agent_checkpoint',
+            kind: 'other',
+            label: `已保存检查点，继续执行（累计 ${event.checkpoint.totalRounds} 轮）`,
+            status: 'succeeded',
+            startedAt: new Date().toISOString(),
+            finishedAt: new Date().toISOString(),
+            turnId: assistantTurnId,
+          },
+        ];
+        this.appendControlAudit(runtime, 'agent_checkpoint', 'system', {
+          sequence: event.checkpoint.sequence,
+          totalRounds: event.checkpoint.totalRounds,
+          messageCount: checkpointMessages.length,
+        });
+        this.emit(runtime);
+        return;
+      }
       if (event.type === 'context_status' && event.contextUsage) {
         const previous = runtime.contextUsage;
         runtime.contextUsage = {
@@ -1758,7 +1800,7 @@ export class AgentService {
         })),
         fileAccessMode: runtime.fileAccessMode,
         gateway,
-        maxRounds,
+        maxRounds: checkpointIntervalRounds,
         signal,
         onEvent,
       });
@@ -1791,7 +1833,11 @@ export class AgentService {
       this.cancelStreamEmit(runtime);
       if (result.haltedError) {
         runtime.error = result.haltedError;
-        this.setHumanState(runtime, 'FAILED', controlLeaseId);
+        this.setHumanState(
+          runtime,
+          result.haltedState === 'paused' ? 'PAUSED' : 'FAILED',
+          controlLeaseId,
+        );
       } else {
         this.setHumanState(runtime, 'COMPLETED', controlLeaseId);
       }
@@ -2208,6 +2254,9 @@ export class AgentService {
             this.setLockedState(runtime, 'RUNNING');
             this.emit(runtime);
           },
+          onIdleTimeout: (started) => {
+            this.handleCommandIdleTimeout(runtime, token, started);
+          },
           onAuthPrompt: (started) => {
             this.handleAuthPrompt(runtime, token, started);
           },
@@ -2333,6 +2382,30 @@ export class AgentService {
       interactionId: runtime.authRequest.id,
     });
     this.emit(runtime);
+  }
+
+  private handleCommandIdleTimeout(
+    runtime: AgentRuntimeRecord,
+    token: number,
+    execution: CommandExecution,
+  ): void {
+    if (
+      !this.isCurrentTurn(runtime, token)
+      || runtime.activeExecution?.id !== execution.id
+    ) return;
+    runtime.activeExecution = execution;
+    try {
+      this.takeover(
+        runtime.owner,
+        { terminalId: runtime.terminalId },
+        'takeover',
+        'system',
+        'command-inactivity',
+      );
+    } catch (error) {
+      runtime.error = `命令无活动保护触发，但暂停智能体失败：${error instanceof Error ? error.message : String(error)}`;
+      this.emit(runtime);
+    }
   }
 
   private handleSensitiveSubmission(
@@ -3117,7 +3190,7 @@ export class AgentService {
     runtime.fileCommandViolationCounts.clear();
     runtime.fileCommandException = undefined;
     const token = runtime.turnToken;
-    const maxRounds = runtime.backend.kind === 'generic-provider'
+    const checkpointIntervalRounds = runtime.backend.kind === 'generic-provider'
       ? this.genericMaxRounds()
       : undefined;
     runtime.abortController = new AbortController();
@@ -3147,7 +3220,7 @@ export class AgentService {
       this.setLockedState(runtime, 'THINKING');
     }
     this.emit(runtime);
-    void this.runTurn(runtime, token, prompt, runtime.controlLeaseId, maxRounds);
+    void this.runTurn(runtime, token, prompt, runtime.controlLeaseId, checkpointIntervalRounds);
     return cloneView(runtime);
   }
 

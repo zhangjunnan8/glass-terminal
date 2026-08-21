@@ -219,8 +219,8 @@ describe('TerminalService control and redaction invariants', () => {
     expect((await executionPromise).status).toBe('cancelled');
   });
 
-  it('fails closed when the backend throws while sending manual Ctrl+C', async () => {
-    const { service, browser, backend } = setup();
+  it('keeps the terminal connected when the backend rejects manual Ctrl+C', async () => {
+    const { service, testable, browser, backend } = setup();
     service.bindSession(browser, 'terminal', 'session');
     const executionPromise = service.executeStructured(
       browser,
@@ -229,62 +229,79 @@ describe('TerminalService control and redaction invariants', () => {
       'ai',
     );
     const execution = service.currentExecution(browser, 'terminal')!;
+    const envelope = backend.writes[0];
+    const nonce = nonceFromPosixEnvelope(envelope);
     backend.write = () => { throw new Error('transport write failed'); };
 
-    expect(service.interruptExecution(browser, 'terminal', execution.id)?.id).toBe(execution.id);
-    await new Promise<void>((resolve) => queueMicrotask(resolve));
+    expect(() => service.interruptExecution(browser, 'terminal', execution.id))
+      .toThrow(/kept connected/i);
+    expect(backend.closes).toBe(0);
+    expect(service.state(browser, 'terminal').status).toBe('connected');
+    expect(service.currentExecution(browser, 'terminal')?.interruptRequestedAt).toBeUndefined();
 
-    expect(backend.closes).toBe(1);
-    expect((await executionPromise).status).toBe('cancelled');
-    expect(() => service.write(browser, 'terminal', 'new command\r')).toThrow(/no longer connected/i);
+    backend.write = (data) => { backend.writes.push(data); };
+    testable.emitData('terminal', `\x1eAI:${nonce}:START\x1f\r\n`);
+    testable.emitData('terminal', `\x1eAI:${nonce}:END:0\x1f`);
+    expect((await executionPromise).status).toBe('completed');
   });
 
-  it('fails closed by closing a terminal whose timed-out command never emits an end sentinel', async () => {
+  it('reports command inactivity without Ctrl+C or closing the terminal', async () => {
     vi.useFakeTimers();
     try {
-      const { service, browser, backend } = setup();
+      const { service, testable, browser, backend } = setup();
       service.bindSession(browser, 'terminal', 'session');
+      const onIdleTimeout = vi.fn();
       const executionPromise = service.executeStructured(
         browser,
         'terminal',
         'hung-command',
         'ai',
+        { onIdleTimeout },
       );
-      const controlLease = service.acquireAgentControl(browser, 'terminal');
-      service.setAgentControlMode(browser, 'terminal', controlLease, 'secure-human');
+      const nonce = nonceFromPosixEnvelope(backend.writes[0]);
 
       await vi.advanceTimersByTimeAsync(5 * 60 * 1_000);
-      expect(backend.writes.filter((data) => data === '\x03')).toHaveLength(1);
+      expect(backend.writes.filter((data) => data === '\x03')).toHaveLength(0);
       expect(service.currentExecution(browser, 'terminal')?.status).toBe('running');
-      expect(() => service.write(browser, 'terminal', 'credential\r')).toThrow(/locked/i);
-      await vi.advanceTimersByTimeAsync(5_000);
+      expect(service.currentExecution(browser, 'terminal')?.inactivityTimedOutAt).toBeTruthy();
+      expect(onIdleTimeout).toHaveBeenCalledOnce();
+      expect(backend.closes).toBe(0);
+      expect(service.state(browser, 'terminal').status).toBe('connected');
 
-      expect(backend.closes).toBe(1);
-      expect((await executionPromise).status).toBe('cancelled');
-      expect(() => service.write(browser, 'terminal', 'new command\r')).toThrow(/no longer connected/i);
+      testable.emitData('terminal', `\x1eAI:${nonce}:START\x1f\r\n`);
+      testable.emitData('terminal', `\x1eAI:${nonce}:END:0\x1f`);
+      expect((await executionPromise).status).toBe('completed');
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('still fails closed when the timeout Ctrl+C write itself throws', async () => {
+  it('resets the inactivity watchdog whenever command output arrives', async () => {
     vi.useFakeTimers();
     try {
-      const { service, browser, backend } = setup();
+      const { service, testable, browser, backend } = setup();
       service.bindSession(browser, 'terminal', 'session');
+      const onIdleTimeout = vi.fn();
       const executionPromise = service.executeStructured(
         browser,
         'terminal',
-        'hung-command',
+        'slow-command',
         'ai',
+        { onIdleTimeout },
       );
-      backend.write = () => { throw new Error('transport write failed'); };
+      const nonce = nonceFromPosixEnvelope(backend.writes[0]);
 
-      await vi.advanceTimersByTimeAsync(5 * 60 * 1_000);
+      await vi.advanceTimersByTimeAsync(4 * 60 * 1_000);
+      testable.emitData('terminal', 'still working\r\n');
+      await vi.advanceTimersByTimeAsync(4 * 60 * 1_000);
+      expect(onIdleTimeout).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(60 * 1_000);
 
-      expect(backend.closes).toBe(1);
-      expect((await executionPromise).status).toBe('cancelled');
-      expect(() => service.write(browser, 'terminal', 'new command\r')).toThrow(/no longer connected/i);
+      expect(onIdleTimeout).toHaveBeenCalledOnce();
+      expect(backend.closes).toBe(0);
+      testable.emitData('terminal', `\x1eAI:${nonce}:START\x1f\r\n`);
+      testable.emitData('terminal', `\x1eAI:${nonce}:END:0\x1f`);
+      expect((await executionPromise).status).toBe('completed');
     } finally {
       vi.useRealTimers();
     }

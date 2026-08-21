@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type {
   AIMessage,
   BaseMessage,
@@ -52,8 +53,10 @@ import { agentMemorySystemMessage } from './agent-memory';
  */
 
 const MAX_BACKEND_THREAD_ID_CHARS = 256;
-const MAX_HARNESS_ROUNDS = 64;
-const DEFAULT_MAX_ROUNDS = 40;
+const MAX_CHECKPOINT_INTERVAL_ROUNDS = 64;
+const DEFAULT_CHECKPOINT_INTERVAL_ROUNDS = 40;
+const REPEATED_TOOL_ROUND_LIMIT = 3;
+const CONSECUTIVE_TOOL_FAILURE_LIMIT = 5;
 const MIN_DYNAMIC_READ_CHARS = 32;
 const MIN_TOOL_RESULT_RESERVE_TOKENS = 48;
 const CONTEXT_SUMMARY_SYSTEM_PROMPT = `You compact an AI coding-agent conversation into durable working memory.
@@ -168,10 +171,12 @@ function normalizedThreadId(id: string): string {
   return normalized;
 }
 
-function configuredMaxRounds(value: number | undefined): number {
-  if (value === undefined) return DEFAULT_MAX_ROUNDS;
-  if (!Number.isInteger(value) || value < 1 || value > MAX_HARNESS_ROUNDS) {
-    throw new Error(`LangChain Harness maxRounds must be an integer from 1 to ${MAX_HARNESS_ROUNDS}.`);
+function configuredCheckpointInterval(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_CHECKPOINT_INTERVAL_ROUNDS;
+  if (!Number.isInteger(value) || value < 1 || value > MAX_CHECKPOINT_INTERVAL_ROUNDS) {
+    throw new Error(
+      `LangChain Harness checkpoint interval must be an integer from 1 to ${MAX_CHECKPOINT_INTERVAL_ROUNDS}.`,
+    );
   }
   return value;
 }
@@ -268,6 +273,38 @@ function errorResult(error: unknown): string {
   });
 }
 
+function toolResultFailed(result: string): boolean {
+  try {
+    const parsed = JSON.parse(result) as unknown;
+    return Boolean(
+      parsed
+      && typeof parsed === 'object'
+      && !Array.isArray(parsed)
+      && (parsed as { ok?: unknown }).ok === false,
+    );
+  } catch {
+    return true;
+  }
+}
+
+function toolRoundFingerprint(
+  calls: readonly AgentToolCall[],
+  results: readonly string[],
+): string {
+  const hash = createHash('sha256');
+  calls.forEach((call, index) => {
+    // Provider-generated call ids change on every retry and are intentionally
+    // excluded. The operation, exact arguments, and exact result define progress.
+    hash.update(call.name);
+    hash.update('\0');
+    hash.update(call.arguments);
+    hash.update('\0');
+    hash.update(results[index] ?? '');
+    hash.update('\0');
+  });
+  return hash.digest('hex');
+}
+
 function providerReportedInputTokens(response: unknown): number | undefined {
   if (!response || typeof response !== 'object') return undefined;
   const message = response as {
@@ -308,7 +345,7 @@ export class LangChainBackend implements AgentBackend {
   private readonly threads = new Map<string, LangChainThreadRecord>();
   private readonly activeTurns = new Map<string, ActiveTurn>();
   private readonly modelFactory: () => Promise<ChatOpenAICompletions>;
-  private readonly defaultMaxRounds: number;
+  private readonly defaultCheckpointInterval: number;
   private readonly contextWindowTokens: number;
   private readonly contextEstimateSafetyFactor: number | undefined;
   private readonly customSummarize?: LangChainBackendOptions['summarize'];
@@ -316,7 +353,7 @@ export class LangChainBackend implements AgentBackend {
 
   constructor(options: LangChainBackendOptions) {
     this.modelFactory = options.modelFactory;
-    this.defaultMaxRounds = configuredMaxRounds(options.maxRounds);
+    this.defaultCheckpointInterval = configuredCheckpointInterval(options.maxRounds);
     this.contextWindowTokens = options.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
     this.contextEstimateSafetyFactor = options.contextEstimateSafetyFactor;
     this.customSummarize = options.summarize;
@@ -353,7 +390,9 @@ export class LangChainBackend implements AgentBackend {
   }
 
   async sendMessage(input: SendAgentBackendMessageInput): Promise<AgentBackendResult> {
-    const maxRounds = configuredMaxRounds(input.maxRounds ?? this.defaultMaxRounds);
+    const checkpointInterval = configuredCheckpointInterval(
+      input.maxRounds ?? this.defaultCheckpointInterval,
+    );
     const record = this.requireThread(input.thread);
     if (!input.gateway) throw new Error('LangChain Harness requires a per-turn ToolGateway.');
     if (this.activeTurns.has(record.handle.id)) {
@@ -406,12 +445,20 @@ export class LangChainBackend implements AgentBackend {
 
       let finalText = '';
       let rounds = 0;
+      let roundsSinceCheckpoint = 0;
+      let checkpointSequence = 0;
+      let checkpointEmitted = false;
+      let safetyCheckpointRequired = false;
+      let previousToolRoundFingerprint: string | undefined;
+      let repeatedToolRounds = 0;
+      let consecutiveToolFailures = 0;
       const initialPriorCount = record.priorMessages.length;
       let contextWasRewritten = record.requiresCheckpoint;
       let lastCompressedAt: string | undefined;
       let lastProviderReportedInputTokens: number | undefined;
       let pendingToolAssistant: Extract<AgentMessage, { role: 'assistant' }> | undefined;
       let haltedError: string | undefined;
+      let haltedState: AgentBackendResult['haltedState'];
       let localOnlyCompressionRequired = false;
 
       const estimation = () => ({
@@ -537,7 +584,31 @@ export class LangChainBackend implements AgentBackend {
         return after;
       };
 
-      while (rounds < maxRounds) {
+      const persistIntermediateCheckpoint = async (): Promise<AgentEstimatedContextUsage> => {
+        if (pendingToolAssistant) pendingToolAssistant.toolResultsPending = true;
+        const contextUsage = await refreshContext();
+        if (pendingToolAssistant) pendingToolAssistant.toolResultsPending = true;
+        const checkpointMessages = cloneMessages(
+          transcript.filter((message) => message.role !== 'system'),
+        );
+        record.priorMessages = cloneMessages(checkpointMessages);
+        record.requiresCheckpoint = false;
+        checkpointSequence += 1;
+        checkpointEmitted = true;
+        contextWasRewritten = true;
+        input.onEvent?.({
+          type: 'checkpoint',
+          contextUsage,
+          checkpoint: {
+            sequence: checkpointSequence,
+            totalRounds: rounds,
+            messages: checkpointMessages,
+          },
+        });
+        return contextUsage;
+      };
+
+      while (true) {
         throwIfCancelled(controller.signal);
         const requestUsage = await refreshContext();
         if (requestUsage.estimatedTokens >= requestUsage.compressionThresholdTokens) {
@@ -615,6 +686,8 @@ export class LangChainBackend implements AgentBackend {
         pendingToolAssistant = assistant as Extract<AgentMessage, { role: 'assistant' }>;
 
         let rejectRemainingTools = false;
+        const completedRoundCalls: AgentToolCall[] = [];
+        const completedRoundResults: string[] = [];
         for (let callIndex = 0; callIndex < response.tool_calls.length; callIndex += 1) {
           const call = response.tool_calls[callIndex]!;
           throwIfCancelled(controller.signal);
@@ -679,6 +752,11 @@ export class LangChainBackend implements AgentBackend {
 
           messages.push(new runtime.ToolMessage({ content: result, tool_call_id: call.id ?? '' }));
           transcript.push({ role: 'tool', content: result, toolCallId: call.id ?? '' });
+          completedRoundCalls.push(toolCall);
+          completedRoundResults.push(result);
+          consecutiveToolFailures = toolResultFailed(result)
+            ? consecutiveToolFailures + 1
+            : 0;
           input.onEvent?.({ type: 'tool_completed', toolCall, result });
           const afterTool = agentContextUsage(
             transcript,
@@ -694,15 +772,41 @@ export class LangChainBackend implements AgentBackend {
           }
         }
         rounds += 1;
+        roundsSinceCheckpoint += 1;
+        const fingerprint = toolRoundFingerprint(completedRoundCalls, completedRoundResults);
+        if (fingerprint === previousToolRoundFingerprint) repeatedToolRounds += 1;
+        else {
+          previousToolRoundFingerprint = fingerprint;
+          repeatedToolRounds = 1;
+        }
+        if (!haltedError && repeatedToolRounds >= REPEATED_TOOL_ROUND_LIMIT) {
+          haltedError = `Agent 连续 ${REPEATED_TOOL_ROUND_LIMIT} 轮执行了完全相同的工具请求并得到相同结果，已保存进度并暂停，避免无进展循环。`;
+          haltedState = 'paused';
+          safetyCheckpointRequired = true;
+        }
+        if (!haltedError && consecutiveToolFailures >= CONSECUTIVE_TOOL_FAILURE_LIMIT) {
+          haltedError = `Agent 连续 ${CONSECUTIVE_TOOL_FAILURE_LIMIT} 次工具调用失败，已保存进度并暂停，请检查失败原因后继续。`;
+          haltedState = 'paused';
+          safetyCheckpointRequired = true;
+        }
         if (haltedError) break;
+        if (roundsSinceCheckpoint >= checkpointInterval) {
+          const checkpointUsage = await persistIntermediateCheckpoint();
+          roundsSinceCheckpoint = 0;
+          if (checkpointUsage.estimatedTokens >= checkpointUsage.compressionThresholdTokens) {
+            haltedError = new AgentContextBudgetExceededError(
+              'tool_result',
+              checkpointUsage.estimatedTokens,
+              checkpointUsage.compressionThresholdTokens,
+              '检查点压缩后，当前必须保留的工具协议组仍超过安全输入上限',
+            ).message;
+            haltedState = 'failed';
+            break;
+          }
+        }
       }
 
       throwIfCancelled(controller.signal);
-      if (!haltedError && rounds >= maxRounds) {
-        throw new Error(
-          `Agent 超出 ${maxRounds} 轮安全上限。请拆分任务、减少单次修改的文件数，或分多轮继续。`,
-        );
-      }
       if (haltedError && pendingToolAssistant) {
         pendingToolAssistant.toolResultsPending = true;
       }
@@ -715,7 +819,10 @@ export class LangChainBackend implements AgentBackend {
       const nextPriorMessages = cloneMessages(
         transcript.filter((message) => message.role !== 'system'),
       );
-      const persistenceMessages = contextWasRewritten
+      const persistFullCheckpoint = contextWasRewritten
+        || checkpointEmitted
+        || safetyCheckpointRequired;
+      const persistenceMessages = persistFullCheckpoint
         ? cloneMessages(nextPriorMessages)
         : cloneMessages(nextPriorMessages.slice(initialPriorCount));
       record.priorMessages = nextPriorMessages;
@@ -727,10 +834,11 @@ export class LangChainBackend implements AgentBackend {
         rounds,
         contextUsage,
         contextPersistence: {
-          mode: contextWasRewritten ? 'checkpoint' : 'delta',
+          mode: persistFullCheckpoint ? 'checkpoint' : 'delta',
           messages: persistenceMessages,
         },
         ...(haltedError ? { haltedError } : {}),
+        ...(haltedState ? { haltedState } : {}),
       };
     } finally {
       input.signal.removeEventListener('abort', abortFromCaller);

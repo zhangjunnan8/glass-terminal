@@ -79,6 +79,7 @@ interface ActiveExecution {
 export interface StructuredExecutionHooks {
   onOutput?: (data: string) => void;
   onStarted?: (execution: CommandExecution) => void;
+  onIdleTimeout?: (execution: CommandExecution) => void;
   onAuthPrompt?: (execution: CommandExecution) => void;
   onConfirmation?: (
     answer: 'y' | 'n',
@@ -89,8 +90,7 @@ export interface StructuredExecutionHooks {
 const MAX_PENDING_OUTPUT = 256 * 1024;
 const MAX_TEMPORARY_JOURNAL = 8 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT = 2 * 1024 * 1024;
-const COMMAND_TIMEOUT_MS = 5 * 60 * 1_000;
-const COMMAND_TIMEOUT_INTERRUPT_GRACE_MS = 5_000;
+const COMMAND_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1_000;
 
 export interface TerminalSnapshot {
   descriptor: TerminalDescriptor;
@@ -458,33 +458,6 @@ export class TerminalService {
     if (recent.length > 4) recent.shift();
     this.recentEnvelopeEchos.set(terminalId, recent);
     return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        const active = record.activeExecution;
-        if (active?.execution.id !== execution.id) return;
-        active.interruptRequested = true;
-        active.execution.interruptRequestedAt = new Date().toISOString();
-        if (record.controlLease) record.controlLease.inputMode = 'locked';
-        const failClosed = () => {
-          if (record.activeExecution?.execution.id !== execution.id) return;
-          try {
-            record.backend?.close();
-          } catch (error) {
-            console.error('Unable to close a timed-out terminal:', error);
-          } finally {
-            this.emitExit(terminalId, 124);
-          }
-        };
-        const grace = setTimeout(failClosed, COMMAND_TIMEOUT_INTERRUPT_GRACE_MS);
-        grace.unref();
-        active.timeout = grace;
-        try {
-          record.backend?.write('\x03');
-        } catch {
-          clearTimeout(grace);
-          failClosed();
-        }
-      }, COMMAND_TIMEOUT_MS);
-      timeout.unref();
       record.activeExecution = {
         execution,
         capture: new SentinelCapture(envelope),
@@ -497,11 +470,11 @@ export class TerminalService {
         outputBytes: 0,
         hooks,
         resolve,
-        timeout,
         sensitiveTainted: false,
         sensitiveOutputRedacted: false,
         interruptRequested: false,
       };
+      this.armExecutionInactivityWatchdog(record);
       hooks.onStarted?.({ ...execution });
       try {
         record.backend!.write(envelope.input);
@@ -526,25 +499,22 @@ export class TerminalService {
       record.activeExecution?.execution.id !== executionId
       || record.activeExecution.interruptRequested
     ) return undefined;
-    record.activeExecution.interruptRequested = true;
-    record.activeExecution.execution.interruptRequestedAt = new Date().toISOString();
-    if (record.activeExecution.timeout) {
-      clearTimeout(record.activeExecution.timeout);
-      record.activeExecution.timeout = undefined;
+    const active = record.activeExecution;
+    active.interruptRequested = true;
+    active.execution.interruptRequestedAt = new Date().toISOString();
+    if (active.timeout) {
+      clearTimeout(active.timeout);
+      active.timeout = undefined;
     }
     try {
       record.backend?.write('\x03');
-    } catch {
-      queueMicrotask(() => {
-        if (record.activeExecution?.execution.id !== executionId) return;
-        try {
-          record.backend?.close();
-        } catch (error) {
-          console.error('Unable to close a terminal after Ctrl+C failed:', error);
-        } finally {
-          this.emitExit(terminalId, 130);
-        }
-      });
+    } catch (error) {
+      active.interruptRequested = false;
+      active.execution.interruptRequestedAt = undefined;
+      this.armExecutionInactivityWatchdog(record);
+      throw new Error(
+        `Unable to send Ctrl+C; the terminal was kept connected: ${(error as Error).message}`,
+      );
     }
     return { ...record.activeExecution.execution };
   }
@@ -871,6 +841,7 @@ export class TerminalService {
   private processExecutionOutput(record: TerminalRecord, data: string): void {
     const active = record.activeExecution;
     if (!active) return;
+    this.armExecutionInactivityWatchdog(record);
     const update = active.capture.push(data);
     const interaction = active.interactionDetector.push(update.observed);
     if (interaction?.kind === 'authentication') {
@@ -948,6 +919,26 @@ export class TerminalService {
     }
     record.activeExecution = undefined;
     active.resolve({ ...active.execution });
+  }
+
+  private armExecutionInactivityWatchdog(record: TerminalRecord): void {
+    const active = record.activeExecution;
+    if (!active || active.execution.inactivityTimedOutAt) return;
+    if (active.timeout) clearTimeout(active.timeout);
+    const executionId = active.execution.id;
+    const timeout = setTimeout(() => {
+      const current = record.activeExecution;
+      if (current?.execution.id !== executionId) return;
+      current.timeout = undefined;
+      current.execution.inactivityTimedOutAt = new Date().toISOString();
+      try {
+        current.hooks.onIdleTimeout?.({ ...current.execution });
+      } catch (error) {
+        console.error('Unable to pause Agent after command inactivity:', error);
+      }
+    }, COMMAND_INACTIVITY_TIMEOUT_MS);
+    timeout.unref();
+    active.timeout = timeout;
   }
 
   private taintSensitiveExecution(

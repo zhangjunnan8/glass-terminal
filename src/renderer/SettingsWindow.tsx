@@ -247,7 +247,7 @@ export function SettingsWindow() {
             </label>
 
             <label className="settings-field">
-              <span>Agent 单轮最大轮数（1-64）</span>
+              <span>Agent 自动检查点间隔（1-64 轮）</span>
               <input
                 type="number"
                 min={1}
@@ -257,6 +257,7 @@ export function SettingsWindow() {
                   defaultMaxRounds: Math.min(64, Math.max(1, Number(event.target.value) || 1)),
                 })}
               />
+              <small>达到间隔后保存完整上下文并自动继续，不是任务总轮数上限。</small>
             </label>
 
             <div className="settings-actions">

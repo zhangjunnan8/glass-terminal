@@ -7,7 +7,7 @@ export interface AppSettings {
   language: AppLanguage;
   /** Days to retain per-session logs. `0` keeps logs indefinitely. */
   logRetentionDays: number;
-  /** Upper bound for a Generic Provider harness turn; 1-64. */
+  /** Generic Provider automatic checkpoint interval in tool rounds; 1-64. */
   defaultMaxRounds: number;
   createdAt: string;
   updatedAt: string;

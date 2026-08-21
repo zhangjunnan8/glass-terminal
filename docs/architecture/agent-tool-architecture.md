@@ -181,9 +181,11 @@ It replaces the in-house `AgentLoop` while keeping every boundary below it intac
   still replayed as checkpoints, so existing conversations remain readable.
 - The harness owns no PTY, SSH, SFTP, or filesystem client; those remain under
   `TerminalService` and `AgentFileService`, reachable only through `ToolGateway`.
-- One Generic harness turn freezes the current Settings round limit when it starts
-  (default 40, range 1–64, hard cap 64). A Settings change affects the next turn
-  without rebuilding or clearing the existing backend thread.
+- One Generic harness turn freezes the current Settings checkpoint interval when it
+  starts (default 40, range 1–64). At each protocol-complete interval the harness
+  persists a full checkpoint, refreshes/compacts context, and continues the same
+  user turn. A Settings change affects the next turn without rebuilding or clearing
+  the existing backend thread; the interval is not a total task-round limit.
 
 ## Known large-workspace limits
 
