@@ -1,8 +1,8 @@
 {
   "name": "glass-terminal",
-  "version": "0.1.0-alpha.2",
+  "version": "0.1.0-beta.0",
   "private": true,
-  "description": "Windows-first shared terminal AI agent desktop demo",
+  "description": "Windows-first visible AI agent terminal for local and SSH workflows",
   "license": "MIT",
   "type": "module",
   "main": "dist-electron/main.cjs",

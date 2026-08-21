@@ -400,7 +400,9 @@ describe('LangChain backend spike (DeepSeek-compatible transport)', () => {
       terminalId = descriptor.id;
       terminals.attach(owner, terminalId);
       if (profile.kind === 'powershell') {
-        const integrationDeadline = Date.now() + 5_000;
+        // A real pwsh process can take several seconds to load the user's
+        // profile when the full suite starts many workers concurrently.
+        const integrationDeadline = Date.now() + 15_000;
         while (Date.now() < integrationDeadline) {
           const integration = terminals.state(owner, terminalId).shellIntegration as
             | { status?: string; rich?: boolean }

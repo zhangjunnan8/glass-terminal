@@ -12,9 +12,9 @@ Glass Terminal 是一个 **Windows-first、终端优先、远程设备优先**�
 ![Electron](https://img.shields.io/badge/Electron-43-2b2e3a?logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178c6?logo=typescript&logoColor=white)
-![Version](https://img.shields.io/badge/version-0.1.0--alpha.2-orange)
+![Version](https://img.shields.io/badge/version-0.1.0--beta.0-blue)
 ![Tests](https://img.shields.io/badge/tests-676%20passed-brightgreen)
-![Status](https://img.shields.io/badge/status-alpha-important)
+![Status](https://img.shields.io/badge/status-beta-blue)
 
 </div>
 
@@ -54,7 +54,7 @@ Codex IDE、Remote IDE 和通用 Agent Harness 主要围绕代码工作区与 Ag
 | 🔐 **安全优先** | 凭据不进模型上下文与明文日志；密钥库 AES-256-GCM 加密；敏感认证交接；无任何遥测 |
 | 💾 **持久化与会话** | 会话历史、审计日志（audit JSONL）、断线重连、终端回放 |
 | 🌗 **主题** | 暗色 / 亮色 / 跟随系统 三态循环 |
-| 📦 **设置与备份** | 设置窗口、AES-256-GCM 文件密钥库、配置备份导出/导入；Session 与审计日志可选包含（导出包当前未加密） |
+| 📦 **设置与备份** | 设置窗口、AES-256-GCM 文件密钥库、配置备份导出/导入；包含 Provider/SSH 凭据时强制使用至少 12 字符的口令加密整包 |
 | 🔗 **SFTP** | 与远程会话关联的文件传输队列 |
 
 ---
@@ -105,8 +105,9 @@ npm run package:win
 > 当前绿色版不内置 Codex CLI。Codex App Server 模式需要从界面自动检测 PATH 中的官方
 > `codex` 可执行文件，或由用户手动选择 `codex.exe`。
 >
-> ⚠️ 导出的 `.aitbak` 会包含可读的 Provider API Key，`.aithosts` 会包含可读的
-> SSH 凭据；当前两种备份都没有口令加密。请将它们视为密钥文件保管，不要提交到仓库或发送到不可信位置。
+> ⚠️ 默认备份不包含 Provider API Key 或 SSH 凭据。显式包含凭据时，`.aitbak` 和
+> `.aithosts` 会使用用户提供的口令加密整个文件；口令不会由应用保存，遗失后无法恢复。
+> 旧版明文凭据备份仍可在显式确认风险后导入，请继续将所有备份视为敏感文件。
 
 ---
 
@@ -155,6 +156,7 @@ src/
 docs/
   codex-app-server.md        Codex 原生模式使用与能力边界
   architecture/              架构与技术选型
+  releases/                  版本发布说明
 ```
 
 ---

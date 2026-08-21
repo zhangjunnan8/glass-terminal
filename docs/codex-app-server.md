@@ -1,6 +1,6 @@
 # Codex App Server 使用与接入说明
 
-> 当前状态：Glass Terminal Alpha 已接入 Codex App Server 的完整 UI 控制面和原生
+> 当前状态：Glass Terminal Beta 已接入 Codex App Server 的完整 UI 控制面和原生
 > Agent 链路，包括 CLI 检测与启动、ChatGPT 登录、账号、模型、推理强度、
 > Thread/Turn、流式输出、内建 Shell/File 项目以及可选的当前终端只读上下文。
 > 用户无需运行 PowerShell、输入 JSON 或复制 token。
