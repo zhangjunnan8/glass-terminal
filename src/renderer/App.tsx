@@ -1562,7 +1562,11 @@ export function App() {
   function openSshConnection(host: HostProfile, sessionId?: string) {
     setConnectionError(null);
     setReconnectingSessionId(sessionId ?? null);
-    if (host.credentialConfigured || host.authMethod === 'agent') {
+    if (
+      host.credentialConfigured
+      || host.authMethod === 'agent'
+      || host.authMethod === 'private-key'
+    ) {
       void establishSsh(host, {}, undefined, sessionId);
       return;
     }
@@ -1645,7 +1649,11 @@ export function App() {
       }
     } catch (error) {
       setConnectionError(errorMessage(error));
-      if (host.credentialConfigured && !secret.password && !secret.passphrase) {
+      if (
+        !secret.password
+        && !secret.passphrase
+        && (host.credentialConfigured || host.authMethod === 'private-key')
+      ) {
         setConnectingHost(host);
         setReconnectingSessionId(sessionId ?? null);
       }

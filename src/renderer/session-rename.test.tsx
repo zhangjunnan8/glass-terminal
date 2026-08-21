@@ -540,6 +540,40 @@ describe('renderer host and session dialogs', () => {
     expect(container.querySelector('[data-testid="ssh-connect-dialog"]')).toBeNull();
   });
 
+  it('tries a configured private key without a passphrase dialog and asks only after failure', async () => {
+    const keyHost: HostProfile = {
+      ...host,
+      authMethod: 'private-key',
+      privateKeyPath: 'C:\\keys\\id_ed25519',
+      credentialConfigured: false,
+    };
+    const bridge = bridgeWith(vi.fn());
+    vi.mocked(bridge.hosts.list).mockResolvedValue([keyHost]);
+    let rejectConnection!: (reason?: unknown) => void;
+    vi.mocked(bridge.terminal.connectSsh).mockReturnValueOnce(new Promise((_, reject) => {
+      rejectConnection = reject;
+    }));
+    await renderSelectedHost(bridge);
+
+    const connectButton = container.querySelector<HTMLButtonElement>(
+      '.selected-host-card [data-action="connect-host"]',
+    )!;
+    await act(async () => connectButton.click());
+    expect(container.querySelector('[data-testid="ssh-connect-dialog"]')).toBeNull();
+    await act(async () => rejectConnection(new Error('私钥需要口令')));
+    await settle();
+
+    expect(bridge.terminal.connectSsh).toHaveBeenCalledWith({
+      hostId: keyHost.id,
+      sessionId: undefined,
+      trustHostKey: undefined,
+    });
+    const dialog = container.querySelector<HTMLFormElement>('[data-testid="ssh-connect-dialog"]');
+    expect(dialog).not.toBeNull();
+    expect(dialog?.elements.namedItem('passphrase')).toBeInstanceOf(HTMLInputElement);
+    expect(dialog?.textContent).toContain('私钥需要口令');
+  });
+
   it('reconnects a saved session immediately with its durable session id', async () => {
     const savedHost = { ...host, credentialConfigured: true };
     const bridge = bridgeWith(vi.fn());
