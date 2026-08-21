@@ -236,8 +236,8 @@ const TERMINAL_LAYOUT_PATTERN = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x
 const TERMINAL_REFLOW_PATTERN = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))|[\r\n\t ]/g;
 const MIN_WRAPPED_ENVELOPE_CHARS = 24;
 const MIN_REFLOW_FRAGMENT_CHARS = 18;
-const REFLOW_FILTER_WINDOW_MS = 1_500;
-const REFLOW_FILTER_PUSH_LIMIT = 32;
+const REFLOW_FILTER_WINDOW_MS = 3_000;
+const REFLOW_FILTER_PUSH_LIMIT = 128;
 
 function stripAnsi(value: string): string {
   return value.replace(ANSI_PATTERN, '');
@@ -264,6 +264,14 @@ interface NormalizedTerminalText {
   rawIndices: number[];
 }
 
+interface PowerShellTranscriptKey {
+  startMarker: string;
+  markerIdentity: string;
+  endTail: string;
+  displaySignatures: string[];
+  completed: boolean;
+}
+
 function normalizedTerminalText(
   value: string,
   ignoreHorizontalWhitespace = false,
@@ -275,6 +283,25 @@ function normalizedTerminalText(
     ? TERMINAL_REFLOW_PATTERN
     : TERMINAL_LAYOUT_PATTERN;
   for (const match of value.matchAll(layoutPattern)) {
+    const matchIndex = match.index;
+    for (let index = cursor; index < matchIndex; index += 1) {
+      text += value[index];
+      rawIndices.push(index);
+    }
+    cursor = matchIndex + match[0].length;
+  }
+  for (let index = cursor; index < value.length; index += 1) {
+    text += value[index];
+    rawIndices.push(index);
+  }
+  return { text, rawIndices };
+}
+
+function visibleTerminalText(value: string): NormalizedTerminalText {
+  let text = '';
+  const rawIndices: number[] = [];
+  let cursor = 0;
+  for (const match of value.matchAll(ANSI_PATTERN)) {
     const matchIndex = match.index;
     for (let index = cursor; index < matchIndex; index += 1) {
       text += value[index];
@@ -371,6 +398,135 @@ function stripInterleavedEnvelopeFragments(value: string, needles: string[]): st
   return output;
 }
 
+function completedEndMarkerIndex(
+  text: string,
+  endTail: string,
+  searchFrom: number,
+): number | undefined {
+  let tailIndex = text.indexOf(endTail, searchFrom);
+  while (tailIndex >= 0) {
+    const codeStart = tailIndex + endTail.length;
+    const suffix = text.slice(codeStart).match(/^-?\d{1,10}__/u);
+    if (suffix) return codeStart + suffix[0].length;
+    tailIndex = text.indexOf(endTail, tailIndex + 1);
+  }
+  return undefined;
+}
+
+function trailingPowerShellPromptEnd(value: string, start: number): number {
+  const visible = visibleTerminalText(value.slice(start));
+  const prompt = visible.text.match(
+    /^(?:[ \t]*(?:\r\n|\r|\n))+[ \t]*(?:\([^\r\n)]{1,80}\)[ \t]*)?PS[ \t]+[^\r\n]{0,512}>[ \t]*/u,
+  );
+  if (!prompt || prompt[0].length === 0) return start;
+  const rawEnd = visible.rawIndices[prompt[0].length - 1];
+  return rawEnd === undefined ? start : start + rawEnd + 1;
+}
+
+interface TranscriptFilterResult {
+  output: string;
+  pending: string;
+}
+
+/**
+ * Windows PowerShell can replay the raw, already-completed structured command
+ * transcript after a ConPTY resize. Unlike the injected input echo, that replay
+ * contains the clean display command, START, prior output, END and prompt. A
+ * known nonce is an unambiguous boundary, so discard the whole historical block
+ * instead of trying to remove its individual visible lines.
+ */
+function stripCompletedTranscriptRedraws(
+  value: string,
+  transcripts: readonly PowerShellTranscriptKey[],
+): TranscriptFilterResult {
+  let output = value;
+  while (output) {
+    const normalized = normalizedTerminalText(output, true);
+    let candidate: {
+      transcript: PowerShellTranscriptKey;
+      identityIndex: number;
+      rawStart: number;
+    } | undefined;
+
+    for (const transcript of transcripts) {
+      if (!transcript.completed) continue;
+      const identityIndex = normalized.text.indexOf(transcript.markerIdentity);
+      if (identityIndex < 0) continue;
+      let displayIndex = -1;
+      for (const signature of transcript.displaySignatures) {
+        const signatureIndex = normalized.text.indexOf(signature);
+        if (signatureIndex < 0 || signatureIndex > identityIndex) continue;
+        displayIndex = displayIndex < 0
+          ? signatureIndex
+          : Math.min(displayIndex, signatureIndex);
+      }
+      const markerRawStart = normalized.rawIndices[identityIndex];
+      if (markerRawStart === undefined) continue;
+      const rawStart = displayIndex >= 0
+        ? normalized.rawIndices[displayIndex] ?? markerRawStart
+        : output.lastIndexOf('\n', markerRawStart - 1) + 1;
+      if (!candidate || markerRawStart < normalized.rawIndices[candidate.identityIndex]!) {
+        candidate = { transcript, identityIndex, rawStart };
+      }
+    }
+
+    if (!candidate) {
+      let pendingDisplayIndex = -1;
+      for (const transcript of transcripts) {
+        if (!transcript.completed) continue;
+        for (const signature of transcript.displaySignatures) {
+          pendingDisplayIndex = Math.max(
+            pendingDisplayIndex,
+            normalized.text.lastIndexOf(signature),
+          );
+        }
+      }
+      if (pendingDisplayIndex >= 0) {
+        const rawStart = normalized.rawIndices[pendingDisplayIndex];
+        if (rawStart !== undefined) {
+          return {
+            output: output.slice(0, rawStart),
+            pending: output.slice(rawStart),
+          };
+        }
+      }
+      for (const transcript of transcripts) {
+        if (!transcript.completed) continue;
+        for (const signature of transcript.displaySignatures) {
+          const maxSuffix = Math.min(signature.length - 1, normalized.text.length);
+          for (let length = maxSuffix; length >= 8; length -= 1) {
+            if (!signature.startsWith(normalized.text.slice(-length))) continue;
+            const rawStart = normalized.rawIndices[normalized.text.length - length];
+            if (rawStart !== undefined) {
+              return {
+                output: output.slice(0, rawStart),
+                pending: output.slice(rawStart),
+              };
+            }
+          }
+        }
+      }
+      return { output, pending: '' };
+    }
+    const normalizedEnd = completedEndMarkerIndex(
+      normalized.text,
+      candidate.transcript.endTail,
+      candidate.identityIndex,
+    );
+    if (normalizedEnd === undefined) {
+      return {
+        output: output.slice(0, candidate.rawStart),
+        pending: output.slice(candidate.rawStart),
+      };
+    }
+    const markerRawEnd = normalized.rawIndices[normalizedEnd - 1];
+    if (markerRawEnd === undefined) return { output, pending: '' };
+    const rawEnd = trailingPowerShellPromptEnd(output, markerRawEnd + 1);
+    output = output.slice(0, candidate.rawStart) + output.slice(rawEnd);
+  }
+  return { output, pending: '' };
+}
+
 /**
  * Line-level fallback filter: drops whole lines whose ANSI-stripped content
  * exactly matches a line we injected as part of a recent command envelope.
@@ -404,15 +560,41 @@ export function stripEnvelopeEcho(
  */
 export class EnvelopeEchoFilter {
   private readonly recentEnvelopes: Set<string>[] = [];
+  private readonly recentTranscripts: PowerShellTranscriptKey[] = [];
   private pending = '';
+  private transcriptPending = '';
   private reflowFilterUntil = 0;
   private reflowPushesRemaining = 0;
 
   constructor(private readonly shellKind: ShellProfile['kind'] = 'powershell') {}
 
-  remember(input: string): void {
+  remember(
+    input: string,
+    envelope?: CommandEnvelope,
+    displayCommand?: string,
+  ): void {
     this.recentEnvelopes.push(envelopeInputLines(input));
     if (this.recentEnvelopes.length > 4) this.recentEnvelopes.shift();
+    if (this.shellKind !== 'powershell' || !envelope || !displayCommand) return;
+    const marker = envelope.startMarker.match(/^__AI_TERMINAL_([a-f\d]+)_START__$/iu);
+    if (!marker) return;
+    const markerIdentity = marker[1];
+    this.recentTranscripts.push({
+      startMarker: envelope.startMarker,
+      markerIdentity,
+      endTail: `${markerIdentity}_END_`,
+      displaySignatures: [`$${displayCommand}`, `PS${displayCommand}`]
+        .map((signature) => normalizedTerminalText(signature, true).text),
+      completed: false,
+    });
+    if (this.recentTranscripts.length > 4) this.recentTranscripts.shift();
+  }
+
+  complete(startMarker: string): void {
+    const transcript = [...this.recentTranscripts]
+      .reverse()
+      .find((candidate) => candidate.startMarker === startMarker);
+    if (transcript) transcript.completed = true;
   }
 
   noteResize(now = Date.now()): void {
@@ -422,12 +604,27 @@ export class EnvelopeEchoFilter {
   }
 
   push(data: string): string {
-    if (!data && !this.pending) return '';
+    if (!data && !this.pending && !this.transcriptPending) return '';
     const combined = this.pending + data;
     this.pending = '';
-    let filtered = stripEnvelopeEcho(combined, this.recentEnvelopes);
-    if (Date.now() <= this.reflowFilterUntil && this.reflowPushesRemaining > 0) {
+    const reflowFiltering = Date.now() <= this.reflowFilterUntil
+      && this.reflowPushesRemaining > 0;
+    let transcriptFiltered = combined;
+    if (reflowFiltering) {
       this.reflowPushesRemaining -= 1;
+      const result = stripCompletedTranscriptRedraws(
+        this.transcriptPending + transcriptFiltered,
+        this.recentTranscripts,
+      );
+      transcriptFiltered = result.output;
+      this.transcriptPending = result.pending;
+    } else {
+      // A pending block already contained a completed-command nonce and is
+      // therefore confirmed redraw data. Drop it when the bounded window ends.
+      this.transcriptPending = '';
+    }
+    let filtered = stripEnvelopeEcho(transcriptFiltered, this.recentEnvelopes);
+    if (reflowFiltering) {
       filtered = stripInterleavedEnvelopeFragments(
         filtered,
         wrappedEnvelopeNeedles(this.recentEnvelopes),
@@ -441,7 +638,9 @@ export class EnvelopeEchoFilter {
 
   clear(): void {
     this.recentEnvelopes.length = 0;
+    this.recentTranscripts.length = 0;
     this.pending = '';
+    this.transcriptPending = '';
     this.reflowFilterUntil = 0;
     this.reflowPushesRemaining = 0;
   }

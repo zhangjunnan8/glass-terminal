@@ -19,6 +19,7 @@ import { TERMINAL_CHANNELS } from '../../shared/terminal';
 import { discoverShells } from './shell-discovery';
 import {
   buildCommandEnvelope,
+  type CommandEnvelope,
   CommandDisplayFilter,
   EnvelopeEchoFilter,
   SentinelCapture,
@@ -41,6 +42,8 @@ interface TerminalRecord {
   pendingOutputLength: number;
   status: 'connected' | 'exited';
   envelopeEchoFilter: EnvelopeEchoFilter;
+  resizeTimer?: NodeJS.Timeout;
+  pendingResize?: { cols: number; rows: number };
   startedAt: string;
   sequence: number;
   journal: TerminalJournalEvent[];
@@ -64,6 +67,7 @@ interface TerminalRecord {
 
 interface ActiveExecution {
   execution: CommandExecution;
+  envelope: CommandEnvelope;
   capture: SentinelCapture;
   displayFilter: CommandDisplayFilter;
   interactionDetector: TerminalInteractionDetector;
@@ -91,6 +95,7 @@ const MAX_PENDING_OUTPUT = 256 * 1024;
 const MAX_TEMPORARY_JOURNAL = 8 * 1024 * 1024;
 const MAX_COMMAND_OUTPUT = 2 * 1024 * 1024;
 const COMMAND_INACTIVITY_TIMEOUT_MS = 5 * 60 * 1_000;
+const POWERSHELL_SSH_RESIZE_DEBOUNCE_MS = 120;
 
 export interface TerminalSnapshot {
   descriptor: TerminalDescriptor;
@@ -330,17 +335,42 @@ export class TerminalService {
     const safeCols = Math.max(2, cols);
     const safeRows = Math.max(1, rows);
     record.envelopeEchoFilter.noteResize();
+    if (
+      record.descriptor.transport === 'ssh'
+      && record.descriptor.shellKind === 'powershell'
+    ) {
+      record.pendingResize = { cols: safeCols, rows: safeRows };
+      if (record.resizeTimer) clearTimeout(record.resizeTimer);
+      const timer = setTimeout(() => {
+        record.resizeTimer = undefined;
+        const pending = record.pendingResize;
+        record.pendingResize = undefined;
+        if (
+          !pending
+          || record.status !== 'connected'
+          || this.terminals.get(terminalId) !== record
+        ) return;
+        this.applyResize(record, pending.cols, pending.rows);
+      }, POWERSHELL_SSH_RESIZE_DEBOUNCE_MS);
+      timer.unref();
+      record.resizeTimer = timer;
+      return;
+    }
+    this.applyResize(record, safeCols, safeRows);
+  }
+
+  private applyResize(record: TerminalRecord, cols: number, rows: number): void {
     record.backend!.resize(
-      safeCols,
-      safeRows,
+      cols,
+      rows,
     );
     this.appendJournal(record, {
       version: 1,
       sequence: this.nextSequence(record),
       timestamp: new Date().toISOString(),
       kind: 'resize',
-      cols: safeCols,
-      rows: safeRows,
+      cols,
+      rows,
     });
   }
 
@@ -447,10 +477,11 @@ export class TerminalService {
     };
     const nonce = randomUUID().replaceAll('-', '');
     const envelope = buildCommandEnvelope(record.descriptor.shellKind, normalizedCommand, nonce);
-    record.envelopeEchoFilter.remember(envelope.input);
+    record.envelopeEchoFilter.remember(envelope.input, envelope, normalizedCommand);
     return new Promise((resolve) => {
       record.activeExecution = {
         execution,
+        envelope,
         capture: new SentinelCapture(envelope),
         displayFilter: new CommandDisplayFilter(
           envelope,
@@ -747,6 +778,9 @@ export class TerminalService {
     const record = this.terminals.get(terminalId);
     if (!record || record.status === 'exited') return;
     record.status = 'exited';
+    if (record.resizeTimer) clearTimeout(record.resizeTimer);
+    record.resizeTimer = undefined;
+    record.pendingResize = undefined;
     record.envelopeEchoFilter.clear();
     record.backend = undefined;
     if (record.activeExecution) {
@@ -907,6 +941,7 @@ export class TerminalService {
       record.sensitiveLease = undefined;
       record.sensitiveJournalRedacted = false;
     }
+    record.envelopeEchoFilter.complete(active.envelope.startMarker);
     record.activeExecution = undefined;
     active.resolve({ ...active.execution });
   }

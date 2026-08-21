@@ -223,6 +223,60 @@ describe('envelope echo redraw filtering', () => {
     expect(output).not.toContain('fedcba09');
   });
 
+  it('drops repeated completed PowerShell transcript redraws from the real ConPTY shape', () => {
+    const command = 'echo "Hello, Glass Terminal!"';
+    const nonce = '02336944c80d414fbc7c47bd6a49e0d5';
+    const envelope = buildCommandEnvelope('powershell', command, nonce);
+    const completedBlock = [
+      `$ ${command}\r\n`,
+      `${envelope.startMarker}\r\n`,
+      'Hello, Glass Terminal!\r\n',
+      `${envelope.endPrefix}0${envelope.endSuffix}\r\n`,
+      '(base) PS C:\\Users\\zjn> ',
+    ].join('');
+    const clippedThenComplete = [
+      `$ ${command}\r\n`,
+      `      ERMINAL_${nonce.slice(6)}\r\n`,
+      completedBlock,
+    ].join('');
+    const redraw = `${completedBlock}\r\n${clippedThenComplete}\r\n${completedBlock}`;
+    const filter = new EnvelopeEchoFilter('powershell');
+    filter.remember(envelope.input, envelope, command);
+    filter.complete(envelope.startMarker);
+    filter.noteResize();
+
+    const cuts = [81, 207, 419, 600, redraw.length];
+    let previous = 0;
+    let output = '';
+    for (const cut of cuts) {
+      output += filter.push(redraw.slice(previous, cut));
+      previous = cut;
+    }
+
+    expect(output).not.toContain(command);
+    expect(output).not.toContain('Hello, Glass Terminal!');
+    expect(output).not.toContain('__AI_TERMINAL_');
+    expect(output).not.toContain(`ERMINAL_${nonce.slice(6, 18)}`);
+    expect(output).not.toContain('(base) PS C:\\Users\\zjn>');
+    expect(filter.push('\r\nfresh output\r\n')).toContain('fresh output');
+  });
+
+  it('keeps ordinary resize-time output that has no completed transcript nonce', () => {
+    const command = 'echo "Hello, Glass Terminal!"';
+    const envelope = buildCommandEnvelope(
+      'powershell',
+      command,
+      '12344321123443211234432112344321',
+    );
+    const filter = new EnvelopeEchoFilter('powershell');
+    filter.remember(envelope.input, envelope, command);
+    filter.complete(envelope.startMarker);
+    filter.noteResize();
+
+    const output = 'build still running\r\nnew output remains visible\r\n';
+    expect(filter.push(output)).toBe(output);
+  });
+
   it('does not enable partial-redraw suppression for POSIX shells', () => {
     const envelope = buildCommandEnvelope('posix', 'printf hello', 'abcdef1234567890');
     const fragment = [...envelopeInputLines(envelope.input)][0]!.slice(4, 38);

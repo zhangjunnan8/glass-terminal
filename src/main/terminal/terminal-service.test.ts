@@ -6,9 +6,10 @@ import { TerminalService } from './terminal-service';
 
 interface FakeBackend {
   writes: string[];
+  resizes: Array<[number, number]>;
   closes: number;
   write(data: string): void;
-  resize(): void;
+  resize(cols: number, rows: number): void;
   close(): void;
 }
 
@@ -30,15 +31,19 @@ function owner(): WebContents {
   } as unknown as WebContents;
 }
 
-function setup(shellKind: TerminalDescriptor['shellKind'] = 'posix') {
+function setup(
+  shellKind: TerminalDescriptor['shellKind'] = 'posix',
+  transport: TerminalDescriptor['transport'] = 'local',
+) {
   const service = new TerminalService();
   const testable = service as unknown as TestableTerminalService;
   const browser = owner();
   const backend: FakeBackend = {
     writes: [],
+    resizes: [],
     closes: 0,
     write(data) { this.writes.push(data); },
-    resize() {},
+    resize(cols, rows) { this.resizes.push([cols, rows]); },
     close() { this.closes += 1; },
   };
   const descriptor: TerminalDescriptor = {
@@ -46,7 +51,7 @@ function setup(shellKind: TerminalDescriptor['shellKind'] = 'posix') {
     title: 'Test',
     profileId: 'test-posix',
     shellKind,
-    transport: 'local',
+    transport,
   };
   testable.register(browser, descriptor, backend);
   return { service, testable, browser, backend };
@@ -347,6 +352,68 @@ describe('TerminalService control and redaction invariants', () => {
     expect(rendered).not.toContain('__ait_');
     expect(rendered).not.toContain('FromBase64String');
     expect(journal.some((event) => event.kind === 'output' && event.data.includes('__ait_'))).toBe(true);
+  });
+
+  it('does not render repeated completed PowerShell transcript blocks after resize', async () => {
+    const { service, testable, browser, backend } = setup('powershell');
+    const journal: TerminalJournalEvent[] = [];
+    const command = 'echo "Hello, Glass Terminal!"';
+    service.onJournal((_terminalId, _sessionId, event) => journal.push(event));
+    service.bindSession(browser, 'terminal', 'session');
+    service.attach(browser, 'terminal');
+    const executionPromise = service.executeStructured(browser, 'terminal', command, 'ai');
+    const nonce = nonceFromPowerShellEnvelope(backend.writes[0]);
+    testable.emitData('terminal', `__AI_TERMINAL_${nonce}_START__\r\n`);
+    testable.emitData(
+      'terminal',
+      `Hello, Glass Terminal!\r\n__AI_TERMINAL_${nonce}_END_0__\r\n(base) PS C:\\Users\\zjn> `,
+    );
+    await executionPromise;
+    vi.mocked(browser.send).mockClear();
+
+    service.resize(browser, 'terminal', 43, 24);
+    const block = [
+      `$ ${command}\r\n`,
+      `__AI_TERMINAL_${nonce}_START__\r\n`,
+      'Hello, Glass Terminal!\r\n',
+      `__AI_TERMINAL_${nonce}_END_0__\r\n`,
+      '(base) PS C:\\Users\\zjn> ',
+    ].join('');
+    const redraw = `${block}\r\n$ ${command}\r\n      ERMINAL_${nonce}\r\n${block}`;
+    testable.emitData('terminal', redraw.slice(0, 117));
+    testable.emitData('terminal', redraw.slice(117, 301));
+    testable.emitData('terminal', redraw.slice(301));
+
+    const rendered = vi.mocked(browser.send).mock.calls.map(([, payload]) => (
+      (payload as { data?: string }).data ?? ''
+    )).join('');
+    expect(rendered).not.toContain(command);
+    expect(rendered).not.toContain('Hello, Glass Terminal!');
+    expect(rendered).not.toContain('__AI_TERMINAL_');
+    expect(rendered).not.toContain('(base) PS C:\\Users\\zjn>');
+    expect(journal.some((event) => (
+      event.kind === 'output' && event.data.includes(`__AI_TERMINAL_${nonce}_START__`)
+    ))).toBe(true);
+  });
+
+  it('coalesces a Windows SSH PowerShell resize storm to the final dimensions', () => {
+    vi.useFakeTimers();
+    try {
+      const { service, browser, backend } = setup('powershell', 'ssh');
+      service.bindSession(browser, 'terminal', 'session');
+
+      service.resize(browser, 'terminal', 80, 24);
+      service.resize(browser, 'terminal', 112, 32);
+      service.resize(browser, 'terminal', 147, 41);
+      expect(backend.resizes).toEqual([]);
+
+      vi.advanceTimersByTime(119);
+      expect(backend.resizes).toEqual([]);
+      vi.advanceTimersByTime(1);
+      expect(backend.resizes).toEqual([[147, 41]]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('runs every exit listener even when persistence-oriented listeners throw', () => {
