@@ -329,6 +329,7 @@ export class TerminalService {
     const record = this.requireConnected(owner, terminalId);
     const safeCols = Math.max(2, cols);
     const safeRows = Math.max(1, rows);
+    record.envelopeEchoFilter.noteResize();
     record.backend!.resize(
       safeCols,
       safeRows,
@@ -688,7 +689,7 @@ export class TerminalService {
       pendingOutput: [],
       pendingOutputLength: 0,
       status: 'connected',
-      envelopeEchoFilter: new EnvelopeEchoFilter(),
+      envelopeEchoFilter: new EnvelopeEchoFilter(descriptor.shellKind),
       startedAt: new Date().toISOString(),
       sequence: 0,
       journal: [],

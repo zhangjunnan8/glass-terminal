@@ -233,7 +233,11 @@ export class CommandDisplayFilter {
 
 const ANSI_PATTERN = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))/g;
 const TERMINAL_LAYOUT_PATTERN = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))|\r|\n/g;
+const TERMINAL_REFLOW_PATTERN = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))|[\r\n\t ]/g;
 const MIN_WRAPPED_ENVELOPE_CHARS = 24;
+const MIN_REFLOW_FRAGMENT_CHARS = 18;
+const REFLOW_FILTER_WINDOW_MS = 1_500;
+const REFLOW_FILTER_PUSH_LIMIT = 32;
 
 function stripAnsi(value: string): string {
   return value.replace(ANSI_PATTERN, '');
@@ -260,11 +264,17 @@ interface NormalizedTerminalText {
   rawIndices: number[];
 }
 
-function normalizedTerminalText(value: string): NormalizedTerminalText {
+function normalizedTerminalText(
+  value: string,
+  ignoreHorizontalWhitespace = false,
+): NormalizedTerminalText {
   let text = '';
   const rawIndices: number[] = [];
   let cursor = 0;
-  for (const match of value.matchAll(TERMINAL_LAYOUT_PATTERN)) {
+  const layoutPattern = ignoreHorizontalWhitespace
+    ? TERMINAL_REFLOW_PATTERN
+    : TERMINAL_LAYOUT_PATTERN;
+  for (const match of value.matchAll(layoutPattern)) {
     const matchIndex = match.index;
     for (let index = cursor; index < matchIndex; index += 1) {
       text += value[index];
@@ -296,14 +306,67 @@ function wrappedEnvelopeNeedles(
 
 function stripWrappedEnvelope(value: string, needle: string): string {
   let output = value;
+  const normalizedNeedle = normalizedTerminalText(needle, true).text;
   while (output) {
-    const normalized = normalizedTerminalText(output);
-    const matchIndex = normalized.text.indexOf(needle);
+    const normalized = normalizedTerminalText(output, true);
+    const matchIndex = normalized.text.indexOf(normalizedNeedle);
     if (matchIndex < 0) return output;
     const rawStart = normalized.rawIndices[matchIndex];
-    const rawEndIndex = normalized.rawIndices[matchIndex + needle.length - 1];
+    const rawEndIndex = normalized.rawIndices[matchIndex + normalizedNeedle.length - 1];
     if (rawStart === undefined || rawEndIndex === undefined) return output;
     output = output.slice(0, rawStart) + output.slice(rawEndIndex + 1);
+  }
+  return output;
+}
+
+function longestFragmentAt(value: string, start: number, needle: string): number {
+  const seed = value.slice(start, start + MIN_REFLOW_FRAGMENT_CHARS);
+  if (seed.length < MIN_REFLOW_FRAGMENT_CHARS) return 0;
+  let best = 0;
+  let needleIndex = needle.indexOf(seed);
+  while (needleIndex >= 0) {
+    let length = MIN_REFLOW_FRAGMENT_CHARS;
+    while (
+      start + length < value.length
+      && needleIndex + length < needle.length
+      && value[start + length] === needle[needleIndex + length]
+    ) length += 1;
+    best = Math.max(best, length);
+    needleIndex = needle.indexOf(seed, needleIndex + 1);
+  }
+  return best;
+}
+
+/**
+ * During a rapid PowerShell resize PSReadLine can interleave several abandoned
+ * redraw attempts. No single reflow then equals the complete injected input,
+ * so remove only sufficiently long literal fragments of that known input.
+ * This aggressive path is enabled for a short resize window by the stateful
+ * filter below; it is not used for ordinary output or POSIX shells.
+ */
+function stripInterleavedEnvelopeFragments(value: string, needles: string[]): string {
+  let output = value;
+  for (const rawNeedle of needles) {
+    const needle = normalizedTerminalText(rawNeedle, true).text;
+    const normalized = normalizedTerminalText(output, true);
+    const ranges: Array<{ start: number; end: number }> = [];
+    for (let index = 0; index <= normalized.text.length - MIN_REFLOW_FRAGMENT_CHARS;) {
+      const length = longestFragmentAt(normalized.text, index, needle);
+      if (length < MIN_REFLOW_FRAGMENT_CHARS) {
+        index += 1;
+        continue;
+      }
+      const rawStart = normalized.rawIndices[index];
+      const rawEnd = normalized.rawIndices[index + length - 1];
+      if (rawStart !== undefined && rawEnd !== undefined) {
+        ranges.push({ start: rawStart, end: rawEnd + 1 });
+      }
+      index += length;
+    }
+    for (let index = ranges.length - 1; index >= 0; index -= 1) {
+      const range = ranges[index];
+      output = output.slice(0, range.start) + output.slice(range.end);
+    }
   }
   return output;
 }
@@ -342,17 +405,34 @@ export function stripEnvelopeEcho(
 export class EnvelopeEchoFilter {
   private readonly recentEnvelopes: Set<string>[] = [];
   private pending = '';
+  private reflowFilterUntil = 0;
+  private reflowPushesRemaining = 0;
+
+  constructor(private readonly shellKind: ShellProfile['kind'] = 'powershell') {}
 
   remember(input: string): void {
     this.recentEnvelopes.push(envelopeInputLines(input));
     if (this.recentEnvelopes.length > 4) this.recentEnvelopes.shift();
   }
 
+  noteResize(now = Date.now()): void {
+    if (this.shellKind !== 'powershell') return;
+    this.reflowFilterUntil = now + REFLOW_FILTER_WINDOW_MS;
+    this.reflowPushesRemaining = REFLOW_FILTER_PUSH_LIMIT;
+  }
+
   push(data: string): string {
     if (!data && !this.pending) return '';
     const combined = this.pending + data;
     this.pending = '';
-    const filtered = stripEnvelopeEcho(combined, this.recentEnvelopes);
+    let filtered = stripEnvelopeEcho(combined, this.recentEnvelopes);
+    if (Date.now() <= this.reflowFilterUntil && this.reflowPushesRemaining > 0) {
+      this.reflowPushesRemaining -= 1;
+      filtered = stripInterleavedEnvelopeFragments(
+        filtered,
+        wrappedEnvelopeNeedles(this.recentEnvelopes),
+      );
+    }
     const pendingStart = this.partialEnvelopeStart(filtered);
     if (pendingStart === undefined) return filtered;
     this.pending = filtered.slice(pendingStart);
@@ -362,12 +442,15 @@ export class EnvelopeEchoFilter {
   clear(): void {
     this.recentEnvelopes.length = 0;
     this.pending = '';
+    this.reflowFilterUntil = 0;
+    this.reflowPushesRemaining = 0;
   }
 
   private partialEnvelopeStart(value: string): number | undefined {
     if (!value) return undefined;
-    const normalized = normalizedTerminalText(value);
-    const needles = wrappedEnvelopeNeedles(this.recentEnvelopes);
+    const normalized = normalizedTerminalText(value, true);
+    const needles = wrappedEnvelopeNeedles(this.recentEnvelopes)
+      .map((needle) => normalizedTerminalText(needle, true).text);
     for (const needle of needles) {
       const prefix = needle.slice(0, MIN_WRAPPED_ENVELOPE_CHARS);
       let searchFrom = 0;

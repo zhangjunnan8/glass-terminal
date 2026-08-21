@@ -181,6 +181,58 @@ describe('envelope echo redraw filtering', () => {
     expect(output).not.toContain('FromBase64String');
   });
 
+  it('hides overlapping partial PowerShell redraws during rapid large resizes', () => {
+    const envelope = buildCommandEnvelope(
+      'powershell',
+      "Get-ChildItem 'C:\\Windows\\System32' | Select-Object -First 20",
+      'fedcba0987654321',
+    );
+    const input = envelope.input.replace(/\r+$/u, '');
+    const fragments = [
+      input.slice(0, 143),
+      input.slice(0, 91),
+      input.slice(76, 278),
+      input.slice(244, 511),
+      input.slice(480),
+    ];
+    const redraw = [
+      'PS C:\\work> ',
+      `\x1b[2K${fragments[0]}   \r\n`,
+      `\x1b[1A\x1b[2K${fragments[1]}     \r\n`,
+      `\x1b[2K${fragments[2]} \r\n`,
+      `\x1b[2K${fragments[3]}       \r\n`,
+      `\x1b[2K${fragments[4]}\r\n`,
+      'visible after resize\r\nPS C:\\work> ',
+    ].join('');
+    const filter = new EnvelopeEchoFilter('powershell');
+    filter.remember(envelope.input);
+    filter.noteResize();
+
+    const cuts = [73, 219, 487, redraw.length];
+    let previous = 0;
+    let output = '';
+    for (const cut of cuts) {
+      output += filter.push(redraw.slice(previous, cut));
+      previous = cut;
+    }
+
+    expect(output).toContain('visible after resize');
+    expect(output).toContain('PS C:\\work>');
+    expect(output).not.toContain('__ait_');
+    expect(output).not.toContain('FromBase64String');
+    expect(output).not.toContain('fedcba09');
+  });
+
+  it('does not enable partial-redraw suppression for POSIX shells', () => {
+    const envelope = buildCommandEnvelope('posix', 'printf hello', 'abcdef1234567890');
+    const fragment = [...envelopeInputLines(envelope.input)][0]!.slice(4, 38);
+    const filter = new EnvelopeEchoFilter('posix');
+    filter.remember(envelope.input);
+    filter.noteResize();
+
+    expect(filter.push(`literal ${fragment} output\r\n`)).toBe(`literal ${fragment} output\r\n`);
+  });
+
   it('releases a partial private prefix unchanged when later data diverges', () => {
     const envelope = buildCommandEnvelope('powershell', 'Get-Date', '0011223344556677');
     const filter = new EnvelopeEchoFilter();
