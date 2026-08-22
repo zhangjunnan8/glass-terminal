@@ -92,6 +92,12 @@ function isNotFound(error: unknown): boolean {
   return code === 'ENOENT' || code === 2;
 }
 
+function isSftpEndOfDirectory(error: unknown): boolean {
+  // SSH_FX_EOF (1) is the protocol's successful end-of-directory signal for
+  // handle-based readdir calls, even though ssh2 exposes it as an Error.
+  return (error as { code?: string | number } | undefined)?.code === 1;
+}
+
 function callbackOperation(
   invoke: (callback: (error?: Error | null) => void) => void,
 ): Promise<void> {
@@ -264,7 +270,8 @@ export class SftpRemoteFilesystem implements RemoteFilesystem {
         throwIfAborted(options.signal);
         const entries = await new Promise<FileEntryWithStats[] | false>((resolve, reject) => {
           this.sftp.readdir(handle, (error, batch) => {
-            if (error) reject(error);
+            if (isSftpEndOfDirectory(error)) resolve(false);
+            else if (error) reject(error);
             else resolve((batch as FileEntryWithStats[] | false) || false);
           });
         });

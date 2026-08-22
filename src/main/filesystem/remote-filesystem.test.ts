@@ -86,12 +86,16 @@ function basicSftp() {
     ) => callback(undefined, handle)),
     readdir: vi.fn((
       _handle: Buffer,
-      callback: (error: Error | undefined, entries: unknown[]) => void,
+      callback: (error: Error | undefined, entries?: unknown[]) => void,
     ) => {
-      callback(undefined, directoryReads++ === 0 ? [
-        { filename: 'child.txt', longname: '', attrs: file },
-        { filename: 'folder', longname: '', attrs: directory },
-      ] : []);
+      if (directoryReads++ === 0) {
+        callback(undefined, [
+          { filename: 'child.txt', longname: '', attrs: file },
+          { filename: 'folder', longname: '', attrs: directory },
+        ]);
+      } else {
+        callback(Object.assign(new Error('End of file'), { code: 1 }));
+      }
     }),
     rename: vi.fn((...args: unknown[]) => successfulCallback(args)),
     ext_openssh_rename: vi.fn((...args: unknown[]) => successfulCallback(args)),
@@ -149,6 +153,19 @@ describe('SftpRemoteFilesystem', () => {
     expect(sftp.opendir).toHaveBeenCalledWith('/canonical', expect.any(Function));
     expect(sftp.readdir).toHaveBeenCalledWith(Buffer.from('handle'), expect.any(Function));
     expect(sftp.close).toHaveBeenCalledWith(Buffer.from('handle'), expect.any(Function));
+  });
+
+  it('treats SSH_FX_EOF as successful directory completion', async () => {
+    const sftp = basicSftp();
+    sftp.readdir.mockImplementation((...args: unknown[]) => {
+      const callback = args.at(-1) as (error?: Error, entries?: unknown[]) => void;
+      callback(Object.assign(new Error('End of file'), { code: 1 }));
+    });
+    const filesystem = new SftpRemoteFilesystem(sftp as unknown as SFTPWrapper);
+    const iterator = filesystem.iterateDirectory('/empty')[Symbol.asyncIterator]();
+
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+    expect(sftp.close).toHaveBeenCalledTimes(1);
   });
 
   it('closes the SFTP directory handle on an early consumer limit', async () => {
