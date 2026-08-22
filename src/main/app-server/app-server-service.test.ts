@@ -1,4 +1,6 @@
 import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import {
   mkdirSync,
   mkdtempSync,
@@ -17,9 +19,27 @@ import type {
 import {
   bundledCodexCandidates,
   CodexAppServerService,
+  installedCodexCandidates,
+  probeCodexExecutable,
 } from './app-server-service';
 
 const roots: string[] = [];
+
+class FakeProbeChild extends EventEmitter {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  killed = false;
+
+  kill(): boolean {
+    this.killed = true;
+    return true;
+  }
+
+  asChild(): ChildProcessWithoutNullStreams {
+    return this as unknown as ChildProcessWithoutNullStreams;
+  }
+}
 
 class FakeConnection extends EventEmitter implements AppServerConnection {
   account: unknown = null;
@@ -134,6 +154,131 @@ afterEach(() => {
 });
 
 describe('CodexAppServerService', () => {
+  it('accepts an official version line even when the CLI prints a warning first', async () => {
+    const child = new FakeProbeChild();
+    const result = probeCodexExecutable('C:\\tools\\codex.exe', () => child.asChild());
+
+    child.stderr.write(`${'A non-fatal startup warning. '.repeat(200)}\n`);
+    child.stdout.write('codex-cli 0.148.0-alpha.21\n');
+    child.emit('exit', 0, null);
+
+    await expect(result).resolves.toBe('codex-cli 0.148.0-alpha.21');
+    expect(child.killed).toBe(false);
+  });
+
+  it('resolves PATH and official editor extension binaries to absolute candidates', () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-codex-discovery-test-'));
+    roots.push(root);
+    const pathDirectory = join(root, 'command-bin');
+    const pathExecutable = join(pathDirectory, 'codex.exe');
+    const npmDirectory = join(root, 'npm-bin');
+    const npmWrapper = join(npmDirectory, 'codex.cmd');
+    const npmExecutable = bundledCodexCandidates(npmDirectory, npmDirectory, 'win32', 'x64')[0];
+    const olderExtension = join(
+      root,
+      '.vscode',
+      'extensions',
+      'openai.chatgpt-1.2.9-win32-x64',
+      'bin',
+      'windows-x86_64',
+      'codex.exe',
+    );
+    const newerExtension = join(
+      root,
+      '.vscode',
+      'extensions',
+      'openai.chatgpt-1.2.10-win32-x64',
+      'bin',
+      'windows-x86_64',
+      'codex.exe',
+    );
+    for (const executable of [
+      pathExecutable,
+      npmWrapper,
+      npmExecutable,
+      olderExtension,
+      newerExtension,
+    ]) {
+      mkdirSync(dirname(executable), { recursive: true });
+      writeFileSync(executable, 'fake codex binary');
+    }
+
+    expect(installedCodexCandidates({
+      Path: `"${pathDirectory}";${npmDirectory}`,
+      USERPROFILE: root,
+    }, 'win32', 'x64')).toEqual([
+      pathExecutable,
+      npmExecutable,
+      newerExtension,
+      olderExtension,
+    ]);
+  });
+
+  it('auto-detects an absolute PATH executable and launches it without a shell', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-codex-path-test-'));
+    roots.push(root);
+    const executable = join(root, 'command-bin', 'codex.exe');
+    mkdirSync(dirname(executable), { recursive: true });
+    writeFileSync(executable, 'fake codex binary');
+    const connection = new FakeConnection();
+    connection.requiresOpenaiAuth = false;
+    const probe = vi.fn(async () => 'codex-cli 1.2.3');
+    const launch = vi.fn(async () => connection as AppServerConnection);
+    const service = new CodexAppServerService(
+      join(root, 'config.json'),
+      join(root, 'application'),
+      join(root, 'resources'),
+      '0.1.0',
+      async () => undefined,
+      {
+        platform: 'win32',
+        arch: 'x64',
+        environment: { PATH: dirname(executable), USERPROFILE: join(root, 'profile') },
+        probe,
+        launch,
+      },
+    );
+
+    const state = await service.start();
+
+    expect(probe).toHaveBeenCalledWith(executable);
+    expect(launch).toHaveBeenCalledWith(
+      executable,
+      '0.1.0',
+      expect.objectContaining({ codexHome: expect.any(String) }),
+    );
+    expect(state).toMatchObject({
+      phase: 'ready',
+      executable: { path: executable, source: 'path', version: 'codex-cli 1.2.3' },
+    });
+    service.close();
+  });
+
+  it('does not persist or disconnect a manually selected executable that fails probing', async () => {
+    const { root, connection, probe, service } = fixture();
+    connection.requiresOpenaiAuth = false;
+    await service.start();
+    service.saveSelection({ modelId: 'gpt-test', reasoningEffort: 'medium' });
+    const configPath = join(root, 'config.json');
+    const configBefore = readFileSync(configPath, 'utf8');
+    const executableBefore = service.getState().executable;
+    const invalidExecutable = join(root, 'not-codex.exe');
+    writeFileSync(invalidExecutable, 'wrong executable');
+    probe.mockRejectedValueOnce(new Error('所选文件不是可识别的 Codex CLI。'));
+
+    await expect(service.configureExecutableAndStart(invalidExecutable))
+      .rejects.toThrow('不是可识别的 Codex CLI');
+
+    expect(readFileSync(configPath, 'utf8')).toBe(configBefore);
+    expect(service.getState()).toMatchObject({
+      phase: 'ready',
+      executable: executableBefore,
+      bound: true,
+    });
+    expect(connection.closed).toBe(false);
+    service.close();
+  });
+
   it.skip('legacy isolation policy: replaced by native App Server mode', async () => {
     const {
       root,
@@ -199,6 +344,7 @@ describe('CodexAppServerService', () => {
       {
         platform: 'win32',
         arch: 'x64',
+        environment: {},
         probe,
         launch,
       },
@@ -257,6 +403,7 @@ describe('CodexAppServerService', () => {
       {
         platform: 'win32',
         arch: 'x64',
+        environment: {},
         probe,
         launch,
       },
@@ -692,6 +839,7 @@ describe('CodexAppServerService', () => {
       {
         platform: 'win32',
         arch: 'x64',
+        environment: {},
         probe,
         launch,
       },
@@ -700,6 +848,42 @@ describe('CodexAppServerService', () => {
     const state = await service.start();
 
     expect(state.phase).toBe('error');
+    expect(probe).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  it('reports a stale saved executable path instead of silently hiding it', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'ai-terminal-app-server-stale-cli-'));
+    roots.push(root);
+    const configPath = join(root, 'config.json');
+    const staleExecutable = join(root, 'removed', 'codex.exe');
+    writeFileSync(configPath, JSON.stringify({
+      executablePath: staleExecutable,
+      bound: true,
+      terminalContextAccessEnabled: false,
+    }));
+    const probe = vi.fn(async () => 'codex-cli 1.2.3');
+    const launch = vi.fn(async () => new FakeConnection() as AppServerConnection);
+    const service = new CodexAppServerService(
+      configPath,
+      join(root, 'application'),
+      join(root, 'resources'),
+      '0.1.0',
+      async () => undefined,
+      {
+        platform: 'win32',
+        arch: 'x64',
+        environment: {},
+        probe,
+        launch,
+      },
+    );
+
+    const state = await service.startIfBound();
+
+    expect(state.phase).toBe('error');
+    expect(state.error).toContain(staleExecutable);
+    expect(state.error).toContain('已保存的 Codex CLI 路径不存在');
     expect(probe).not.toHaveBeenCalled();
     expect(launch).not.toHaveBeenCalled();
   });

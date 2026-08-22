@@ -747,16 +747,16 @@ export function AiServiceSettings() {
               className="codex-safety-boundary codex-agent-boundary codex-native-boundary"
               data-testid="codex-native-boundary"
             >
-              <strong>Codex 原生模式与当前终端相互独立</strong>
+              <strong>Codex 原生工具与可见终端是两条受控通道</strong>
               <p>
-                Codex 的内建 <code>Shell</code>/<code>File</code> 工具在 Glass Terminal
-                为它分配的应用独立工作区内执行，不会进入当前 SSH 或本地 Shell。
+                Codex 的内建 <code>Shell</code>/<code>File</code> 默认在应用独立工作区运行；
+                主界面授权本地 Workspace 后可直接使用该根，授权 SSH Workspace 后则通过现有连接的 SFTP 工具访问远程文件。
               </p>
               <ul>
-                <li>当前终端始终由你控制；Codex 原生模式不提供任何终端控制功能。</li>
+                <li><code>terminal_execute</code> 会逐条请求批准，只执行一次于当前可见终端；仅在命令运行期间临时锁定输入。</li>
                 <li>Glass Terminal 每轮都会提供当前终端的类型、目标、目录、有效用户和 Shell；不包含密码或凭据引用。</li>
-                <li>开启这个开关会额外提供 <code>terminal_state</code> 和 <code>terminal_read</code>，用于只读刷新状态和读取近期文本；不能向终端写入或执行命令。</li>
-                <li>关闭后，Codex 仍知道每轮开始时绑定的终端身份，并可在自己的独立工作区中工作。</li>
+                <li>下面的开关只控制 <code>terminal_state</code> 和 <code>terminal_read</code>，用于只读刷新状态和读取近期文本；它不授予终端执行权。</li>
+                <li>关闭后，Codex 仍知道每轮开始时绑定的终端身份，获批的 <code>terminal_execute</code> 也仍可使用。</li>
               </ul>
             </div>
 

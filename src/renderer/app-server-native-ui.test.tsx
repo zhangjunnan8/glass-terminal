@@ -1,7 +1,10 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { CODEX_APP_SERVER_AGENT_BACKEND } from '../shared/agent';
+import {
+  CODEX_APP_SERVER_AGENT_BACKEND,
+  CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+} from '../shared/agent';
 import type {
   AgentAssistantDelta,
   AgentSessionView,
@@ -343,6 +346,117 @@ describe('native Codex App Server renderer mode', () => {
     expect(contextMeter?.textContent).not.toContain('0%');
   });
 
+  it('offers bounded Workspace Root authorization in native Codex mode', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    vi.mocked(bridge.sessions.list).mockResolvedValue([
+      localSession('/workspace/codex-project'),
+    ]);
+    const codexBackend = {
+      kind: CODEX_APP_SERVER_AGENT_BACKEND as typeof CODEX_APP_SERVER_AGENT_BACKEND,
+      policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+    };
+    bridge.agent.setFileAccess = vi.fn().mockImplementation(async (request) => ({
+      ...agentView(),
+      revision: 2,
+      backend: codexBackend,
+      providerId: undefined,
+      fileAccessMode: request.mode,
+      fileAccessRoot: request.mode === 'off' ? undefined : '/workspace/codex-project',
+    }));
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    const backendSelect = container.querySelector<HTMLSelectElement>(
+      '[data-testid="agent-backend-select"]',
+    )!;
+    await act(async () => setSelectValue(backendSelect, CODEX_APP_SERVER_AGENT_BACKEND));
+    const access = container.querySelector<HTMLSelectElement>(
+      '[aria-label="Codex App Server 文件访问权限"]',
+    )!;
+    expect(access).not.toBeNull();
+    expect([...access.options].map((option) => option.value)).toEqual([
+      'off', 'read-only', 'read-write',
+    ]);
+
+    await act(async () => setSelectValue(access, 'read-only'));
+    await settle();
+    expect(bridge.agent.setFileAccess).toHaveBeenLastCalledWith({
+      terminalId: 'terminal-1',
+      mode: 'read-only',
+      backend: codexBackend,
+    });
+
+    await act(async () => setSelectValue(access, 'read-write'));
+    const confirmation = container.querySelector<HTMLElement>(
+      '[data-testid="file-access-confirmation"]',
+    )!;
+    expect(confirmation.textContent).toContain('Codex 可在绑定根目录内创建');
+    expect(confirmation.textContent).toContain('terminal_execute');
+    await act(async () => {
+      confirmation.querySelector<HTMLButtonElement>(
+        '[data-action="confirm-file-read-write"]',
+      )!.click();
+    });
+    await settle();
+    expect(bridge.agent.setFileAccess).toHaveBeenLastCalledWith({
+      terminalId: 'terminal-1',
+      mode: 'read-write',
+      backend: codexBackend,
+      expectedWorkspaceRoot: '/workspace/codex-project',
+    });
+  });
+
+  it('loads the selected backend own persisted conversation immediately on switch', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    const codexBackend = {
+      kind: CODEX_APP_SERVER_AGENT_BACKEND as typeof CODEX_APP_SERVER_AGENT_BACKEND,
+      policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+    };
+    bridge.agent.activateBackend = vi.fn()
+      .mockResolvedValueOnce({
+        ...agentView(),
+        revision: 2,
+        threadId: 'codex-thread',
+        backend: codexBackend,
+        providerId: undefined,
+        messages: [{
+          id: 'codex-history', role: 'assistant', content: 'Codex 历史记录', createdAt: now,
+        }],
+      })
+      .mockResolvedValueOnce({
+        ...agentView(),
+        revision: 3,
+        threadId: 'generic-thread',
+        messages: [{
+          id: 'generic-history', role: 'assistant', content: 'Generic 历史记录', createdAt: now,
+        }],
+      });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    const backendSelect = container.querySelector<HTMLSelectElement>(
+      '[data-testid="agent-backend-select"]',
+    )!;
+
+    await act(async () => setSelectValue(backendSelect, CODEX_APP_SERVER_AGENT_BACKEND));
+    await settle();
+    expect(bridge.agent.activateBackend).toHaveBeenNthCalledWith(1, {
+      terminalId: 'terminal-1', backend: codexBackend,
+    });
+    expect(container.textContent).toContain('Codex 历史记录');
+    expect(container.textContent).not.toContain('第一条回复');
+
+    await act(async () => setSelectValue(backendSelect, 'generic-provider'));
+    await settle();
+    expect(bridge.agent.activateBackend).toHaveBeenNthCalledWith(2, {
+      terminalId: 'terminal-1',
+      backend: { kind: 'generic-provider', providerId: provider.id },
+    });
+    expect(container.textContent).toContain('Generic 历史记录');
+    expect(container.textContent).not.toContain('Codex 历史记录');
+  });
+
   it('shows provider-reported Codex usage in the shared circular meter', async () => {
     const bridge = bridgeForCodex(codexSnapshot());
     bridge.agent.getState = vi.fn().mockResolvedValue({
@@ -378,7 +492,9 @@ describe('native Codex App Server renderer mode', () => {
     const toggle = container.querySelector<HTMLInputElement>('[data-testid="codex-terminal-context-toggle"]')!;
     expect(toggle.checked).toBe(false);
     expect(container.querySelector('[data-testid="codex-native-boundary"]')?.textContent)
-      .toContain('不能向终端写入或执行命令');
+      .toContain('不授予终端执行权');
+    expect(container.querySelector('[data-testid="codex-native-boundary"]')?.textContent)
+      .toContain('获批的 terminal_execute 也仍可使用');
 
     await act(async () => toggle.click());
     await settle();
@@ -706,6 +822,54 @@ describe('native Codex App Server renderer mode', () => {
     });
   });
 
+  it('shows Codex terminal command approvals without offering Generic full takeover', async () => {
+    const bridge = bridgeForCodex(codexSnapshot());
+    const waiting: AgentSessionView = {
+      ...agentView('WAITING_APPROVAL'),
+      backend: {
+        kind: CODEX_APP_SERVER_AGENT_BACKEND,
+        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
+      },
+      providerId: CODEX_APP_SERVER_AGENT_BACKEND,
+      terminalInputMode: 'locked',
+      pendingApproval: {
+        id: 'approval-codex-terminal',
+        sessionId: 'session-1',
+        terminalId: 'terminal-1',
+        command: 'npm test',
+        status: 'waiting',
+        requestedAt: now,
+      },
+    };
+    bridge.agent.getState = vi.fn().mockResolvedValue(waiting);
+    bridge.agent.resolveApproval = vi.fn().mockResolvedValue({
+      ...waiting,
+      revision: 2,
+      state: 'RUNNING',
+      pendingApproval: undefined,
+    });
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+    await settle();
+
+    expect(container.textContent).toContain('命令审批');
+    expect(container.querySelector<HTMLTextAreaElement>('[aria-label="待审批命令"]')?.value)
+      .toBe('npm test');
+    expect(container.querySelector('[data-action="reject-command"]')).not.toBeNull();
+    expect(container.querySelector('[data-action="edit-command"]')).not.toBeNull();
+    expect(container.querySelector('[data-action="switch-full-takeover"]')).toBeNull();
+
+    await act(async () => container.querySelector<HTMLButtonElement>(
+      '[data-action="execute-command"]',
+    )!.click());
+    expect(bridge.agent.resolveApproval).toHaveBeenCalledWith({
+      terminalId: 'terminal-1',
+      approvalId: 'approval-codex-terminal',
+      decision: 'execute',
+    });
+  });
+
   it('keeps an explicit revoke available after the granted Provider is removed', async () => {
     const bridge = bridgeForCodex(codexSnapshot());
     vi.mocked(bridge.providers.list).mockResolvedValue([]);
@@ -885,10 +1049,9 @@ describe('native Codex App Server renderer mode', () => {
     expect(container.querySelector('.agent-message-content')?.textContent).toContain('第一条');
     expect(container.querySelectorAll('[data-testid="latest-user-message-actions"]')).toHaveLength(1);
     expect(container.querySelector('[data-action="interrupt-agent-message"]')).toBeNull();
-    expect(container.querySelector('[data-action="retract-agent-message"]')?.classList)
-      .toContain('agent-message-icon-btn');
+    expect(container.querySelector('[data-action="retract-agent-message"]')).toBeNull();
     expect(container.querySelector('[data-action="edit-agent-message"]')?.getAttribute('title'))
-      .toBe('修改这条消息');
+      .toBe('修改并重发');
     const edit = container.querySelector<HTMLButtonElement>('[data-action="edit-agent-message"]')!;
     await act(async () => edit.click());
     const composer = container.querySelector<HTMLTextAreaElement>('[data-testid="agent-composer"]')!;

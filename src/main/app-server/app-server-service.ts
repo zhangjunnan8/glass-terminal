@@ -1,10 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import type { ChildProcessWithoutNullStreams } from 'node:child_process';
+import type {
+  ChildProcessWithoutNullStreams,
+  SpawnOptionsWithoutStdio,
+} from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync,
   statSync,
   writeFileSync,
@@ -30,11 +34,13 @@ import type {
 } from './app-server-client';
 import { CodexAppServerTurnRunner } from './app-server-turn-runner';
 import type {
+  ForkCodexThreadInput,
+  ForkCodexThreadResult,
   RunCodexTurnInput,
   RunCodexTurnResult,
 } from './app-server-turn-runner';
 
-const NATIVE_AGENT_READY_REASON = 'Codex App Server 已就绪；内建 Shell/File 在独立的 Codex 工作区内运行。';
+const NATIVE_AGENT_READY_REASON = 'Codex App Server 已就绪；内建 Shell/File 在独立的 Codex 工作区内运行，可授权 Workspace Root，并支持逐条审批的可见终端命令。';
 const TERMINAL_CONTEXT_ENABLED_REASON = '已允许 Codex 以只读方式获取当前可见终端的状态和近期内容。';
 const PROBE_TIMEOUT_MS = 5_000;
 
@@ -73,6 +79,7 @@ export interface CodexAppServerDependencies {
   resourcesPath: string;
   platform: NodeJS.Platform;
   arch: string;
+  environment: NodeJS.ProcessEnv;
   clientVersion: string;
   openExternal(url: string): Promise<void>;
   launch(
@@ -221,11 +228,143 @@ export function bundledCodexCandidates(
   ];
 }
 
-export function probeCodexExecutable(executable: string): Promise<string> {
+function environmentValue(
+  environment: NodeJS.ProcessEnv,
+  key: string,
+  platform: NodeJS.Platform,
+): string | undefined {
+  const direct = environment[key];
+  if (direct !== undefined || platform !== 'win32') return direct;
+  const matchedKey = Object.keys(environment).find((candidate) => (
+    candidate.toLowerCase() === key.toLowerCase()
+  ));
+  return matchedKey ? environment[matchedKey] : undefined;
+}
+
+function existingFile(path: string): boolean {
+  try {
+    return existsSync(path) && statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function editorBinaryDirectory(
+  platform: NodeJS.Platform,
+  arch: string,
+): string | undefined {
+  if (platform === 'win32' && arch === 'x64') return 'windows-x86_64';
+  if (platform === 'win32' && arch === 'arm64') return 'windows-aarch64';
+  if (platform === 'linux' && arch === 'x64') return 'linux-x86_64';
+  if (platform === 'linux' && arch === 'arm64') return 'linux-aarch64';
+  if (platform === 'darwin' && arch === 'x64') return 'macos-x86_64';
+  if (platform === 'darwin' && arch === 'arm64') return 'macos-aarch64';
+  return undefined;
+}
+
+/**
+ * Resolve externally installed Codex binaries to absolute paths before probing.
+ * This avoids spawning a bare command through a shell while still supporting
+ * PATH installs and the official VS Code/Cursor extension layout.
+ */
+export function installedCodexCandidates(
+  environment: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+  arch: string,
+): string[] {
+  const executable = platform === 'win32' ? 'codex.exe' : 'codex';
+  const candidates: string[] = [];
+  const searchPath = environmentValue(environment, 'PATH', platform);
+  if (searchPath) {
+    const separator = platform === 'win32' ? ';' : ':';
+    for (const rawDirectory of searchPath.split(separator)) {
+      const directory = rawDirectory.trim().replace(/^"(.*)"$/, '$1');
+      if (!directory || !isAbsolute(directory)) continue;
+      const candidate = join(directory, executable);
+      if (existingFile(candidate)) candidates.push(candidate);
+      if (platform === 'win32' && existingFile(join(directory, 'codex.cmd'))) {
+        const globalPackageRoots = [
+          directory,
+          join(directory, 'node_modules', '@openai', 'codex'),
+        ];
+        for (const packageRoot of globalPackageRoots) {
+          const nativeCandidate = bundledCodexCandidates(
+            packageRoot,
+            packageRoot,
+            platform,
+            arch,
+          )[0];
+          if (nativeCandidate && existingFile(nativeCandidate)) {
+            candidates.push(nativeCandidate);
+          }
+        }
+      }
+    }
+  }
+
+  const home = platform === 'win32'
+    ? environmentValue(environment, 'USERPROFILE', platform)
+    : environmentValue(environment, 'HOME', platform);
+  const binaryDirectory = editorBinaryDirectory(platform, arch);
+  if (home && isAbsolute(home) && binaryDirectory) {
+    const extensionRoots = [
+      join(home, '.vscode', 'extensions'),
+      join(home, '.vscode-insiders', 'extensions'),
+      join(home, '.cursor', 'extensions'),
+      join(home, '.windsurf', 'extensions'),
+      join(home, '.vscode-oss', 'extensions'),
+    ];
+    for (const root of extensionRoots) {
+      let extensionNames: string[];
+      try {
+        extensionNames = readdirSync(root, { withFileTypes: true })
+          .filter((entry) => (
+            entry.isDirectory() && entry.name.toLowerCase().startsWith('openai.chatgpt-')
+          ))
+          .map((entry) => entry.name)
+          .sort((left, right) => right.localeCompare(left, undefined, {
+            numeric: true,
+            sensitivity: 'base',
+          }));
+      } catch {
+        continue;
+      }
+      for (const extensionName of extensionNames) {
+        const candidate = join(
+          root,
+          extensionName,
+          'bin',
+          binaryDirectory,
+          executable,
+        );
+        if (existingFile(candidate)) candidates.push(candidate);
+      }
+    }
+  }
+
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => {
+    const key = platform === 'win32' ? candidate.toLowerCase() : candidate;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+type SpawnCodexProbe = (
+  executable: string,
+  args: string[],
+  options: SpawnOptionsWithoutStdio,
+) => ChildProcessWithoutNullStreams;
+
+export function probeCodexExecutable(
+  executable: string,
+  spawnProcess: SpawnCodexProbe = spawn as SpawnCodexProbe,
+): Promise<string> {
   return new Promise((resolve, reject) => {
     let child: ChildProcessWithoutNullStreams;
     try {
-      child = spawn(executable, ['--version'], {
+      child = spawnProcess(executable, ['--version'], {
         windowsHide: true,
         shell: false,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -235,6 +374,13 @@ export function probeCodexExecutable(executable: string): Promise<string> {
       return;
     }
     let output = '';
+    let detectedVersion: string | undefined;
+    const appendOutput = (chunk: Buffer | string) => {
+      output = `${output}${String(chunk)}`.slice(-4096);
+      detectedVersion ??= output.split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => /^codex-cli\s+/i.test(line));
+    };
     let settled = false;
     const finish = (error?: Error) => {
       if (settled) return;
@@ -242,8 +388,10 @@ export function probeCodexExecutable(executable: string): Promise<string> {
       clearTimeout(timer);
       if (error) reject(error);
       else {
-        const version = output.trim().split(/\r?\n/)[0] || '';
-        if (!/^codex-cli\s+/i.test(version)) {
+        const version = detectedVersion ?? output.split(/\r?\n/)
+          .map((line) => line.trim())
+          .find((line) => /^codex-cli\s+/i.test(line));
+        if (!version) {
           reject(new Error('所选文件不是可识别的 Codex CLI。'));
         } else {
           resolve(version);
@@ -251,10 +399,10 @@ export function probeCodexExecutable(executable: string): Promise<string> {
       }
     };
     child.stdout.on('data', (chunk: Buffer | string) => {
-      output = `${output}${String(chunk)}`.slice(0, 4096);
+      appendOutput(chunk);
     });
     child.stderr.on('data', (chunk: Buffer | string) => {
-      output = `${output}${String(chunk)}`.slice(0, 4096);
+      appendOutput(chunk);
     });
     child.once('error', (error) => finish(new Error(error.message)));
     child.once('exit', (code) => {
@@ -262,7 +410,7 @@ export function probeCodexExecutable(executable: string): Promise<string> {
       else finish(new Error(output.trim() || `进程返回退出码 ${code ?? '未知'}`));
     });
     const timer = setTimeout(() => {
-      child.kill();
+      try { child.kill(); } catch { /* timeout is already the primary error */ }
       finish(new Error('版本检测超时。'));
     }, PROBE_TIMEOUT_MS);
   });
@@ -279,6 +427,7 @@ function defaultDependencies(
     resourcesPath,
     platform: process.platform,
     arch: process.arch,
+    environment: process.env,
     clientVersion,
     openExternal,
     launch: launchCodexAppServer,
@@ -377,6 +526,13 @@ export class CodexAppServerService {
     });
   }
 
+  forkTerminalAgentThread(input: ForkCodexThreadInput): Promise<ForkCodexThreadResult> {
+    if (!this.snapshot.agentAvailable) {
+      return Promise.reject(new Error(this.snapshot.agentReason));
+    }
+    return this.turnRunner.forkThread(input);
+  }
+
   interruptTerminalAgentTurn(): Promise<void> {
     return this.turnRunner.interrupt();
   }
@@ -419,10 +575,15 @@ export class CodexAppServerService {
       throw new Error('Windows 上请选择 codex.exe。');
     }
     return this.enqueueOperation(async () => {
+      const version = await this.dependencies.probe(normalized);
       const nextConfig = { ...this.config, executablePath: normalized };
       this.writeConfig(nextConfig);
       this.config = nextConfig;
-      return this.restartInternal();
+      return this.restartInternal({
+        path: normalized,
+        source: 'configured',
+        version,
+      });
     });
   }
 
@@ -740,14 +901,17 @@ export class CodexAppServerService {
     });
   }
 
-  private async restartInternal(): Promise<CodexAppServerSnapshot> {
+  private async restartInternal(
+    selectedExecutable?: CodexExecutableInfo,
+  ): Promise<CodexAppServerSnapshot> {
     this.update({ operation: 'restarting', error: undefined });
     this.disconnect();
-    return this.startInternal('restarting');
+    return this.startInternal('restarting', selectedExecutable);
   }
 
   private async startInternal(
     operation: 'starting' | 'restarting',
+    selectedExecutable?: CodexExecutableInfo,
   ): Promise<CodexAppServerSnapshot> {
     if (this.disposed) return this.getState();
     const generation = this.connectionGeneration + 1;
@@ -765,17 +929,24 @@ export class CodexAppServerService {
     this.pendingLoginUrl = undefined;
     this.completedLogins.clear();
     const attempts: string[] = [];
-    let selected: CodexExecutableInfo | undefined;
-    for (const candidate of this.executableCandidates()) {
-      if (isAbsolute(candidate.path) && !existsSync(candidate.path)) continue;
-      try {
-        const version = await this.dependencies.probe(candidate.path);
-        if (!this.isGenerationCurrent(generation)) return this.getState();
-        selected = { ...candidate, version };
-        break;
-      } catch (error) {
-        if (!this.isGenerationCurrent(generation)) return this.getState();
-        attempts.push(`${candidate.path}：${this.actionError(error)}`);
+    let selected = selectedExecutable;
+    if (!selected) {
+      for (const candidate of this.executableCandidates()) {
+        if (isAbsolute(candidate.path) && !existsSync(candidate.path)) {
+          if (candidate.source === 'configured') {
+            attempts.push(`${candidate.path}：已保存的 Codex CLI 路径不存在`);
+          }
+          continue;
+        }
+        try {
+          const version = await this.dependencies.probe(candidate.path);
+          if (!this.isGenerationCurrent(generation)) return this.getState();
+          selected = { ...candidate, version };
+          break;
+        } catch (error) {
+          if (!this.isGenerationCurrent(generation)) return this.getState();
+          attempts.push(`${candidate.path}：${this.actionError(error)}`);
+        }
       }
     }
     if (!selected) {
@@ -979,8 +1150,17 @@ export class CodexAppServerService {
       this.dependencies.platform,
       this.dependencies.arch,
     )) candidates.push({ path, source: 'bundled' });
+    for (const path of installedCodexCandidates(
+      this.dependencies.environment,
+      this.dependencies.platform,
+      this.dependencies.arch,
+    )) candidates.push({ path, source: 'path' });
     return candidates.filter((candidate, index, all) => (
-      all.findIndex((other) => other.path === candidate.path) === index
+      all.findIndex((other) => (
+        this.dependencies.platform === 'win32'
+          ? other.path.toLowerCase() === candidate.path.toLowerCase()
+          : other.path === candidate.path
+      )) === index
     ));
   }
 

@@ -7,6 +7,7 @@ import {
 } from '../../shared/agent';
 import type {
   AgentAssistantDelta,
+  ActivateAgentBackendRequest,
   AgentBackendRef,
   AgentChatItem,
   AgentContextUsage,
@@ -59,6 +60,10 @@ import {
 } from './agent-tool-activity';
 import type { CodexAppServerService } from '../app-server/app-server-service';
 import type { CodexAppServerContextEvent } from '../app-server/app-server-turn-runner';
+import {
+  codexDynamicToolDefinitions,
+  executeCodexDynamicTool,
+} from './codex-app-server-tools';
 import { SharedTerminalTool } from '../tools/shared-terminal-tool';
 import { SessionToolGateway } from '../tools/tool-gateway';
 import {
@@ -485,6 +490,40 @@ function sameBackend(left: AgentBackendRef | undefined, right: AgentBackendRef):
     ).policyVersion;
 }
 
+function savedThreadForBackend(
+  session: SessionRecord,
+  backend: AgentBackendRef,
+  backendFingerprint?: string,
+): NonNullable<SessionRecord['agentThreads']>[number] | undefined {
+  return session.agentThreads?.find((binding) => {
+    if (!sameBackend(binding.backend, backend)) return false;
+    return backend.kind !== 'generic-provider'
+      || (
+        Boolean(backendFingerprint)
+        && binding.backendFingerprint === backendFingerprint
+      );
+  }) ?? (
+    sameBackend(session.agentBackend, backend)
+    && Boolean(session.aiThreadId)
+    && (
+      backend.kind !== 'generic-provider'
+      || (
+        Boolean(backendFingerprint)
+        && session.agentBackendFingerprint === backendFingerprint
+      )
+    )
+      ? {
+        backend,
+        threadId: session.aiThreadId!,
+        ...(session.agentBackendFingerprint
+          ? { backendFingerprint: session.agentBackendFingerprint }
+          : {}),
+        ...(session.providerThreadId ? { providerThreadId: session.providerThreadId } : {}),
+      }
+      : undefined
+  );
+}
+
 function safePriorMessages(value: unknown): AgentMessage[] {
   if (!Array.isArray(value)) return [];
   return value.filter((message): message is AgentMessage => (
@@ -561,6 +600,44 @@ function safeChatItem(value: unknown): AgentChatItem | undefined {
   return item as AgentChatItem;
 }
 
+function codexRevisionBaseTurnId(
+  events: Array<Record<string, unknown>>,
+  targetMessageId: string,
+): string | undefined {
+  let targetEventIndex = -1;
+  for (let eventIndex = 0; eventIndex < events.length; eventIndex += 1) {
+    const event = events[eventIndex];
+    if (event.type === 'chat') {
+      if (safeChatItem(event.item)?.id === targetMessageId) {
+        targetEventIndex = eventIndex;
+        break;
+      }
+      continue;
+    }
+    if (event.type !== 'chat_action') continue;
+    const replacementItem = safeChatItem(event.replacementItem);
+    if (replacementItem?.id !== targetMessageId) continue;
+    // A replacement user item lives inside its append-only action event. A
+    // native fork records the exact inherited turn so a repeated edit never
+    // mistakes the superseded provider turn for the branch base.
+    return typeof event.providerForkLastTurnId === 'string'
+      && event.providerForkLastTurnId.trim()
+      ? event.providerForkLastTurnId
+      : undefined;
+  }
+  if (targetEventIndex < 0) return undefined;
+  for (let eventIndex = targetEventIndex - 1; eventIndex >= 0; eventIndex -= 1) {
+    const event = events[eventIndex];
+    if (
+      event.type === 'codex_app_server_turn'
+      && typeof event.providerTurnId === 'string'
+      && event.providerTurnId.trim()
+      && (event.status === undefined || event.status === 'completed')
+    ) return event.providerTurnId;
+  }
+  return undefined;
+}
+
 /** Replays append-only chat events, including later user retractions/replacements. */
 function replayConversation(
   events: Array<Record<string, unknown>>,
@@ -608,9 +685,14 @@ function replayConversation(
     if (replacementItem?.role === 'user') {
       chats.push({ item: replacementItem, eventIndex });
     }
-    // App Server threads are stateful and cannot be rewound. A later turn must
-    // start a new native thread instead of silently reusing the retracted one.
-    providerThreadId = undefined;
+    // Native revisions persist the fork binding in the same append-only event
+    // as the visible chat action. Legacy actions have no binding and retain the
+    // old compatibility fallback of starting a fresh provider thread.
+    providerThreadId = event.providerStrategy === 'native-fork'
+      && typeof event.providerThreadId === 'string'
+      && event.providerThreadId.trim()
+      ? event.providerThreadId
+      : undefined;
   });
 
   let priorMessages: AgentMessage[] = [];
@@ -750,6 +832,14 @@ export class AgentService {
     runtime.abortController?.abort();
     runtime.abortController = undefined;
     runtime.backendTurnDraining = true;
+    if (foregroundExecution) {
+      const interrupted = this.terminals.interruptExecution(
+        owner,
+        request.terminalId,
+        foregroundExecution.id,
+      );
+      runtime.activeExecution = interrupted ?? foregroundExecution;
+    }
     this.setIndependentCodexState(runtime, 'PAUSED');
     try {
       this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
@@ -793,7 +883,10 @@ export class AgentService {
     }
   }
 
-  revisePrompt(owner: WebContents, request: ReviseAgentPromptRequest): AgentSessionView {
+  revisePrompt(
+    owner: WebContents,
+    request: ReviseAgentPromptRequest,
+  ): AgentSessionView | Promise<AgentSessionView> {
     const runtime = this.requireOwned(owner, request.terminalId);
     this.requireLatestUserMessage(runtime, request.messageId);
     if (BUSY_STATES.has(runtime.state) || runtime.backendTurnDraining) {
@@ -809,6 +902,72 @@ export class AgentService {
     if (replacement.length > 20_000) {
       throw new Error('Agent prompt exceeds 20,000 characters.');
     }
+
+    if (
+      runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
+      && runtime.providerThreadId
+      && this.codexAppServer
+    ) {
+      const events = this.sessions.readThreadEvents(runtime.sessionId, runtime.threadId);
+      const lastTurnId = codexRevisionBaseTurnId(events, request.messageId);
+      if (lastTurnId) {
+        return this.reviseCodexPromptWithFork(
+          runtime,
+          request,
+          replacement,
+          runtime.providerThreadId,
+          lastTurnId,
+        );
+      }
+    }
+
+    return this.applyConversationRevision(runtime, request, replacement);
+  }
+
+  private async reviseCodexPromptWithFork(
+    runtime: AgentRuntimeRecord,
+    request: ReviseAgentPromptRequest,
+    replacement: string,
+    sourceThreadId: string,
+    lastTurnId: string,
+  ): Promise<AgentSessionView> {
+    const expectedTurnToken = runtime.turnToken;
+    const service = this.codexAppServer;
+    if (!service) throw new Error('Codex App Server service is unavailable.');
+    const forked = await service.forkTerminalAgentThread({
+      threadId: sourceThreadId,
+      lastTurnId,
+    });
+    if (
+      this.runtimes.get(runtime.terminalId) !== runtime
+      || runtime.turnToken !== expectedTurnToken
+      || runtime.providerThreadId !== sourceThreadId
+      || BUSY_STATES.has(runtime.state)
+      || runtime.backendTurnDraining
+    ) {
+      throw new Error('Codex 会话在原生分叉完成前已经变化；原对话未修改。');
+    }
+    this.requireLatestUserMessage(runtime, request.messageId);
+    if (this.terminals.currentExecution(runtime.owner, runtime.terminalId)) {
+      throw new Error('终端前台进程在原生分叉期间开始运行；原对话未修改。');
+    }
+    return this.applyConversationRevision(runtime, request, replacement, {
+      sourceThreadId,
+      threadId: forked.threadId,
+      lastTurnId,
+    });
+  }
+
+  private applyConversationRevision(
+    runtime: AgentRuntimeRecord,
+    request: ReviseAgentPromptRequest,
+    replacement: string,
+    providerFork?: {
+      sourceThreadId: string;
+      threadId: string;
+      lastTurnId: string;
+    },
+  ): AgentSessionView {
 
     const replacementItem: AgentChatItem | undefined = request.action === 'replace'
       ? {
@@ -827,6 +986,14 @@ export class AgentService {
       // This operation changes conversation context only. Terminal output,
       // command executions, and audits remain append-only and untouched.
       executionHistoryPreserved: true,
+      ...(providerFork
+        ? {
+          providerStrategy: 'native-fork',
+          providerThreadId: providerFork.threadId,
+          providerForkedFromThreadId: providerFork.sourceThreadId,
+          providerForkLastTurnId: providerFork.lastTurnId,
+        }
+        : {}),
     };
     this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, actionEvent);
     const replayed = replayConversation(
@@ -841,6 +1008,13 @@ export class AgentService {
     runtime.activities = [];
     if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
       runtime.providerThreadId = replayed.providerThreadId;
+      if (providerFork && runtime.providerThreadId) {
+        this.sessions.bindProviderThread(
+          runtime.sessionId,
+          runtime.threadId,
+          runtime.providerThreadId,
+        );
+      }
     } else {
       // Generic Harness threads own their in-memory history. Replaying an
       // append-only retract/replace must seed a fresh backend thread next turn.
@@ -877,6 +1051,22 @@ export class AgentService {
       runtime = this.ensureRuntime(owner, terminalId, persistedBackend);
     }
     if (runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
+    return this.cloneRuntime(runtime);
+  }
+
+  activateBackend(
+    owner: WebContents,
+    request: ActivateAgentBackendRequest,
+  ): AgentSessionView {
+    const existing = this.runtimes.get(request.terminalId);
+    if (existing && existing.ownerId !== owner.id) throw new Error('Agent Session not found.');
+    if (existing && (BUSY_STATES.has(existing.state) || existing.backendTurnDraining)) {
+      throw new Error('智能体运行时不能切换后端。');
+    }
+    const backend = this.selectBackend(request.backend);
+    const runtime = this.ensureRuntime(owner, request.terminalId, backend);
+    runtime.error = undefined;
+    this.emit(runtime);
     return this.cloneRuntime(runtime);
   }
 
@@ -919,7 +1109,7 @@ export class AgentService {
   }
 
   /**
-   * Workspace roots are part of the tool boundary for a Generic Provider
+   * Workspace roots are part of the tool boundary for an Agent
    * runtime. Keep that boundary immutable while a turn can still use it, or
    * while file tools remain authorized against the current root.
    */
@@ -936,7 +1126,9 @@ export class AgentService {
       throw new Error('Agent 运行或正在停止时不能更改 Workspace 根目录。');
     }
     if (runtime.fileAccessMode !== 'off') {
-      throw new Error('请先关闭 Generic Provider 文件访问，再更改 Workspace 根目录。');
+      throw new Error(runtime.backend.kind === 'generic-provider'
+        ? '请先关闭 Generic Provider 文件访问，再更改 Workspace 根目录。'
+        : '请先关闭 Codex 文件访问，再更改 Workspace 根目录。');
     }
   }
 
@@ -952,6 +1144,12 @@ export class AgentService {
     if (request.mode === 'full-access' && request.fullAccessConfirmed !== true) {
       throw new Error('Full Filesystem Access 需要用户显式确认。');
     }
+    if (
+      request.mode === 'full-access'
+      && request.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
+    ) {
+      throw new Error('Codex 原生模式仅支持只读或读写绑定 Workspace Root。');
+    }
     const existing = this.runtimes.get(request.terminalId);
     if (existing && existing.ownerId !== owner.id) throw new Error('Agent Session not found.');
     if (existing && (BUSY_STATES.has(existing.state) || existing.backendTurnDraining)) {
@@ -959,11 +1157,17 @@ export class AgentService {
     }
 
     if (request.mode === 'off') {
-      const backend = this.genericBackendReference(request.backend);
+      const backend = request.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
+        ? {
+          kind: CODEX_APP_SERVER_AGENT_BACKEND,
+          policyVersion: request.backend.policyVersion,
+        }
+        : this.genericBackendReference(request.backend);
+      if (
+        backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
+        && backend.policyVersion !== CODEX_APP_SERVER_AGENT_POLICY_VERSION
+      ) throw new Error('Codex App Server Agent 隔离策略版本不受支持。');
       const runtime = existing ?? this.ensureRuntime(owner, request.terminalId, backend);
-      if (runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
-        throw new Error('Codex 原生模式不使用 Generic Provider 文件工具。');
-      }
       parseRequestedFileAccessPolicy('off', request.policy);
       this.revokeChangedProviderAuthority(runtime);
       runtime.fileAccessGeneration += 1;
@@ -971,7 +1175,9 @@ export class AgentService {
       runtime.fileAccessMode = 'off';
       runtime.fileAccessPolicy = disabledFileAccessPolicy();
       runtime.fileAccessRoot = undefined;
-      runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
+      if (runtime.backend.kind === 'generic-provider') {
+        runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
+      }
       runtime.error = undefined;
       if (hadFileAccess) {
         this.appendControlAudit(runtime, 'file_permission_changed', 'user', {
@@ -986,9 +1192,6 @@ export class AgentService {
     }
 
     const backend = this.selectBackend(request.backend);
-    if (backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) {
-      throw new Error('Codex 原生模式不使用 Generic Provider 文件工具。');
-    }
     const sessionBefore = this.sessions.sessionForTerminal(owner, request.terminalId);
     const workspaceBefore = sessionBefore?.workspace
       ? { ...sessionBefore.workspace }
@@ -1082,7 +1285,9 @@ export class AgentService {
     runtime.fileAccessMode = request.mode;
     runtime.fileAccessPolicy = fileAccessPolicy;
     runtime.fileAccessRoot = fileAccessRoot;
-    runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
+    if (runtime.backend.kind === 'generic-provider') {
+      runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
+    }
     runtime.error = undefined;
     if (narrowsExistingAuthority) {
       // Revocation and strict narrowing are fail-closed even if audit storage is unavailable.
@@ -1896,12 +2101,110 @@ export class AgentService {
 
     const assistantTurnId = randomUUID();
     let streamedMessage: AgentChatItem | undefined;
+    let turnToolsLive = true;
+    let workspaceTool: AgentFileWorkspaceAdapter | undefined;
     try {
       const boundSession = this.sessions.sessionForTerminal(
         runtime.owner,
         runtime.terminalId,
       );
       if (!boundSession) throw new Error('当前终端没有可用的持久会话上下文。');
+      const turnFileAccessGeneration = runtime.fileAccessGeneration;
+      const turnFileAccessRoot = runtime.fileAccessRoot;
+      const turnSessionWorkspace = boundSession.workspace
+        ? { ...boundSession.workspace }
+        : undefined;
+      const turnBindingIsLive = (): boolean => {
+        let currentSession: SessionRecord | undefined;
+        let terminalConnected = false;
+        try {
+          currentSession = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
+          terminalConnected = this.terminals.state(
+            runtime.owner,
+            runtime.terminalId,
+          ).status === 'connected';
+        } catch {
+          // A closed or replaced terminal revokes this turn-local capability.
+        }
+        return Boolean(
+          turnToolsLive
+          && this.isCurrentTurn(runtime, token)
+          && runtime.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
+          && terminalConnected
+          && currentSession
+          && currentSession.id === runtime.sessionId
+          && currentSession.connectionState === 'connected'
+          && currentSession.runtimeTerminalId === runtime.terminalId
+          && currentSession.transport === boundSession.transport
+          && currentSession.hostId === boundSession.hostId
+        );
+      };
+      const assertTerminalToolLive = (): void => {
+        if (!turnBindingIsLive()) throw new Error('Terminal tool grant is no longer active.');
+      };
+      const assertWorkspaceToolLive = (): void => {
+        if (
+          !turnBindingIsLive()
+          || runtime.fileAccessGeneration !== turnFileAccessGeneration
+          || runtime.fileAccessRoot !== turnFileAccessRoot
+          || runtime.fileAccessMode === 'off'
+          || !sameWorkspaceBinding(turnSessionWorkspace, this.sessions.sessionForTerminal(
+            runtime.owner,
+            runtime.terminalId,
+          )?.workspace)
+        ) throw new Error('Workspace tool grant is no longer active.');
+      };
+      const workspace: WorkspaceBinding | undefined = runtime.fileAccessRoot
+        ? {
+          backend: boundSession.transport === 'ssh' ? 'sftp' : 'local',
+          root: runtime.fileAccessRoot,
+          ...(boundSession.hostId ? { hostId: boundSession.hostId } : {}),
+        }
+        : undefined;
+      const fileToolPermissions = workspacePermissions(
+        runtime.fileAccessMode,
+        workspace,
+        runtime.fileAccessPolicy,
+      );
+      const terminalDescriptor = this.terminals.descriptor(runtime.owner, runtime.terminalId);
+      const toolContext = buildSessionToolContext(
+        { ...boundSession, ...(workspace ? { workspace } : {}) },
+        terminalDescriptor,
+        { workspacePermissions: fileToolPermissions },
+      );
+      const terminalTool = new SharedTerminalTool({
+        context: toolContext,
+        owner: runtime.owner,
+        terminals: this.terminals,
+        sessions: this.sessions,
+        execute: (command, reason) => this.requestCodexCommand(
+          runtime,
+          token,
+          { command, reason },
+        ),
+        assertLive: assertTerminalToolLive,
+      });
+      const workspaceAccessEnabled = Boolean(workspace) && runtime.fileAccessMode !== 'off';
+      const remoteWorkspaceToolsEnabled = workspace?.backend === 'sftp'
+        && workspaceAccessEnabled;
+      workspaceTool = workspaceAccessEnabled && workspace
+        ? new AgentFileWorkspaceAdapter(
+          this.fileService,
+          runtime.owner,
+          runtime.terminalId,
+          workspace,
+          fileToolPermissions,
+          assertWorkspaceToolLive,
+        )
+        : undefined;
+      const gateway = new SessionToolGateway(toolContext, terminalTool, workspaceTool);
+      const dynamicTools = codexDynamicToolDefinitions(
+        gateway,
+        runtime.fileAccessMode,
+        remoteWorkspaceToolsEnabled,
+      );
+      const localWorkspaceDirect = workspace?.backend === 'local'
+        && runtime.fileAccessMode !== 'off';
       let lastKnownTerminalContext = codexVisibleTerminalContext(boundSession);
       const upstreamPrompt = codexPromptWithLocalHistory(
         runtime.messages,
@@ -1915,6 +2218,29 @@ export class AgentService {
         threadId: runtime.providerThreadId,
         signal,
         terminalContextAccess: snapshot.terminalContextAccess.enabled,
+        dynamicTools,
+        ...(localWorkspaceDirect && workspace
+          ? {
+            executionWorkspaceRoot: workspace.root,
+            executionWorkspaceReadOnly: runtime.fileAccessMode === 'read-only',
+          }
+          : {}),
+        workspaceBinding: localWorkspaceDirect && workspace
+          ? {
+            mode: 'local-direct',
+            access: runtime.fileAccessMode === 'read-only' ? 'read-only' : 'read-write',
+            root: workspace.root,
+            backend: 'local',
+          }
+          : remoteWorkspaceToolsEnabled && workspace
+            ? {
+              mode: 'remote-tools',
+              access: runtime.fileAccessMode === 'read-only' ? 'read-only' : 'read-write',
+              root: workspace.root,
+              backend: 'sftp',
+              ...(workspace.hostId ? { hostId: workspace.hostId } : {}),
+            }
+            : { mode: 'isolated-local', access: 'off' },
         tools: {
           readTerminal: async ({ maxChars }) => this.sessions
             .readTerminalHistorySince(runtime.sessionId, undefined, maxChars)
@@ -1938,12 +2264,25 @@ export class AgentService {
               connectionState: 'disconnected',
             };
           },
+          callDynamicTool: (name, args) => executeCodexDynamicTool(
+            gateway,
+            runtime.fileAccessMode,
+            name,
+            args,
+          ),
         },
         onThreadBound: (threadId) => {
           if (!this.isCurrentTurn(runtime, token)) {
             throw new Error('Codex App Server Thread 已失效。');
           }
-          if (runtime.providerThreadId !== threadId) {
+          const persistedProviderThreadId = this.sessions.sessionForTerminal(
+            runtime.owner,
+            runtime.terminalId,
+          )?.providerThreadId;
+          if (
+            runtime.providerThreadId !== threadId
+            || persistedProviderThreadId !== threadId
+          ) {
             this.sessions.bindProviderThread(runtime.sessionId, runtime.threadId, threadId);
             runtime.providerThreadId = threadId;
             runtime.contextUsage = unknownCodexContextUsage();
@@ -2053,6 +2392,9 @@ export class AgentService {
       runtime.pendingTakeover = undefined;
       this.setIndependentCodexState(runtime, wasAborted ? 'PAUSED' : 'FAILED');
       this.emit(runtime);
+    } finally {
+      turnToolsLive = false;
+      await workspaceTool?.waitForInFlight();
     }
   }
 
@@ -2092,6 +2434,31 @@ export class AgentService {
       && runtime.fileAccessGeneration === binding.fileAccessGeneration
       && this.fileCommandProviderRecipient(runtime) === binding.providerRecipient
     );
+  }
+
+  private async requestCodexCommand(
+    runtime: AgentRuntimeRecord,
+    token: number,
+    request: { command: string; reason?: string },
+  ): Promise<TerminalCommandResult> {
+    if (!this.isCurrentTurn(runtime, token)) throw new Error('Agent turn is no longer active.');
+    if (runtime.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND) {
+      throw new Error('Codex terminal tool is no longer bound to this runtime.');
+    }
+    if (runtime.controlLeaseId) throw new Error('Terminal control is already leased.');
+    const leaseId = this.terminals.acquireAgentControl(runtime.owner, runtime.terminalId);
+    runtime.controlLeaseId = leaseId;
+    try {
+      return await this.requestCommand(runtime, token, request);
+    } finally {
+      this.terminals.releaseAgentControl(runtime.owner, runtime.terminalId, leaseId);
+      if (runtime.controlLeaseId === leaseId) runtime.controlLeaseId = undefined;
+      if (this.isCurrentTurn(runtime, token)) {
+        runtime.terminalInputMode = 'human';
+        if (runtime.state !== 'FAILED' && runtime.state !== 'PAUSED') runtime.state = 'THINKING';
+        this.emit(runtime);
+      }
+    }
   }
 
   private async requestCommand(
@@ -2490,25 +2857,25 @@ export class AgentService {
       this.invalidateRuntime(existing, 'user');
     }
 
-    const persistedBackend = session.agentBackend
-      ?? (session.providerId
-        ? { kind: 'generic-provider' as const, providerId: session.providerId }
-        : undefined);
     const currentProvider = backend.kind === 'generic-provider'
       ? this.providerSecurityState(backend.providerId)
       : undefined;
-    const samePersistedBackend = sameBackend(persistedBackend, backend)
-      && Boolean(session.aiThreadId);
-    const canReuseThread = backend.kind === 'generic-provider'
-      ? samePersistedBackend
-        && currentProvider?.fingerprint !== undefined
-        && session.agentBackendFingerprint === currentProvider.fingerprint
-      : samePersistedBackend;
-    const threadId = canReuseThread ? session.aiThreadId! : randomUUID();
-    if (!canReuseThread) {
+    const savedThread = savedThreadForBackend(
+      session,
+      backend,
+      currentProvider?.fingerprint,
+    );
+    const canReuseThread = Boolean(savedThread);
+    const threadId = savedThread?.threadId ?? randomUUID();
+    let selectedSession = session;
+    if (
+      !canReuseThread
+      || session.aiThreadId !== threadId
+      || !sameBackend(session.agentBackend, backend)
+    ) {
       if (backend.kind === 'generic-provider') {
         if (currentProvider?.fingerprint) {
-          this.sessions.bindAgentThread(
+          selectedSession = this.sessions.bindAgentThread(
             session.id,
             backend.providerId,
             threadId,
@@ -2516,11 +2883,14 @@ export class AgentService {
           );
         }
       } else {
-        this.sessions.bindAgentBackendThread(session.id, backend, threadId);
+        selectedSession = this.sessions.bindAgentBackendThread(session.id, backend, threadId);
       }
     }
     const persisted = this.sessions.readThreadEvents(session.id, threadId);
-    const replayed = replayConversation(persisted, session.providerThreadId);
+    const replayed = replayConversation(
+      persisted,
+      savedThread?.providerThreadId ?? selectedSession.providerThreadId,
+    );
     const memories = parseAgentMemoryCards(
       this.sessions.readThreadMemories(session.id, threadId),
     );

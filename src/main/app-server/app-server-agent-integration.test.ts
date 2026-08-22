@@ -317,6 +317,19 @@ class FakeTerminals {
     return { transport: 'ssh', shellKind: 'posix', status: 'connected' };
   }
 
+  descriptor(owner: WebContents, terminalId: string) {
+    if (owner.id !== 99 || terminalId !== TERMINAL_ID) throw new Error('Terminal not found.');
+    return {
+      id: TERMINAL_ID,
+      title: 'Test SSH',
+      profileId: 'ssh:host',
+      shellKind: 'posix' as const,
+      transport: 'ssh' as const,
+      hostId: 'host',
+      sessionId: SESSION_ID,
+    };
+  }
+
   currentExecution(): CommandExecution | undefined {
     return this.current ? { ...this.current } : undefined;
   }
@@ -491,7 +504,7 @@ function completeTurn(
 }
 
 describe('Codex App Server Agent integration', () => {
-  it.skip('legacy shared-terminal execute routing', async () => {
+  it('routes an approved Codex command exactly once through the shared visible terminal', async () => {
     const {
       agents,
       browser,
@@ -533,11 +546,9 @@ describe('Codex App Server Agent integration', () => {
     const contentItem = asRecord((toolResponse.contentItems as unknown[])[0]);
     expect(JSON.parse(contentItem.text as string)).toMatchObject({
       ok: true,
-      result: {
-        command: 'printf edited-visible-command',
-        status: 'completed',
-        output: OUTPUT_CANARY,
-      },
+      command: 'printf edited-visible-command',
+      status: 'completed',
+      output: OUTPUT_CANARY,
     });
     expect(terminals.backend.writes).toHaveLength(1);
     expect(terminals.backend.writes[0]).toMatchObject({
@@ -706,7 +717,7 @@ describe('Codex App Server Agent integration', () => {
     });
   });
 
-  it('keeps the visible terminal human-owned and exposes only read-only context', async () => {
+  it('keeps the visible terminal human-owned until an approved command requests it', async () => {
     const { agents, browser, connection, sessions, terminals } = await harness();
     sendCodexPrompt(agents, browser, 'Use native Codex tools and inspect terminal context.');
     const turnId = await waitForTurnStart(connection);
@@ -742,21 +753,41 @@ describe('Codex App Server Agent integration', () => {
     expect(JSON.stringify(state)).toContain('local ');
     expect(JSON.stringify(state)).toContain('App Server process');
 
-    const execute = asRecord(await connection.invoke('item/tool/call', {
+    const threadStart = connection.requests.find((request) => request.method === 'thread/start');
+    expect(JSON.stringify(threadStart?.params)).toContain('terminal_execute');
+    const executePromise = connection.invoke('item/tool/call', {
       threadId: PROVIDER_THREAD_ID,
       turnId,
-      callId: 'execute-must-not-route',
+      callId: 'execute-with-approval',
       tool: 'terminal_execute',
-      arguments: { command: 'printf must-not-run' },
-    }));
-    expect(execute.success).toBe(false);
+      arguments: { command: 'printf approval-required' },
+    });
+    await vi.waitFor(() => {
+      expect(agents.getState(browser, TERMINAL_ID)?.state).toBe('WAITING_APPROVAL');
+    });
+    expect(terminals.controlModes[0]).toBe('locked');
+    const approval = agents.getState(browser, TERMINAL_ID)!.pendingApproval!;
+    agents.resolveApproval(browser, {
+      terminalId: TERMINAL_ID,
+      approvalId: approval.id,
+      decision: 'reject',
+    });
+    const execute = asRecord(await executePromise);
+    expect(execute.success).toBe(true);
+    const executeContent = asRecord((execute.contentItems as unknown[])[0]);
+    expect(JSON.parse(executeContent.text as string)).toMatchObject({
+      ok: false,
+      status: 'rejected',
+      command: 'printf approval-required',
+    });
     expect(terminals.backend.writes).toEqual([]);
+    expect(terminals.controlModes.at(-1)).toBe('human');
 
     completeTurn(connection, turnId, 'Native work complete.');
     await vi.waitFor(() => {
       expect(agents.getState(browser, TERMINAL_ID)?.state).toBe('COMPLETED');
     });
-    expect(terminals.controlModes).toEqual([]);
+    expect(terminals.controlModes.at(-1)).toBe('human');
     expect(sessions.session.providerThreadId).toBe(PROVIDER_THREAD_ID);
   });
 

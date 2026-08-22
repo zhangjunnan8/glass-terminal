@@ -39,6 +39,7 @@ import type {
 } from '../shared/backup';
 import { AGENT_CHANNELS } from '../shared/agent';
 import type {
+  ActivateAgentBackendRequest,
   ConfirmShellReadyRequest,
   InterruptAgentTurnRequest,
   ResolveApprovalRequest,
@@ -844,6 +845,13 @@ handleTrusted(AGENT_CHANNELS.getState, (event, terminalId: string) => {
   if (!agentService) throw new Error('Agent service is not ready.');
   return agentService.getState(event.sender, terminalId);
 });
+handleTrusted(
+  AGENT_CHANNELS.activateBackend,
+  (event, request: ActivateAgentBackendRequest) => {
+    if (!agentService) throw new Error('Agent service is not ready.');
+    return agentService.activateBackend(event.sender, request);
+  },
+);
 handleTrusted(AGENT_CHANNELS.setFileAccess, (event, request: SetAgentFileAccessRequest) => {
   if (!agentService) throw new Error('Agent service is not ready.');
   return agentService.setFileAccess(event.sender, request);
@@ -1013,7 +1021,11 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
     () => requireAppSettingsStore().get().defaultMaxRounds,
   );
   createMainWindow();
-  void codexAppServerService.startIfBound();
+  void codexAppServerService.startIfBound().catch((error) => {
+    // Startup should remain usable even if an unexpected App Server error
+    // escapes the service's recoverable UI state handling.
+    console.error('Unable to auto-start Codex App Server:', error);
+  });
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
   });

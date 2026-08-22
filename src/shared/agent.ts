@@ -249,6 +249,11 @@ export interface SendAgentPromptRequest {
   providerId?: string;
 }
 
+export interface ActivateAgentBackendRequest {
+  terminalId: string;
+  backend: AgentBackendRef;
+}
+
 export interface InterruptAgentTurnRequest {
   terminalId: string;
   messageId: string;
@@ -317,6 +322,7 @@ export const AGENT_CHANNELS = {
   saveMemory: 'agent:save-memory',
   removeMemory: 'agent:remove-memory',
   getState: 'agent:get-state',
+  activateBackend: 'agent:activate-backend',
   resolveApproval: 'agent:resolve-approval',
   setFullTakeover: 'agent:set-full-takeover',
   setFullTakeoverPreference: 'agent:set-full-takeover-preference',

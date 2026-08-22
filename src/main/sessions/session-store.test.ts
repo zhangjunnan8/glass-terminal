@@ -509,6 +509,67 @@ describe('SessionStore', () => {
     expect(restored.providerThreadId).toBe('upstream-thread-opaque');
   });
 
+  it('preserves independent Generic and Codex threads when the active backend switches', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    const genericThreadId = '11111111-2222-3333-4444-555555555555';
+    const codexThreadId = '66666666-7777-8888-9999-000000000000';
+    const fingerprint = 'c'.repeat(64);
+
+    store.bindAgentThread(session.id, 'deepseek', genericThreadId, fingerprint);
+    store.bindAgentBackendThread(session.id, {
+      kind: 'codex-app-server-isolated',
+      policyVersion: 1,
+    }, codexThreadId);
+    store.bindProviderThread(session.id, codexThreadId, 'codex-upstream-thread');
+    const switchedBack = store.bindAgentThread(
+      session.id,
+      'deepseek',
+      genericThreadId,
+      fingerprint,
+    );
+
+    expect(switchedBack.aiThreadId).toBe(genericThreadId);
+    expect(switchedBack.providerThreadId).toBeUndefined();
+    expect(switchedBack.agentThreads).toEqual(expect.arrayContaining([
+      {
+        backend: { kind: 'generic-provider', providerId: 'deepseek' },
+        threadId: genericThreadId,
+        backendFingerprint: fingerprint,
+      },
+      {
+        backend: { kind: 'codex-app-server-isolated', policyVersion: 1 },
+        threadId: codexThreadId,
+        providerThreadId: 'codex-upstream-thread',
+      },
+    ]));
+
+    const restored = new SessionStore(root).get(session.id);
+    expect(restored.agentThreads).toEqual(switchedBack.agentThreads);
+  });
+
+  it('migrates the legacy active Agent thread into the per-backend binding list', () => {
+    const root = temporaryRoot();
+    const store = new SessionStore(root);
+    const session = createSession(store);
+    const metadataPath = join(root, session.id, 'session.json');
+    const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
+    metadata.aiThreadId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    metadata.agentBackend = { kind: 'generic-provider', providerId: 'legacy' };
+    metadata.agentBackendFingerprint = 'd'.repeat(64);
+    delete metadata.agentThreads;
+    writeFileSync(metadataPath, `${JSON.stringify(metadata)}\n`, 'utf8');
+
+    const restored = new SessionStore(root).get(session.id);
+
+    expect(restored.agentThreads).toEqual([{
+      backend: { kind: 'generic-provider', providerId: 'legacy' },
+      threadId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+      backendFingerprint: 'd'.repeat(64),
+    }]);
+  });
+
   it('reads bounded recent terminal and AI history previews', () => {
     const store = new SessionStore(temporaryRoot());
     const session = createSession(store);

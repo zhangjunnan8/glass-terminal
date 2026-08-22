@@ -41,6 +41,7 @@ import type {
 } from './provider';
 import type {
   AgentAssistantDelta,
+  ActivateAgentBackendRequest,
   AgentSessionView,
   ConfirmShellReadyRequest,
   InterruptAgentTurnRequest,
@@ -173,6 +174,7 @@ export interface DesktopBridge {
     saveMemory(request: SaveAgentMemoryRequest): Promise<AgentSessionView>;
     removeMemory(request: RemoveAgentMemoryRequest): Promise<AgentSessionView>;
     getState(terminalId: string): Promise<AgentSessionView | null>;
+    activateBackend?(request: ActivateAgentBackendRequest): Promise<AgentSessionView>;
     setFileAccess(request: SetAgentFileAccessRequest): Promise<AgentSessionView>;
     resolveApproval(request: ResolveApprovalRequest): Promise<AgentSessionView>;
     setFullTakeover(request: SetFullTakeoverRequest): Promise<AgentSessionView>;

@@ -178,6 +178,7 @@ const agentBridge: DesktopBridge['agent'] = {
   },
   removeMemory: (request) => ipcRenderer.invoke(AGENT_CHANNELS.removeMemory, request),
   getState: (terminalId) => ipcRenderer.invoke(AGENT_CHANNELS.getState, terminalId),
+  activateBackend: (request) => ipcRenderer.invoke(AGENT_CHANNELS.activateBackend, request),
   setFileAccess: (request) => ipcRenderer.invoke(AGENT_CHANNELS.setFileAccess, request),
   resolveApproval: (request) => ipcRenderer.invoke(AGENT_CHANNELS.resolveApproval, request),
   setFullTakeover: (request) => ipcRenderer.invoke(AGENT_CHANNELS.setFullTakeover, request),

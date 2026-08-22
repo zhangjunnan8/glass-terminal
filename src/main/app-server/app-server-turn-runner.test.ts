@@ -54,6 +54,9 @@ class FakeConnection implements AppServerConnection {
     if (method === 'thread/resume') {
       return Promise.resolve({ thread: { id: asRecord(params).threadId } }) as Promise<T>;
     }
+    if (method === 'thread/fork') {
+      return Promise.resolve({ thread: { id: 'thread-forked' } }) as Promise<T>;
+    }
     if (method === 'turn/start') {
       return Promise.resolve({
         turn: { id: 'turn-1', status: 'inProgress', items: [] },
@@ -244,6 +247,87 @@ describe('CodexAppServerTurnRunner native mode', () => {
     await expect(resultPromise).resolves.toMatchObject({ status: 'completed' });
   });
 
+  it('routes an explicitly registered dynamic tool exactly once to the turn-local handler', async () => {
+    const connection = new FakeConnection();
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));
+    const callDynamicTool = vi.fn(async (name: string, args: Record<string, unknown>) => ({
+      ok: true,
+      name,
+      args,
+    }));
+    runner.attach(connection);
+    const terminalExecute = {
+      type: 'function' as const,
+      name: 'terminal_execute',
+      description: 'Execute exactly once in the visible terminal.',
+      deferLoading: false,
+      inputSchema: {
+        type: 'object',
+        properties: { command: { type: 'string' } },
+        required: ['command'],
+        additionalProperties: false,
+      },
+    };
+    const resultPromise = runner.run(createInput({
+      tools: { ...createTools(), callDynamicTool },
+      dynamicTools: [terminalExecute],
+    }));
+    const threadStart = await waitForRequest(connection, 'thread/start');
+    expect(asRecord(threadStart.params).dynamicTools).toEqual([
+      ...CODEX_TERMINAL_DYNAMIC_TOOLS,
+      terminalExecute,
+    ]);
+    await waitForRequest(connection, 'turn/start');
+
+    const result = asRecord(await connection.invoke('item/tool/call', {
+      threadId: 'thread-new', turnId: 'turn-1', callId: 'execute-once',
+      tool: 'terminal_execute', arguments: { command: 'uname -a' },
+    }));
+    expect(result.success).toBe(true);
+    expect(callDynamicTool).toHaveBeenCalledTimes(1);
+    expect(callDynamicTool).toHaveBeenCalledWith('terminal_execute', { command: 'uname -a' });
+
+    await expect(connection.invoke('item/tool/call', {
+      threadId: 'thread-new', turnId: 'turn-1', callId: 'execute-once',
+      tool: 'terminal_execute', arguments: { command: 'uname -a' },
+    })).rejects.toThrow('callId 已处理');
+    expect(callDynamicTool).toHaveBeenCalledTimes(1);
+    completeTurn(connection);
+    await expect(resultPromise).resolves.toMatchObject({ status: 'completed' });
+  });
+
+  it('uses a selected local workspace as the native cwd with a read-only sandbox', async () => {
+    const isolatedRoot = resolve('app-server-agent-workspace');
+    const selectedRoot = resolve('selected-local-workspace');
+    const connection = new FakeConnection();
+    const runner = new CodexAppServerTurnRunner(isolatedRoot);
+    runner.attach(connection);
+    const resultPromise = runner.run(createInput({
+      executionWorkspaceRoot: selectedRoot,
+      executionWorkspaceReadOnly: true,
+      workspaceBinding: {
+        mode: 'local-direct', access: 'read-only', root: selectedRoot, backend: 'local',
+      },
+    }));
+    const threadStart = await waitForRequest(connection, 'thread/start');
+    expect(threadStart.params).toMatchObject({
+      cwd: selectedRoot,
+      runtimeWorkspaceRoots: [selectedRoot],
+      sandbox: 'read-only',
+    });
+    expect(connection.requests.some(({ method }) => method === 'permissionProfile/list')).toBe(false);
+    const turnStart = await waitForRequest(connection, 'turn/start');
+    expect(turnStart.params).toMatchObject({
+      cwd: selectedRoot,
+      runtimeWorkspaceRoots: [selectedRoot],
+      sandboxPolicy: { type: 'readOnly' },
+    });
+    expect(turnInputText(turnStart.params)).toContain('local-direct');
+    expect(turnInputText(turnStart.params)).toContain(selectedRoot.replaceAll('\\', '\\\\'));
+    completeTurn(connection);
+    await expect(resultPromise).resolves.toMatchObject({ status: 'completed' });
+  });
+
   it('injects local terminal metadata without leaking extra sensitive fields', async () => {
     const connection = new FakeConnection();
     const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));
@@ -372,6 +456,40 @@ describe('CodexAppServerTurnRunner native mode', () => {
     await waitForRequest(connection, 'turn/start');
     completeTurn(connection, 'thread-existing');
     await expect(resultPromise).resolves.toMatchObject({ threadId: 'thread-existing' });
+  });
+
+  it('forks a completed native history boundary without starting a turn', async () => {
+    const connection = new FakeConnection();
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));
+    runner.attach(connection);
+
+    await expect(runner.forkThread({
+      threadId: 'thread-existing',
+      lastTurnId: 'turn-previous',
+    })).resolves.toEqual({ threadId: 'thread-forked' });
+
+    expect(connection.requests).toContainEqual({
+      method: 'thread/fork',
+      params: { threadId: 'thread-existing', lastTurnId: 'turn-previous' },
+    });
+    expect(connection.requests.some(({ method }) => method === 'turn/start')).toBe(false);
+  });
+
+  it('rejects an invalid native fork response without reusing the source thread', async () => {
+    const connection = new FakeConnection();
+    connection.responder = (method, params) => {
+      if (method === 'thread/fork') {
+        return { thread: { id: asRecord(params).threadId } };
+      }
+      throw new Error(`Unexpected request: ${method}`);
+    };
+    const runner = new CodexAppServerTurnRunner(resolve('app-server-agent-workspace'));
+    runner.attach(connection);
+
+    await expect(runner.forkThread({
+      threadId: 'thread-existing',
+      lastTurnId: 'turn-previous',
+    })).rejects.toThrow('返回了原 Thread ID');
   });
 
   it('streams final text and interrupts through the native turn API', async () => {

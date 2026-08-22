@@ -6,6 +6,22 @@ export type SessionNameSource = 'automatic' | 'manual';
 export type SessionConnectionState = 'connected' | 'disconnected';
 export type SessionStatus = 'active' | 'disconnected' | 'interrupted';
 
+/**
+ * One resumable conversation owned by an exact Agent recipient.
+ *
+ * Generic Provider fingerprints prevent a changed endpoint/model/credential
+ * from receiving an older recipient's history. Codex App Server bindings use
+ * the backend policy version as their stable identity.
+ */
+export interface AgentThreadBinding {
+  backend: AgentBackendRef;
+  threadId: string;
+  /** Required for Generic Provider bindings and absent for native Codex. */
+  backendFingerprint?: string;
+  /** Native App Server thread id corresponding to the local append-only thread. */
+  providerThreadId?: string;
+}
+
 export type TerminalJournalEvent =
   | { version: 1; sequence: number; timestamp: string; kind: 'output'; data: string }
   | {
@@ -59,6 +75,8 @@ export interface SessionRecord {
   /** SHA-256 identity of the Generic Provider recipient bound to aiThreadId. */
   agentBackendFingerprint?: string;
   providerThreadId?: string;
+  /** All independently resumable backend conversations for this Session. */
+  agentThreads?: AgentThreadBinding[];
   /** @deprecated Kept for schema-v1 Generic Provider sessions. */
   providerId?: string;
   pinned: boolean;

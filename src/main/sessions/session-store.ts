@@ -20,6 +20,7 @@ import { basename, dirname, isAbsolute, join, posix, resolve } from 'node:path';
 import { gunzipSync, gzipSync } from 'node:zlib';
 import type {
   SessionAuditEvent,
+  AgentThreadBinding,
   SessionNameSource,
   SessionRecord,
   TerminalJournalEvent,
@@ -45,6 +46,100 @@ const MAX_SESSION_LOG_BYTES = 200 * 1024 * 1024;
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const AUDIT_SEQUENCE_TAIL_BYTES = 256 * 1024;
 const PROVIDER_FINGERPRINT_PATTERN = /^[a-f0-9]{64}$/u;
+const MAX_AGENT_THREAD_ID_CHARS = 512;
+
+function parsedAgentBackend(value: unknown): AgentBackendRef | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const backend = value as Partial<AgentBackendRef>;
+  if (
+    backend.kind === 'generic-provider'
+    && typeof (backend as { providerId?: unknown }).providerId === 'string'
+    && (backend as { providerId: string }).providerId.trim()
+  ) {
+    return {
+      kind: 'generic-provider',
+      providerId: (backend as { providerId: string }).providerId,
+    };
+  }
+  if (
+    backend.kind === 'codex-app-server-isolated'
+    && (backend as { policyVersion?: unknown }).policyVersion === 1
+  ) {
+    return { kind: 'codex-app-server-isolated', policyVersion: 1 };
+  }
+  return undefined;
+}
+
+function validLocalAgentThreadId(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f-]{36}$/iu.test(value);
+}
+
+function validProviderThreadId(value: unknown): value is string {
+  return typeof value === 'string'
+    && Boolean(value.trim())
+    && value.length <= MAX_AGENT_THREAD_ID_CHARS;
+}
+
+function agentThreadRecipientKey(binding: AgentThreadBinding): string {
+  return binding.backend.kind === 'generic-provider'
+    ? `generic:${binding.backend.providerId}:${binding.backendFingerprint}`
+    : `codex:${binding.backend.policyVersion}`;
+}
+
+function parsedAgentThreads(candidate: Partial<SessionRecord>): AgentThreadBinding[] | undefined {
+  if (candidate.agentThreads !== undefined && !Array.isArray(candidate.agentThreads)) {
+    throw new Error('Invalid Session Agent thread bindings.');
+  }
+  const bindings: AgentThreadBinding[] = [];
+  const upsert = (binding: AgentThreadBinding) => {
+    const key = agentThreadRecipientKey(binding);
+    const index = bindings.findIndex((entry) => agentThreadRecipientKey(entry) === key);
+    if (index >= 0) bindings[index] = binding;
+    else bindings.push(binding);
+  };
+  for (const value of candidate.agentThreads ?? []) {
+    if (!value || typeof value !== 'object') continue;
+    const stored = value as Partial<AgentThreadBinding>;
+    const backend = parsedAgentBackend(stored.backend);
+    if (!backend || !validLocalAgentThreadId(stored.threadId)) continue;
+    const backendFingerprint = backend.kind === 'generic-provider'
+      && typeof stored.backendFingerprint === 'string'
+      && PROVIDER_FINGERPRINT_PATTERN.test(stored.backendFingerprint)
+      ? stored.backendFingerprint
+      : undefined;
+    if (backend.kind === 'generic-provider' && !backendFingerprint) continue;
+    upsert({
+      backend,
+      threadId: stored.threadId,
+      ...(backendFingerprint ? { backendFingerprint } : {}),
+      ...(validProviderThreadId(stored.providerThreadId)
+        ? { providerThreadId: stored.providerThreadId }
+        : {}),
+    });
+  }
+
+  // Schema-v1 Sessions stored only the active backend. Fold that binding into
+  // the collection in memory so the next ordinary save migrates it losslessly.
+  const activeBackend = parsedAgentBackend(candidate.agentBackend);
+  if (activeBackend && validLocalAgentThreadId(candidate.aiThreadId)) {
+    const activeFingerprint = activeBackend.kind === 'generic-provider'
+      && typeof candidate.agentBackendFingerprint === 'string'
+      && PROVIDER_FINGERPRINT_PATTERN.test(candidate.agentBackendFingerprint)
+      ? candidate.agentBackendFingerprint
+      : undefined;
+    if (activeBackend.kind !== 'generic-provider' || activeFingerprint) {
+      upsert({
+        backend: activeBackend,
+        threadId: candidate.aiThreadId,
+        ...(activeFingerprint ? { backendFingerprint: activeFingerprint } : {}),
+        ...(validProviderThreadId(candidate.providerThreadId)
+          ? { providerThreadId: candidate.providerThreadId }
+          : {}),
+      });
+    }
+  }
+  return bindings.length ? bindings : undefined;
+}
 
 interface LogChunk {
   sequence: number;
@@ -205,6 +300,7 @@ function parseSession(value: unknown, source: string): SessionRecord {
     && PROVIDER_FINGERPRINT_PATTERN.test(candidate.agentBackendFingerprint)
     ? candidate.agentBackendFingerprint
     : undefined;
+  record.agentThreads = parsedAgentThreads(candidate);
   record.workspace = validateWorkspaceBinding(record, candidate.workspace, source);
   return record;
 }
@@ -738,6 +834,7 @@ export class SessionStore {
     threadId: string,
     backendFingerprint?: string,
   ): SessionRecord {
+    if (!validLocalAgentThreadId(threadId)) throw new Error('Invalid AI Thread identifier.');
     if (
       backend.kind === 'generic-provider'
       && (
@@ -746,6 +843,28 @@ export class SessionStore {
       )
     ) throw new Error('Generic Provider thread requires a valid recipient fingerprint.');
     const current = this.get(sessionId);
+    const binding: AgentThreadBinding = {
+      backend,
+      threadId,
+      ...(backend.kind === 'generic-provider'
+        ? { backendFingerprint }
+        : {}),
+    };
+    const recipientKey = agentThreadRecipientKey(binding);
+    const previousBinding = current.agentThreads?.find((entry) => (
+      agentThreadRecipientKey(entry) === recipientKey
+    ));
+    const selectedBinding = previousBinding?.threadId === threadId
+      ? { ...binding, ...(previousBinding.providerThreadId
+        ? { providerThreadId: previousBinding.providerThreadId }
+        : {}) }
+      : binding;
+    const agentThreads = [
+      ...(current.agentThreads ?? []).filter((entry) => (
+        agentThreadRecipientKey(entry) !== recipientKey
+      )),
+      selectedBinding,
+    ];
     const updated: SessionRecord = {
       ...current,
       aiThreadId: threadId,
@@ -753,7 +872,8 @@ export class SessionStore {
       agentBackendFingerprint: backend.kind === 'generic-provider'
         ? backendFingerprint
         : undefined,
-      providerThreadId: undefined,
+      providerThreadId: selectedBinding.providerThreadId,
+      agentThreads,
       providerId: backend.kind === 'generic-provider' ? backend.providerId : undefined,
       updatedAt: new Date().toISOString(),
     };
@@ -772,6 +892,9 @@ export class SessionStore {
     localThreadId: string,
     providerThreadId: string,
   ): SessionRecord {
+    if (!validProviderThreadId(providerThreadId)) {
+      throw new Error('Invalid Provider Thread identifier.');
+    }
     const current = this.get(sessionId);
     if (current.aiThreadId !== localThreadId) {
       throw new Error('AI Thread changed before the Provider thread could be bound.');
@@ -779,6 +902,11 @@ export class SessionStore {
     const updated: SessionRecord = {
       ...current,
       providerThreadId,
+      agentThreads: current.agentThreads?.map((binding) => (
+        binding.threadId === localThreadId
+          ? { ...binding, providerThreadId }
+          : binding
+      )),
       updatedAt: new Date().toISOString(),
     };
     this.save(updated);

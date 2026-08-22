@@ -80,8 +80,9 @@ export interface CodexTerminalContextAccessState {
 
 /**
  * Non-secret identity and shell metadata for the user's currently selected
- * visible terminal. This is deliberately separate from the local workspace in
- * which Codex App Server runs its built-in Shell/File tools.
+ * visible terminal. This is deliberately separate from the App Server process:
+ * built-in Shell/File may use an authorized local root, while visible commands
+ * still enter the terminal only through the approved terminal_execute bridge.
  */
 export interface CodexVisibleTerminalContext {
   transport: 'local' | 'ssh';

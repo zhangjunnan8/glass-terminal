@@ -12,8 +12,8 @@ Glass Terminal 是一个 **Windows-first、终端优先、远程设备优先**�
 ![Electron](https://img.shields.io/badge/Electron-43-2b2e3a?logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178c6?logo=typescript&logoColor=white)
-![Version](https://img.shields.io/badge/version-0.1.0--beta.0-blue)
-![Tests](https://img.shields.io/badge/tests-676%20passed-brightgreen)
+![Version](https://img.shields.io/badge/version-0.1.0--beta.1-blue)
+![Tests](https://img.shields.io/badge/tests-682%20passed-brightgreen)
 ![Status](https://img.shields.io/badge/status-beta-blue)
 
 </div>
@@ -36,7 +36,7 @@ Codex IDE、Remote IDE 和通用 Agent Harness 主要围绕代码工作区与 Ag
 
 > Glass Terminal 不替代单片机本身的物理调试链路。对于不能运行 SSH 的 MCU，它连接的是挂载该设备、烧录器或串口的控制主机。
 
-> **当前模式边界：**共享终端执行是 Generic Provider（OpenAI-compatible API）模式的核心能力。Codex App Server 原生模式使用 Codex 自己的本地工作区与内建工具，可以按授权读取当前终端上下文，但目前不会控制远程公共终端。详见 [Codex App Server 使用与接入说明](docs/codex-app-server.md)。
+> **当前模式边界：**Generic Provider 与 Codex App Server 都可通过 `terminal_execute` 将获批命令只执行一次于当前可见 PTY/SSH。Codex 内建 Shell 本身仍是本机进程：授权本地 Workspace 后可原生直连，授权 SSH Workspace 后经现有连接的 SFTP 工具处理远程文件。详见 [Codex App Server 使用与接入说明](docs/codex-app-server.md)。
 
 ## ✨ 核心特性
 
@@ -50,7 +50,7 @@ Codex IDE、Remote IDE 和通用 Agent Harness 主要围绕代码工作区与 Ag
 | 🎮 **AI 全接管 / 人工接管** | 显式确认后 Full Takeover 可连续执行命令，Take Control 可随时抢回当前终端；SSH Host 当前会记住该偏好 |
 | 🌐 **SSH 远程主机** | 密码 / 键盘交互 / 私钥 / Windows OpenSSH 代理认证；多主机、文件夹分组、收藏 |
 | 🪟 **远程 Shell 适配** | 每台主机可指定 Linux/POSIX、PowerShell 或 cmd；PowerShell 使用会话级 Shell Integration 获取命令边界、退出码和 cwd，可见 VT 流不做文本猜测或重绘过滤 |
-| 📁 **Workspace 文件工具** | 只读 / 读写绑定根、FULL FILESYSTEM ACCESS 三种授权；`read / search / glob / apply_patch / write` 全程显示 diff |
+| 📁 **Workspace 文件工具** | 两种后端均支持只读 / 读写绑定根；Generic 另有显式风险确认的 FULL FILESYSTEM ACCESS；`read / search / glob / apply_patch / write` 全程显示 diff |
 | 🔐 **安全优先** | 凭据不进模型上下文与明文日志；密钥库 AES-256-GCM 加密；敏感认证交接；无任何遥测 |
 | 💾 **持久化与会话** | 会话历史、审计日志（audit JSONL）、断线重连、终端回放 |
 | 🌗 **主题** | 暗色 / 亮色 / 跟随系统 三态循环 |
