@@ -270,6 +270,7 @@ function createMainWindow(): BrowserWindow {
     height: 900,
     minWidth: 980,
     minHeight: 640,
+    autoHideMenuBar: true,
     // The renderer already uses the same dark background, so showing the native
     // window immediately avoids a white flash without making visibility depend
     // on Chromium's first-paint `ready-to-show` event. Smoke runners stay hidden.
@@ -324,6 +325,7 @@ function showSettingsWindow(): void {
     height: 640,
     minWidth: 640,
     minHeight: 480,
+    autoHideMenuBar: true,
     show: !isSmokeTest,
     backgroundColor: '#0b1018',
     title: `${PRODUCT_NAME} — 设置`,
