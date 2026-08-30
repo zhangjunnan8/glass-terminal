@@ -448,7 +448,6 @@ describe('LangChain backend spike (DeepSeek-compatible transport)', () => {
         terminals,
         sessions,
         providers,
-        undefined,
         files,
         () => new LangChainBackend({ modelFactory: () => Promise.resolve(model) }),
       );

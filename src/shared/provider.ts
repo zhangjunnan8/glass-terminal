@@ -8,7 +8,7 @@ export interface ProviderProfile {
   baseUrl: string;
   modelId: string;
   /**
-   * Provider/model input context window. Existing profiles default to 64K.
+   * Provider/model input context window. Profiles without an explicit value default to 500,736.
    * Automatic compression triggers before this hard ceiling.
    */
   contextWindowTokens?: number;
@@ -65,4 +65,5 @@ export const PROVIDER_CHANNELS = {
   setDefault: 'provider:set-default',
   testConnection: 'provider:test-connection',
   discoverModels: 'provider:discover-models',
+  changed: 'provider:changed',
 } as const;

@@ -2,6 +2,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DesktopBridge } from '../shared/ipc';
+import type { ProviderProfile } from '../shared/provider';
 import { AiServiceSettings } from './AiServiceSettings';
 
 vi.mock('./components/TerminalPane', () => ({
@@ -12,7 +13,10 @@ vi.mock('./components/SftpDrawer', () => ({
   SftpDrawer: () => null,
 }));
 
-function providerBridge(discoverModels: DesktopBridge['providers']['discoverModels']): DesktopBridge {
+function providerBridge(
+  discoverModels: DesktopBridge['providers']['discoverModels'],
+  providers: ProviderProfile[] = [],
+): DesktopBridge {
   return {
     runtime: {
       getInfo: vi.fn().mockResolvedValue({ platform: 'win32', arch: 'x64', version: 'test' }),
@@ -45,7 +49,7 @@ function providerBridge(discoverModels: DesktopBridge['providers']['discoverMode
       onRenamed: vi.fn(() => () => undefined),
     },
     providers: {
-      list: vi.fn().mockResolvedValue([]),
+      list: vi.fn().mockResolvedValue(providers),
       discoverModels,
       save: vi.fn().mockImplementation(async (input) => ({
         ...input,
@@ -58,10 +62,10 @@ function providerBridge(discoverModels: DesktopBridge['providers']['discoverMode
         createdAt: '2026-08-20T00:00:00.000Z',
         updatedAt: '2026-08-20T00:00:00.000Z',
       })),
-    },
-    codexAppServer: {
-      getState: vi.fn(() => new Promise(() => undefined)),
-      onStateChanged: vi.fn(() => () => undefined),
+      testConnection: vi.fn().mockResolvedValue({ ok: true, message: '连接成功' }),
+      remove: vi.fn().mockResolvedValue(undefined),
+      setDefault: vi.fn(),
+      onChanged: vi.fn(() => () => undefined),
     },
     agent: {
       getState: vi.fn().mockResolvedValue(undefined),
@@ -77,12 +81,6 @@ function setInputValue(input: HTMLInputElement, value: string) {
   const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
   setter?.call(input, value);
   input.dispatchEvent(new Event('input', { bubbles: true }));
-}
-
-function setSelectValue(select: HTMLSelectElement, value: string) {
-  const setter = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value')?.set;
-  setter?.call(select, value);
-  select.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 async function settle() {
@@ -125,14 +123,12 @@ describe('compatible API model picker', () => {
 
     await act(async () => root.render(<AiServiceSettings />));
     await settle();
+    expect(container.querySelector('.provider-form')).toBeNull();
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('添加 Provider'))!.click());
 
-    await act(async () => {
-      container.querySelector<HTMLButtonElement>('[data-testid="provider-kind-generic"]')!.click();
-    });
-
-    let picker = container.querySelector<HTMLSelectElement>('[data-testid="provider-model-select"]')!;
-    expect(picker.options[0]?.textContent).toBe('模板建议（1 个）');
-    expect(picker.querySelectorAll('[data-provider-model]')).toHaveLength(1);
+    let options = container.querySelector<HTMLDataListElement>('[data-testid="provider-model-options"]')!;
+    expect(options.querySelectorAll('[data-provider-model]')).toHaveLength(1);
 
     const apiKey = container.querySelector<HTMLInputElement>('input[name="apiKey"]')!;
     await act(async () => setInputValue(apiKey, 'test-key'));
@@ -145,18 +141,52 @@ describe('compatible API model picker', () => {
       baseUrl: 'https://api.openai.com/v1',
       apiKey: 'test-key',
     });
-    picker = container.querySelector<HTMLSelectElement>('[data-testid="provider-model-select"]')!;
-    expect(picker.options[0]?.textContent).toBe('已检索到 3 个可用模型');
-    expect([...picker.querySelectorAll<HTMLOptionElement>('[data-provider-model]')]
+    options = container.querySelector<HTMLDataListElement>('[data-testid="provider-model-options"]')!;
+    expect(container.querySelector('[data-testid="provider-model-prompt"]')?.textContent)
+      .toContain('已检索到 3 个可用模型');
+    expect([...options.querySelectorAll<HTMLOptionElement>('[data-provider-model]')]
       .map((option) => option.value))
       .toEqual(['model-alpha', 'model-beta', 'model-gamma']);
 
     const modelInput = container.querySelector<HTMLInputElement>('input[name="modelId"]')!;
-    await act(async () => setSelectValue(picker, 'model-beta'));
+    await act(async () => setInputValue(modelInput, 'model-beta'));
     expect(modelInput.value).toBe('model-beta');
 
     await act(async () => setInputValue(modelInput, 'manually-entered-model'));
     expect(modelInput.value).toBe('manually-entered-model');
+  });
+
+  it('keeps the editor hidden until an existing provider is selected', async () => {
+    const provider: ProviderProfile = {
+      id: 'existing-provider',
+      name: 'Existing API',
+      kind: 'generic-openai-compatible',
+      baseUrl: 'https://api.example.com/v1',
+      modelId: 'existing-model',
+      contextWindowTokens: 500_736,
+      contextEstimateSafetyFactor: 1.15,
+      recipientRevision: 'recipient-1',
+      apiKeyConfigured: true,
+      isDefault: true,
+      status: 'ready',
+      createdAt: '2026-08-20T00:00:00.000Z',
+      updatedAt: '2026-08-20T00:00:00.000Z',
+    };
+    Object.defineProperty(window, 'aiTerminal', {
+      configurable: true,
+      value: providerBridge(vi.fn(), [provider]),
+    });
+
+    await act(async () => root.render(<AiServiceSettings />));
+    await settle();
+
+    expect(container.querySelector('.provider-form')).toBeNull();
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>('.provider-list button')]
+      .find((button) => button.textContent?.includes(provider.name))!.click());
+
+    expect(container.querySelector('.provider-form')).not.toBeNull();
+    expect(container.querySelector<HTMLInputElement>('input[name="name"]')?.value)
+      .toBe(provider.name);
   });
 
   it('shows and saves the configurable context estimation safety factor', async () => {
@@ -167,10 +197,8 @@ describe('compatible API model picker', () => {
     Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
     await act(async () => root.render(<AiServiceSettings />));
     await settle();
-    await act(async () => {
-      container.querySelector<HTMLButtonElement>('[data-testid="provider-kind-generic"]')!.click();
-    });
-
+    await act(async () => [...container.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('添加 Provider'))!.click());
     const factor = container.querySelector<HTMLInputElement>(
       'input[name="contextEstimateSafetyFactor"]',
     )!;
@@ -187,8 +215,9 @@ describe('compatible API model picker', () => {
     await settle();
 
     expect(bridge.providers.save).toHaveBeenCalledWith(expect.objectContaining({
-      contextWindowTokens: 64_000,
+      contextWindowTokens: 500_736,
       contextEstimateSafetyFactor: 1.4,
     }));
+    expect(bridge.providers.testConnection).toHaveBeenCalledWith('saved-provider');
   });
 });

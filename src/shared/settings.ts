@@ -26,4 +26,7 @@ export const SETTINGS_CHANNELS = {
 
 export const SETTINGS_WINDOW_CHANNELS = {
   open: 'settings-window:open',
+  navigate: 'settings-window:navigate',
 } as const;
+
+export type SettingsWindowSection = 'general' | 'ai' | 'data';

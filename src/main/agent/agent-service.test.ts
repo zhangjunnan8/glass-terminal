@@ -1,11 +1,7 @@
 import type { WebContents } from 'electron';
 import { createHash, randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
-import {
-  AGENT_CHANNELS,
-  CODEX_APP_SERVER_AGENT_BACKEND,
-  CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-} from '../../shared/agent';
+import { AGENT_CHANNELS } from '../../shared/agent';
 import type {
   AgentBackendRef,
   AgentFileAccessMode,
@@ -18,11 +14,6 @@ import type { ProviderProfile } from '../../shared/provider';
 import type { SessionRecord } from '../../shared/session';
 import type { ToolGateway } from '../../shared/tools';
 import type { ProviderStore } from '../providers/provider-store';
-import type { CodexAppServerService } from '../app-server/app-server-service';
-import type {
-  ForkCodexThreadInput,
-  RunCodexTurnInput,
-} from '../app-server/app-server-turn-runner';
 import type { SessionManager } from '../sessions/session-manager';
 import type {
   StructuredExecutionHooks,
@@ -590,90 +581,36 @@ class FakeSessions {
     backendFingerprint: string,
   ) {
     const backend = { kind: 'generic-provider' as const, providerId };
-    const previous = this.session.agentThreads?.find((binding) => (
-      binding.backend.kind === 'generic-provider'
-      && binding.backend.providerId === providerId
-      && binding.backendFingerprint === backendFingerprint
-    ));
     this.session = {
       ...this.session,
       providerId,
       agentBackend: backend,
       aiThreadId: threadId,
       agentBackendFingerprint: backendFingerprint,
-      providerThreadId: previous?.threadId === threadId
-        ? previous.providerThreadId
-        : undefined,
       agentThreads: [
         ...(this.session.agentThreads ?? []).filter((binding) => !(
           binding.backend.kind === 'generic-provider'
           && binding.backend.providerId === providerId
           && binding.backendFingerprint === backendFingerprint
         )),
-        {
-          backend,
-          threadId,
-          backendFingerprint,
-          ...(previous?.threadId === threadId && previous.providerThreadId
-            ? { providerThreadId: previous.providerThreadId }
-            : {}),
-        },
+        { backend, threadId, backendFingerprint },
       ],
     };
     return this.session;
   }
   bindAgentBackendThread(_sessionId: string, backend: AgentBackendRef, threadId: string) {
-    const previous = this.session.agentThreads?.find((binding) => (
-      binding.backend.kind === backend.kind
-      && (
-        backend.kind !== 'generic-provider'
-        || (
-          binding.backend.kind === 'generic-provider'
-          && binding.backend.providerId === backend.providerId
-        )
-      )
-    ));
     this.session = {
       ...this.session,
-      providerId: backend.kind === 'generic-provider' ? backend.providerId : undefined,
+      providerId: backend.providerId,
       agentBackend: backend,
       aiThreadId: threadId,
       agentBackendFingerprint: undefined,
-      providerThreadId: previous?.threadId === threadId
-        ? previous.providerThreadId
-        : undefined,
       agentThreads: [
         ...(this.session.agentThreads ?? []).filter((binding) => !(
-          binding.backend.kind === backend.kind
-          && (
-            backend.kind !== 'generic-provider'
-            || (
-              binding.backend.kind === 'generic-provider'
-              && binding.backend.providerId === backend.providerId
-            )
-          )
+          binding.backend.providerId === backend.providerId
         )),
-        {
-          backend,
-          threadId,
-          ...(previous?.threadId === threadId && previous.providerThreadId
-            ? { providerThreadId: previous.providerThreadId }
-            : {}),
-        },
+        { backend, threadId },
       ],
-    };
-    return this.session;
-  }
-  bindProviderThread(_sessionId: string, localThreadId: string, providerThreadId: string) {
-    if (this.session.aiThreadId !== localThreadId) throw new Error('stale local thread');
-    this.session = {
-      ...this.session,
-      providerThreadId,
-      agentThreads: this.session.agentThreads?.map((binding) => (
-        binding.threadId === localThreadId
-          ? { ...binding, providerThreadId }
-          : binding
-      )),
     };
     return this.session;
   }
@@ -747,169 +684,6 @@ class ThreadedFakeSessions extends FakeSessions {
     const events = this.eventsByThread.get(threadId) ?? [];
     events.push(event);
     this.eventsByThread.set(threadId, events);
-  }
-}
-
-class FakeCodexAppServer {
-  readonly turns: RunCodexTurnInput[] = [];
-
-  getState() {
-    return {
-      agentAvailable: true,
-      agentReason: 'ready',
-      terminalContextAccess: {
-        available: true,
-        enabled: true,
-        acceptedClientTools: ['terminal_state', 'terminal_read'],
-        reason: 'allowed',
-      },
-      terminalAgentEnabled: true,
-      terminalAgentReason: 'ready',
-      selection: { modelId: 'gpt-codex', reasoningEffort: 'high' },
-    };
-  }
-
-  async runTerminalAgentTurn(input: RunCodexTurnInput) {
-    this.turns.push(input);
-    input.onThreadBound?.('provider-thread-1');
-    const history = await input.tools.readTerminal({ maxChars: 500 });
-    const finalText = history.includes('tester@host') ? 'history-ok' : 'history-missing';
-    input.onDelta?.(finalText);
-    return {
-      threadId: 'provider-thread-1',
-      turnId: 'provider-turn-1',
-      status: 'completed' as const,
-      finalText,
-    };
-  }
-}
-
-class ForkingCodexAppServer extends FakeCodexAppServer {
-  readonly forks: ForkCodexThreadInput[] = [];
-  forkError?: Error;
-  private turnNumber = 0;
-
-  async forkTerminalAgentThread(input: ForkCodexThreadInput) {
-    this.forks.push(input);
-    if (this.forkError) throw this.forkError;
-    return { threadId: `provider-thread-fork-${this.forks.length}` };
-  }
-
-  override async runTerminalAgentTurn(input: RunCodexTurnInput) {
-    this.turns.push(input);
-    this.turnNumber += 1;
-    const threadId = input.threadId ?? `provider-thread-${this.turnNumber}`;
-    const turnId = `provider-turn-${this.turnNumber}`;
-    input.onThreadBound?.(threadId);
-    const finalText = `answer-${this.turnNumber}`;
-    input.onDelta?.(finalText);
-    return {
-      threadId,
-      turnId,
-      status: 'completed' as const,
-      finalText,
-    };
-  }
-}
-
-class TerminalCallingCodexAppServer extends FakeCodexAppServer {
-  override async runTerminalAgentTurn(input: RunCodexTurnInput) {
-    this.turns.push(input);
-    input.onThreadBound?.('provider-thread-terminal');
-    const result = await input.tools.callDynamicTool?.('terminal_execute', {
-      command: 'printf codex-once',
-      reason: 'verify shared terminal routing',
-    });
-    return {
-      threadId: 'provider-thread-terminal',
-      turnId: 'provider-turn-terminal',
-      status: 'completed' as const,
-      finalText: JSON.stringify(result),
-    };
-  }
-}
-
-class DeferredStreamingCodexAppServer {
-  input?: RunCodexTurnInput;
-  interruptRequested = false;
-  private resolveTurn?: (value: {
-    threadId: string;
-    turnId: string;
-    status: 'completed' | 'interrupted';
-    finalText: string;
-  }) => void;
-  private resolveInterrupt?: () => void;
-
-  getState() {
-    return {
-      agentAvailable: true,
-      agentReason: 'ready',
-      terminalContextAccess: {
-        available: true,
-        enabled: true,
-        acceptedClientTools: ['terminal_state', 'terminal_read'],
-        reason: 'allowed',
-      },
-      terminalAgentEnabled: true,
-      terminalAgentReason: 'ready',
-      selection: { modelId: 'gpt-codex', reasoningEffort: 'high' },
-    };
-  }
-
-  runTerminalAgentTurn(input: RunCodexTurnInput) {
-    this.input = input;
-    input.onThreadBound?.('provider-thread-stream');
-    return new Promise<{
-      threadId: string;
-      turnId: string;
-      status: 'completed' | 'interrupted';
-      finalText: string;
-    }>((resolve) => {
-      this.resolveTurn = resolve;
-    });
-  }
-
-  push(delta: string): void {
-    if (!this.input) throw new Error('Codex turn has not started.');
-    this.input.onDelta?.(delta);
-  }
-
-  context(event: Parameters<NonNullable<RunCodexTurnInput['onContext']>>[0]): void {
-    if (!this.input) throw new Error('Codex turn has not started.');
-    this.input.onContext?.(event);
-  }
-
-  finish(finalText: string): void {
-    if (!this.resolveTurn) throw new Error('Codex turn has not started.');
-    this.resolveTurn({
-      threadId: 'provider-thread-stream',
-      turnId: 'provider-turn-stream',
-      status: 'completed',
-      finalText,
-    });
-  }
-
-  interruptTerminalAgentTurn(): Promise<void> {
-    this.interruptRequested = true;
-    return new Promise<void>((resolve) => { this.resolveInterrupt = resolve; });
-  }
-
-  finishInterrupt(): void {
-    this.resolveTurn?.({
-      threadId: 'provider-thread-stream',
-      turnId: 'provider-turn-stream',
-      status: 'interrupted',
-      finalText: '',
-    });
-    this.resolveInterrupt?.();
-    this.resolveInterrupt = undefined;
-  }
-}
-
-class RejectingInterruptCodexAppServer extends DeferredStreamingCodexAppServer {
-  override interruptTerminalAgentTurn(): Promise<void> {
-    this.interruptRequested = true;
-    return Promise.reject(new Error('interrupt rejected; connection quarantined'));
   }
 }
 
@@ -1172,7 +946,6 @@ async function startActivityHarness(prompt = 'Inspect the workspace.') {
     sessions as unknown as SessionManager,
     providerStore(),
     undefined,
-    undefined,
     () => backend,
   );
   const initial = service.sendPrompt(owner, { terminalId: 'terminal', prompt });
@@ -1190,7 +963,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => backend,
     );
@@ -1225,7 +997,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => new RecordingBackend(),
     );
     expect(restoredService.getState(owner, 'terminal')?.memories).toEqual(saved.memories);
@@ -1255,7 +1026,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       backendFactory,
     );
@@ -1304,7 +1074,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       backendFactory,
     );
 
@@ -1350,7 +1119,6 @@ describe('AgentService shared-terminal controls', () => {
         terminals as unknown as TerminalService,
         new FakeSessions() as unknown as SessionManager,
         providerStore(),
-        undefined,
         undefined,
         () => backend,
       );
@@ -1503,7 +1271,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => backend,
     );
     const owner = browserOwner();
@@ -1514,9 +1281,9 @@ describe('AgentService shared-terminal controls', () => {
       type: 'context_status',
       contextUsage: {
         source: 'estimated',
-        estimatedTokens: 54_400,
-        contextWindowTokens: 64_000,
-        compressionThresholdTokens: 54_400,
+        estimatedTokens: 425_625,
+        contextWindowTokens: 500_736,
+        compressionThresholdTokens: 425_625,
         percentage: 100,
         status: 'compressing',
       },
@@ -1530,14 +1297,14 @@ describe('AgentService shared-terminal controls', () => {
       type: 'context_status',
       contextUsage: {
         source: 'estimated',
-        estimatedTokens: 8_000,
-        contextWindowTokens: 64_000,
-        compressionThresholdTokens: 54_400,
+        estimatedTokens: 60_000,
+        contextWindowTokens: 500_736,
+        compressionThresholdTokens: 425_625,
         percentage: 15,
         status: 'ready',
         lastCompressedAt: '2026-08-20T00:00:00.000Z',
       },
-      compression: { beforeTokens: 54_400, afterTokens: 8_000 },
+      compression: { beforeTokens: 425_625, afterTokens: 60_000 },
     });
     expect(service.getState(owner, 'terminal')?.contextUsage).toMatchObject({
       percentage: 15,
@@ -1545,7 +1312,7 @@ describe('AgentService shared-terminal controls', () => {
     });
     expect(sessions.audits.filter(({ type }) => type === 'context_compressed')).toEqual([
       expect.objectContaining({
-        details: expect.objectContaining({ beforeTokens: 54_400, afterTokens: 8_000 }),
+        details: expect.objectContaining({ beforeTokens: 425_625, afterTokens: 60_000 }),
       }),
     ]);
     backend.finish();
@@ -1758,7 +1525,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       backendFactory,
     );
     const owner = browserOwner();
@@ -1817,7 +1583,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       backendFactory,
     );
 
@@ -1861,7 +1626,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => backend,
     );
 
@@ -1884,7 +1648,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       backendFactory,
     );
@@ -1924,7 +1687,6 @@ describe('AgentService shared-terminal controls', () => {
         new FakeSessions() as unknown as SessionManager,
         providerStore(),
         undefined,
-        undefined,
         () => backend,
       );
       const running = service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Wait.' });
@@ -1961,35 +1723,7 @@ describe('AgentService shared-terminal controls', () => {
     closed.backend.finish();
   });
 
-  it('never constructs a Generic backend for a native Codex turn', async () => {
-    const genericBackendFactory = vi.fn((_providerId: string): AgentBackend => {
-      throw new Error('Generic backend must not be constructed.');
-    });
-    const codex = new FakeCodexAppServer();
-    const owner = browserOwner();
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      new FakeSessions() as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-      undefined,
-      genericBackendFactory,
-    );
-
-    service.sendPrompt(owner, {
-      terminalId: 'terminal',
-      prompt: 'Use native Codex.',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-
-    expect(genericBackendFactory).not.toHaveBeenCalled();
-  });
-
-  it('allows Workspace changes without a runtime and enforces runtime ownership', async () => {
+    it('allows Workspace changes without a runtime and enforces runtime ownership', async () => {
     const terminals = new FakeTerminals();
     const service = new AgentService(
       terminals as unknown as TerminalService,
@@ -2011,7 +1745,7 @@ describe('AgentService shared-terminal controls', () => {
     } as WebContents, 'terminal')).toThrow('Agent Session not found.');
   });
 
-  it('rejects Workspace changes while Generic Provider file access is enabled', async () => {
+  it('allows Workspace changes while automatic Workspace access is active', async () => {
     const fileService = {
       bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
       canonicalizeAccessRoot: vi.fn(async (_owner, _terminalId, accessRoot) => accessRoot),
@@ -2020,7 +1754,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      undefined,
       fileService,
     );
     const owner = browserOwner();
@@ -2031,8 +1764,50 @@ describe('AgentService shared-terminal controls', () => {
       backend: { kind: 'generic-provider', providerId: 'provider' },
     });
 
-    expect(() => service.assertWorkspaceChangeAllowed(owner, 'terminal'))
-      .toThrow('请先关闭 Generic Provider 文件访问');
+    expect(() => service.assertWorkspaceChangeAllowed(owner, 'terminal')).not.toThrow();
+  });
+
+  it('binds Workspace to read-write access and Full Takeover to full filesystem access', () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+    );
+    const owner = browserOwner();
+
+    const enabled = service.setFullTakeover(owner, {
+      terminalId: 'terminal', enabled: true, providerId: 'provider',
+    });
+    expect(enabled).toMatchObject({
+      fullTakeover: true,
+      fileAccessMode: 'full-access',
+      fileAccessRoot: '/work',
+      fileAccessPolicy: { fullAccess: true, read: true, write: true, create: true, delete: true },
+    });
+
+    const disabled = service.setFullTakeover(owner, {
+      terminalId: 'terminal', enabled: false, providerId: 'provider',
+    });
+    expect(disabled).toMatchObject({
+      fullTakeover: false,
+      fileAccessMode: 'read-write',
+      fileAccessRoot: '/work',
+      fileAccessPolicy: { fullAccess: false, read: true, write: true, create: true, delete: true },
+    });
+
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/replacement', hostId: 'host' },
+    };
+    expect(service.syncWorkspaceAccess(owner, 'terminal')).toMatchObject({
+      fileAccessMode: 'read-write',
+      fileAccessRoot: '/replacement',
+    });
   });
 
   it('maps legacy file-access modes to ephemeral policies and returns isolated snapshots', async () => {
@@ -2049,7 +1824,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       fileService,
     );
     const owner = browserOwner();
@@ -2135,7 +1909,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       fileService,
     );
 
@@ -2183,7 +1956,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       fileService,
     );
     const owner = browserOwner();
@@ -2215,7 +1987,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      undefined,
       {
         bindWorkspaceRoot: vi.fn().mockRejectedValue(new Error('请先设置 Workspace Root。')),
       } as unknown as AgentFileService,
@@ -2241,7 +2012,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       { bindWorkspaceRoot, canonicalizeAccessRoot } as unknown as AgentFileService,
     );
     const owner = browserOwner();
@@ -2278,8 +2048,8 @@ describe('AgentService shared-terminal controls', () => {
     resolveCanonical!('/scope');
     await expect(pending).rejects.toThrow('状态已变化');
     expect(service.getState(owner, 'terminal')).toMatchObject({
-      fileAccessMode: 'off',
-      fileAccessRoot: undefined,
+      fileAccessMode: 'read-write',
+      fileAccessRoot: '/work',
     });
     expect(sessions.audits.filter((entry) => entry.type === 'file_permission_changed'))
       .toHaveLength(0);
@@ -2299,7 +2069,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       { bindWorkspaceRoot } as unknown as AgentFileService,
     );
     const owner = browserOwner();
@@ -2340,7 +2109,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       { bindWorkspaceRoot } as unknown as AgentFileService,
     );
     const owner = browserOwner();
@@ -2389,7 +2157,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providers,
-      undefined,
       { bindWorkspaceRoot } as unknown as AgentFileService,
       () => backendAdapter,
     );
@@ -2412,8 +2179,8 @@ describe('AgentService shared-terminal controls', () => {
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
     expect(service.getState(owner, 'terminal')).toMatchObject({
       backend: { kind: 'generic-provider', providerId: 'provider-b' },
-      fileAccessMode: 'off',
-      fileAccessRoot: undefined,
+      fileAccessMode: 'read-write',
+      fileAccessRoot: '/work',
     });
   });
 
@@ -2429,7 +2196,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       { bindWorkspaceRoot } as unknown as AgentFileService,
     );
     const owner = browserOwner();
@@ -2448,7 +2214,6 @@ describe('AgentService shared-terminal controls', () => {
         session: { ...sessions.session, connectionState: 'disconnected' },
       }) as unknown as SessionManager,
       providerStore(),
-      undefined,
       { bindWorkspaceRoot } as unknown as AgentFileService,
     );
     await expect(sessionOnlyService.setFileAccess(owner, {
@@ -2467,7 +2232,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       {
         bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
         canonicalizeAccessRoot: vi.fn(async (
@@ -2507,7 +2271,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       {
         bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
         canonicalizeAccessRoot: vi.fn(async (
@@ -2541,7 +2304,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       {
         bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
         canonicalizeAccessRoot: vi.fn(async (
@@ -2588,7 +2350,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providers,
-      undefined,
       {
         bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
         canonicalizeAccessRoot: vi.fn(async (
@@ -2641,7 +2402,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providers,
-      undefined,
       undefined,
       factory,
     );
@@ -2705,7 +2465,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providers,
       undefined,
-      undefined,
       () => backendAdapter,
     );
 
@@ -2738,7 +2497,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providers,
-      undefined,
       {
         bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
         canonicalizeAccessRoot: vi.fn(async (
@@ -2800,7 +2558,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providers,
-      undefined,
       {
         bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
         canonicalizeAccessRoot: vi.fn(async (
@@ -2846,7 +2603,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       fileService,
       () => backendAdapter,
     );
@@ -2913,7 +2669,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       fileService,
       () => backendAdapter,
     );
@@ -2968,7 +2723,6 @@ describe('AgentService shared-terminal controls', () => {
         options.terminals as unknown as TerminalService,
         sessions as unknown as SessionManager,
         options.providers,
-        undefined,
         fileService,
         () => options.backend,
       );
@@ -3028,83 +2782,12 @@ describe('AgentService shared-terminal controls', () => {
     changedBackend.finish();
   });
 
-  it('revokes ephemeral file authority on terminal exit and backend replacement', async () => {
-    const sessions = new FakeSessions();
-    sessions.session = {
-      ...sessions.session,
-      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
-    };
-    const terminals = new FakeTerminals();
-    const fileService = {
-      bindWorkspaceRoot: vi.fn().mockResolvedValue('/work'),
-      canonicalizeAccessRoot: vi.fn(async (
-        _owner: WebContents,
-        _terminalId: string,
-        accessRoot: string,
-      ) => accessRoot),
-    } as unknown as AgentFileService;
-    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
-    const owner = browserOwner();
-    const terminalExitService = new AgentService(
-      terminals as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      undefined,
-      fileService,
-    );
-    await terminalExitService.setFileAccess(owner, {
-      terminalId: 'terminal', mode: 'read-only', backend,
-    });
-    terminals.exit();
-    expect(terminalExitService.getState(owner, 'terminal')).toMatchObject({
-      state: 'FAILED',
-      fileAccessMode: 'off',
-      fileAccessRoot: undefined,
-      fileAccessPolicy: { read: false, write: false, create: false, delete: false },
-    });
-
-    const replacementSessions = new FakeSessions();
-    replacementSessions.session = {
-      ...replacementSessions.session,
-      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
-    };
-    const replacementService = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      replacementSessions as unknown as SessionManager,
-      providerStore(),
-      new FakeCodexAppServer() as unknown as CodexAppServerService,
-      fileService,
-    );
-    await replacementService.setFileAccess(owner, {
-      terminalId: 'terminal', mode: 'read-only', backend,
-    });
-    replacementService.sendPrompt(owner, {
-      terminalId: 'terminal',
-      prompt: 'Switch backend.',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    await waitFor(() => replacementService.getState(owner, 'terminal')?.state === 'COMPLETED');
-    expect(replacementService.getState(owner, 'terminal')).toMatchObject({
-      fileAccessMode: 'off',
-      fileAccessRoot: undefined,
-      fileAccessPolicy: { read: false, write: false, create: false, delete: false },
-    });
-    expect(replacementSessions.audits).toContainEqual({
-      type: 'file_permission_changed',
-      details: { mode: 'off', reason: 'user', ephemeral: true },
-    });
-  });
-
-  it('rejects Workspace changes while a Generic Provider turn is running', async () => {
+    it('rejects Workspace changes while a Generic Provider turn is running', async () => {
     const provider = new DeferredStreamingProvider();
     const service = new AgentService(
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -3123,38 +2806,7 @@ describe('AgentService shared-terminal controls', () => {
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
   });
 
-  it('rejects Workspace changes while a native backend turn is draining', async () => {
-    const codex = new DeferredStreamingCodexAppServer();
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      new FakeSessions() as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-    const owner = browserOwner();
-    const running = service.sendPrompt(owner, {
-      terminalId: 'terminal',
-      prompt: 'Keep working.',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    await waitFor(() => Boolean(codex.input));
-    service.interruptTurn(owner, {
-      terminalId: 'terminal',
-      messageId: running.messages.at(-1)!.id,
-    });
-
-    expect(service.getState(owner, 'terminal')?.backendTurnDraining).toBe(true);
-    expect(() => service.assertWorkspaceChangeAllowed(owner, 'terminal'))
-      .toThrow('Agent 运行或正在停止时');
-
-    codex.finishInterrupt();
-    await waitFor(() => service.getState(owner, 'terminal')?.backendTurnDraining === false);
-  });
-
-  it('binds ephemeral file permission and does not use a hidden command or legacy mutation audit', async () => {
+    it('binds ephemeral file permission and does not use a hidden command or legacy mutation audit', async () => {
     const sessions = new FakeSessions();
     sessions.session = { ...sessions.session, cwd: '/work' };
     const terminals = new FakeTerminals();
@@ -3179,7 +2831,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       fileService,
       () => new ScriptedLoopBackend(provider),
     );
@@ -3262,300 +2913,7 @@ describe('AgentService shared-terminal controls', () => {
     })]);
   });
 
-  it('publishes App Server deltas before turn completion using one stable message', async () => {
-    const codex = new DeferredStreamingCodexAppServer();
-    const sessions = new FakeSessions();
-    const owner = browserOwner();
-    const send = owner.send as unknown as ReturnType<typeof vi.fn>;
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-
-    service.sendPrompt(owner, {
-      terminalId: 'terminal',
-      prompt: 'Stream from App Server.',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    await waitFor(() => Boolean(codex.input));
-    codex.push('**部分');
-    codex.push('输出');
-    await waitFor(() => send.mock.calls.some((call) => {
-      const event = call[1] as { delta?: string };
-      return call[0] === AGENT_CHANNELS.assistantDelta
-        && event.delta === '**部分输出';
-    }));
-    const deltaPayload = send.mock.calls.find(
-      (call) => call[0] === AGENT_CHANNELS.assistantDelta,
-    )?.[1] as Record<string, unknown>;
-    expect(deltaPayload).toMatchObject({
-      terminalId: 'terminal',
-      messageId: expect.any(String),
-      turnId: expect.any(String),
-      sequence: 1,
-      delta: '**部分输出',
-    });
-    expect(deltaPayload).not.toHaveProperty('messages');
-    expect(send.mock.calls.some((call) => {
-      if (call[0] !== AGENT_CHANNELS.stateChanged) return false;
-      const view = call[1] as AgentSessionView;
-      return Boolean(view.streamingMessageId)
-        && view.messages.at(-1)?.content === '';
-    })).toBe(true);
-    const partial = service.getState(owner, 'terminal')!;
-    const partialId = partial.streamingMessageId;
-    expect(partial.messages.at(-1)?.id).toBe(partialId);
-    expect(partial.state).toBe('THINKING');
-
-    codex.finish('**部分输出**');
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    const completed = service.getState(owner, 'terminal')!;
-    expect(completed.streamingMessageId).toBeUndefined();
-    expect(completed.messages.at(-1)).toMatchObject({
-      id: partialId,
-      content: '**部分输出**',
-    });
-  });
-
-  it('publishes only thread-matched Codex usage and invalidates stale values after compaction or restart', async () => {
-    const codex = new DeferredStreamingCodexAppServer();
-    const owner = browserOwner();
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      new FakeSessions() as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-
-    const started = service.sendPrompt(owner, {
-      terminalId: 'terminal',
-      prompt: 'Report current context.',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    expect(started.contextUsage).toEqual({ source: 'provider-reported', status: 'ready' });
-    await waitFor(() => Boolean(codex.input));
-
-    codex.context({
-      type: 'usage-updated',
-      threadId: 'stale-thread',
-      currentTokens: 60_000,
-      contextWindowTokens: 64_000,
-    });
-    expect(service.getState(owner, 'terminal')?.contextUsage)
-      .toEqual({ source: 'provider-reported', status: 'ready' });
-
-    codex.context({
-      type: 'usage-updated',
-      threadId: 'provider-thread-stream',
-      currentTokens: 12_000,
-      contextWindowTokens: 64_000,
-    });
-    expect(service.getState(owner, 'terminal')?.contextUsage).toEqual({
-      source: 'provider-reported',
-      status: 'ready',
-      currentTokens: 12_000,
-      contextWindowTokens: 64_000,
-      percentage: 19,
-    });
-
-    codex.context({
-      type: 'compaction-started',
-      threadId: 'provider-thread-stream',
-      turnId: 'provider-turn-stream',
-      itemId: 'compact-1',
-      occurredAt: '2026-08-21T00:00:00.000Z',
-    });
-    expect(service.getState(owner, 'terminal')?.contextUsage).toMatchObject({
-      source: 'provider-reported', status: 'compressing', currentTokens: 12_000,
-    });
-    codex.context({
-      type: 'compaction-completed',
-      threadId: 'provider-thread-stream',
-      turnId: 'provider-turn-stream',
-      itemId: 'compact-1',
-      occurredAt: '2026-08-21T00:00:01.000Z',
-    });
-    expect(service.getState(owner, 'terminal')?.contextUsage).toEqual({
-      source: 'provider-reported',
-      status: 'ready',
-      contextWindowTokens: 64_000,
-      lastCompressedAt: '2026-08-21T00:00:01.000Z',
-    });
-
-    codex.context({
-      type: 'usage-updated',
-      threadId: 'provider-thread-stream',
-      currentTokens: 4_000,
-      contextWindowTokens: 64_000,
-    });
-    expect(service.getState(owner, 'terminal')?.contextUsage).toMatchObject({
-      currentTokens: 4_000, percentage: 6,
-    });
-    service.handleCodexAppServerRestarted();
-    expect(service.getState(owner, 'terminal')?.contextUsage)
-      .toEqual({ source: 'provider-reported', status: 'ready' });
-
-    codex.finish('done');
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-  });
-
-  it('invalidates provider usage when a Codex conversation is replayed after retract', async () => {
-    const codex = new DeferredStreamingCodexAppServer();
-    const owner = browserOwner();
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      new FakeSessions() as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-    const started = service.sendPrompt(owner, {
-      terminalId: 'terminal',
-      prompt: 'A very long resumed conversation.',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    const messageId = started.messages.find((message) => message.role === 'user')!.id;
-    await waitFor(() => Boolean(codex.input));
-    codex.context({
-      type: 'usage-updated',
-      threadId: 'provider-thread-stream',
-      currentTokens: 48_000,
-      contextWindowTokens: 64_000,
-    });
-    codex.finish('done');
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    expect(service.getState(owner, 'terminal')?.contextUsage).toMatchObject({
-      source: 'provider-reported', currentTokens: 48_000,
-    });
-
-    const retracted = await service.revisePrompt(owner, {
-      terminalId: 'terminal', messageId, action: 'retract',
-    });
-    expect(retracted.contextUsage).toEqual({ source: 'provider-reported', status: 'ready' });
-  });
-
-  it('restores a long persisted Codex session with unknown usage until App Server reports it', () => {
-    const sessions = new FakeSessions();
-    sessions.session = {
-      ...sessions.session,
-      runtimeTerminalId: 'reconnected-terminal',
-      aiThreadId: '33333333-3333-3333-3333-333333333333',
-      agentBackend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-      providerId: CODEX_APP_SERVER_AGENT_BACKEND,
-      providerThreadId: 'provider-thread-long',
-    };
-    sessions.persistedThreadEvents = Array.from({ length: 120 }, (_, index) => ({
-      type: 'chat',
-      timestamp: new Date(index + 1).toISOString(),
-      item: {
-        id: `message-${index}`,
-        role: index % 2 === 0 ? 'user' : 'assistant',
-        content: `Persisted message ${index}`,
-        createdAt: new Date(index + 1).toISOString(),
-      },
-    }));
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-    );
-
-    const restored = service.getState(browserOwner(), 'reconnected-terminal');
-    expect(restored?.messages).toHaveLength(120);
-    expect(restored?.contextUsage).toEqual({ source: 'provider-reported', status: 'ready' });
-  });
-
-  it('keeps the visible terminal human-owned and disables manual takeover for App Server', async () => {
-    const codex = new DeferredStreamingCodexAppServer();
-    const terminals = new FakeTerminals();
-    const owner = browserOwner();
-    const service = new AgentService(
-      terminals as unknown as TerminalService,
-      new FakeSessions() as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-    const request = {
-      terminalId: 'terminal',
-      prompt: 'First turn.',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      } as const,
-    };
-
-    service.sendPrompt(owner, request);
-    await waitFor(() => Boolean(codex.input));
-    expect(service.getState(owner, 'terminal')?.terminalInputMode).toBe('human');
-    expect(terminals.controlModes).toEqual([]);
-    expect(() => service.takeover(owner, { terminalId: 'terminal' }))
-      .toThrow('无需人工接管');
-    expect(() => service.setFullTakeover(owner, {
-      terminalId: 'terminal', enabled: true,
-    })).toThrow('Full Takeover');
-    codex.finish('done');
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    expect(terminals.controlModes).toEqual([]);
-  });
-
-  it('reads fresh non-secret Session metadata for native Codex terminal state', async () => {
-    const codex = new DeferredStreamingCodexAppServer();
-    const sessions = new FakeSessions();
-    const owner = browserOwner();
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-
-    service.sendPrompt(owner, {
-      terminalId: 'terminal',
-      prompt: 'Inspect the current SSH terminal.',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    await waitFor(() => Boolean(codex.input));
-
-    sessions.session = {
-      ...sessions.session,
-      cwd: '/srv/latest',
-      effectiveUser: 'root',
-      connectionState: 'disconnected',
-    };
-    const state = await codex.input!.tools.getTerminalState();
-    expect(state).toEqual({
-      transport: 'ssh',
-      target: {
-        label: 'Test', hostname: '192.0.2.10', port: 22, username: 'tester',
-      },
-      cwd: '/srv/latest',
-      effectiveUser: 'root',
-      shellKind: 'posix',
-      connectionState: 'disconnected',
-    });
-    expect(state).not.toHaveProperty('hostId');
-
-    codex.finish('state read');
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-  });
-
-  it('publishes partial Generic Provider output and finalizes one persisted chat item', async () => {
+              it('publishes partial Generic Provider output and finalizes one persisted chat item', async () => {
     const provider = new DeferredStreamingProvider();
     const sessions = new FakeSessions();
     const terminals = new FakeTerminals();
@@ -3565,7 +2923,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -3614,7 +2971,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeSessions() as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => backend,
       () => configuredCheckpointInterval,
     );
@@ -3643,7 +2999,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => backend,
     );
@@ -3693,7 +3048,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => resumedBackend,
     );
     const restored = resumedService.getState(owner, 'terminal')!;
@@ -3716,7 +3070,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -3743,252 +3096,7 @@ describe('AgentService shared-terminal controls', () => {
     expect(service.getState(owner, 'terminal')?.state).toBe('PAUSED');
   });
 
-  it('runs App Server independently without routing commands into the visible terminal', async () => {
-    const sessions = new FakeSessions();
-    const terminals = new FakeTerminals();
-    const codex = new FakeCodexAppServer();
-    const owner = browserOwner();
-    const service = new AgentService(
-      terminals as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-
-    service.sendPrompt(owner, {
-      terminalId: 'terminal',
-      prompt: 'Use native Codex tools.',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-
-    const view = service.getState(owner, 'terminal')!;
-    expect(view.backend).toEqual({
-      kind: CODEX_APP_SERVER_AGENT_BACKEND,
-      policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-    });
-    expect(terminals.executions).toEqual([]);
-    expect(terminals.controlModes).toEqual([]);
-    expect(view.terminalInputMode).toBe('human');
-    expect(sessions.session.providerThreadId).toBe('provider-thread-1');
-    expect(view.messages.at(-1)?.content).toBe('history-ok');
-    expect(sessions.threadEvents.some((event) => (
-      event.type === 'codex_app_server_turn'
-      && event.providerTurnId === 'provider-turn-1'
-    ))).toBe(true);
-  });
-
-  it('routes Codex terminal_execute through one approved visible-terminal execution', async () => {
-    const sessions = new FakeSessions();
-    const terminals = new FakeTerminals();
-    const codex = new TerminalCallingCodexAppServer();
-    const owner = browserOwner();
-    const service = new AgentService(
-      terminals as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-
-    service.sendPrompt(owner, {
-      terminalId: 'terminal',
-      prompt: 'Run one command in the visible terminal.',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    await waitFor(() => Boolean(service.getState(owner, 'terminal')?.pendingApproval));
-    const approval = service.getState(owner, 'terminal')!.pendingApproval!;
-    expect(codex.turns[0]?.dynamicTools?.map((tool) => tool.name)).toContain('terminal_execute');
-    expect(terminals.executions).toHaveLength(0);
-
-    service.resolveApproval(owner, {
-      terminalId: 'terminal', approvalId: approval.id, decision: 'execute',
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-
-    expect(terminals.executions).toEqual([{
-      command: 'printf codex-once', actor: 'ai',
-    }]);
-    expect(terminals.controlModes[0]).toBe('locked');
-    expect(terminals.controlModes.at(-1)).toBe('human');
-    expect(terminals.hasControlLease()).toBe(false);
-    expect(service.getState(owner, 'terminal')?.terminalInputMode).toBe('human');
-  });
-
-  it('passes an authorized local Workspace Root to native Codex as its direct cwd', async () => {
-    const sessions = new FakeSessions();
-    sessions.session = {
-      ...sessions.session,
-      transport: 'local',
-      hostId: undefined,
-      workspace: { backend: 'local', root: 'C:\\work\\codex-project' },
-    };
-    const terminals = new FakeTerminals(undefined, 'local');
-    const codex = new DeferredStreamingCodexAppServer();
-    const fileService = {
-      bindWorkspaceRoot: vi.fn().mockResolvedValue('C:\\work\\codex-project'),
-      canonicalizeAccessRoot: vi.fn(async (_owner, _terminalId, path: string) => path),
-    } as unknown as AgentFileService;
-    const owner = browserOwner();
-    const backend = {
-      kind: CODEX_APP_SERVER_AGENT_BACKEND as typeof CODEX_APP_SERVER_AGENT_BACKEND,
-      policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-    };
-    const service = new AgentService(
-      terminals as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-      fileService,
-    );
-    await service.setFileAccess(owner, {
-      terminalId: 'terminal', mode: 'read-only', backend,
-      expectedWorkspaceRoot: 'C:\\work\\codex-project',
-    });
-    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Inspect local files.', backend });
-    await waitFor(() => Boolean(codex.input));
-
-    expect(codex.input?.executionWorkspaceRoot).toBe('C:\\work\\codex-project');
-    expect(codex.input?.executionWorkspaceReadOnly).toBe(true);
-    expect(codex.input?.workspaceBinding).toEqual({
-      mode: 'local-direct', access: 'read-only',
-      root: 'C:\\work\\codex-project', backend: 'local',
-    });
-    expect(codex.input?.dynamicTools?.map((tool) => tool.name)).toEqual(['terminal_execute']);
-    codex.finish('local workspace ready');
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-  });
-
-  it('exposes an authorized SSH Workspace Root through bounded SFTP tools', async () => {
-    const sessions = new FakeSessions();
-    sessions.session = {
-      ...sessions.session,
-      workspace: { backend: 'sftp', root: '/srv/codex-project', hostId: 'host' },
-    };
-    const terminals = new FakeTerminals();
-    const codex = new DeferredStreamingCodexAppServer();
-    const fileService = {
-      bindWorkspaceRoot: vi.fn().mockResolvedValue('/srv/codex-project'),
-      canonicalizeAccessRoot: vi.fn(async (_owner, _terminalId, path: string) => path),
-    } as unknown as AgentFileService;
-    const owner = browserOwner();
-    const backend = {
-      kind: CODEX_APP_SERVER_AGENT_BACKEND as typeof CODEX_APP_SERVER_AGENT_BACKEND,
-      policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-    };
-    const service = new AgentService(
-      terminals as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-      fileService,
-    );
-    await service.setFileAccess(owner, {
-      terminalId: 'terminal', mode: 'read-write', backend,
-      expectedWorkspaceRoot: '/srv/codex-project',
-    });
-    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Inspect remote files.', backend });
-    await waitFor(() => Boolean(codex.input));
-
-    expect(codex.input?.executionWorkspaceRoot).toBeUndefined();
-    expect(codex.input?.workspaceBinding).toEqual({
-      mode: 'remote-tools', access: 'read-write', root: '/srv/codex-project',
-      backend: 'sftp', hostId: 'host',
-    });
-    const names = codex.input?.dynamicTools?.map((tool) => tool.name) ?? [];
-    expect(names).toContain('terminal_execute');
-    expect(names).toContain('workspace_read_file');
-    expect(names).toContain('workspace_apply_patch');
-    expect(names).not.toContain('terminal_read');
-    expect(names).not.toContain('terminal_state');
-    codex.finish('remote workspace ready');
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-  });
-
-  it('restores each backend own thread when switching Generic to Codex and back', async () => {
-    const sessions = new ThreadedFakeSessions();
-    const terminals = new FakeTerminals();
-    const codex = new FakeCodexAppServer();
-    const genericBackends: RecordingBackend[] = [];
-    const owner = browserOwner();
-    const service = new AgentService(
-      terminals as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-      undefined,
-      () => {
-        const backend = new RecordingBackend();
-        genericBackends.push(backend);
-        return backend;
-      },
-    );
-
-    service.sendPrompt(owner, {
-      terminalId: 'terminal', prompt: 'generic-one',
-      backend: { kind: 'generic-provider', providerId: 'provider' },
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    const genericThreadId = service.getState(owner, 'terminal')!.threadId;
-
-    service.sendPrompt(owner, {
-      terminalId: 'terminal', prompt: 'codex-one',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    const codexThreadId = service.getState(owner, 'terminal')!.threadId;
-    expect(codexThreadId).not.toBe(genericThreadId);
-
-    const activatedGeneric = service.activateBackend(owner, {
-      terminalId: 'terminal',
-      backend: { kind: 'generic-provider', providerId: 'provider' },
-    });
-    expect(activatedGeneric.threadId).toBe(genericThreadId);
-    expect(activatedGeneric.messages.map((message) => message.content)).toContain('generic-one');
-    expect(activatedGeneric.messages.map((message) => message.content)).not.toContain('codex-one');
-    service.sendPrompt(owner, {
-      terminalId: 'terminal', prompt: 'generic-two',
-      backend: { kind: 'generic-provider', providerId: 'provider' },
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    const restoredGeneric = service.getState(owner, 'terminal')!;
-    expect(restoredGeneric.threadId).toBe(genericThreadId);
-    expect(restoredGeneric.messages.map((message) => message.content)).toContain('generic-one');
-    expect(restoredGeneric.messages.map((message) => message.content)).not.toContain('codex-one');
-    expect(genericBackends.at(-1)?.resumeInputs[0]?.id).toBe(genericThreadId);
-
-    const activatedCodex = service.activateBackend(owner, {
-      terminalId: 'terminal',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    expect(activatedCodex.threadId).toBe(codexThreadId);
-    expect(activatedCodex.messages.map((message) => message.content)).toContain('codex-one');
-    expect(activatedCodex.messages.map((message) => message.content)).not.toContain('generic-two');
-    service.sendPrompt(owner, {
-      terminalId: 'terminal', prompt: 'codex-two',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    expect(service.getState(owner, 'terminal')?.threadId).toBe(codexThreadId);
-    expect(codex.turns.at(-1)?.threadId).toBe('provider-thread-1');
-    expect(sessions.session.agentThreads).toHaveLength(2);
-  });
-
-  it('does not acquire terminal control when the initial prompt cannot be persisted', () => {
+            it('does not acquire terminal control when the initial prompt cannot be persisted', () => {
     const sessions = new FakeSessions();
     sessions.failThreadEvents = true;
     const terminals = new FakeTerminals();
@@ -3996,7 +3104,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(new FakeProvider([])),
     );
@@ -4024,7 +3131,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -4063,7 +3169,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -4104,7 +3209,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       fileService,
       () => new ScriptedLoopBackend(provider),
     );
@@ -4144,7 +3248,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -4188,7 +3291,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => new ScriptedLoopBackend(provider),
     );
 
@@ -4212,46 +3314,6 @@ describe('AgentService shared-terminal controls', () => {
     ))).toBe(true);
   });
 
-  it('invalidates a file-tool bypass approval when its Workspace binding changes', async () => {
-    const provider = new FakeProvider([
-      toolCall('call-stale-bypass', 'cat README.md'),
-      { message: { role: 'assistant', content: 'The stale approval was rejected.' } },
-    ]);
-    const sessions = new FakeSessions();
-    sessions.session = {
-      ...sessions.session,
-      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
-    };
-    const terminals = new FakeTerminals();
-    const owner = browserOwner();
-    const service = new AgentService(
-      terminals as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      undefined,
-      undefined,
-      () => new ScriptedLoopBackend(provider),
-    );
-
-    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Read a file.' });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
-    const approval = service.getState(owner, 'terminal')!.pendingApproval!;
-    sessions.session = {
-      ...sessions.session,
-      workspace: { backend: 'sftp', root: '/replacement', hostId: 'host' },
-    };
-    expect(() => service.resolveApproval(owner, {
-      terminalId: 'terminal', approvalId: approval.id, decision: 'execute',
-    })).toThrow(/绑定已变化/u);
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-
-    expect(terminals.executions).toEqual([]);
-    expect(sessions.audits.some((audit) => (
-      audit.type === 'file_command_policy'
-      && audit.details?.action === 'exception_approval_invalidated'
-    ))).toBe(true);
-  });
-
   it('runs multiple commands without approval only after explicit Full Takeover', async () => {
     const provider = new FakeProvider([
       toolCall('call-1', 'printf one'),
@@ -4265,7 +3327,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -4303,7 +3364,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -4460,7 +3520,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => new ScriptedLoopBackend(provider),
     );
 
@@ -4503,7 +3562,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -4550,7 +3608,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -4604,7 +3661,6 @@ describe('AgentService shared-terminal controls', () => {
       normalSessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => new ScriptedLoopBackend(normalProvider),
     );
     normalService.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Confirm.' });
@@ -4641,7 +3697,6 @@ describe('AgentService shared-terminal controls', () => {
       takeoverSessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => new ScriptedLoopBackend(takeoverProvider),
     );
     takeoverService.setFullTakeover(owner, { terminalId: 'terminal', enabled: true });
@@ -4666,7 +3721,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -4748,7 +3802,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => new ScriptedLoopBackend(provider),
     );
 
@@ -4814,7 +3867,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => new ScriptedLoopBackend(provider),
     );
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Start it.' });
@@ -4867,7 +3919,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -4932,7 +3983,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => new ScriptedLoopBackend(provider),
     );
 
@@ -4957,7 +4007,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -4997,7 +4046,6 @@ describe('AgentService shared-terminal controls', () => {
       terminals as unknown as TerminalService,
       sessions as unknown as SessionManager,
       providerStore(),
-      undefined,
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
@@ -5050,7 +4098,6 @@ describe('AgentService shared-terminal controls', () => {
       sessions as unknown as SessionManager,
       providerStore(),
       undefined,
-      undefined,
       () => new ScriptedLoopBackend(provider),
     ).getState(owner, 'terminal');
     expect(restored?.messages.map((item) => item.content)).toEqual([
@@ -5061,262 +4108,7 @@ describe('AgentService shared-terminal controls', () => {
     ]);
   });
 
-  it('replaces a completed Codex prompt through a native fork and reuses its exact base turn', async () => {
-    const sessions = new FakeSessions();
-    const codex = new ForkingCodexAppServer();
-    const owner = browserOwner();
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-    const backend = {
-      kind: CODEX_APP_SERVER_AGENT_BACKEND as typeof CODEX_APP_SERVER_AGENT_BACKEND,
-      policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-    };
-
-    service.sendPrompt(owner, {
-      terminalId: 'terminal', prompt: 'First prompt.', backend,
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    service.sendPrompt(owner, {
-      terminalId: 'terminal', prompt: 'Old second prompt.', backend,
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    const oldMessageId = [...service.getState(owner, 'terminal')!.messages]
-      .reverse().find((item) => item.role === 'user')!.id;
-
-    await service.revisePrompt(owner, {
-      terminalId: 'terminal',
-      messageId: oldMessageId,
-      action: 'replace',
-      prompt: 'Revised second prompt.',
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-
-    expect(codex.forks).toEqual([{
-      threadId: 'provider-thread-1',
-      lastTurnId: 'provider-turn-1',
-    }]);
-    expect(codex.turns[2]).toMatchObject({
-      threadId: 'provider-thread-fork-1',
-      prompt: 'Revised second prompt.',
-    });
-    expect(codex.turns[2]?.prompt).not.toContain('local_conversation_history');
-    expect(service.getState(owner, 'terminal')?.messages.map((item) => item.content)).toEqual([
-      'First prompt.',
-      'answer-1',
-      'Revised second prompt.',
-      'answer-3',
-    ]);
-    expect(sessions.session.providerThreadId).toBe('provider-thread-fork-1');
-    expect(sessions.threadEvents).toContainEqual(expect.objectContaining({
-      type: 'chat_action',
-      action: 'replace',
-      providerStrategy: 'native-fork',
-      providerThreadId: 'provider-thread-fork-1',
-      providerForkedFromThreadId: 'provider-thread-1',
-      providerForkLastTurnId: 'provider-turn-1',
-    }));
-
-    const revisedMessageId = [...service.getState(owner, 'terminal')!.messages]
-      .reverse().find((item) => item.role === 'user')!.id;
-    await service.revisePrompt(owner, {
-      terminalId: 'terminal',
-      messageId: revisedMessageId,
-      action: 'replace',
-      prompt: 'Revised second prompt again.',
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    expect(codex.forks[1]).toEqual({
-      threadId: 'provider-thread-fork-1',
-      lastTurnId: 'provider-turn-1',
-    });
-    expect(codex.turns[3]).toMatchObject({
-      threadId: 'provider-thread-fork-2',
-      prompt: 'Revised second prompt again.',
-    });
-  });
-
-  it('leaves the Codex conversation untouched when its native fork fails', async () => {
-    const sessions = new FakeSessions();
-    const codex = new ForkingCodexAppServer();
-    const owner = browserOwner();
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-    const backend = {
-      kind: CODEX_APP_SERVER_AGENT_BACKEND as typeof CODEX_APP_SERVER_AGENT_BACKEND,
-      policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-    };
-    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'First.', backend });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Second.', backend });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    const before = service.getState(owner, 'terminal')!;
-    const messageId = [...before.messages].reverse().find((item) => item.role === 'user')!.id;
-    const eventCount = sessions.threadEvents.length;
-    codex.forkError = new Error('native fork rejected');
-
-    await expect(service.revisePrompt(owner, {
-      terminalId: 'terminal', messageId, action: 'replace', prompt: 'Changed.',
-    })).rejects.toThrow('native fork rejected');
-
-    expect(service.getState(owner, 'terminal')?.messages).toEqual(before.messages);
-    expect(service.getState(owner, 'terminal')?.state).toBe('COMPLETED');
-    expect(sessions.session.providerThreadId).toBe('provider-thread-1');
-    expect(sessions.threadEvents).toHaveLength(eventCount);
-    expect(codex.turns).toHaveLength(2);
-  });
-
-  it('does not switch to an orphaned native fork when local revision persistence fails', async () => {
-    const sessions = new FakeSessions();
-    const codex = new ForkingCodexAppServer();
-    const owner = browserOwner();
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-    const backend = {
-      kind: CODEX_APP_SERVER_AGENT_BACKEND as typeof CODEX_APP_SERVER_AGENT_BACKEND,
-      policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-    };
-    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'First.', backend });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Second.', backend });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    const before = service.getState(owner, 'terminal')!;
-    const messageId = [...before.messages].reverse().find((item) => item.role === 'user')!.id;
-    sessions.failThreadEvents = true;
-
-    await expect(service.revisePrompt(owner, {
-      terminalId: 'terminal', messageId, action: 'replace', prompt: 'Changed.',
-    })).rejects.toThrow('thread persistence failed');
-
-    expect(codex.forks).toHaveLength(1);
-    expect(codex.turns).toHaveLength(2);
-    expect(service.getState(owner, 'terminal')?.messages).toEqual(before.messages);
-    expect(sessions.session.providerThreadId).toBe('provider-thread-1');
-  });
-
-  it('edits the first Codex prompt by starting a fresh native thread without a fork', async () => {
-    const sessions = new FakeSessions();
-    const codex = new ForkingCodexAppServer();
-    const owner = browserOwner();
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-    const backend = {
-      kind: CODEX_APP_SERVER_AGENT_BACKEND as typeof CODEX_APP_SERVER_AGENT_BACKEND,
-      policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-    };
-    const first = service.sendPrompt(owner, {
-      terminalId: 'terminal', prompt: 'Original first prompt.', backend,
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-
-    await service.revisePrompt(owner, {
-      terminalId: 'terminal',
-      messageId: first.messages.find((item) => item.role === 'user')!.id,
-      action: 'replace',
-      prompt: 'Revised first prompt.',
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-
-    expect(codex.forks).toEqual([]);
-    expect(codex.turns[1]).toMatchObject({
-      threadId: undefined,
-      prompt: 'Revised first prompt.',
-    });
-    expect(service.getState(owner, 'terminal')?.messages.map((item) => item.content)).toEqual([
-      'Revised first prompt.',
-      'answer-2',
-    ]);
-  });
-
-  it('drains an interrupted native Codex turn without taking terminal control', async () => {
-    const codex = new DeferredStreamingCodexAppServer();
-    const owner = browserOwner();
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      new FakeSessions() as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-    const running = service.sendPrompt(owner, {
-      terminalId: 'terminal',
-      prompt: 'Native long task.',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    await waitFor(() => Boolean(codex.input));
-
-    const interrupted = service.interruptTurn(owner, {
-      terminalId: 'terminal',
-      messageId: running.messages.at(-1)!.id,
-    });
-    expect(interrupted).toMatchObject({
-      state: 'PAUSED',
-      terminalInputMode: 'human',
-      backendTurnDraining: true,
-    });
-    expect(codex.interruptRequested).toBe(true);
-    codex.finishInterrupt();
-    await waitFor(() => service.getState(owner, 'terminal')?.backendTurnDraining === false);
-    expect(service.getState(owner, 'terminal')?.state).toBe('PAUSED');
-  });
-
-  it('reports a rejected native interrupt instead of presenting it as safely stopped', async () => {
-    const codex = new RejectingInterruptCodexAppServer();
-    const owner = browserOwner();
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      new FakeSessions() as unknown as SessionManager,
-      providerStore(),
-      codex as unknown as CodexAppServerService,
-    );
-    const running = service.sendPrompt(owner, {
-      terminalId: 'terminal',
-      prompt: 'Native long task.',
-      backend: {
-        kind: CODEX_APP_SERVER_AGENT_BACKEND,
-        policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-      },
-    });
-    await waitFor(() => Boolean(codex.input));
-
-    service.interruptTurn(owner, {
-      terminalId: 'terminal',
-      messageId: running.messages.at(-1)!.id,
-    });
-    await waitFor(() => service.getState(owner, 'terminal')?.error !== undefined);
-    expect(service.getState(owner, 'terminal')).toMatchObject({
-      state: 'PAUSED',
-      terminalInputMode: 'human',
-      backendTurnDraining: true,
-      error: 'interrupt rejected; connection quarantined',
-    });
-    service.handleCodexAppServerRestarted();
-    expect(service.getState(owner, 'terminal')).toMatchObject({
-      state: 'PAUSED',
-      terminalInputMode: 'human',
-      backendTurnDraining: false,
-      error: undefined,
-    });
-  });
-
-  it('keeps renderer revisions increasing when the Provider creates a new runtime', async () => {
+              it('keeps renderer revisions increasing when the Provider creates a new runtime', async () => {
     const firstProfile: ProviderProfile = {
       id: 'provider-a',
       name: 'Provider A',
@@ -5352,7 +4144,6 @@ describe('AgentService shared-terminal controls', () => {
       new FakeTerminals() as unknown as TerminalService,
       new FakeSessions() as unknown as SessionManager,
       store,
-      undefined,
       undefined,
       (providerId) => new ScriptedLoopBackend(providerId === firstProfile.id ? firstProvider : secondProvider),
     );

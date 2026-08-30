@@ -375,14 +375,6 @@ export class SessionManager {
     return this.store.bindAgentBackendThread(sessionId, backend, threadId);
   }
 
-  bindProviderThread(
-    sessionId: string,
-    localThreadId: string,
-    providerThreadId: string,
-  ): SessionRecord {
-    return this.store.bindProviderThread(sessionId, localThreadId, providerThreadId);
-  }
-
   appendThreadEvent(
     sessionId: string,
     threadId: string,

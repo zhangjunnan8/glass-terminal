@@ -22,7 +22,7 @@ Glass Terminal 是一个 **Windows-first、终端优先、远程设备优先**�
 
 ## 🎯 为什么 Glass Terminal
 
-Codex IDE、Remote IDE 和通用 Agent Harness 主要围绕代码工作区与 Agent 自有执行环境设计；Glass Terminal 首先解决的是另一类问题：**如何让 AI 安全、透明地进入已经存在的真实设备终端**。
+AI IDE、Remote IDE 和通用 Agent Harness 主要围绕代码工作区与 Agent 自有执行环境设计；Glass Terminal 首先解决的是另一类问题：**如何让 AI 安全、透明地进入已经存在的真实设备终端**。
 
 | | Glass Terminal | 常见 Remote IDE | 常见 Agent Harness |
 |---|---|---|---|
@@ -36,7 +36,7 @@ Codex IDE、Remote IDE 和通用 Agent Harness 主要围绕代码工作区与 Ag
 
 > Glass Terminal 不替代单片机本身的物理调试链路。对于不能运行 SSH 的 MCU，它连接的是挂载该设备、烧录器或串口的控制主机。
 
-> **当前模式边界：**Generic Provider 与 Codex App Server 都可通过 `terminal_execute` 将获批命令只执行一次于当前可见 PTY/SSH。Codex 内建 Shell 本身仍是本机进程：授权本地 Workspace 后可原生直连，授权 SSH Workspace 后经现有连接的 SFTP 工具处理远程文件。详见 [Codex App Server 使用与接入说明](docs/codex-app-server.md)。
+> **当前模式边界：**OpenAI 兼容 Provider 通过受控工具将获批命令只执行一次于当前可见 PTY/SSH；本地 Workspace 使用本机文件工具，SSH Workspace 复用现有连接的 SFTP 通道。
 
 ## ✨ 核心特性
 
@@ -44,7 +44,7 @@ Codex IDE、Remote IDE 和通用 Agent Harness 主要围绕代码工作区与 Ag
 |---|---|
 | 🖥️ **共享可见终端** | Generic Provider 与人类共用同一个真实 PTY/SSH Shell；命令只执行一次，输出实时可见，没有第二条隐藏执行通道 |
 | 🪶 **远程零侵入** | 目标主机无需安装 Glass Terminal、远程 IDE 或 Agent Runtime；会话集成不修改远端 PowerShell Profile、不落地脚本 |
-| 🤖 **双 Agent 后端** | Generic Provider（LangChain，兼容 DeepSeek / GLM / MiniMax / OpenAI 等）与原生 Codex App Server 两种模式 |
+| 🤖 **开放模型接入** | 基于 LangChain 的 OpenAI 兼容 Provider，可接入 DeepSeek / GLM / MiniMax / OpenAI 等兼容端点，并支持手动填写模型 ID |
 | 🧠 **有界上下文记忆** | Generic Provider 按模型窗口保守估算；满阈值生成经校验的结构化摘要，用户还可审阅、编辑和合并独立的短记忆卡片 |
 | ✅ **命令审批** | AI 请求执行命令需你确认；支持编辑后执行、拒绝 |
 | 🎮 **AI 全接管 / 人工接管** | 显式确认后 Full Takeover 可连续执行命令，Take Control 可随时抢回当前终端；SSH Host 当前会记住该偏好 |
@@ -102,9 +102,6 @@ npm run package:win
 
 > 用户数据（主机、Provider、加密密钥库、会话）保存在 `%APPDATA%\glass-terminal\`，与应用本体分离。
 >
-> 当前绿色版不内置 Codex CLI。Codex App Server 模式需要从界面自动检测 PATH 中的官方
-> `codex` 可执行文件，或由用户手动选择 `codex.exe`。
->
 > ⚠️ 默认备份不包含 Provider API Key 或 SSH 凭据。显式包含凭据时，`.aitbak` 和
 > `.aithosts` 会使用用户提供的口令加密整个文件；口令不会由应用保存，遗失后无法恢复。
 > 旧版明文凭据备份仍可在显式确认风险后导入，请继续将所有备份视为敏感文件。
@@ -120,7 +117,7 @@ npm run package:win
 | 桌面壳 | Electron + Vite + React 19 |
 | 终端 | xterm.js + node-pty（ConPTY） |
 | 远程 | ssh2（SSH / SFTP） |
-| Agent | LangChain（Generic Provider）+ Codex App Server |
+| Agent | LangChain（OpenAI 兼容 Provider） |
 | 构建 | tsup（main/preload）+ Vite（renderer）+ electron-builder |
 | 测试 | Vitest |
 
@@ -154,7 +151,6 @@ src/
   renderer/   React 界面（终端面板、Agent 面板、设置窗口）
   shared/     IPC 契约与共享类型
 docs/
-  codex-app-server.md        Codex 原生模式使用与能力边界
   architecture/              架构与技术选型
   releases/                  版本发布说明
 ```
@@ -169,7 +165,6 @@ docs/
 
 | | 工具 | 角色 |
 |---|---|---|
-| 🦾 | **[Codex](https://github.com/openai/codex)**（OpenAI） | AI 编程代理：功能实现、代码生成与重构 |
 | 🌊 | **[DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh)**（DeepSeek） | 开发调试环境：承载开发、测试与迭代 |
 
 </div>

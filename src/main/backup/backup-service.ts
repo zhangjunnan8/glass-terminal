@@ -45,7 +45,6 @@ import {
 interface BackupPaths {
   settings: string;
   providers: string;
-  codexAppServer: string;
   /** Root of per-session data and logs; bundled only when requested. */
   sessions: string;
 }
@@ -53,7 +52,6 @@ interface BackupPaths {
 const CONFIG_SECTIONS = [
   ['settings', 'settings.json'],
   ['providers', 'providers.json'],
-  ['codexAppServer', 'codex-app-server.json'],
 ] as const;
 const PROVIDER_SECRETS_SECTION = 'providerSecrets';
 const SESSIONS_SECTION = 'sessions';
@@ -232,8 +230,6 @@ export class BackupService {
         } else if (name === 'providers') {
           incomingProviderData = data;
           incomingProviderBindings = validateProviderBackupMetadata(data);
-        } else {
-          validateObjectSection(data, 'Codex App Server 配置');
         }
         expectedFiles.set(this.paths[name], serialized);
         sectionsImported.push(name);
@@ -343,11 +339,6 @@ export class BackupService {
         new AppSettingsStore(target).get();
       } else if (target === this.paths.providers) {
         validateProviderBackupMetadata(JSON.parse(readFileSync(target, 'utf8')) as unknown);
-      } else if (target === this.paths.codexAppServer) {
-        validateObjectSection(
-          JSON.parse(readFileSync(target, 'utf8')) as unknown,
-          'Codex App Server 配置',
-        );
       }
     }
     for (const [relativePath, expected] of expectedSessionFiles) {
@@ -387,12 +378,6 @@ export class BackupService {
 
 function jsonBytes(data: unknown): Buffer {
   return Buffer.from(`${JSON.stringify(data, null, 2)}\n`, 'utf8');
-}
-
-function validateObjectSection(value: unknown, label: string): void {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new Error(`${label}格式无效。`);
-  }
 }
 
 function readRequiredJson(path: string, label: string): unknown {

@@ -1,10 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import type { AppSettings } from '../shared/settings';
+import type { SettingsWindowSection } from '../shared/settings';
 import type { BackupImportChallenge, BackupImportResponse } from '../shared/backup';
 import { AiServiceSettings } from './AiServiceSettings';
 import { useSystemTheme } from './theme';
-
-type SettingsSection = 'general' | 'ai' | 'data';
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -17,7 +16,10 @@ function isImportChallenge(
 }
 
 export function SettingsWindow() {
-  const [section, setSection] = useState<SettingsSection>('general');
+  const initialSection = window.location.hash.slice(1);
+  const [section, setSection] = useState<SettingsWindowSection>(
+    initialSection === 'ai' || initialSection === 'data' ? initialSection : 'general',
+  );
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [draft, setDraft] = useState<AppSettings | null>(null);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
@@ -44,6 +46,11 @@ export function SettingsWindow() {
     });
     return removeSettingsListener;
   }, []);
+
+  useEffect(() => window.aiTerminal.settingsWindow.onNavigate((nextSection) => {
+    setSection(nextSection);
+    window.location.hash = nextSection;
+  }), []);
 
   const patchDraft = useCallback((patch: Partial<AppSettings>) => {
     setDraft((current) => (current ? { ...current, ...patch } : current));

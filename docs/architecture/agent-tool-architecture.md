@@ -110,10 +110,6 @@ commands and output remain visible in the shared terminal history.
 
 ## Extension points
 
-A future Codex-backed `AgentBackend` may reuse `SessionToolContext` and
-`ToolGateway` when it needs these exact shared-terminal guarantees; it must not
-bypass them with Codex-internal shell, filesystem, or SSH access.
-
 An optional future MCP adapter should expose this same main-process
 `ToolGateway`, not create a second tool host, shell, filesystem client, or SSH
 connection. MCP is therefore a transport option at the Harness boundary rather

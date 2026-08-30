@@ -23,7 +23,7 @@ describe('AgentActivityCard', () => {
     await act(async () => root.render(
       <AgentActivityCard
         phase="AI 正在思考"
-        backend="Codex App Server"
+        backend="OpenAI 兼容 Provider"
         context="当前终端：SSH · tester@server"
         interruptLabel="打断"
         interruptDisabled={false}
@@ -35,7 +35,7 @@ describe('AgentActivityCard', () => {
     const dots = container.querySelector<HTMLElement>('[data-testid="agent-activity-dots"]')!;
     expect(card.getAttribute('aria-label')).toBe('AI 运行状态');
     expect(card.textContent).toContain('AI 正在思考');
-    expect(card.textContent).toContain('Codex App Server · 当前终端：SSH · tester@server');
+    expect(card.textContent).toContain('OpenAI 兼容 Provider · 当前终端：SSH · tester@server');
     expect(dots.getAttribute('aria-hidden')).toBe('true');
     expect(dots.children).toHaveLength(3);
     expect(container.querySelector('[role="status"]')?.getAttribute('aria-live')).toBe('polite');

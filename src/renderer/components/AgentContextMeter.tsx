@@ -9,8 +9,6 @@ import {
 interface AgentContextMeterProps {
   usage?: AgentContextUsage;
   contextWindowTokens?: number;
-  /** Selects neutral Codex semantics even before the first provider event arrives. */
-  providerManaged?: boolean;
 }
 
 function compactTokens(tokens: number): string {
@@ -19,92 +17,11 @@ function compactTokens(tokens: number): string {
   return `${value >= 10 ? value.toFixed(0) : value.toFixed(1)}k`;
 }
 
-function knownProviderUsage(usage: AgentContextUsage | undefined): usage is Extract<
-  AgentContextUsage,
-  { source: 'provider-reported' }
-> & Required<Pick<Extract<AgentContextUsage, { source: 'provider-reported' }>,
-  'currentTokens' | 'contextWindowTokens' | 'percentage'
->> {
-  return usage?.source === 'provider-reported'
-    && Number.isSafeInteger(usage.currentTokens)
-    && usage.currentTokens! >= 0
-    && Number.isSafeInteger(usage.contextWindowTokens)
-    && usage.contextWindowTokens! > 0
-    && Number.isFinite(usage.percentage);
-}
-
 export function AgentContextMeter({
   usage,
   contextWindowTokens = DEFAULT_CONTEXT_WINDOW_TOKENS,
-  providerManaged = false,
 }: AgentContextMeterProps) {
-  const codexManaged = providerManaged || usage?.source === 'provider-reported';
-  const providerKnown = codexManaged && knownProviderUsage(usage);
   const compressing = usage?.status === 'compressing';
-
-  if (codexManaged) {
-    const percentage = providerKnown
-      ? Math.max(0, Math.min(100, usage.percentage))
-      : 0;
-    const title = providerKnown
-      ? [
-        `Codex 实际上下文 ${usage.currentTokens.toLocaleString('zh-CN')} tokens`,
-        `模型窗口 ${usage.contextWindowTokens.toLocaleString('zh-CN')} tokens`,
-        '由 Codex 管理；Glass Terminal 不会主动触发压缩',
-        usage.lastCompressedAt
-          ? `上次压缩 ${new Date(usage.lastCompressedAt).toLocaleTimeString('zh-CN')}`
-          : '尚未收到压缩完成事件',
-      ].join('\n')
-      : [
-        '由 Codex 管理，等待用量数据',
-        'Glass Terminal 不会主动触发压缩',
-        ...(usage?.lastCompressedAt
-          ? [`上次压缩 ${new Date(usage.lastCompressedAt).toLocaleTimeString('zh-CN')}`]
-          : []),
-      ].join('\n');
-    const ariaLabel = compressing
-      ? 'Codex 正在压缩上下文'
-      : providerKnown ? 'Codex 实际上下文用量' : 'Codex 上下文用量未知';
-
-    return (
-      <div
-        className={`agent-context-meter ${compressing ? 'compressing' : providerKnown && percentage >= 80 ? 'warning' : ''} ${providerKnown ? '' : 'unknown'}`}
-        data-testid="agent-context-meter"
-        data-context-source="provider-reported"
-        data-context-known={providerKnown ? 'true' : 'false'}
-        data-context-status={compressing ? 'compressing' : 'ready'}
-        title={title}
-      >
-        <div
-          className="agent-context-ring"
-          role="progressbar"
-          aria-label={ariaLabel}
-          aria-valuemin={0}
-          aria-valuemax={100}
-          {...(providerKnown ? { 'aria-valuenow': percentage } : {})}
-        >
-          <svg viewBox="0 0 44 44" aria-hidden="true">
-            <circle className="agent-context-ring-track" cx="22" cy="22" r="18" />
-            <circle
-              className="agent-context-ring-value"
-              cx="22"
-              cy="22"
-              r="18"
-              pathLength="100"
-              strokeDasharray={`${percentage} 100`}
-            />
-          </svg>
-          <strong>{compressing ? '…' : providerKnown ? `${percentage}%` : '—'}</strong>
-        </div>
-        <span className="agent-context-copy">
-          <b>{compressing ? 'Codex 正在压缩上下文' : 'Codex 实际用量'}</b>
-          <small>{providerKnown
-            ? `${compactTokens(usage.currentTokens)} / ${compactTokens(usage.contextWindowTokens)} · 由 Codex 管理`
-            : '由 Codex 管理，等待用量数据'}</small>
-        </span>
-      </div>
-    );
-  }
 
   const estimatedUsage = usage?.source === 'estimated' ? usage : undefined;
   const normalizedWindow = normalizedContextWindowTokens(

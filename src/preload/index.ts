@@ -8,12 +8,12 @@ import type { SessionRecord } from '../shared/session';
 import { SFTP_CHANNELS } from '../shared/sftp';
 import type { TransferJobSnapshot } from '../shared/sftp';
 import { PROVIDER_CHANNELS } from '../shared/provider';
+import type { ProviderProfile } from '../shared/provider';
 import { AGENT_CHANNELS } from '../shared/agent';
 import { containsObviousAgentSecret } from '../shared/agent-memory';
 import type { AgentAssistantDelta, AgentSessionView } from '../shared/agent';
-import { CODEX_APP_SERVER_CHANNELS } from '../shared/codex-app-server';
-import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import { SETTINGS_CHANNELS, SETTINGS_WINDOW_CHANNELS } from '../shared/settings';
+import type { SettingsWindowSection } from '../shared/settings';
 import { BACKUP_CHANNELS, HOST_BACKUP_CHANNELS } from '../shared/backup';
 import { createTerminalEventDispatcher } from './terminal-event-dispatcher';
 
@@ -131,38 +131,12 @@ const providerBridge: DesktopBridge['providers'] = {
     providerId,
   ),
   discoverModels: (input) => ipcRenderer.invoke(PROVIDER_CHANNELS.discoverModels, input),
-};
-
-const codexAppServerBridge: DesktopBridge['codexAppServer'] = {
-  getState: () => ipcRenderer.invoke(CODEX_APP_SERVER_CHANNELS.getState),
-  start: () => ipcRenderer.invoke(CODEX_APP_SERVER_CHANNELS.start),
-  chooseExecutable: () => ipcRenderer.invoke(CODEX_APP_SERVER_CHANNELS.chooseExecutable),
-  restart: () => ipcRenderer.invoke(CODEX_APP_SERVER_CHANNELS.restart),
-  refresh: () => ipcRenderer.invoke(CODEX_APP_SERVER_CHANNELS.refresh),
-  loginBrowser: () => ipcRenderer.invoke(CODEX_APP_SERVER_CHANNELS.loginBrowser),
-  loginDeviceCode: () => ipcRenderer.invoke(CODEX_APP_SERVER_CHANNELS.loginDeviceCode),
-  reopenLogin: () => ipcRenderer.invoke(CODEX_APP_SERVER_CHANNELS.reopenLogin),
-  cancelLogin: () => ipcRenderer.invoke(CODEX_APP_SERVER_CHANNELS.cancelLogin),
-  logout: () => ipcRenderer.invoke(CODEX_APP_SERVER_CHANNELS.logout),
-  saveSelection: (request) => ipcRenderer.invoke(
-    CODEX_APP_SERVER_CHANNELS.saveSelection,
-    request,
-  ),
-  setTerminalContextAccess: (request) => ipcRenderer.invoke(
-    CODEX_APP_SERVER_CHANNELS.setTerminalContextAccess,
-    request,
-  ),
-  setTerminalAgentEnabled: (request) => ipcRenderer.invoke(
-    CODEX_APP_SERVER_CHANNELS.setTerminalAgentEnabled,
-    request,
-  ),
-  onStateChanged: (listener) => {
-    const handler = (
-      _event: Electron.IpcRendererEvent,
-      state: CodexAppServerSnapshot,
-    ) => listener(state);
-    ipcRenderer.on(CODEX_APP_SERVER_CHANNELS.stateChanged, handler);
-    return () => ipcRenderer.removeListener(CODEX_APP_SERVER_CHANNELS.stateChanged, handler);
+  onChanged: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, providers: ProviderProfile[]) => {
+      listener(providers);
+    };
+    ipcRenderer.on(PROVIDER_CHANNELS.changed, handler);
+    return () => ipcRenderer.removeListener(PROVIDER_CHANNELS.changed, handler);
   },
 };
 
@@ -179,7 +153,6 @@ const agentBridge: DesktopBridge['agent'] = {
   removeMemory: (request) => ipcRenderer.invoke(AGENT_CHANNELS.removeMemory, request),
   getState: (terminalId) => ipcRenderer.invoke(AGENT_CHANNELS.getState, terminalId),
   activateBackend: (request) => ipcRenderer.invoke(AGENT_CHANNELS.activateBackend, request),
-  setFileAccess: (request) => ipcRenderer.invoke(AGENT_CHANNELS.setFileAccess, request),
   resolveApproval: (request) => ipcRenderer.invoke(AGENT_CHANNELS.resolveApproval, request),
   setFullTakeover: (request) => ipcRenderer.invoke(AGENT_CHANNELS.setFullTakeover, request),
   setFullTakeoverPreference: (request) => ipcRenderer.invoke(
@@ -231,7 +204,14 @@ const hostBackupBridge: DesktopBridge['hostBackup'] = {
 };
 
 const settingsWindowBridge: DesktopBridge['settingsWindow'] = {
-  open: () => ipcRenderer.invoke(SETTINGS_WINDOW_CHANNELS.open),
+  open: (section) => ipcRenderer.invoke(SETTINGS_WINDOW_CHANNELS.open, section),
+  onNavigate: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, section: SettingsWindowSection) => {
+      listener(section);
+    };
+    ipcRenderer.on(SETTINGS_WINDOW_CHANNELS.navigate, handler);
+    return () => ipcRenderer.removeListener(SETTINGS_WINDOW_CHANNELS.navigate, handler);
+  },
 };
 
 const bridge: DesktopBridge = Object.freeze({
@@ -243,7 +223,6 @@ const bridge: DesktopBridge = Object.freeze({
   sessions: Object.freeze(sessionBridge),
   sftp: Object.freeze(sftpBridge),
   providers: Object.freeze(providerBridge),
-  codexAppServer: Object.freeze(codexAppServerBridge),
   agent: Object.freeze(agentBridge),
   settings: Object.freeze(settingsBridge),
   backup: Object.freeze(backupBridge),

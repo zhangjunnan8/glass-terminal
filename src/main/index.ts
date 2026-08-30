@@ -29,7 +29,7 @@ import type { DownloadSelectionRequest, UploadSelectionRequest } from '../shared
 import { PROVIDER_CHANNELS } from '../shared/provider';
 import type { ProviderInput, ProviderModelDiscoveryInput } from '../shared/provider';
 import { SETTINGS_CHANNELS, SETTINGS_WINDOW_CHANNELS } from '../shared/settings';
-import type { AppSettingsPatch } from '../shared/settings';
+import type { AppSettingsPatch, SettingsWindowSection } from '../shared/settings';
 import { BACKUP_CHANNELS, HOST_BACKUP_CHANNELS } from '../shared/backup';
 import type {
   BackupExportRequest,
@@ -48,17 +48,10 @@ import type {
   ReviseAgentPromptRequest,
   SendAgentPromptRequest,
   SaveAgentMemoryRequest,
-  SetAgentFileAccessRequest,
   SetFullTakeoverRequest,
   SetFullTakeoverPreferenceRequest,
   TakeoverRequest,
 } from '../shared/agent';
-import { CODEX_APP_SERVER_CHANNELS } from '../shared/codex-app-server';
-import type {
-  SaveCodexAppServerSelectionRequest,
-  SetCodexTerminalContextAccessRequest,
-  SetCodexTerminalAgentEnabledRequest,
-} from '../shared/codex-app-server';
 import { HostStore } from './hosts/host-store';
 import { HostCredentialStore } from './hosts/host-credential-store';
 import { HostService } from './hosts/host-service';
@@ -79,7 +72,6 @@ import type { AgentSmokeProvider } from './smoke/agent-provider-server';
 import { registerSmokeRunner, smokeModeFromEnvironment } from './smoke/smoke-runner';
 import { TerminalService } from './terminal/terminal-service';
 import { RemoteFilesystemProvider } from './filesystem/remote-filesystem';
-import { CodexAppServerService } from './app-server/app-server-service';
 import {
   isTrustedRendererUrl,
   resolveDevelopmentRendererUrl,
@@ -108,7 +100,6 @@ let hostService: HostService | undefined;
 let sessionManager: SessionManager | undefined;
 let providerStore: ProviderStore | undefined;
 let agentService: AgentService | undefined;
-let codexAppServerService: CodexAppServerService | undefined;
 let agentSmokeProvider: AgentSmokeProvider | undefined;
 let appSettingsStore: AppSettingsStore | undefined;
 let backupService: BackupService | undefined;
@@ -159,9 +150,16 @@ function requireProviderStore(): ProviderStore {
   return providerStore;
 }
 
-function requireCodexAppServerService(): CodexAppServerService {
-  if (!codexAppServerService) throw new Error('Codex App Server service is not ready.');
-  return codexAppServerService;
+function broadcastProvidersChanged(): void {
+  const providers = requireProviderStore().list();
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (window.webContents.isDestroyed()) continue;
+    try {
+      window.webContents.send(PROVIDER_CHANNELS.changed, providers);
+    } catch {
+      // A concurrently closing window must not block updates to the others.
+    }
+  }
 }
 
 function requireAgentService(): AgentService {
@@ -315,9 +313,10 @@ function createMainWindow(): BrowserWindow {
   return window;
 }
 
-function showSettingsWindow(): void {
+function showSettingsWindow(section: SettingsWindowSection = 'general'): void {
   if (settingsWindow && !settingsWindow.isDestroyed()) {
     if (settingsWindow.isMinimized()) settingsWindow.restore();
+    settingsWindow.webContents.send(SETTINGS_WINDOW_CHANNELS.navigate, section);
     settingsWindow.focus();
     return;
   }
@@ -360,7 +359,9 @@ function showSettingsWindow(): void {
     settingsWindow = null;
   });
 
-  void settingsWindow.loadURL(settingsEntryUrl).catch((error) => {
+  const entryUrl = new URL(settingsEntryUrl);
+  entryUrl.hash = section;
+  void settingsWindow.loadURL(entryUrl.href).catch((error) => {
     console.error('Unable to load the settings renderer:', error);
   });
 }
@@ -390,8 +391,8 @@ handleTrusted(SETTINGS_CHANNELS.update, (_event, patch: AppSettingsPatch) => {
   }
   return updated;
 });
-handleTrusted(SETTINGS_WINDOW_CHANNELS.open, () => {
-  showSettingsWindow();
+handleTrusted(SETTINGS_WINDOW_CHANNELS.open, (_event, section?: SettingsWindowSection) => {
+  showSettingsWindow(section === 'ai' || section === 'data' ? section : 'general');
 });
 handleTrusted(BACKUP_CHANNELS.export, async (event, request: BackupExportRequest = {}) => {
   const ownerWindow = BrowserWindow.fromWebContents(event.sender);
@@ -634,7 +635,7 @@ handleTrusted(
 );
 handleTrusted(
   SESSION_CHANNELS.setWorkspace,
-  (event, request: SetWorkspaceRequest) => {
+  async (event, request: SetWorkspaceRequest) => {
     const service = requireAgentService();
     const beforeCommit = () => (
       service.assertWorkspaceChangeAllowed(event.sender, request.terminalId)
@@ -644,7 +645,9 @@ handleTrusted(
     if (descriptor.transport !== 'ssh') {
       throw new Error('Local workspace roots must be selected with the system folder picker.');
     }
-    return requireSessionManager().setWorkspace(event.sender, request, beforeCommit);
+    const session = await requireSessionManager().setWorkspace(event.sender, request, beforeCommit);
+    service.syncWorkspaceAccess(event.sender, request.terminalId);
+    return session;
   },
 );
 handleTrusted(
@@ -655,9 +658,12 @@ handleTrusted(
 );
 handleTrusted(
   SESSION_CHANNELS.clearWorkspace,
-  (event, request: ClearWorkspaceRequest) => {
-    requireAgentService().assertWorkspaceChangeAllowed(event.sender, request.terminalId);
-    return requireSessionManager().clearWorkspace(event.sender, request);
+  async (event, request: ClearWorkspaceRequest) => {
+    const service = requireAgentService();
+    service.assertWorkspaceChangeAllowed(event.sender, request.terminalId);
+    const session = await requireSessionManager().clearWorkspace(event.sender, request);
+    service.syncWorkspaceAccess(event.sender, request.terminalId);
+    return session;
   },
 );
 handleTrusted(
@@ -679,10 +685,12 @@ handleTrusted(
     // The Agent may have started, entered a draining state, or enabled file
     // tools while the native folder picker was open.
     service.assertWorkspaceChangeAllowed(event.sender, request.terminalId);
-    return requireSessionManager().setWorkspace(event.sender, {
+    const session = await requireSessionManager().setWorkspace(event.sender, {
       terminalId: request.terminalId,
       root: selection.filePaths[0],
     }, () => service.assertWorkspaceChangeAllowed(event.sender, request.terminalId));
+    service.syncWorkspaceAccess(event.sender, request.terminalId);
+    return session;
   },
 );
 
@@ -741,86 +749,29 @@ handleTrusted(SFTP_CHANNELS.retryTransfer, (event, jobId: string) => (
   transferQueue.retry(event.sender, jobId)
 ));
 handleTrusted(PROVIDER_CHANNELS.list, () => requireProviderStore().list());
-handleTrusted(PROVIDER_CHANNELS.save, (_event, input: ProviderInput) => (
-  requireProviderStore().save(input)
-));
-handleTrusted(PROVIDER_CHANNELS.remove, (_event, providerId: string) => (
-  requireProviderStore().remove(providerId)
-));
-handleTrusted(PROVIDER_CHANNELS.setDefault, (_event, providerId: string) => (
-  requireProviderStore().setDefault(providerId)
-));
-handleTrusted(PROVIDER_CHANNELS.testConnection, (_event, providerId: string) => (
-  requireProviderStore().testConnection(providerId)
-));
+handleTrusted(PROVIDER_CHANNELS.save, async (_event, input: ProviderInput) => {
+  const saved = await requireProviderStore().save(input);
+  broadcastProvidersChanged();
+  return saved;
+});
+handleTrusted(PROVIDER_CHANNELS.remove, async (_event, providerId: string) => {
+  await requireProviderStore().remove(providerId);
+  broadcastProvidersChanged();
+});
+handleTrusted(PROVIDER_CHANNELS.setDefault, async (_event, providerId: string) => {
+  const updated = await requireProviderStore().setDefault(providerId);
+  broadcastProvidersChanged();
+  return updated;
+});
+handleTrusted(PROVIDER_CHANNELS.testConnection, async (_event, providerId: string) => {
+  const result = await requireProviderStore().testConnection(providerId);
+  broadcastProvidersChanged();
+  return result;
+});
 handleTrusted(PROVIDER_CHANNELS.discoverModels, (
   _event,
   input: ProviderModelDiscoveryInput,
 ) => requireProviderStore().discoverModels(input));
-handleTrusted(CODEX_APP_SERVER_CHANNELS.getState, () => (
-  requireCodexAppServerService().getState()
-));
-handleTrusted(CODEX_APP_SERVER_CHANNELS.start, () => (
-  requireCodexAppServerService().start()
-));
-handleTrusted(CODEX_APP_SERVER_CHANNELS.chooseExecutable, async (event) => {
-  const ownerWindow = BrowserWindow.fromWebContents(event.sender);
-  if (!ownerWindow) throw new Error('无法打开 Codex CLI 选择窗口。');
-  const selection = await dialog.showOpenDialog(ownerWindow, {
-    title: '选择 Codex CLI 可执行文件',
-    properties: ['openFile'],
-    filters: process.platform === 'win32'
-      ? [{ name: 'Codex CLI', extensions: ['exe'] }]
-      : [{ name: 'Codex CLI', extensions: ['*'] }],
-  });
-  if (selection.canceled || !selection.filePaths[0]) {
-    return requireCodexAppServerService().getState();
-  }
-  return requireCodexAppServerService().configureExecutableAndStart(
-    selection.filePaths[0],
-  );
-});
-handleTrusted(CODEX_APP_SERVER_CHANNELS.restart, async () => {
-  const state = await requireCodexAppServerService().restart();
-  agentService?.handleCodexAppServerRestarted();
-  return state;
-});
-handleTrusted(CODEX_APP_SERVER_CHANNELS.refresh, () => (
-  requireCodexAppServerService().refresh()
-));
-handleTrusted(CODEX_APP_SERVER_CHANNELS.loginBrowser, () => (
-  requireCodexAppServerService().loginBrowser()
-));
-handleTrusted(CODEX_APP_SERVER_CHANNELS.loginDeviceCode, () => (
-  requireCodexAppServerService().loginDeviceCode()
-));
-handleTrusted(CODEX_APP_SERVER_CHANNELS.reopenLogin, () => (
-  requireCodexAppServerService().openPendingLogin()
-));
-handleTrusted(CODEX_APP_SERVER_CHANNELS.cancelLogin, () => (
-  requireCodexAppServerService().cancelLogin()
-));
-handleTrusted(CODEX_APP_SERVER_CHANNELS.logout, () => (
-  requireCodexAppServerService().logout()
-));
-handleTrusted(
-  CODEX_APP_SERVER_CHANNELS.saveSelection,
-  (_event, request: SaveCodexAppServerSelectionRequest) => (
-    requireCodexAppServerService().saveSelection(request)
-  ),
-);
-handleTrusted(
-  CODEX_APP_SERVER_CHANNELS.setTerminalContextAccess,
-  (_event, request: SetCodexTerminalContextAccessRequest) => (
-    requireCodexAppServerService().setTerminalContextAccess(request)
-  ),
-);
-handleTrusted(
-  CODEX_APP_SERVER_CHANNELS.setTerminalAgentEnabled,
-  (_event, request: SetCodexTerminalAgentEnabledRequest) => (
-    requireCodexAppServerService().setTerminalAgentEnabled(request)
-  ),
-);
 handleTrusted(AGENT_CHANNELS.sendPrompt, (event, request: SendAgentPromptRequest) => {
   if (!agentService) throw new Error('Agent service is not ready.');
   return agentService.sendPrompt(event.sender, request);
@@ -852,10 +803,6 @@ handleTrusted(
     return agentService.activateBackend(event.sender, request);
   },
 );
-handleTrusted(AGENT_CHANNELS.setFileAccess, (event, request: SetAgentFileAccessRequest) => {
-  if (!agentService) throw new Error('Agent service is not ready.');
-  return agentService.setFileAccess(event.sender, request);
-});
 handleTrusted(
   AGENT_CHANNELS.resolveApproval,
   (event, request: ResolveApprovalRequest) => {
@@ -926,7 +873,6 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
     {
       settings: join(app.getPath('userData'), 'config', 'app-settings.json'),
       providers: join(app.getPath('userData'), 'config', 'providers.json'),
-      codexAppServer: join(app.getPath('userData'), 'config', 'codex-app-server.json'),
       sessions: join(app.getPath('userData'), 'sessions'),
     },
     secretStore,
@@ -974,31 +920,10 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
     terminalService,
     sessionManager,
   );
-  codexAppServerService = new CodexAppServerService(
-    join(app.getPath('userData'), 'config', 'codex-app-server.json'),
-    app.getAppPath(),
-    process.resourcesPath,
-    app.getVersion(),
-    async (url) => {
-      await shell.openExternal(url);
-    },
-  );
-  codexAppServerService.onStateChanged((state) => {
-    for (const window of BrowserWindow.getAllWindows()) {
-      if (!window.webContents.isDestroyed()) {
-        try {
-          window.webContents.send(CODEX_APP_SERVER_CHANNELS.stateChanged, state);
-        } catch {
-          // A concurrently closing window must not starve other windows of state.
-        }
-      }
-    }
-  });
   agentService = new AgentService(
     terminalService,
     sessionManager,
     providerStore,
-    codexAppServerService,
     new AgentFileService(terminalService, sessionManager, remoteFilesystemProvider),
     // The Generic Provider backend runs through the LangChain harness, loaded
     // lazily so its ESM-only dependencies do not delay application startup.
@@ -1021,11 +946,6 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
     () => requireAppSettingsStore().get().defaultMaxRounds,
   );
   createMainWindow();
-  void codexAppServerService.startIfBound().catch((error) => {
-    // Startup should remain usable even if an unexpected App Server error
-    // escapes the service's recoverable UI state handling.
-    console.error('Unable to auto-start Codex App Server:', error);
-  });
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
   });
@@ -1034,7 +954,6 @@ if (ownsSingleInstance) void app.whenReady().then(async () => {
 if (ownsSingleInstance) app.on('before-quit', () => {
   transferQueue.close();
   agentService?.close();
-  codexAppServerService?.close();
   sessionManager?.close();
   void agentSmokeProvider?.close();
 });

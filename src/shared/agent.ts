@@ -18,6 +18,7 @@ export type AgentRuntimeState =
   | 'FAILED';
 
 export type TerminalInputMode = 'human' | 'locked' | 'secure-human';
+/** `read-only` is retained for persisted/internal policy compatibility but is no longer exposed by the UI. */
 export type AgentFileAccessMode = 'off' | 'read-only' | 'read-write' | 'full-access';
 
 /**
@@ -36,18 +37,10 @@ export interface AgentFileAccessPolicy {
   fullAccess: boolean;
 }
 
-export const CODEX_APP_SERVER_AGENT_BACKEND = 'codex-app-server-isolated' as const;
-export const CODEX_APP_SERVER_AGENT_POLICY_VERSION = 1 as const;
-
-export type AgentBackendRef =
-  | {
-    kind: 'generic-provider';
-    providerId: string;
-  }
-  | {
-    kind: typeof CODEX_APP_SERVER_AGENT_BACKEND;
-    policyVersion: typeof CODEX_APP_SERVER_AGENT_POLICY_VERSION;
-  };
+export interface AgentBackendRef {
+  kind: 'generic-provider';
+  providerId: string;
+}
 
 export type CommandActor = 'ai' | 'user_modified_ai_command';
 export type CommandExecutionStatus =
@@ -122,8 +115,7 @@ export interface AgentToolActivity {
 }
 
 interface AgentContextUsageBase {
-  /** Identifies whether Glass estimated this value or Codex reported it. */
-  source: 'estimated' | 'provider-reported';
+  source: 'estimated';
   status: 'ready' | 'compressing';
   lastCompressedAt?: string;
   // Optional on the shared union so diagnostic consumers can inspect a metric
@@ -165,17 +157,7 @@ export interface AgentEstimatedContextUsage extends AgentContextUsageBase {
   percentage: number;
 }
 
-export interface AgentProviderContextUsage extends AgentContextUsageBase {
-  source: 'provider-reported';
-  /** Current context occupancy reported for the latest Codex turn, not lifetime usage. */
-  currentTokens?: number;
-  /** Codex model context window. Missing means the installed CLI has not reported it. */
-  contextWindowTokens?: number;
-  /** Current occupancy against the Codex model window. Missing is rendered as unknown. */
-  percentage?: number;
-}
-
-export type AgentContextUsage = AgentEstimatedContextUsage | AgentProviderContextUsage;
+export type AgentContextUsage = AgentEstimatedContextUsage;
 
 export interface AgentSessionView {
   revision: number;
@@ -202,15 +184,13 @@ export interface AgentSessionView {
   memories?: AgentMemoryCard[];
   /** Bounded, metadata-only summaries of recent tool use. */
   activities: AgentToolActivity[];
-  /** Generic estimates or authoritative Codex provider-managed context state. */
+  /** Conservative local estimate for the configured compatible API model. */
   contextUsage?: AgentContextUsage;
   streamingMessageId?: string;
   /** Stable local turn identity for validating Assistant delta events. */
   streamingTurnId?: string;
   /** Last Assistant delta sequence already represented by this snapshot. */
   streamingSequence?: number;
-  /** App Server interrupt is still draining; terminal input is human-owned but a new turn is unsafe. */
-  backendTurnDraining?: boolean;
   pendingApproval?: CommandApproval;
   authRequest?: InteractiveAuthRequest;
   pendingTakeover?: PendingTakeover;
@@ -326,7 +306,6 @@ export const AGENT_CHANNELS = {
   resolveApproval: 'agent:resolve-approval',
   setFullTakeover: 'agent:set-full-takeover',
   setFullTakeoverPreference: 'agent:set-full-takeover-preference',
-  setFileAccess: 'agent:set-file-access',
   takeover: 'agent:takeover',
   resolveTakeover: 'agent:resolve-takeover',
   confirmShellReady: 'agent:confirm-shell-ready',

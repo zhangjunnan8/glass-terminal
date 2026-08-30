@@ -59,7 +59,7 @@ describe('ProviderStore', () => {
     expect(reference).toMatch(/^AI Terminal\/provider\//);
     expect(await secrets.get(reference)).toBe('super-secret-provider-key');
     expect(profile.baseUrl).toBe('https://provider.example/v1');
-    expect(profile.contextWindowTokens).toBe(64_000);
+    expect(profile.contextWindowTokens).toBe(500_736);
     expect(profile.contextEstimateSafetyFactor).toBe(1.15);
   });
 

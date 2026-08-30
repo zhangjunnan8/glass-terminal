@@ -23,10 +23,6 @@ import type { BackupImportChallenge, BackupImportResponse } from '../shared/back
 import type { SessionRecord } from '../shared/session';
 import type { ProviderProfile } from '../shared/provider';
 import {
-  CODEX_APP_SERVER_AGENT_BACKEND,
-  CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-} from '../shared/agent';
-import {
   containsObviousAgentSecret,
   type AgentMemoryCategory,
 } from '../shared/agent-memory';
@@ -37,7 +33,6 @@ import type {
   AgentRuntimeState,
   AgentSessionView,
 } from '../shared/agent';
-import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
 import type {
   RemoteWorkspaceAtomicity,
@@ -63,7 +58,6 @@ import type { UiTheme } from './theme';
 import {
   agentStateLabel,
   authMethodLabel,
-  codexNativeAgentAvailabilityLabel,
   executionStatusLabel,
   formatClock,
   formatDuration,
@@ -93,12 +87,12 @@ interface ConnectionSecret {
   saveCredential?: boolean;
 }
 
-interface CodexUiMessage {
+interface UiMessage {
   tone: 'success' | 'error';
   text: string;
 }
 
-interface HostCredentialMessage extends CodexUiMessage {
+interface HostCredentialMessage extends UiMessage {
   hostId: string;
 }
 
@@ -127,24 +121,10 @@ interface FullTakeoverChallenge {
   hostPreference: boolean;
 }
 
-interface FileAccessChallenge {
-  terminalId: string;
-  target: string;
-  root: string;
-  mode: Extract<AgentFileAccessMode, 'read-write' | 'full-access'>;
-  backend: AgentBackendRef;
-}
-
-type AgentBackendKind = AgentBackendRef['kind'];
 type SidebarView = 'terminals' | 'hosts' | 'history';
 
 function sameAgentBackend(left: AgentBackendRef | undefined, right: AgentBackendRef): boolean {
-  if (!left || left.kind !== right.kind) return false;
-  if (left.kind === 'generic-provider') {
-    return right.kind === 'generic-provider' && left.providerId === right.providerId;
-  }
-  return right.kind === CODEX_APP_SERVER_AGENT_BACKEND
-    && left.policyVersion === right.policyVersion;
+  return left?.kind === 'generic-provider' && left.providerId === right.providerId;
 }
 
 function isBackupImportChallenge(
@@ -152,11 +132,6 @@ function isBackupImportChallenge(
 ): response is BackupImportChallenge {
   return 'challenge' in response;
 }
-
-const CODEX_AGENT_BACKEND: AgentBackendRef = {
-  kind: CODEX_APP_SERVER_AGENT_BACKEND,
-  policyVersion: CODEX_APP_SERVER_AGENT_POLICY_VERSION,
-};
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -178,16 +153,8 @@ function agentBackendActivityLabel(
   backend: AgentBackendRef,
   providers: ProviderProfile[],
 ): string {
-  if (backend.kind === CODEX_APP_SERVER_AGENT_BACKEND) return 'Codex App Server';
   return providers.find((provider) => provider.id === backend.providerId)?.name
     ?? '默认 Provider';
-}
-
-function mergeCodexAppServerState(
-  current: CodexAppServerSnapshot | null,
-  incoming: CodexAppServerSnapshot,
-): CodexAppServerSnapshot {
-  return current && current.revision >= incoming.revision ? current : incoming;
 }
 
 /** Max composer height in pixels before the textarea stops growing and scrolls. */
@@ -258,7 +225,6 @@ export function App() {
   const [sidebarSearch, setSidebarSearch] = useState('');
   const [newTerminalOpen, setNewTerminalOpen] = useState(false);
   const [sftpOpen, setSftpOpen] = useState(false);
-  const [codexAppServer, setCodexAppServer] = useState<CodexAppServerSnapshot | null>(null);
   const agentBodyRef = useRef<HTMLDivElement>(null);
   const agentComposerRef = useRef<HTMLTextAreaElement>(null);
   const agentStickToBottomRef = useRef(true);
@@ -269,7 +235,6 @@ export function App() {
   const agentDeltaQueueRef = useRef<AgentAssistantDelta[]>([]);
   const agentDeltaFrameRef = useRef<number | null>(null);
   const agentDeltaResyncRef = useRef<Set<string>>(new Set());
-  const [agentBackendChoices, setAgentBackendChoices] = useState<Record<string, AgentBackendKind>>({});
   const [agentUpdatesBelow, setAgentUpdatesBelow] = useState(false);
   const [agentPanelVisible, setAgentPanelVisible] = useState(true);
   const [agentControlsExpanded, setAgentControlsExpanded] = useState(true);
@@ -294,7 +259,6 @@ export function App() {
   const [sessionRenamePending, setSessionRenamePending] = useState(false);
   const [trustChallenge, setTrustChallenge] = useState<TrustChallenge | null>(null);
   const [fullTakeoverChallenge, setFullTakeoverChallenge] = useState<FullTakeoverChallenge | null>(null);
-  const [fileAccessChallenge, setFileAccessChallenge] = useState<FileAccessChallenge | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [workspaceActionError, setWorkspaceActionError] = useState<string | null>(null);
@@ -342,11 +306,7 @@ export function App() {
     void window.aiTerminal.providers.list().then(setProviders).catch((error) => {
       setStartupError(errorMessage(error));
     });
-    void window.aiTerminal.codexAppServer.getState().then((state) => {
-      setCodexAppServer((current) => mergeCodexAppServerState(current, state));
-    }).catch((error) => {
-      setStartupError(errorMessage(error));
-    });
+    const removeProviderListener = window.aiTerminal.providers.onChanged(setProviders);
     const removeAgentListener = window.aiTerminal.agent.onStateChanged((state) => {
       installAgentSnapshot(state);
       setTabs((current) => current.map((tab) => (
@@ -355,9 +315,6 @@ export function App() {
     });
     const removeAgentDeltaListener = window.aiTerminal.agent.onAssistantDelta((event) => {
       queueAgentAssistantDelta(event);
-    });
-    const removeCodexAppServerListener = window.aiTerminal.codexAppServer.onStateChanged((state) => {
-      setCodexAppServer((current) => mergeCodexAppServerState(current, state));
     });
 
     let cancelled = false;
@@ -381,7 +338,7 @@ export function App() {
       cancelled = true;
       removeAgentListener();
       removeAgentDeltaListener();
-      removeCodexAppServerListener();
+      removeProviderListener();
       if (agentDeltaFrameRef.current !== null) {
         cancelAnimationFrame(agentDeltaFrameRef.current);
         agentDeltaFrameRef.current = null;
@@ -552,64 +509,22 @@ export function App() {
   const latestUserMessage = activeAgent
     ? [...activeAgent.messages].reverse().find((message) => message.role === 'user')
     : undefined;
-  const explicitAgentBackendKind = activeTab
-    ? agentBackendChoices[activeTab.id]
-    : undefined;
-  const selectedAgentBackendKind = explicitAgentBackendKind
-    ?? activeAgent?.backend.kind
-    ?? 'generic-provider';
   const selectedGenericProvider = defaultProvider;
-  const selectedAgentBackend: AgentBackendRef | undefined = selectedAgentBackendKind
-    === CODEX_APP_SERVER_AGENT_BACKEND
-    ? CODEX_AGENT_BACKEND
-    : selectedGenericProvider
-      ? { kind: 'generic-provider', providerId: selectedGenericProvider.id }
-      : undefined;
-  const codexAgentAvailable = codexAppServer?.agentAvailable === true;
-  const codexTerminalContextAccess = codexAppServer?.terminalContextAccess;
-  const codexBackendSelected = selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND;
-  const activeRuntimeFileAccessMode: AgentFileAccessMode = activeAgent?.fileAccessMode ?? 'off';
-  const activeGenericProviderId = activeAgent?.backend.kind === 'generic-provider'
-    ? activeAgent.backend.providerId
+  const selectedAgentBackend: AgentBackendRef | undefined = selectedGenericProvider
+    ? { kind: 'generic-provider', providerId: selectedGenericProvider.id }
     : undefined;
+  const activeRuntimeFileAccessMode: AgentFileAccessMode = activeAgent?.fileAccessMode ?? 'off';
+  const activeGenericProviderId = activeAgent?.backend.providerId;
   const selectedGenericBackendMatchesActive = Boolean(
     selectedAgentBackend?.kind === 'generic-provider'
     && activeGenericProviderId
     && selectedAgentBackend.providerId === activeGenericProviderId,
   );
-  const selectedCodexBackendMatchesActive = Boolean(
-    codexBackendSelected
-    && activeAgent?.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND,
-  );
-  const selectedBackendMatchesActive = selectedGenericBackendMatchesActive
-    || selectedCodexBackendMatchesActive;
-  const selectedFileAccessMode: AgentFileAccessMode = selectedBackendMatchesActive
-    ? activeRuntimeFileAccessMode
-    : 'off';
-  const activeFileAccessBackendLabel = activeAgent?.backend.kind
-    === CODEX_APP_SERVER_AGENT_BACKEND
-    ? 'Codex App Server'
-    : activeGenericProviderId
-      ? providers.find((provider) => provider.id === activeGenericProviderId)?.name
-        ?? activeGenericProviderId
-      : null;
   const activeWorkspaceRoot = activeSession?.workspace?.root;
-  const selectedAgentBackendReady = selectedAgentBackendKind
-    === CODEX_APP_SERVER_AGENT_BACKEND
-    ? codexAgentAvailable
-    : selectedGenericProvider?.status === 'ready';
-  const activeFileAccessNeedsSeparateRevoke = Boolean(
-    activeAgent?.fileAccessMode !== 'off'
-    && (!selectedBackendMatchesActive || !selectedAgentBackendReady)
-  );
-  const selectedAgentBackendStatus = selectedAgentBackendKind
-    === CODEX_APP_SERVER_AGENT_BACKEND
-    ? codexAppServer
-      ? `${codexNativeAgentAvailabilityLabel(codexAppServer.agentAvailable)} · ${codexAppServer.agentReason}`
-      : '正在读取 Codex App Server 状态。'
-    : selectedGenericProvider
-      ? `${selectedGenericProvider.name} · ${providerStatusLabel(selectedGenericProvider.status)}`
-      : '尚未配置默认 Provider。';
+  const selectedAgentBackendReady = selectedGenericProvider?.status === 'ready';
+  const selectedAgentBackendStatus = selectedGenericProvider
+    ? `${selectedGenericProvider.name} · ${providerStatusLabel(selectedGenericProvider.status)}`
+    : '尚未配置默认 Provider。';
 
   useLayoutEffect(() => {
     agentStickToBottomRef.current = true;
@@ -726,36 +641,14 @@ export function App() {
   const foregroundRunning = activeAgent?.state === 'PAUSED'
     && activeAgent.activeExecution?.status === 'running';
   const composerBlocked = agentTurnBusy(activeAgent?.state)
-    || foregroundRunning
-    || Boolean(activeAgent?.backendTurnDraining);
+    || foregroundRunning;
   const workspaceChangeDisabledReason = !activeTab
     ? '请先选择终端'
     : activeTab.status !== 'connected'
       ? '终端已断开，不能修改工作区'
-      : activeRuntimeFileAccessMode !== 'off'
-        ? '请先关闭 AI 文件访问，再修改工作区'
-        : composerBlocked
+      : composerBlocked
           ? 'AI 正在运行，暂时不能修改工作区'
           : null;
-  const fileAccessChallengeIsCurrent = Boolean(
-    fileAccessChallenge
-    && activeTab?.id === fileAccessChallenge.terminalId
-    && activeTab.status === 'connected'
-    && !composerBlocked
-    && selectedAgentBackendReady
-    && sameAgentBackend(selectedAgentBackend, fileAccessChallenge.backend)
-    && activeWorkspaceRoot === fileAccessChallenge.root
-    && (fileAccessChallenge.mode === 'full-access'
-      ? selectedFileAccessMode !== 'full-access'
-      : selectedFileAccessMode !== 'read-write'
-        && selectedFileAccessMode !== 'full-access'),
-  );
-
-  useEffect(() => {
-    if (!fileAccessChallenge || fileAccessChallengeIsCurrent) return;
-    setFileAccessChallenge(null);
-    setWorkspaceActionError('文件访问授权目标已变化，请重新选择权限。');
-  }, [fileAccessChallenge, fileAccessChallengeIsCurrent]);
 
   useEffect(() => {
     if (!activeId) return;
@@ -912,12 +805,8 @@ export function App() {
     )));
   }
 
-  async function refreshProviders() {
-    setProviders(await window.aiTerminal.providers.list());
-  }
-
   function openAgentBackendSettings() {
-    void window.aiTerminal.settingsWindow.open();
+    void window.aiTerminal.settingsWindow.open('ai');
   }
 
   async function sendAgentPrompt(event: FormEvent<HTMLFormElement>) {
@@ -963,9 +852,7 @@ export function App() {
       if (activeIdRef.current === requestTerminalId) setAgentPrompt(prompt);
       setWorkspaceActionError(errorMessage(error));
       if (replacementMessageId) {
-        // A native fork failure leaves the original message intact, while a
-        // later turn-start failure can occur after the append-only replacement
-        // was committed. Refresh once and preserve whichever state is durable.
+        // Refresh append-only conversation state after any failed replacement.
         try {
           const current = await window.aiTerminal.agent.getState(requestTerminalId);
           if (current) {
@@ -1102,62 +989,6 @@ export function App() {
       });
       if (state) installAgentSnapshot(state);
       await refreshHosts();
-    } catch (error) {
-      setWorkspaceActionError(errorMessage(error));
-    }
-  }
-
-  async function setAgentFileAccess(
-    mode: AgentFileAccessMode,
-    terminalId = activeTab?.id,
-    backend = selectedAgentBackend,
-    fullAccessConfirmed = false,
-    expectedWorkspaceRoot?: string,
-  ) {
-    if (!terminalId || !backend) return;
-    setWorkspaceActionError(null);
-    if (
-      expectedWorkspaceRoot !== undefined
-      && (
-        activeTab?.id !== terminalId
-        || activeTab.status !== 'connected'
-        || !sameAgentBackend(selectedAgentBackend, backend)
-        || activeWorkspaceRoot !== expectedWorkspaceRoot
-      )
-    ) {
-      setWorkspaceActionError('文件访问授权目标已变化，请重新选择权限。');
-      return;
-    }
-    if (mode !== 'off') {
-      const session = sessions.find((candidate) => (
-        candidate.runtimeTerminalId === terminalId
-        || candidate.id === tabs.find((tab) => tab.id === terminalId)?.sessionId
-      ));
-      if (!session?.workspace?.root) {
-        setWorkspaceActionError('请先为当前终端设置 Workspace Root，再开启 AI 文件访问。');
-        return;
-      }
-      if (
-        expectedWorkspaceRoot !== undefined
-        && session.workspace.root !== expectedWorkspaceRoot
-      ) {
-        setWorkspaceActionError('Workspace Root 已变化，请重新选择文件访问权限。');
-        return;
-      }
-    }
-    try {
-      const state = await window.aiTerminal.agent.setFileAccess({
-        terminalId,
-        mode,
-        backend,
-        ...(mode === 'full-access' ? { fullAccessConfirmed } : {}),
-        ...(expectedWorkspaceRoot !== undefined ? { expectedWorkspaceRoot } : {}),
-      });
-      installAgentSnapshot(state);
-      setTabs((current) => current.map((tab) => (
-        tab.id === terminalId ? { ...tab, sessionId: state.sessionId } : tab
-      )));
-      await refreshSessions();
     } catch (error) {
       setWorkspaceActionError(errorMessage(error));
     }
@@ -1912,7 +1743,7 @@ export function App() {
           }}
         >◷</button>
         <div className="activity-spacer" />
-        <button className="activity" title="AI 服务设置" data-action="open-provider-settings" onClick={() => {
+        <button className="activity" title="设置" data-action="open-settings" onClick={() => {
           void window.aiTerminal.settingsWindow.open();
         }}>⚙</button>
       </aside>
@@ -2435,7 +2266,7 @@ export function App() {
                   aria-expanded={agentControlsExpanded}
                   data-action="toggle-agent-controls"
                   onClick={() => setAgentControlsExpanded((current) => !current)}
-                >⚙</button>
+                ><span aria-hidden>{agentControlsExpanded ? '▴' : '▾'}</span></button>
                 <button
                   type="button"
                   title="隐藏 AI 栏"
@@ -2446,49 +2277,10 @@ export function App() {
               </span>
             </div>
             {agentControlsExpanded && (
-              <label className="agent-backend-picker">
-                <span>当前智能体后端</span>
-                <select
-                  aria-describedby="agent-backend-status"
-                  data-testid="agent-backend-select"
-                  data-backend-kind={selectedAgentBackendKind}
-                  value={selectedAgentBackendKind}
-                  disabled={!activeTab || composerBlocked || activeAgent?.fullTakeover}
-                  onChange={(event) => {
-                    if (!activeTab) return;
-                    const kind = event.target.value as AgentBackendKind;
-                    const nextBackend: AgentBackendRef | undefined = kind
-                      === CODEX_APP_SERVER_AGENT_BACKEND
-                      ? CODEX_AGENT_BACKEND
-                      : defaultProvider
-                        ? { kind: 'generic-provider', providerId: defaultProvider.id }
-                        : undefined;
-                    setAgentBackendChoices((current) => ({
-                      ...current,
-                      [activeTab.id]: kind,
-                    }));
-                    if (nextBackend && window.aiTerminal.agent.activateBackend) {
-                      setWorkspaceActionError(null);
-                      void window.aiTerminal.agent.activateBackend({
-                        terminalId: activeTab.id,
-                        backend: nextBackend,
-                      }).then((state) => {
-                        installAgentSnapshot(state);
-                        setTabs((current) => current.map((tab) => (
-                          tab.id === activeTab.id ? { ...tab, sessionId: state.sessionId } : tab
-                        )));
-                      }).catch((error) => setWorkspaceActionError(errorMessage(error)));
-                    }
-                  }}
-                >
-                  <option value="generic-provider">
-                    默认 Provider{defaultProvider ? ` · ${defaultProvider.name}` : '（未配置）'}
-                  </option>
-                  <option value={CODEX_APP_SERVER_AGENT_BACKEND}>
-                    Codex App Server · 原生模式
-                  </option>
-                </select>
-              </label>
+              <div className="agent-backend-picker">
+                <span>当前 Provider</span>
+                <strong>{defaultProvider?.name ?? '尚未配置'}</strong>
+              </div>
             )}
             <span
               id="agent-backend-status"
@@ -2497,19 +2289,9 @@ export function App() {
               role="status"
             >{selectedAgentBackendStatus}</span>
           </div>
-          {agentControlsExpanded && codexBackendSelected && (
-            <div className="agent-controls">
-              <AgentContextMeter
-                providerManaged
-                usage={selectedCodexBackendMatchesActive
-                  ? activeAgent?.contextUsage
-                  : undefined}
-              />
-            </div>
-          )}
           {agentControlsExpanded && (
             <div className="agent-controls">
-              {!codexBackendSelected && <div className="agent-context-and-memory">
+              <div className="agent-context-and-memory">
                 <AgentContextMeter
                   usage={selectedGenericBackendMatchesActive
                     ? activeAgent?.contextUsage
@@ -2530,99 +2312,14 @@ export function App() {
                   onRemove={removeAgentMemory}
                   onLocate={locateAgentMemorySource}
                 />
-              </div>}
-              <label
-                className="agent-file-access-picker"
-                title={activeWorkspaceRoot
-                  ? codexBackendSelected
-                    ? activeSession?.workspace?.backend === 'sftp'
-                      ? '开启后，Codex 通过受控 SFTP 工具访问远程 Workspace Root；权限仅在本次应用运行中有效。'
-                      : '开启后，Codex 原生文件与 Shell 工具直接使用本地 Workspace Root；权限仅在本次应用运行中有效。'
-                    : '开启后，读取到的文件内容会发送给当前 Generic Provider；权限仅在本次应用运行中有效。'
-                  : '请先为当前终端设置 Workspace Root，再开启 AI 文件访问。'}
-              >
-                <span>文件访问</span>
-                <select
-                  aria-label={codexBackendSelected
-                    ? 'Codex App Server 文件访问权限'
-                    : 'Generic Provider 文件访问权限'}
-                  data-testid="agent-file-access-mode"
-                  value={selectedFileAccessMode}
-                  disabled={
-                    !activeTab
-                    || activeTab.status !== 'connected'
-                    || composerBlocked
-                    || !selectedAgentBackendReady
-                    || (!activeWorkspaceRoot && activeRuntimeFileAccessMode === 'off')
-                  }
-                  onChange={(event) => {
-                    const mode = event.target.value as AgentFileAccessMode;
-                    const workspaceRoot = activeWorkspaceRoot;
-                    if (mode !== 'off' && !workspaceRoot) {
-                      setWorkspaceActionError(
-                        '请先为当前终端设置 Workspace Root，再开启 AI 文件访问。',
-                      );
-                      return;
-                    }
-                    const requiresWriteConfirmation = mode === 'read-write'
-                      && selectedFileAccessMode !== 'read-write'
-                      && selectedFileAccessMode !== 'full-access';
-                    const requiresFullAccessConfirmation = mode === 'full-access'
-                      && selectedFileAccessMode !== 'full-access';
-                    if (
-                      (requiresWriteConfirmation || requiresFullAccessConfirmation)
-                      && activeTab
-                      && workspaceRoot
-                      && selectedAgentBackend
-                    ) {
-                      setFileAccessChallenge({
-                        terminalId: activeTab.id,
-                        target: activeTab.title,
-                        root: workspaceRoot,
-                        mode,
-                        backend: selectedAgentBackend,
-                      });
-                      return;
-                    }
-                    void setAgentFileAccess(mode);
-                  }}
-                >
-                  <option value="off">关闭</option>
-                  <option value="read-only">只读绑定根</option>
-                  <option value="read-write">读写绑定根</option>
-                  {!codexBackendSelected && (
-                    <option value="full-access">FULL FILESYSTEM ACCESS</option>
-                  )}
-                </select>
-              </label>
-              {activeFileAccessNeedsSeparateRevoke && activeAgent && (
-                <div className="agent-file-access-detached" data-testid="detached-file-access-grant">
-                  <span>
-                    当前文件授权属于 {activeFileAccessBackendLabel}，并未授予当前所选后端。
-                  </span>
-                  <button
-                    type="button"
-                    data-action="disable-active-file-access"
-                    disabled={composerBlocked}
-                    onClick={() => void setAgentFileAccess(
-                      'off',
-                      activeTab?.id,
-                      activeAgent.backend,
-                    )}
-                  >关闭现有授权</button>
-                </div>
-              )}
-              {!activeWorkspaceRoot && activeRuntimeFileAccessMode === 'off' && (
-                <span className="agent-file-access-root" data-testid="agent-workspace-required">
-                  请先设置 Workspace Root
-                </span>
-              )}
-              {selectedFileAccessMode !== 'off' && activeWorkspaceRoot && (
-                <span className="agent-file-access-root" title={activeWorkspaceRoot}>
-                  绑定根：{activeWorkspaceRoot}
-                </span>
-              )}
-              {!codexBackendSelected && <>
+              </div>
+              <span className="agent-file-access-root" data-testid="agent-file-access-status">
+                {activeAgent?.fullTakeover
+                  ? '全文件访问已随 AI 全接管开启'
+                  : activeWorkspaceRoot
+                    ? `Workspace 读写：${activeWorkspaceRoot}`
+                    : '未设置 Workspace'}
+              </span>
               {activeAgent?.fullTakeover && <span className="takeover-badge">AI 全接管</span>}
               {activeFullTakeoverPreference && (
                 <span
@@ -2676,7 +2373,6 @@ export function App() {
                   : activeFullTakeoverPreference
                     ? '为本次终端启用'
                     : 'AI 全接管'}</button>
-              </>}
             </div>
           )}
         </div>
@@ -2687,53 +2383,30 @@ export function App() {
             ref={agentBodyRef}
             onScroll={handleAgentBodyScroll}
           >
-          {selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND && (
-            <section
-              className={`agent-backend-notice ${codexAgentAvailable ? 'ready' : 'unavailable'}`}
-              data-testid="agent-codex-boundary"
-              data-agent-available={codexAgentAvailable ? 'true' : 'false'}
-            >
-              <strong>Codex App Server · 原生模式</strong>
-              <p>{codexAgentAvailable
-                ? `Codex 的内建 Shell/File ${selectedFileAccessMode === 'off'
-                  ? '在应用独立工作区内执行'
-                  : activeSession?.workspace?.backend === 'sftp'
-                    ? '留在本机；远程文件通过已授权的 SFTP Workspace 工具处理'
-                    : '直接使用已授权的本地 Workspace Root'}，不与当前 SSH/本地 Shell 共用进程。terminal_execute 会逐条审批并只执行一次于当前可见终端。每轮都会告诉它当前终端的类型、目标、目录和用户。${codexTerminalContextAccess?.enabled
-                  ? '已额外允许它只读刷新状态并获取近期内容。'
-                  : '当前未允许它刷新状态或读取终端内容。'}当前终端始终由你控制（批准命令运行期间会临时锁定输入）。`
-                : selectedAgentBackendStatus}</p>
-              <button data-action="open-codex-agent-settings" onClick={openAgentBackendSettings}>
-                打开 App Server 设置
-              </button>
-            </section>
-          )}
           {!activeAgent?.messages.length && !activeAgent?.activities?.length && (
-            <div className="agent-empty">
+            <div className={`agent-empty ${selectedGenericProvider ? '' : 'provider-onboarding'}`}>
               <div className="agent-glyph">✦</div>
-              <strong>理解终端上下文的 AI 助手</strong>
-              <p>{codexBackendSelected
-                ? 'Codex 默认使用应用独立工作区；也可授权本地/远程 Workspace，并在逐条批准后向当前可见终端执行命令。'
-                : '智能体会读取当前会话，并在向这个可见终端发送每条命令前请求你的批准。'}</p>
-              <div className="guardrail"><span>✓</span> {codexBackendSelected
-                ? '当前终端始终由你控制 · 命令逐条审批'
-                : '默认逐条审批命令'}</div>
+              <strong>{selectedGenericProvider ? '理解终端上下文的 AI 助手' : '首次使用：配置 AI Provider'}</strong>
+              <p>{selectedGenericProvider
+                ? '智能体会读取当前会话，并在向这个可见终端发送每条命令前请求你的批准。'
+                : '添加 OpenAI 兼容 API 后，即可在当前终端中使用 AI。保存时会自动检测连接，无需重启软件。'}</p>
+              <div className="guardrail"><span>✓</span> {selectedGenericProvider
+                ? '默认逐条审批命令'
+                : '支持 OpenAI 兼容接口与手动模型 ID'}</div>
               <button
-                className="provider-configure"
+                className={`provider-configure ${selectedGenericProvider ? '' : 'primary'}`}
                 data-action="open-agent-provider-settings"
                 data-testid="open-agent-backend-settings"
                 onClick={openAgentBackendSettings}
               >
-                管理智能体后端
+                {selectedGenericProvider ? '管理 AI Provider' : '立即配置 AI 服务'}
               </button>
             </div>
           )}
           {activeAgent?.messages.map((message, index) => {
             const latestUser = message.role === 'user' && message.id === latestUserMessage?.id;
             const latestUserRunning = latestUser && (
-              agentTurnBusy(activeAgent.state)
-              || Boolean(activeAgent.backendTurnDraining)
-              || foregroundRunning
+              agentTurnBusy(activeAgent.state) || foregroundRunning
             );
             const interruptAlreadyRequested = foregroundRunning
               && Boolean(activeAgent.activeExecution?.interruptRequestedAt);
@@ -2775,27 +2448,25 @@ export function App() {
                   />
                 </Suspense>
               </div>
-              {!codexBackendSelected && (
-                <div className="agent-message-memory-action">
-                  <button
-                    type="button"
-                    className="agent-message-icon-btn"
-                    data-action="pin-agent-memory"
-                    disabled={
-                      composerBlocked
-                      || containsObviousAgentSecret(message.content)
-                    }
-                    title={containsObviousAgentSecret(message.content)
-                      ? '检测到明显凭据，不能保存到上下文记忆'
-                      : '提炼并保存为当前 AI 对话的持久上下文记忆卡片'}
-                    aria-label="存为记忆"
-                    onClick={() => setAgentMemoryDraftSource({
-                      id: message.id,
-                      content: message.content,
-                    })}
-                  >◈</button>
-                </div>
-              )}
+              <div className="agent-message-memory-action">
+                <button
+                  type="button"
+                  className="agent-message-icon-btn"
+                  data-action="pin-agent-memory"
+                  disabled={
+                    composerBlocked
+                    || containsObviousAgentSecret(message.content)
+                  }
+                  title={containsObviousAgentSecret(message.content)
+                    ? '检测到明显凭据，不能保存到上下文记忆'
+                    : '提炼并保存为当前 AI 对话的持久上下文记忆卡片'}
+                  aria-label="存为记忆"
+                  onClick={() => setAgentMemoryDraftSource({
+                    id: message.id,
+                    content: message.content,
+                  })}
+                >◈</button>
+              </div>
               {turnActivities.length > 0 && (
                 <ToolActivityList
                   activities={turnActivities}
@@ -2806,9 +2477,7 @@ export function App() {
               {latestUser && (
                 latestUserRunning ? (
                   <AgentActivityCard
-                    phase={activeAgent.backendTurnDraining
-                      ? '正在安全停止当前轮次'
-                      : interruptAlreadyRequested
+                    phase={interruptAlreadyRequested
                         ? '已发送 Ctrl+C，等待前台进程退出'
                         : foregroundRunning
                           ? '前台命令正在运行'
@@ -2817,13 +2486,10 @@ export function App() {
                     context={activeTab
                       ? `当前终端：${activeTab.transport === 'ssh' ? 'SSH' : '本地'} · ${activeTab.title}`
                       : '当前无终端'}
-                    interruptLabel={activeAgent.backendTurnDraining
-                      ? '正在停止…'
-                      : interruptAlreadyRequested
+                    interruptLabel={interruptAlreadyRequested
                         ? '已发送 Ctrl+C'
                         : foregroundRunning ? '打断前台进程' : '打断'}
                     interruptDisabled={Boolean(agentMessageActionPending)
-                      || Boolean(activeAgent.backendTurnDraining)
                       || interruptAlreadyRequested}
                     onInterrupt={() => void interruptLatestAgentMessage(message.id)}
                   />
@@ -2870,8 +2536,7 @@ export function App() {
               <div className="approval-actions">
                 <button data-action="reject-command" onClick={() => void resolveAgentApproval('reject')}>拒绝</button>
                 <button data-action="edit-command" onClick={() => void resolveAgentApproval('edit')}>编辑并执行</button>
-                {activeAgent.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND
-                  && activeAgent.pendingApproval.kind !== 'workspace-tool-bypass' && (
+                {activeAgent.pendingApproval.kind !== 'workspace-tool-bypass' && (
                   <button onClick={() => {
                     if (!activeTab || !activeAgent.pendingApproval) return;
                     setFullTakeoverChallenge({
@@ -2950,14 +2615,10 @@ export function App() {
             disabled={!selectedAgentBackendReady || !activeTab || activeTab.status !== 'connected' || composerBlocked}
           />
           <div>
-            <span title="Enter 发送，Shift+Enter 换行">{activeAgent?.backendTurnDraining
-              ? '正在等待 App Server 安全停止旧轮次…'
-              : selectedAgentBackendReady
+            <span title="Enter 发送，Shift+Enter 换行">{selectedAgentBackendReady
               ? activeAgent
                 ? agentStateLabel(activeAgent.state)
-                : selectedAgentBackendKind === CODEX_APP_SERVER_AGENT_BACKEND
-                  ? '原生 Codex 已就绪 · 不控制当前终端'
-                  : '已就绪 · 命令需审批'
+                : '已就绪 · 命令需审批'
               : selectedAgentBackendStatus}</span>
             <button
               type="submit"
@@ -3313,83 +2974,6 @@ export function App() {
         </div>
       )}
 
-      {fileAccessChallenge && (
-        <div className="modal-backdrop">
-          <div
-            className={`modal compact-modal file-access-modal ${
-              fileAccessChallenge.mode === 'full-access' ? 'full-access-risk' : ''
-            }`}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="file-access-confirmation-title"
-            data-testid="file-access-confirmation"
-            data-access-mode={fileAccessChallenge.mode}
-            onKeyDown={(event) => {
-              if (event.key !== 'Escape') return;
-              event.preventDefault();
-              setFileAccessChallenge(null);
-            }}
-          >
-            <div className="modal-header">
-              <strong id="file-access-confirmation-title">
-                {fileAccessChallenge.mode === 'full-access'
-                  ? '允许 AI 访问完整文件系统？'
-                  : '允许 AI 直接修改文件？'}
-              </strong>
-            </div>
-            <p>终端：<b>{fileAccessChallenge.target}</b></p>
-            <p>绑定根目录：<code>{fileAccessChallenge.root}</code></p>
-            <p className="risk-note">
-              {fileAccessChallenge.mode === 'full-access' ? (
-                <>
-                  允许后，Generic Provider 可读取、创建、修改、重命名或删除当前本机/远程用户能访问的任意路径，
-                  软件不再限制 Readable/Writable Paths。它不会提权，仍受本机 OS 或当前 SSH/SFTP 用户权限限制；
-                  相对路径仍以上述 Workspace Root 为起点。权限只在本次应用运行期间有效。
-                </>
-              ) : (
-                <>
-                  允许后，{fileAccessChallenge.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
-                    ? 'Codex 可在绑定根目录内创建、修改、重命名或删除文件与目录；本地工作区由原生工具直接访问，远程工作区经受控 SFTP 工具访问。'
-                    : 'Generic Provider 可在绑定根目录内创建、修改、重命名或删除文件与目录；这些修改不会经过终端，也不能通过终端撤销。读取到的文件内容会作为 AI 请求上下文发送给当前 Provider。'}
-                  权限只在本次应用运行期间有效。
-                </>
-              )}
-              {fileAccessChallenge.backend.kind === CODEX_APP_SERVER_AGENT_BACKEND
-                ? 'AI 调用 terminal_execute 的命令仍会进入可见终端并遵循命令审批。'
-                : '所有命令仍必须进入可见终端。'}
-            </p>
-            <div className="modal-actions">
-              <button autoFocus onClick={() => setFileAccessChallenge(null)}>取消</button>
-              <button
-                className="danger-action"
-                data-action={fileAccessChallenge.mode === 'full-access'
-                  ? 'confirm-full-filesystem-access'
-                  : 'confirm-file-read-write'}
-                disabled={!fileAccessChallengeIsCurrent}
-                onClick={() => {
-                  const challenge = fileAccessChallenge;
-                  if (!fileAccessChallengeIsCurrent) {
-                    setFileAccessChallenge(null);
-                    setWorkspaceActionError('文件访问授权目标已变化，请重新选择权限。');
-                    return;
-                  }
-                  setFileAccessChallenge(null);
-                  void setAgentFileAccess(
-                    challenge.mode,
-                    challenge.terminalId,
-                    challenge.backend,
-                    challenge.mode === 'full-access',
-                    challenge.root,
-                  );
-                }}
-              >{fileAccessChallenge.mode === 'full-access'
-                  ? '我已了解风险，允许完整文件系统访问'
-                  : '允许本次读写与删除'}</button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {hostBackupExportOpen && (
         <div className="modal-backdrop" data-testid="host-backup-export-dialog">
           <div className="modal compact-modal host-backup-modal">
@@ -3498,8 +3082,7 @@ export function App() {
         </div>
       )}
 
-      {activeAgent?.pendingTakeover
-        && activeAgent.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND && (
+      {activeAgent?.pendingTakeover && (
         <div className="modal-backdrop">
           <div
             className="modal compact-modal takeover-modal"
@@ -3520,8 +3103,7 @@ export function App() {
         </div>
       )}
 
-      {fullTakeoverChallenge
-        && fullTakeoverChallenge.backend.kind !== CODEX_APP_SERVER_AGENT_BACKEND && (
+      {fullTakeoverChallenge && (
         <div className="modal-backdrop">
           <div
             className="modal compact-modal full-takeover-modal"
@@ -3539,7 +3121,7 @@ export function App() {
               本次确认只授权当前终端；新建、重连或重启后的终端仍会重新询问。
             </p>
             <p className="risk-note" data-testid="full-takeover-file-policy-note">
-              AI 全接管不会绕过 Workspace 文件工具路由策略；相关文件命令仍会被纠正，或要求逐次批准例外。
+              确认后会同时开启完整文件系统访问，不再限制于 Workspace 根目录；仍受本机 OS 或当前 SSH/SFTP 用户权限限制。可由文件工具等价完成的命令仍会优先改用文件工具。
             </p>
             <p className="risk-note">
               {fullTakeoverChallenge.approvalId

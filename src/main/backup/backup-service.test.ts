@@ -28,7 +28,6 @@ function paths(root: string) {
   return {
     settings: join(root, 'config', 'app-settings.json'),
     providers: join(root, 'config', 'providers.json'),
-    codexAppServer: join(root, 'config', 'codex-app-server.json'),
     sessions: join(root, 'sessions'),
   };
 }
@@ -53,7 +52,6 @@ function seedConfig(root: string) {
     createdAt: new Date(0).toISOString(),
     updatedAt: new Date(0).toISOString(),
   }]), 'utf8');
-  writeFileSync(p.codexAppServer, JSON.stringify({ bound: true }), 'utf8');
 }
 
 async function readManifest(bundlePath: string, passphrase?: string) {
@@ -73,7 +71,6 @@ function configSnapshot(root: string): Record<string, Buffer> {
   return Object.fromEntries([
     ['settings', readFileSync(p.settings)],
     ['providers', readFileSync(p.providers)],
-    ['codexAppServer', readFileSync(p.codexAppServer)],
   ]);
 }
 
@@ -151,7 +148,6 @@ describe('BackupService', () => {
     expect(exported.sections).toEqual([
       'settings',
       'providers',
-      'codexAppServer',
       'providerSecrets',
     ]);
     expect(exported).toMatchObject({ encrypted: true, credentialsIncluded: true });
@@ -178,7 +174,6 @@ describe('BackupService', () => {
     expect(imported.sectionsImported).toEqual([
       'settings',
       'providers',
-      'codexAppServer',
       'providerSecrets',
     ]);
     expect(imported.needsRestart).toBe(true);

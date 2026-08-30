@@ -4,7 +4,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { DesktopBridge } from '../shared/ipc';
 import type { HostProfile } from '../shared/host';
 import type { SessionRecord } from '../shared/session';
-import type { CodexAppServerSnapshot } from '../shared/codex-app-server';
 import { App } from './App';
 
 vi.mock('./components/TerminalPane', () => ({
@@ -144,22 +143,7 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       setDefault: vi.fn(),
       testConnection: vi.fn(),
       discoverModels: vi.fn(),
-    },
-    codexAppServer: {
-      getState: vi.fn(() => new Promise<CodexAppServerSnapshot>(() => undefined)),
-      chooseExecutable: vi.fn(),
-      start: vi.fn(),
-      restart: vi.fn(),
-      loginBrowser: vi.fn(),
-      loginDeviceCode: vi.fn(),
-      reopenLogin: vi.fn(),
-      cancelLogin: vi.fn(),
-      logout: vi.fn(),
-      refresh: vi.fn(),
-      saveSelection: vi.fn(),
-      setTerminalAgentEnabled: vi.fn(),
-      setTerminalContextAccess: vi.fn(),
-      onStateChanged: vi.fn(() => () => undefined),
+      onChanged: vi.fn().mockReturnValue(() => undefined),
     },
     agent: {
       sendPrompt: vi.fn(),
@@ -168,7 +152,6 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       saveMemory: vi.fn(),
       removeMemory: vi.fn(),
       getState: vi.fn().mockResolvedValue(undefined),
-      setFileAccess: vi.fn(),
       resolveApproval: vi.fn(),
       setFullTakeover: vi.fn(),
       setFullTakeoverPreference: vi.fn(),
@@ -202,6 +185,7 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
     },
     settingsWindow: {
       open: vi.fn().mockResolvedValue(undefined),
+      onNavigate: vi.fn().mockReturnValue(() => undefined),
     },
   };
 }
@@ -330,6 +314,23 @@ describe('renderer host and session dialogs', () => {
     expect(container.querySelector('.history-session-meta')?.textContent).toContain('活动中');
     expect(container.querySelector('.history-session-actions [title="查看会话"]')).not.toBeNull();
     expect(container.querySelector('.history-session-actions [title="重命名会话"]')).not.toBeNull();
+  });
+
+  it('routes the global settings button to home and the AI provider button to AI settings', async () => {
+    const bridge = bridgeWith(vi.fn());
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    await act(async () => container.querySelector<HTMLButtonElement>(
+      '[data-action="open-settings"]',
+    )!.click());
+    expect(bridge.settingsWindow.open).toHaveBeenLastCalledWith();
+
+    await act(async () => container.querySelector<HTMLButtonElement>(
+      '[data-testid="open-agent-backend-settings"]',
+    )!.click());
+    expect(bridge.settingsWindow.open).toHaveBeenLastCalledWith('ai');
   });
 
   it('hides and restores the AI panel without destroying the terminal workspace', async () => {

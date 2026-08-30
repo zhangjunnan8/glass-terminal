@@ -51,18 +51,11 @@ import type {
   ReviseAgentPromptRequest,
   SendAgentPromptRequest,
   SaveAgentMemoryRequest,
-  SetAgentFileAccessRequest,
   SetFullTakeoverRequest,
   SetFullTakeoverPreferenceRequest,
   TakeoverRequest,
 } from './agent';
-import type {
-  CodexAppServerSnapshot,
-  SaveCodexAppServerSelectionRequest,
-  SetCodexTerminalContextAccessRequest,
-  SetCodexTerminalAgentEnabledRequest,
-} from './codex-app-server';
-import type { AppSettings, AppSettingsPatch } from './settings';
+import type { AppSettings, AppSettingsPatch, SettingsWindowSection } from './settings';
 import type {
   BackupExportRequest,
   BackupExportResult,
@@ -143,29 +136,7 @@ export interface DesktopBridge {
     setDefault(providerId: string): Promise<ProviderProfile>;
     testConnection(providerId: string): Promise<ProviderConnectionResult>;
     discoverModels(input: ProviderModelDiscoveryInput): Promise<ProviderModelDiscoveryResult>;
-  };
-  codexAppServer: {
-    getState(): Promise<CodexAppServerSnapshot>;
-    start(): Promise<CodexAppServerSnapshot>;
-    chooseExecutable(): Promise<CodexAppServerSnapshot>;
-    restart(): Promise<CodexAppServerSnapshot>;
-    refresh(): Promise<CodexAppServerSnapshot>;
-    loginBrowser(): Promise<CodexAppServerSnapshot>;
-    loginDeviceCode(): Promise<CodexAppServerSnapshot>;
-    reopenLogin(): Promise<CodexAppServerSnapshot>;
-    cancelLogin(): Promise<CodexAppServerSnapshot>;
-    logout(): Promise<CodexAppServerSnapshot>;
-    saveSelection(
-      request: SaveCodexAppServerSelectionRequest,
-    ): Promise<CodexAppServerSnapshot>;
-    setTerminalContextAccess(
-      request: SetCodexTerminalContextAccessRequest,
-    ): Promise<CodexAppServerSnapshot>;
-    /** @deprecated Use setTerminalContextAccess. */
-    setTerminalAgentEnabled(
-      request: SetCodexTerminalAgentEnabledRequest,
-    ): Promise<CodexAppServerSnapshot>;
-    onStateChanged(listener: (state: CodexAppServerSnapshot) => void): () => void;
+    onChanged(listener: (providers: ProviderProfile[]) => void): () => void;
   };
   agent: {
     sendPrompt(request: SendAgentPromptRequest): Promise<AgentSessionView>;
@@ -175,7 +146,6 @@ export interface DesktopBridge {
     removeMemory(request: RemoveAgentMemoryRequest): Promise<AgentSessionView>;
     getState(terminalId: string): Promise<AgentSessionView | null>;
     activateBackend?(request: ActivateAgentBackendRequest): Promise<AgentSessionView>;
-    setFileAccess(request: SetAgentFileAccessRequest): Promise<AgentSessionView>;
     resolveApproval(request: ResolveApprovalRequest): Promise<AgentSessionView>;
     setFullTakeover(request: SetFullTakeoverRequest): Promise<AgentSessionView>;
     setFullTakeoverPreference(
@@ -201,6 +171,7 @@ export interface DesktopBridge {
     import(request?: BackupImportRequest): Promise<BackupImportResponse | null>;
   };
   settingsWindow: {
-    open(): Promise<void>;
+    open(section?: SettingsWindowSection): Promise<void>;
+    onNavigate(listener: (section: SettingsWindowSection) => void): () => void;
   };
 }

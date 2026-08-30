@@ -111,10 +111,7 @@ function hostBridge() {
     },
     providers: {
       list: vi.fn().mockResolvedValue([]),
-    },
-    codexAppServer: {
-      getState: vi.fn(() => new Promise(() => undefined)),
-      onStateChanged: vi.fn(() => () => undefined),
+      onChanged: vi.fn(() => () => undefined),
     },
     agent: {
       getState: vi.fn().mockResolvedValue(undefined),
