@@ -32,7 +32,7 @@ import { LangChainBackend } from './langchain-backend';
  *
  * Proves:
  *  1. `terminal_execute` lands in the shared visible PTY (approved, visible).
- *  2. `workspace_read_file` / `workspace_apply_patch` go through the filesystem,
+ *  2. `file_read` / `file_patch` go through the filesystem,
  *     never through cat/sed and never into the terminal.
  *  3. The harness never obtains its own shell/SSH/SFTP (no hidden connections).
  */
@@ -206,8 +206,8 @@ function nextWorkflowCompletion(
   const toolNames = (payload.tools as Array<{ function?: { name?: unknown } }>)
     .map((entry) => entry.function?.name);
   assertCondition(
-    toolNames.includes('terminal_execute') && toolNames.includes('workspace_read_file'),
-    'LangChain must expose terminal_execute and workspace_read_file tools.',
+    toolNames.includes('terminal_execute') && toolNames.includes('file_read'),
+    'LangChain must expose terminal_execute and file_read tools.',
   );
 
   switch (state.round) {
@@ -221,18 +221,18 @@ function nextWorkflowCompletion(
       assertCondition(result.ok === true, 'terminal_execute (node --version) failed.');
       assertCondition(result.command === 'node --version', 'Wrong first command.');
       assertCondition(typeof result.output === 'string', 'Terminal output is missing.');
-      return openAiCompletion(toolChoice('call-read', 'workspace_read_file', {
+      return openAiCompletion(toolChoice('call-read', 'file_read', {
         path: 'src/app.txt',
       }));
     }
     case 2: {
       const result = lastToolResult(payload, 'call-read');
-      assertCondition(result.ok === true, 'workspace_read_file failed.');
+      assertCondition(result.ok === true, 'file_read failed.');
       assertCondition(typeof result.content === 'string', 'Read content is missing.');
       assertCondition(result.content.includes(MODE_OFF), 'Read content lost the MODE=off canary.');
       assertCondition(typeof result.sha256 === 'string', 'Read SHA-256 is missing.');
       state.sha256 = result.sha256;
-      return openAiCompletion(toolChoice('call-patch', 'workspace_apply_patch', {
+      return openAiCompletion(toolChoice('call-patch', 'file_patch', {
         path: 'src/app.txt',
         expectedSha256: state.sha256,
         patches: [{ search: MODE_OFF, replace: MODE_ON }],
@@ -240,7 +240,7 @@ function nextWorkflowCompletion(
     }
     case 3: {
       const result = lastToolResult(payload, 'call-patch');
-      assertCondition(result.ok === true, 'workspace_apply_patch failed.');
+      assertCondition(result.ok === true, 'file_patch failed.');
       assertCondition(result.created === false, 'Patch unexpectedly created a file.');
       return openAiCompletion(toolChoice('call-test', 'terminal_execute', {
         command: testCommand,
@@ -468,6 +468,11 @@ describe('LangChain backend spike (DeepSeek-compatible transport)', () => {
         },
       });
       expect(permission.fullTakeover).toBe(false);
+      agents.setReviewMode(owner, {
+        terminalId,
+        mode: 'risky',
+        backend,
+      });
 
       agents.sendPrompt(owner, {
         terminalId,
@@ -482,28 +487,10 @@ describe('LangChain backend spike (DeepSeek-compatible transport)', () => {
         (view) => view.state === 'WAITING_APPROVAL' && Boolean(view.pendingApproval),
         providerStub.state,
       );
-      expect(firstApproval.pendingApproval?.command).toBe('node --version');
+      expect(firstApproval.pendingApproval?.command).toBe(testCommand);
       agents.resolveApproval(owner, {
         terminalId,
         approvalId: firstApproval.pendingApproval!.id,
-        decision: 'execute',
-      });
-
-      const secondApproval = await waitForView(
-        agents,
-        owner,
-        terminalId,
-        (view) => (
-          view.state === 'WAITING_APPROVAL'
-          && Boolean(view.pendingApproval)
-          && view.pendingApproval?.id !== firstApproval.pendingApproval?.id
-        ),
-        providerStub.state,
-      );
-      expect(secondApproval.pendingApproval?.command).toBe(testCommand);
-      agents.resolveApproval(owner, {
-        terminalId,
-        approvalId: secondApproval.pendingApproval!.id,
         decision: 'execute',
       });
 

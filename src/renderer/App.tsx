@@ -31,6 +31,7 @@ import type {
   AgentBackendRef,
   AgentFileAccessMode,
   AgentRuntimeState,
+  AgentReviewMode,
   AgentSessionView,
 } from '../shared/agent';
 import type { ShellProfile, TerminalDescriptor } from '../shared/terminal';
@@ -41,12 +42,13 @@ import type {
 import { mergeAgentAssistantDelta, mergeAgentState } from './agent-state';
 import { TerminalPane } from './components/TerminalPane';
 import { SftpDrawer } from './components/SftpDrawer';
-import { AgentActivityCard } from './components/AgentActivityCard';
 import { AgentContextMeter } from './components/AgentContextMeter';
 import {
   AgentMemoryPanel,
   type AgentMemoryDraftSource,
 } from './components/AgentMemoryPanel';
+import { AgentReviewModePicker } from './components/AgentReviewModePicker';
+import { AgentTurnProcess } from './components/AgentTurnProcess';
 import { ToolActivityList } from './components/ToolActivityList';
 import {
   isAgentOutputNearBottom,
@@ -111,14 +113,10 @@ interface TrustChallenge {
   sessionId?: string;
 }
 
-interface FullTakeoverChallenge {
+interface CompleteAccessChallenge {
   terminalId: string;
   target: string;
   backend: AgentBackendRef;
-  approvalId?: string;
-  command?: string;
-  editedCommand?: string;
-  hostPreference: boolean;
 }
 
 type SidebarView = 'terminals' | 'hosts' | 'history';
@@ -147,14 +145,6 @@ function agentTurnBusy(state?: AgentRuntimeState): boolean {
     'WAITING_AUTH',
     'TAKEOVER_PENDING',
   ].includes(state));
-}
-
-function agentBackendActivityLabel(
-  backend: AgentBackendRef,
-  providers: ProviderProfile[],
-): string {
-  return providers.find((provider) => provider.id === backend.providerId)?.name
-    ?? '默认 Provider';
 }
 
 /** Max composer height in pixels before the textarea stops growing and scrolls. */
@@ -237,7 +227,7 @@ export function App() {
   const agentDeltaResyncRef = useRef<Set<string>>(new Set());
   const [agentUpdatesBelow, setAgentUpdatesBelow] = useState(false);
   const [agentPanelVisible, setAgentPanelVisible] = useState(true);
-  const [agentControlsExpanded, setAgentControlsExpanded] = useState(true);
+  const [agentControlsExpanded, setAgentControlsExpanded] = useState(false);
   const [agentPanelWidth, setAgentPanelWidth] = useState(390);
   const [agentPrompt, setAgentPrompt] = useState('');
   const [editingAgentMessageId, setEditingAgentMessageId] = useState<string | null>(null);
@@ -258,7 +248,7 @@ export function App() {
   const [sessionRenameError, setSessionRenameError] = useState<string | null>(null);
   const [sessionRenamePending, setSessionRenamePending] = useState(false);
   const [trustChallenge, setTrustChallenge] = useState<TrustChallenge | null>(null);
-  const [fullTakeoverChallenge, setFullTakeoverChallenge] = useState<FullTakeoverChallenge | null>(null);
+  const [completeAccessChallenge, setCompleteAccessChallenge] = useState<CompleteAccessChallenge | null>(null);
   const [startupError, setStartupError] = useState<string | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [workspaceActionError, setWorkspaceActionError] = useState<string | null>(null);
@@ -497,12 +487,13 @@ export function App() {
     : sessions;
   const defaultProvider = providers.find((provider) => provider.isDefault) ?? null;
   const activeAgent = activeTab ? agentStates[activeTab.id] : undefined;
-  const activeFullTakeoverPreference = activeAgent?.fullTakeoverPreference
-    ?? activeHost?.fullTakeoverPreference
-    ?? false;
+  const activeReviewMode: AgentReviewMode = activeAgent?.reviewMode
+    ?? (activeAgent?.fullTakeover ? 'complete' : 'all');
   const activeMessages = activeAgent?.messages ?? [];
   const activeActivities = activeAgent?.activities ?? [];
-  const activeMessageIds = new Set(activeMessages.map((message) => message.id));
+  const activeMessageIds = new Set(activeMessages.flatMap((message) => (
+    message.turnId ? [message.id, message.turnId] : [message.id]
+  )));
   const unmatchedActivities = activeActivities.filter((activity) => (
     !activity.turnId || !activeMessageIds.has(activity.turnId)
   ));
@@ -811,6 +802,10 @@ export function App() {
 
   async function sendAgentPrompt(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (composerBlocked && latestUserMessage) {
+      await interruptLatestAgentMessage(latestUserMessage.id);
+      return;
+    }
     if (
       !activeTab
       || !agentPrompt.trim()
@@ -951,55 +946,27 @@ export function App() {
     }
   }
 
-  async function setFullTakeover(
-    enabled: boolean,
+  async function setAgentReviewMode(
+    mode: AgentReviewMode,
+    confirmed = false,
     terminalId = activeTab?.id,
-    approvalId?: string,
-    editedCommand?: string,
     backend: AgentBackendRef | undefined = activeAgent?.backend ?? selectedAgentBackend,
-  ) {
+  ): Promise<void> {
     if (!terminalId || !backend) return;
     setWorkspaceActionError(null);
     try {
-      const state = await window.aiTerminal.agent.setFullTakeover({
+      const state = await window.aiTerminal.agent.setReviewMode({
         terminalId,
-        enabled,
+        mode,
         backend,
-        approvalId,
-        editedCommand,
+        ...(mode === 'complete' ? { completeAccessConfirmed: confirmed } : {}),
       });
       installAgentSnapshot(state);
       setTabs((current) => current.map((tab) => (
-        tab.id === terminalId ? { ...tab, sessionId: state.sessionId } : tab
+        tab.id === state.terminalId ? { ...tab, sessionId: state.sessionId } : tab
       )));
-      setFullTakeoverChallenge(null);
+      setCompleteAccessChallenge(null);
       await refreshSessions();
-    } catch (error) {
-      setWorkspaceActionError(errorMessage(error));
-    }
-  }
-
-  async function setFullTakeoverPreference(enabled: boolean): Promise<void> {
-    if (!activeTab) return;
-    setWorkspaceActionError(null);
-    try {
-      const state = await window.aiTerminal.agent.setFullTakeoverPreference({
-        terminalId: activeTab.id,
-        enabled,
-      });
-      if (state) installAgentSnapshot(state);
-      await refreshHosts();
-    } catch (error) {
-      setWorkspaceActionError(errorMessage(error));
-    }
-  }
-
-  async function requestAgentTakeover() {
-    if (!activeTab) return;
-    setWorkspaceActionError(null);
-    try {
-      const state = await window.aiTerminal.agent.takeover({ terminalId: activeTab.id });
-      installAgentSnapshot(state);
     } catch (error) {
       setWorkspaceActionError(errorMessage(error));
     }
@@ -1550,29 +1517,34 @@ export function App() {
         >
           <div className="host-details-collapse-inner">
             <div className="selected-host-card">
-              <strong>{host.name}</strong>
-              <span>{authMethodLabel(host.authMethod)} · {host.hostKeyFingerprint ? '已信任' : '未验证'}</span>
-              <div className="host-card-actions">
-                <button
-                  className="icon-btn"
-                  data-action="connect-host"
-                  title={sshConnectionPending ? '正在连接' : '连接主机'}
-                  aria-label={sshConnectionPending ? '正在连接' : `连接主机 ${host.name}`}
-                  disabled={sshConnectionPending}
-                  onClick={() => openSshConnection(host)}
-                >{sshConnectionPending ? '…' : '↗'}</button>
-                <button
-                  className="icon-btn"
-                  title="编辑主机"
-                  aria-label="编辑主机"
-                  onClick={() => openHostEditor(host)}
-                >✎</button>
-                <button
-                  className="icon-btn danger"
-                  title="删除主机"
-                  aria-label="删除主机"
-                  onClick={() => void removeHost(host)}
-                >🗑</button>
+              <div className="host-card-summary">
+                <div className="host-card-identity">
+                  <strong>{host.name}</strong>
+                  <span>{authMethodLabel(host.authMethod)} · {host.hostKeyFingerprint ? '已信任' : '未验证'}</span>
+                </div>
+                <div className="host-card-actions">
+                  <button
+                    className="compact-text-action"
+                    data-action="connect-host"
+                    title={sshConnectionPending ? '正在连接' : '连接主机'}
+                    aria-label={sshConnectionPending ? '正在连接' : `连接主机 ${host.name}`}
+                    disabled={sshConnectionPending}
+                    onClick={() => openSshConnection(host)}
+                  >{sshConnectionPending ? '连接中' : '连接'}</button>
+                  <button
+                    className="compact-text-action"
+                    title="编辑主机"
+                    aria-label="编辑主机"
+                    onClick={() => openHostEditor(host)}
+                  >编辑</button>
+                  <button
+                    className="compact-text-action danger"
+                    data-action="remove-host"
+                    title="删除主机"
+                    aria-label="删除主机"
+                    onClick={() => void removeHost(host)}
+                  >删除</button>
+                </div>
               </div>
               {host.authMethod !== 'agent' && (
                 <div className="host-credential-row">
@@ -1581,14 +1553,14 @@ export function App() {
                   </small>
                   {host.credentialConfigured && (
                     <button
-                      className="icon-btn"
+                      className="compact-text-action"
                       type="button"
                       title="删除已保存凭据"
                       aria-label="删除已保存凭据"
                       data-action="forget-host-credential"
                       disabled={credentialActionPending}
                       onClick={() => void forgetHostCredential(host)}
-                    >{credentialActionPending ? '…' : '🗝'}</button>
+                    >{credentialActionPending ? '删除中' : '删除凭据'}</button>
                   )}
                 </div>
               )}
@@ -1614,25 +1586,25 @@ export function App() {
                       <span className="session-history-name" title={session.name}>{session.name}</span>
                       <span className="session-history-actions">
                         <button
-                          className="icon-btn"
+                          className="compact-text-action"
                           type="button"
                           title="查看历史"
                           aria-label="查看历史"
                           data-action="view-session-history"
                           data-session-id={session.id}
                           onClick={() => openSessionHistory(session)}
-                        >▤</button>
+                        >历史</button>
                         <button
-                          className="icon-btn"
+                          className="compact-text-action"
                           type="button"
                           title="重命名会话"
                           aria-label="重命名会话"
                           data-action="rename-session"
                           data-session-id={session.id}
                           onClick={() => openSessionRename(session)}
-                        >✎</button>
+                        >重命名</button>
                         <button
-                          className="icon-btn"
+                          className="compact-text-action"
                           type="button"
                           title={liveTab ? '打开' : '重连'}
                           aria-label={liveTab ? '打开' : '重连'}
@@ -1643,7 +1615,7 @@ export function App() {
                             if (liveTab) setActiveId(liveTab.id);
                             else openSshConnection(host, session.id);
                           }}
-                        >{liveTab ? '↗' : '↻'}</button>
+                        >{liveTab ? '打开' : '重连'}</button>
                       </span>
                     </div>
                   );
@@ -2001,22 +1973,22 @@ export function App() {
                     </button>
                     <div className="history-session-actions">
                       <button
-                        className="icon-btn"
+                        className="compact-text-action"
                         type="button"
                         title="查看会话"
                         aria-label={`查看会话 ${session.name}`}
                         onClick={() => openSessionHistory(session)}
-                      >▤</button>
+                      >历史</button>
                       <button
-                        className="icon-btn"
+                        className="compact-text-action"
                         type="button"
                         title="重命名会话"
                         aria-label={`重命名会话 ${session.name}`}
                         onClick={() => openSessionRename(session)}
-                      >✎</button>
+                      >重命名</button>
                       {host && (
                         <button
-                          className="icon-btn"
+                          className="compact-text-action"
                           type="button"
                           title={runtimeTab ? '打开终端' : '重连会话'}
                           aria-label={`${runtimeTab ? '打开终端' : '重连会话'} ${session.name}`}
@@ -2025,7 +1997,7 @@ export function App() {
                             if (runtimeTab) setActiveId(runtimeTab.id);
                             else openSshConnection(host, session.id);
                           }}
-                        >{runtimeTab ? '↗' : '↻'}</button>
+                        >{runtimeTab ? '打开' : '重连'}</button>
                       )}
                     </div>
                   </article>
@@ -2079,16 +2051,18 @@ export function App() {
             'terminal-stage',
             activeInputMode === 'locked' ? 'agent-controlled' : '',
             activeInputMode === 'secure-human' ? 'auth-required' : '',
-            activeAgent?.fullTakeover ? 'full-takeover' : '',
+            activeReviewMode === 'complete' ? 'complete-access' : '',
           ].filter(Boolean).join(' ')}
           data-agent-state={activeAgent?.state ?? 'USER_CONTROL'}
           data-input-mode={activeInputMode}
-          data-full-takeover={activeAgent?.fullTakeover ? 'true' : 'false'}
+          data-review-mode={activeReviewMode}
         >
           <div className="terminal-toolbar">
             <span>
               {activeAgent ? agentStateLabel(activeAgent.state) : '用户控制'}
-              {activeAgent?.fullTakeover ? ' · AI 全接管' : ''}
+              {activeReviewMode === 'complete'
+                ? ' · 完全访问'
+                : activeReviewMode === 'risky' ? ' · 风险审核' : activeAgent ? ' · 全部审核' : ''}
             </span>
             <div className="terminal-actions">
               <span>{activeTab?.status === 'exited'
@@ -2280,6 +2254,22 @@ export function App() {
               <div className="agent-backend-picker">
                 <span>当前 Provider</span>
                 <strong>{defaultProvider?.name ?? '尚未配置'}</strong>
+                <AgentReviewModePicker
+                  value={activeReviewMode}
+                  disabled={!activeTab || composerBlocked || !selectedAgentBackendReady}
+                  onSelect={(mode) => {
+                    if (mode !== 'complete') {
+                      void setAgentReviewMode(mode);
+                      return;
+                    }
+                    if (!activeTab || !selectedAgentBackend) return;
+                    setCompleteAccessChallenge({
+                      terminalId: activeTab.id,
+                      target: activeTab.title,
+                      backend: activeAgent?.backend ?? selectedAgentBackend,
+                    });
+                  }}
+                />
               </div>
             )}
             <span
@@ -2314,65 +2304,10 @@ export function App() {
                 />
               </div>
               <span className="agent-file-access-root" data-testid="agent-file-access-status">
-                {activeAgent?.fullTakeover
-                  ? '全文件访问已随 AI 全接管开启'
-                  : activeWorkspaceRoot
-                    ? `Workspace 读写：${activeWorkspaceRoot}`
-                    : '未设置 Workspace'}
+                {activeWorkspaceRoot
+                  ? `工作范围提示：${activeWorkspaceRoot}（不限制文件权限）`
+                  : '未设置工作范围提示；文件工具仍可直接使用'}
               </span>
-              {activeAgent?.fullTakeover && <span className="takeover-badge">AI 全接管</span>}
-              {activeFullTakeoverPreference && (
-                <span
-                  className="takeover-preference"
-                  data-testid="full-takeover-host-preference"
-                  title="这是主机偏好，不会自动授权新的终端。"
-                >主机偏好：全接管</span>
-              )}
-              {activeFullTakeoverPreference && (
-                <button
-                  type="button"
-                  data-action="forget-full-takeover-preference"
-                  onClick={() => void setFullTakeoverPreference(false)}
-                >忘记偏好</button>
-              )}
-              <button
-                className="take-control"
-                data-action="take-control"
-                disabled={!agentTurnBusy(activeAgent?.state) || activeAgent?.state === 'TAKEOVER_PENDING'}
-                onClick={() => void requestAgentTakeover()}
-              >人工接管</button>
-              <button
-                className={activeAgent?.fullTakeover ? 'full-takeover-enabled' : ''}
-                disabled={
-                  !activeTab
-                  || agentTurnBusy(activeAgent?.state)
-                  || (!activeAgent?.fullTakeover
-                    && (!selectedAgentBackend || !selectedAgentBackendReady))
-                }
-                onClick={() => {
-                  if (!activeTab) return;
-                  if (activeAgent?.fullTakeover) {
-                    void setFullTakeover(
-                      false,
-                      activeTab.id,
-                      undefined,
-                      undefined,
-                      activeAgent.backend,
-                    );
-                  } else if (selectedAgentBackend) {
-                    setFullTakeoverChallenge({
-                      terminalId: activeTab.id,
-                      target: activeTab.title,
-                      backend: selectedAgentBackend,
-                      hostPreference: activeFullTakeoverPreference,
-                    });
-                  }
-                }}
-              >{activeAgent?.fullTakeover
-                  ? '关闭当前终端全接管'
-                  : activeFullTakeoverPreference
-                    ? '为本次终端启用'
-                    : 'AI 全接管'}</button>
             </div>
           )}
         </div>
@@ -2388,13 +2323,13 @@ export function App() {
               <div className="agent-glyph">✦</div>
               <strong>{selectedGenericProvider ? '理解终端上下文的 AI 助手' : '首次使用：配置 AI Provider'}</strong>
               <p>{selectedGenericProvider
-                ? '智能体会读取当前会话，并在向这个可见终端发送每条命令前请求你的批准。'
+                ? '智能体会读取当前会话；默认“全部审核”，也可切换为“风险审核”或橙色“完全访问”。'
                 : '添加 OpenAI 兼容 API 后，即可在当前终端中使用 AI。保存时会自动检测连接，无需重启软件。'}</p>
               <div className="guardrail"><span>✓</span> {selectedGenericProvider
-                ? '默认逐条审批命令'
+                ? '同一审核模式同时管理终端命令和文件工具'
                 : '支持 OpenAI 兼容接口与手动模型 ID'}</div>
               <button
-                className={`provider-configure ${selectedGenericProvider ? '' : 'primary'}`}
+                className="provider-configure primary"
                 data-action="open-agent-provider-settings"
                 data-testid="open-agent-backend-settings"
                 onClick={openAgentBackendSettings}
@@ -2408,16 +2343,49 @@ export function App() {
             const latestUserRunning = latestUser && (
               agentTurnBusy(activeAgent.state) || foregroundRunning
             );
-            const interruptAlreadyRequested = foregroundRunning
-              && Boolean(activeAgent.activeExecution?.interruptRequestedAt);
             const previousMessage = activeAgent.messages[index - 1];
             const turnDurationMs = message.role === 'assistant'
               && previousMessage?.role === 'user'
               ? new Date(message.createdAt).getTime() - new Date(previousMessage.createdAt).getTime()
               : undefined;
+            const turnKey = message.turnId ?? message.id;
             const turnActivities = message.role === 'assistant'
-              ? activeActivities.filter((activity) => activity.turnId === message.id)
+              ? activeActivities.filter((activity) => activity.turnId === turnKey)
               : [];
+            if (message.role === 'assistant' && message.presentation === 'intermediate') {
+              const firstProcessIndex = activeAgent.messages.findIndex((candidate) => (
+                candidate.role === 'assistant'
+                && candidate.presentation === 'intermediate'
+                && candidate.turnId === message.turnId
+              ));
+              if (firstProcessIndex !== index) return null;
+              const processMessages = activeAgent.messages.filter((candidate) => (
+                candidate.role === 'assistant'
+                && candidate.presentation === 'intermediate'
+                && candidate.turnId === message.turnId
+              ));
+              const processCompleted = activeAgent.messages.some((candidate) => (
+                candidate.role === 'assistant'
+                && candidate.presentation === 'summary'
+                && candidate.turnId === message.turnId
+              ));
+              return (
+                <AgentTurnProcess
+                  key={`${turnKey}:process`}
+                  completed={processCompleted}
+                  stageCount={processMessages.length}
+                  activities={turnActivities}
+                >
+                  {processMessages.map((processMessage) => (
+                    <div className="agent-turn-process-message" key={processMessage.id}>
+                      <Suspense fallback={<p className="agent-plain-message">{processMessage.content}</p>}>
+                        <AgentMessageContent role="assistant" content={processMessage.content} />
+                      </Suspense>
+                    </div>
+                  ))}
+                </AgentTurnProcess>
+              );
+            }
             return (
             <article
               className={`agent-message ${message.role}`}
@@ -2467,7 +2435,9 @@ export function App() {
                   })}
                 >◈</button>
               </div>
-              {turnActivities.length > 0 && (
+              {turnActivities.length > 0 && !activeAgent.messages.some((candidate) => (
+                candidate.presentation === 'intermediate' && candidate.turnId === turnKey
+              )) && (
                 <ToolActivityList
                   activities={turnActivities}
                   testId={`tool-activity-list-${message.id}`}
@@ -2475,25 +2445,7 @@ export function App() {
                 />
               )}
               {latestUser && (
-                latestUserRunning ? (
-                  <AgentActivityCard
-                    phase={interruptAlreadyRequested
-                        ? '已发送 Ctrl+C，等待前台进程退出'
-                        : foregroundRunning
-                          ? '前台命令正在运行'
-                          : agentStateLabel(activeAgent.state)}
-                    backend={agentBackendActivityLabel(activeAgent.backend, providers)}
-                    context={activeTab
-                      ? `当前终端：${activeTab.transport === 'ssh' ? 'SSH' : '本地'} · ${activeTab.title}`
-                      : '当前无终端'}
-                    interruptLabel={interruptAlreadyRequested
-                        ? '已发送 Ctrl+C'
-                        : foregroundRunning ? '打断前台进程' : '打断'}
-                    interruptDisabled={Boolean(agentMessageActionPending)
-                      || interruptAlreadyRequested}
-                    onInterrupt={() => void interruptLatestAgentMessage(message.id)}
-                  />
-                ) : (
+                !latestUserRunning && (
                   <div className="agent-message-actions" data-testid="latest-user-message-actions">
                     <small title="终端输出、命令执行和审计记录都会保留">
                       仅调整对话，不回滚终端
@@ -2514,48 +2466,6 @@ export function App() {
             );
           })}
           <ToolActivityList activities={unmatchedActivities} />
-          {activeAgent?.pendingApproval?.status === 'waiting' && (
-            <section className="approval-card">
-              <div>
-                <strong>{activeAgent.pendingApproval.kind === 'workspace-tool-bypass'
-                  ? '文件工具绕过例外'
-                  : '命令审批'}</strong>
-                <span>{activeAgent.pendingApproval.reason ?? '智能体请求在终端中执行命令'}</span>
-              </div>
-              {activeAgent.pendingApproval.kind === 'workspace-tool-bypass' && (
-                <p className="approval-policy-warning" data-testid="file-tool-bypass-warning">
-                  此命令无法由当前授权的 Workspace 文件工具等价完成。批准将仅对当前终端、当前会话轮次和这条命令生效；AI 全接管不会跳过此限制。
-                </p>
-              )}
-              <textarea
-                aria-label="待审批命令"
-                value={editedApprovalCommand}
-                onChange={(event) => setEditedApprovalCommand(event.target.value)}
-                spellCheck={false}
-              />
-              <div className="approval-actions">
-                <button data-action="reject-command" onClick={() => void resolveAgentApproval('reject')}>拒绝</button>
-                <button data-action="edit-command" onClick={() => void resolveAgentApproval('edit')}>编辑并执行</button>
-                {activeAgent.pendingApproval.kind !== 'workspace-tool-bypass' && (
-                  <button onClick={() => {
-                    if (!activeTab || !activeAgent.pendingApproval) return;
-                    setFullTakeoverChallenge({
-                      terminalId: activeTab.id,
-                      target: activeTab.title,
-                      backend: activeAgent.backend,
-                      approvalId: activeAgent.pendingApproval.id,
-                      command: activeAgent.pendingApproval.command,
-                      editedCommand: editedApprovalCommand,
-                      hostPreference: activeAgent.fullTakeoverPreference,
-                    });
-                  }} data-action="switch-full-takeover">切换为 AI 全接管…</button>
-                )}
-                <button className="execute" data-action="execute-command" onClick={() => void resolveAgentApproval('execute')}>
-                  {activeAgent.pendingApproval.kind === 'workspace-tool-bypass' ? '仅批准本次执行' : '执行'}
-                </button>
-              </div>
-            </section>
-          )}
           {activeAgent?.authRequest && (
             <section className="auth-card" data-auth-interaction={activeAgent.authRequest.id}>
               <strong>需要安全认证</strong>
@@ -2589,6 +2499,44 @@ export function App() {
             >↓ 回到底部 · 查看新输出</button>
           )}
         </div>
+        {activeAgent?.pendingApproval?.status === 'waiting' && (
+          <section className="approval-card approval-card-pinned" data-testid="pinned-agent-approval">
+            <div>
+              <strong>{activeAgent.pendingApproval.kind === 'file-operation'
+                ? '文件操作审批'
+                : '终端命令审批'}</strong>
+              <span>{activeAgent.pendingApproval.reason ?? '智能体请求执行操作'}</span>
+            </div>
+            {activeAgent.pendingApproval.fileOperation ? (
+              <div className="approval-file-operation">
+                <code>{activeAgent.pendingApproval.fileOperation.toolName}</code>
+                <span>{activeAgent.pendingApproval.fileOperation.target}</span>
+                {activeAgent.pendingApproval.fileOperation.sensitive && (
+                  <p>敏感提示：批准后读取到的内容会发送给当前 AI Provider。</p>
+                )}
+                {activeAgent.pendingApproval.fileOperation.recursive && (
+                  <p>递归删除：本次批准只适用于这里显示的精确操作。</p>
+                )}
+              </div>
+            ) : (
+              <textarea
+                aria-label="待审批命令"
+                value={editedApprovalCommand}
+                onChange={(event) => setEditedApprovalCommand(event.target.value)}
+                spellCheck={false}
+              />
+            )}
+            <div className="approval-actions">
+              <button data-action="reject-command" onClick={() => void resolveAgentApproval('reject')}>拒绝</button>
+              {!activeAgent.pendingApproval.fileOperation && (
+                <button data-action="edit-command" onClick={() => void resolveAgentApproval('edit')}>编辑并执行</button>
+              )}
+              <button className="execute" data-action="execute-command" onClick={() => void resolveAgentApproval('execute')}>
+                批准本次
+              </button>
+            </div>
+          </section>
+        )}
         <form className="composer" onSubmit={(event) => void sendAgentPrompt(event)}>
           {editingAgentMessageId && (
             <div className="composer-editing" role="status">
@@ -2617,14 +2565,22 @@ export function App() {
           <div>
             <span title="Enter 发送，Shift+Enter 换行">{selectedAgentBackendReady
               ? activeAgent
-                ? agentStateLabel(activeAgent.state)
-                : '已就绪 · 命令需审批'
+                ? `${agentStateLabel(activeAgent.state)} · ${activeReviewMode === 'complete'
+                  ? '完全访问'
+                  : activeReviewMode === 'risky' ? '风险审核' : '全部审核'}`
+                : '已就绪 · 全部审核'
               : selectedAgentBackendStatus}</span>
             <button
               type="submit"
-              aria-label={editingAgentMessageId ? '修改并重新发送' : '发送消息'}
-              disabled={!agentPrompt.trim() || !selectedAgentBackendReady || !activeTab || composerBlocked || Boolean(agentMessageActionPending)}
-            >↑</button>
+              className={composerBlocked ? 'agent-stop-submit' : ''}
+              aria-label={composerBlocked
+                ? '停止当前任务'
+                : editingAgentMessageId ? '修改并重新发送' : '发送消息'}
+              title={composerBlocked ? '停止当前任务；已执行的操作不会回滚' : '发送'}
+              disabled={composerBlocked
+                ? !latestUserMessage || Boolean(agentMessageActionPending)
+                : !agentPrompt.trim() || !selectedAgentBackendReady || !activeTab || Boolean(agentMessageActionPending)}
+            >{composerBlocked ? '■' : '↑'}</button>
           </div>
         </form>
       </aside>
@@ -3103,50 +3059,37 @@ export function App() {
         </div>
       )}
 
-      {fullTakeoverChallenge && (
+      {completeAccessChallenge && (
         <div className="modal-backdrop">
           <div
-            className="modal compact-modal full-takeover-modal"
-            data-terminal-id={fullTakeoverChallenge.terminalId}
-            data-approval-id={fullTakeoverChallenge.approvalId ?? ''}
+            className="modal compact-modal complete-access-modal"
+            data-terminal-id={completeAccessChallenge.terminalId}
           >
-            <div className="modal-header"><strong>启用 AI 全接管？</strong></div>
+            <div className="modal-header"><strong>启用“完全访问”？</strong></div>
             <p>
-              目标：<b>{fullTakeoverChallenge.target}</b>。智能体将可以连续运行命令，包括删除、磁盘、网络、服务或重启命令，不再逐条询问。你仍可随时点击“人工接管”立即暂停智能体。
+              目标：<b>{completeAccessChallenge.target}</b>。智能体可使用当前本机用户或 SSH/SFTP 用户拥有的全部命令与文件权限，不再逐条询问。
             </p>
-            <p className="risk-note" data-testid="full-takeover-scope-note">
-              {fullTakeoverChallenge.hostPreference
-                ? '此主机已保存全接管偏好，但它没有授权当前终端。'
-                : '确认后会为此主机保存全接管偏好。'}
-              本次确认只授权当前终端；新建、重连或重启后的终端仍会重新询问。
+            <p className="risk-note" data-testid="complete-access-scope-note">
+              本次确认只对当前终端运行时生效；新建、重连或重启后的终端默认回到“全部审核”。
             </p>
-            <p className="risk-note" data-testid="full-takeover-file-policy-note">
-              确认后会同时开启完整文件系统访问，不再限制于 Workspace 根目录；仍受本机 OS 或当前 SSH/SFTP 用户权限限制。可由文件工具等价完成的命令仍会优先改用文件工具。
+            <p className="risk-note" data-testid="complete-access-file-policy-note">
+              Workspace 只是工作范围提示，不是权限边界。文件工具可访问账号有权访问的路径，但无法越过操作系统权限，也不会自动获得管理员密码、root、OTP 或密钥。
             </p>
             <p className="risk-note">
-              {fullTakeoverChallenge.approvalId
-                ? '确认后会立即执行下方命令；在关闭全接管或人工接管前，后续命令都不会再次询问。'
-                : ''}
-              仅对你信任的终端和任务启用。遇到认证提示时仍会暂停，并让你直接安全输入。
+              递归删除、磁盘、账号、服务、网络下载执行等高风险操作也会自动执行。遇到交互式凭据提示时仍会暂停，由你在终端安全输入。
             </p>
-            {fullTakeoverChallenge.command && (
-              <code>{fullTakeoverChallenge.editedCommand ?? fullTakeoverChallenge.command}</code>
-            )}
             <div className="modal-actions">
-              <button autoFocus onClick={() => setFullTakeoverChallenge(null)}>取消</button>
+              <button autoFocus onClick={() => setCompleteAccessChallenge(null)}>取消</button>
               <button
                 className="danger-action"
-                data-action="confirm-full-takeover"
-                onClick={() => void setFullTakeover(
+                data-action="confirm-complete-access"
+                onClick={() => void setAgentReviewMode(
+                  'complete',
                   true,
-                  fullTakeoverChallenge.terminalId,
-                  fullTakeoverChallenge.approvalId,
-                  fullTakeoverChallenge.editedCommand,
-                  fullTakeoverChallenge.backend,
+                  completeAccessChallenge.terminalId,
+                  completeAccessChallenge.backend,
                 )}
-              >{fullTakeoverChallenge.approvalId
-                  ? '启用并执行当前命令'
-                  : '启用 AI 全接管'}</button>
+              >启用完全访问</button>
             </div>
           </div>
         </div>

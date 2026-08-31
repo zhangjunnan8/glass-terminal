@@ -64,4 +64,14 @@ describe('ToolActivityList', () => {
     await act(async () => root.render(<ToolActivityList activities={[]} />));
     expect(container.innerHTML).toBe('');
   });
+
+  it('can start expanded when embedded in a live turn process', async () => {
+    await act(async () => root.render(
+      <ToolActivityList activities={[activity(0)]} defaultExpanded />,
+    ));
+    expect(container.querySelector('[data-testid="tool-activity-list"]')
+      ?.getAttribute('data-expanded')).toBe('true');
+    expect(container.querySelector('.tool-activity-toggle')?.getAttribute('aria-expanded'))
+      .toBe('true');
+  });
 });

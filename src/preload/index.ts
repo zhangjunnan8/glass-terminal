@@ -154,11 +154,7 @@ const agentBridge: DesktopBridge['agent'] = {
   getState: (terminalId) => ipcRenderer.invoke(AGENT_CHANNELS.getState, terminalId),
   activateBackend: (request) => ipcRenderer.invoke(AGENT_CHANNELS.activateBackend, request),
   resolveApproval: (request) => ipcRenderer.invoke(AGENT_CHANNELS.resolveApproval, request),
-  setFullTakeover: (request) => ipcRenderer.invoke(AGENT_CHANNELS.setFullTakeover, request),
-  setFullTakeoverPreference: (request) => ipcRenderer.invoke(
-    AGENT_CHANNELS.setFullTakeoverPreference,
-    request,
-  ),
+  setReviewMode: (request) => ipcRenderer.invoke(AGENT_CHANNELS.setReviewMode, request),
   takeover: (request) => ipcRenderer.invoke(AGENT_CHANNELS.takeover, request),
   resolveTakeover: (request) => ipcRenderer.invoke(AGENT_CHANNELS.resolveTakeover, request),
   confirmShellReady: (request) => ipcRenderer.invoke(

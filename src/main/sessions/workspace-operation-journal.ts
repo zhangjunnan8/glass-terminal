@@ -375,7 +375,7 @@ function normalizeCanonicalPath(
     return { scope: 'rejected', pathHash: value.pathHash };
   }
   if (value.pathHash !== undefined) throw new Error(`${label} canonical path cannot contain pathHash.`);
-  const allowRoot = !mutation || value.scope === 'authorized';
+  const allowRoot = !mutation || value.scope !== 'filesystem';
   assertRelativePath(value.path, backend, allowRoot, `${label} path`);
   if (value.scope === 'workspace') {
     if (value.rootId !== undefined) throw new Error(`${label} Workspace path cannot contain rootId.`);

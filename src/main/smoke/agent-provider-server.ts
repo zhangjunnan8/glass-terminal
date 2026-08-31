@@ -143,17 +143,17 @@ export async function startAgentSmokeProvider(remotePosix = false): Promise<Agen
         const toolResultCount = messages
           .slice(lastUserIndex + 1)
           .filter((message) => message.role === 'tool').length;
-        if (prompt.includes('Full Takeover marker')) {
+        if (prompt.includes('Complete Access marker')) {
           if (toolResultCount < 2) {
             sendToolResponse(
               response,
-              `full-takeover-${toolResultCount + 1}`,
+              `complete-access-${toolResultCount + 1}`,
               takeoverCommands[toolResultCount],
-              'verify consecutive Full Takeover commands',
+              'verify consecutive Complete Access commands',
               parsed.stream === true,
             );
           } else {
-            sendTextResponse(response, 'Full Takeover smoke complete.', parsed.stream === true);
+            sendTextResponse(response, 'Complete Access smoke complete.', parsed.stream === true);
           }
           return;
         }
@@ -171,12 +171,12 @@ export async function startAgentSmokeProvider(remotePosix = false): Promise<Agen
           }
           return;
         }
-        if (prompt.includes('manual takeover smoke')) {
+        if (prompt.includes('stop-button smoke')) {
           sendToolResponse(
             response,
             'manual-takeover-call',
             longCommand,
-            'verify manual takeover and Ctrl+C',
+            'verify the composer stop control',
             parsed.stream === true,
           );
           return;

@@ -3,6 +3,7 @@ import type {
   TerminalTool,
   ToolGateway,
   WorkspaceTool,
+  FileToolReviewRequest,
 } from '../../shared/tools';
 import { PolicyWorkspaceTool } from './policy-workspace-tool';
 
@@ -35,10 +36,15 @@ export class SessionToolGateway implements ToolGateway {
   readonly terminal: TerminalTool;
   readonly workspace?: WorkspaceTool;
 
+  requestFileOperation(request: FileToolReviewRequest): Promise<boolean> {
+    return this.reviewFileOperation ? this.reviewFileOperation(request) : Promise.resolve(true);
+  }
+
   constructor(
     context: SessionToolContext,
     terminal: TerminalTool,
     workspace?: WorkspaceTool,
+    private readonly reviewFileOperation?: (request: FileToolReviewRequest) => Promise<boolean>,
   ) {
     this.context = immutableContextSnapshot(context);
     const workspaceEnabled = this.context.permissions.workspace.enabled

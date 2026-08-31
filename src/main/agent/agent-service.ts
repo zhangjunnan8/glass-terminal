@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { homedir } from 'node:os';
+import { isAbsolute, posix } from 'node:path';
 import type { WebContents } from 'electron';
 import { AGENT_CHANNELS } from '../../shared/agent';
 import type {
@@ -9,6 +11,7 @@ import type {
   AgentContextUsage,
   AgentFileAccessMode,
   AgentFileAccessPolicy,
+  AgentReviewMode,
   AgentRuntimeState,
   AgentSessionView,
   CommandActor,
@@ -21,6 +24,7 @@ import type {
   ReviseAgentPromptRequest,
   SendAgentPromptRequest,
   SetFullTakeoverRequest,
+  SetAgentReviewModeRequest,
   SetFullTakeoverPreferenceRequest,
   SetAgentFileAccessRequest,
   SaveAgentMemoryRequest,
@@ -35,7 +39,7 @@ import {
 } from '../../shared/context-window';
 import type { SessionAuditEvent, SessionRecord } from '../../shared/session';
 import { SESSION_CHANNELS } from '../../shared/session';
-import type { TerminalCommandResult, WorkspaceBinding } from '../../shared/tools';
+import type { FileToolReviewRequest, TerminalCommandResult, WorkspaceBinding } from '../../shared/tools';
 import type { ShellProfile, TerminalDescriptor } from '../../shared/terminal';
 import type { ProviderStore } from '../providers/provider-store';
 import type { SessionManager } from '../sessions/session-manager';
@@ -73,6 +77,10 @@ import {
   fileCommandHash,
   WorkspaceToolPolicyError,
 } from './ai-file-command-policy';
+import {
+  classifyFileOperation,
+  classifyTerminalCommand,
+} from './agent-risk-policy';
 
 interface ApprovalResolution {
   decision: 'execute' | 'edit' | 'reject';
@@ -334,29 +342,33 @@ function sameWorkspaceBinding(
     && left?.hostId === right?.hostId;
 }
 
+/**
+ * Pick an absolute base for relative file-tool paths without turning it into
+ * an authorization boundary. Shell displays such as `~` are useful context
+ * for a human, but they are not absolute paths and must never reach the policy
+ * membrane as a synthetic Workspace root.
+ */
+function defaultFileToolRoot(session: Pick<SessionRecord, 'transport' | 'cwd'>): string {
+  const cwd = session.cwd?.trim();
+  if (session.transport === 'ssh') {
+    return cwd && posix.isAbsolute(cwd) ? posix.normalize(cwd) : '/';
+  }
+  return cwd && isAbsolute(cwd) ? cwd : homedir();
+}
+
+function informationalFileToolRoot(
+  session: Pick<SessionRecord, 'transport' | 'cwd' | 'workspace'>,
+): string {
+  return session.workspace?.root ?? defaultFileToolRoot(session);
+}
+
 const SYSTEM_PROMPT = `You are the AI agent inside Glass Terminal.
 You and the human operate the exact same visible terminal session. Use only the provided tools.
 Never invent command output. Read terminal state/history when needed, request one clear command at a time, inspect its structured result, and continue until the user's goal is handled.
-Every command must use terminal_execute so it appears in the visible terminal. Workspace tools, when explicitly enabled, operate only in their authorized filesystem scopes; relative paths start at the explicit Workspace Root. They must never be emulated with a hidden shell. Use workspace_list, workspace_search, workspace_glob, and workspace_read_file for discovery, then prefer small workspace_apply_patch calls for edits; never use terminal cat/grep/sed/echo or PowerShell Get-Content/type/Select-String to emulate file tools or dump an entire repository. Workspace file tools read both UTF-8 and Windows GBK (ANSI) text and preserve the original encoding on write-back, so use them for Chinese Windows files too.
+Every shell command must use terminal_execute so it appears in the visible terminal. Use file_list, file_search, file_glob, file_read, and file_stat for direct filesystem discovery, then prefer small file_patch calls for edits. File tools are available without a Workspace and must never be emulated with cat/grep/sed/echo, PowerShell Get-Content/type/Select-String, or a hidden shell. Relative paths start at the informational Workspace/default file root; absolute paths are allowed. File tools read UTF-8 and Windows GBK (ANSI) text and preserve the original encoding on write-back.
 Do not ask the user to send passwords, API keys, passphrases, OTPs, or other credentials through chat. Authentication is entered by the user directly in the visible terminal.
-Commands require explicit user approval unless the UI reports that Full Takeover is active.`;
-
-function shellFilePolicySystemPrompt(
-  shellKind: ShellProfile['kind'],
-  workspaceToolsEnabled: boolean,
-): string {
-  const examples = shellKind === 'powershell'
-    ? 'Get-Content/gc/cat/type, Select-String/sls, Get-ChildItem/gci/dir/ls, Get-Item, or Test-Path'
-    : shellKind === 'cmd'
-      ? 'type/more, find/findstr, dir, or IF EXIST'
-      : 'cat/head/tail/more/less, grep/rg, ls/find, stat, or test';
-  return `Current visible shell: ${shellKind}. `
-    + (workspaceToolsEnabled
-      ? `Do not use ${examples} for filesystem discovery or reading; use the matching authorized workspace_* tool. `
-      : `Workspace file tools are currently unavailable; filesystem commands such as ${examples} require an exact one-time bypass approval. `)
-    + 'Glass enforces this routing before normal command approval and Full Takeover. '
-    + 'Full Takeover never bypasses it. Do not retry a rejected file command; call the suggested workspace tool instead.';
-}
+The application is the final risk arbiter. You may raise riskLevel to elevated with a short riskReason, but never claim a risky operation is safe. Approval behavior follows the current mode: All Review, Risk Review, or Complete Access.
+At the end of every successfully handled task, return a concise final task summary describing the outcome, important changes, verification, and any remaining issue. Do not put intermediate narration in that final summary.`;
 
 const SESSION_TITLE_SYSTEM_PROMPT = '你是会话命名助手。根据用户的第一个请求，生成一个简短的中文会话标题（不超过 12 个字符）。只输出标题本身，不要引号、标点、前缀或解释。';
 
@@ -370,6 +382,7 @@ function cloneView(runtime: AgentRuntimeRecord): AgentSessionView {
     providerId: runtime.providerId,
     state: runtime.state,
     terminalInputMode: runtime.terminalInputMode,
+    reviewMode: runtime.reviewMode,
     fullTakeover: runtime.fullTakeover,
     fullTakeoverPreference: runtime.fullTakeoverPreference,
     fileAccessMode: runtime.fileAccessMode,
@@ -478,6 +491,15 @@ function replayConversation(events: Array<Record<string, unknown>>): ReplayedCon
         eventIndex,
         mode: event.contextMode === 'delta' ? 'delta' : 'checkpoint',
       });
+      return;
+    }
+    if (
+      event.type === 'chat_presentation'
+      && typeof event.targetMessageId === 'string'
+      && (event.presentation === 'intermediate' || event.presentation === 'summary')
+    ) {
+      const target = chats.find(({ item }) => item.id === event.targetMessageId);
+      if (target) target.item = { ...target.item, presentation: event.presentation };
       return;
     }
     if (
@@ -772,12 +794,13 @@ export class AgentService {
     if (BUSY_STATES.has(runtime.state)) {
       throw new Error('Agent 运行时不能同步 Workspace 权限。');
     }
-    const workspaceRoot = this.sessions.sessionForTerminal(owner, terminalId)?.workspace?.root;
+    const session = this.sessions.sessionForTerminal(owner, terminalId);
+    const workspaceRoot = session
+      ? informationalFileToolRoot(session)
+      : runtime.fileAccessRoot;
     runtime.fileAccessGeneration += 1;
-    runtime.fileAccessMode = runtime.fullTakeover
-      ? 'full-access'
-      : workspaceRoot ? 'read-write' : 'off';
-    runtime.fileAccessPolicy = legacyFileAccessPolicy(runtime.fileAccessMode, workspaceRoot);
+    runtime.fileAccessMode = 'full-access';
+    runtime.fileAccessPolicy = legacyFileAccessPolicy('full-access');
     runtime.fileAccessRoot = workspaceRoot;
     runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
     this.appendControlAudit(runtime, 'file_permission_changed', 'system', {
@@ -795,13 +818,13 @@ export class AgentService {
     runtime: AgentRuntimeRecord,
     reason: 'workspace_changed' | 'full_takeover_enabled' | 'full_takeover_disabled',
   ): void {
-    const workspaceRoot = this.sessions
-      .sessionForTerminal(runtime.owner, runtime.terminalId)?.workspace?.root;
+    const session = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
+    const workspaceRoot = session
+      ? informationalFileToolRoot(session)
+      : runtime.fileAccessRoot;
     runtime.fileAccessGeneration += 1;
-    runtime.fileAccessMode = runtime.fullTakeover
-      ? 'full-access'
-      : workspaceRoot ? 'read-write' : 'off';
-    runtime.fileAccessPolicy = legacyFileAccessPolicy(runtime.fileAccessMode, workspaceRoot);
+    runtime.fileAccessMode = 'full-access';
+    runtime.fileAccessPolicy = legacyFileAccessPolicy('full-access');
     runtime.fileAccessRoot = workspaceRoot;
     runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
     this.appendControlAudit(runtime, 'file_permission_changed', 'system', {
@@ -969,6 +992,9 @@ export class AgentService {
     if (!approval || approval.id !== request.approvalId || !runtime.resolveApproval) {
       throw new Error('Command approval is no longer pending.');
     }
+    if (approval.kind === 'file-operation' && request.decision === 'edit') {
+      throw new Error('文件工具操作不能在审批框中改写；请拒绝后让智能体重新规划。');
+    }
     const exceptionBinding = approval.kind === 'workspace-tool-bypass'
       ? runtime.fileCommandException
       : undefined;
@@ -1052,6 +1078,53 @@ export class AgentService {
     return this.cloneRuntime(runtime);
   }
 
+  setReviewMode(owner: WebContents, request: SetAgentReviewModeRequest): AgentSessionView {
+    if (!(['all', 'risky', 'complete'] as AgentReviewMode[]).includes(request.mode)) {
+      throw new Error('未知的智能体审核模式。');
+    }
+    if (request.mode === 'complete' && request.completeAccessConfirmed !== true) {
+      throw new Error('进入“完全访问”前需要明确确认。');
+    }
+    let runtime = this.runtimes.get(request.terminalId);
+    if (runtime && runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
+    if (runtime && BUSY_STATES.has(runtime.state)) {
+      throw new Error('智能体运行时不能更改审核模式。');
+    }
+    if (runtime && this.terminals.currentExecution(owner, request.terminalId)) {
+      throw new Error('前台进程仍在运行，不能更改审核模式。');
+    }
+    if (!runtime) {
+      runtime = this.ensureRuntime(
+        owner,
+        request.terminalId,
+        this.selectBackend(request.backend),
+      );
+    } else if (request.backend && !sameBackend(runtime.backend, request.backend)) {
+      runtime = this.ensureRuntime(owner, request.terminalId, this.selectBackend(request.backend));
+    }
+    if (runtime.reviewMode === request.mode) return this.cloneRuntime(runtime);
+    const previousMode = runtime.reviewMode;
+    runtime.reviewMode = request.mode;
+    runtime.fullTakeover = request.mode === 'complete';
+    runtime.fileAccessMode = 'full-access';
+    runtime.fileAccessPolicy = legacyFileAccessPolicy('full-access');
+    runtime.fileAccessGeneration += 1;
+    runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
+    runtime.error = undefined;
+    this.appendControlAudit(runtime, request.mode === 'complete'
+      ? 'full_takeover_authority_enabled'
+      : previousMode === 'complete'
+        ? 'full_takeover_authority_revoked'
+        : 'file_permission_changed', 'user', {
+      previousMode,
+      mode: request.mode,
+      policy: 'atomic_review_mode',
+      terminalScoped: true,
+    });
+    this.emit(runtime);
+    return this.cloneRuntime(runtime);
+  }
+
   setFullTakeover(owner: WebContents, request: SetFullTakeoverRequest): AgentSessionView {
     let runtime = this.runtimes.get(request.terminalId);
     if (runtime && runtime.ownerId !== owner.id) throw new Error('Agent Session not found.');
@@ -1092,6 +1165,7 @@ export class AgentService {
           terminalScoped: true,
         });
         runtime.fullTakeover = true;
+        runtime.reviewMode = 'complete';
         this.syncAutomaticFileAccess(runtime, 'full_takeover_enabled');
         this.rememberFullTakeoverPreference(runtime);
       }
@@ -1104,6 +1178,7 @@ export class AgentService {
         });
       } catch (error) {
         runtime.fullTakeover = false;
+        runtime.reviewMode = 'all';
         this.syncAutomaticFileAccess(runtime, 'full_takeover_disabled');
         this.appendControlAudit(runtime, 'full_takeover_authority_revoked', 'system', {
           reason: 'approval_resolution_failed',
@@ -1143,10 +1218,12 @@ export class AgentService {
         terminalScoped: true,
       });
       runtime.fullTakeover = true;
+      runtime.reviewMode = 'complete';
       this.syncAutomaticFileAccess(runtime, 'full_takeover_enabled');
       this.rememberFullTakeoverPreference(runtime);
     } else {
       runtime.fullTakeover = false;
+      runtime.reviewMode = 'all';
       this.syncAutomaticFileAccess(runtime, 'full_takeover_disabled');
       this.appendControlAudit(runtime, 'full_takeover_authority_revoked', 'user', {
         reason: 'user_disabled',
@@ -1231,6 +1308,7 @@ export class AgentService {
 
     if (runtime.fullTakeover) {
       runtime.fullTakeover = false;
+      runtime.reviewMode = 'all';
       this.appendControlAudit(runtime, 'full_takeover_authority_revoked', actor, {
         reason: takeoverReason === 'manual' ? 'manual_takeover' : 'command_inactivity',
         terminalScoped: true,
@@ -1367,6 +1445,7 @@ export class AgentService {
     // One stable id per turn ties the assistant message and all of its tool
     // activities together so the renderer can group them inline.
     const assistantTurnId = randomUUID();
+    let assistantMessageSequence = 0;
     let streamedMessage: AgentChatItem | undefined;
     let acceptBackendEvents = true;
     let turnToolsLive = true;
@@ -1449,10 +1528,12 @@ export class AgentService {
       if (event.type === 'assistant_delta' && event.text) {
         if (!streamedMessage) {
           streamedMessage = {
-            id: assistantTurnId,
+            id: `${assistantTurnId}:step:${++assistantMessageSequence}`,
             role: 'assistant',
             content: '',
             createdAt: new Date().toISOString(),
+            turnId: assistantTurnId,
+            presentation: 'intermediate',
           };
           runtime.messages.push(streamedMessage);
           runtime.streamingMessageId = streamedMessage.id;
@@ -1472,7 +1553,13 @@ export class AgentService {
           streamedMessage = undefined;
           this.cancelStreamEmit(runtime);
         } else {
-          this.addChat(runtime, 'assistant', event.text, assistantTurnId);
+          this.addChat(
+            runtime,
+            'assistant',
+            event.text,
+            `${assistantTurnId}:step:${++assistantMessageSequence}`,
+            { turnId: assistantTurnId, presentation: 'intermediate' },
+          );
         }
         this.emit(runtime);
       }
@@ -1481,6 +1568,25 @@ export class AgentService {
     try {
       const boundSession = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
       if (!boundSession) throw new Error('当前终端没有可用的正式 Session。');
+      let boundFileRoot = informationalFileToolRoot(boundSession);
+      const cwdIsUsableAsFileRoot = boundSession.transport === 'ssh'
+        ? Boolean(boundSession.cwd && posix.isAbsolute(boundSession.cwd))
+        : Boolean(boundSession.cwd && isAbsolute(boundSession.cwd));
+      if (boundSession.workspace || !cwdIsUsableAsFileRoot) {
+        try {
+          boundFileRoot = await this.fileService.bindWorkspaceRoot(
+            runtime.owner,
+            runtime.terminalId,
+          );
+        } catch {
+          // Workspace is guidance only. A disappeared saved path or a shell
+          // shorthand cwd must not disable account-level file tools.
+          boundFileRoot = defaultFileToolRoot({ ...boundSession, cwd: undefined });
+        }
+      }
+      runtime.fileAccessMode = 'full-access';
+      runtime.fileAccessPolicy = legacyFileAccessPolicy('full-access');
+      runtime.fileAccessRoot = boundFileRoot;
       const turnFileAccessGeneration = runtime.fileAccessGeneration;
       const turnFileAccessRoot = runtime.fileAccessRoot;
       const turnProviderFingerprint = runtime.providerFingerprint;
@@ -1537,13 +1643,11 @@ export class AgentService {
           throw new Error('Workspace tool grant is no longer active.');
         }
       };
-      const workspace: WorkspaceBinding | undefined = runtime.fileAccessRoot
-        ? {
-          backend: boundSession.transport === 'ssh' ? 'sftp' : 'local',
-          root: runtime.fileAccessRoot,
-          ...(boundSession.hostId ? { hostId: boundSession.hostId } : {}),
-        }
-        : boundSession.workspace;
+      const workspace: WorkspaceBinding = {
+        backend: boundSession.transport === 'ssh' ? 'sftp' : 'local',
+        root: boundFileRoot,
+        ...(boundSession.hostId ? { hostId: boundSession.hostId } : {}),
+      };
       const fileToolPermissions = workspacePermissions(
         runtime.fileAccessMode,
         workspace,
@@ -1560,20 +1664,23 @@ export class AgentService {
         owner: runtime.owner,
         terminals: this.terminals,
         sessions: this.sessions,
-        execute: (command, reason) => this.requestCommand(runtime, token, { command, reason }),
+        execute: (command, reason, agentRisk) => this.requestCommand(runtime, token, { command, reason, agentRisk }),
         assertLive: assertTerminalToolLive,
       });
-      workspaceTool = workspace
-        ? new AgentFileWorkspaceAdapter(
+      workspaceTool = new AgentFileWorkspaceAdapter(
           this.fileService,
           runtime.owner,
           runtime.terminalId,
           workspace,
           fileToolPermissions,
           assertWorkspaceToolLive,
-        )
-        : undefined;
-      const gateway = new SessionToolGateway(toolContext, terminalTool, workspaceTool);
+        );
+      const gateway = new SessionToolGateway(
+        toolContext,
+        terminalTool,
+        workspaceTool,
+        (request) => this.requestFileOperation(runtime, token, request),
+      );
 
       let backend = runtime.harnessBackend;
       if (!backend) {
@@ -1614,22 +1721,17 @@ export class AgentService {
           MAX_TURN_TERMINAL_CONTEXT_CHARS,
         ).content,
       );
-      const fileAccessModeLabel = runtime.fileAccessMode === 'read-only'
-        ? '只读'
-        : runtime.fileAccessMode === 'read-write' ? '读写' : '完全访问';
-      const shellPolicyPrompt = shellFilePolicySystemPrompt(
-        terminalDescriptor.shellKind,
-        fileToolPermissions.enabled && fileToolPermissions.read,
-      );
-      const systemPrompt = workspace && runtime.fileAccessMode !== 'off'
-        ? `${SYSTEM_PROMPT}\n\n${shellPolicyPrompt}\n\n当前会话工作区（每轮注入）：\n`
-          + `- Workspace Root: ${workspace.root}\n`
-          + `- 文件访问模式: ${fileAccessModeLabel}\n`
-          + 'workspace_* 工具的 path 参数是相对该根的相对路径；'
-          + (runtime.fileAccessMode === 'full-access'
-            ? '完全访问模式也允许使用绝对路径读取根外文件。'
-            : '只有该根内的文件才能用文件工具读写，根外的内容只能经终端命令（仍需审批）。')
-        : `${SYSTEM_PROMPT}\n\n${shellPolicyPrompt}`;
+      const reviewModeLabel = runtime.reviewMode === 'all'
+        ? '全部审核'
+        : runtime.reviewMode === 'risky' ? '风险审核' : '完全访问';
+      const workspaceHint = boundSession.workspace?.root;
+      const systemPrompt = `${SYSTEM_PROMPT}\n\n当前操作环境（每轮注入）：\n`
+        + `- 可见 Shell: ${terminalDescriptor.shellKind}\n`
+        + `- 审核模式: ${reviewModeLabel}\n`
+        + `- 文件相对路径默认根: ${workspace.root}\n`
+        + (workspaceHint
+          ? `- 用户设置的 Workspace（仅作为工作范围提示，不是权限边界）: ${workspaceHint}\n请优先在该范围内工作，除非任务明确需要访问其他位置。`
+          : '- 用户未设置 Workspace；请根据当前任务谨慎选择路径，不要把无关文件写到其他位置。');
       const result = await backend.sendMessage({
         thread,
         prompt,
@@ -1662,6 +1764,29 @@ export class AgentService {
         contextMode: contextPersistence.mode,
         messages: contextPersistence.messages,
       });
+      if (result.finalText.trim()) {
+        const finalText = result.finalText.trim();
+        const lastTurnMessage = [...runtime.messages].reverse().find((message) => (
+          message.role === 'assistant' && message.turnId === assistantTurnId
+        ));
+        if (lastTurnMessage?.content.trim() === finalText) {
+          lastTurnMessage.presentation = 'summary';
+          this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
+            type: 'chat_presentation',
+            timestamp: new Date().toISOString(),
+            targetMessageId: lastTurnMessage.id,
+            presentation: 'summary',
+          });
+        } else {
+          this.addChat(
+            runtime,
+            'assistant',
+            finalText,
+            `${assistantTurnId}:summary`,
+            { turnId: assistantTurnId, presentation: 'summary' },
+          );
+        }
+      }
       runtime.pendingApproval = undefined;
       runtime.fileCommandException = undefined;
       runtime.activeExecution = undefined;
@@ -1747,104 +1872,78 @@ export class AgentService {
     );
   }
 
+  private async requestFileOperation(
+    runtime: AgentRuntimeRecord,
+    token: number,
+    request: FileToolReviewRequest,
+  ): Promise<boolean> {
+    if (!this.isCurrentTurn(runtime, token)) throw new Error('Agent turn is no longer active.');
+    const risk = classifyFileOperation(runtime.reviewMode, request);
+    this.sessions.appendAudit(runtime.sessionId, 'file_command_policy', 'ai', {
+      action: 'file_tool_requested',
+      toolName: request.toolName,
+      operation: request.operation,
+      target: request.target,
+      recursive: request.recursive === true,
+      reviewMode: runtime.reviewMode,
+      riskLevel: risk.level,
+      sensitive: risk.sensitive,
+      approvalRequired: risk.approvalRequired,
+    });
+    if (!risk.approvalRequired) return true;
+
+    const approval: CommandApproval = {
+      id: randomUUID(),
+      sessionId: runtime.sessionId,
+      terminalId: runtime.terminalId,
+      command: `${request.toolName} ${request.target}`,
+      reason: risk.reason,
+      kind: 'file-operation',
+      fileOperation: {
+        toolName: request.toolName,
+        operation: request.operation,
+        target: request.target,
+        ...(request.recursive ? { recursive: true } : {}),
+        ...(risk.sensitive ? { sensitive: true } : {}),
+        ...(risk.reason ? { riskReason: risk.reason } : {}),
+      },
+      status: 'waiting',
+      requestedAt: new Date().toISOString(),
+    };
+    runtime.pendingApproval = approval;
+    this.setLockedState(runtime, 'WAITING_APPROVAL');
+    this.emit(runtime);
+    const resolution = await new Promise<ApprovalResolution>((resolve) => {
+      runtime.resolveApproval = resolve;
+    });
+    runtime.pendingApproval = undefined;
+    if (!this.isCurrentTurn(runtime, token)) throw new Error('Agent turn is no longer active.');
+    this.setLockedState(runtime, 'THINKING');
+    this.emit(runtime);
+    return resolution.decision !== 'reject';
+  }
+
   private async requestCommand(
     runtime: AgentRuntimeRecord,
     token: number,
-    request: { command: string; reason?: string },
+    request: { command: string; reason?: string; agentRisk?: 'normal' | 'elevated' },
   ): Promise<TerminalCommandResult> {
     if (!this.isCurrentTurn(runtime, token)) throw new Error('Agent turn is no longer active.');
-    const descriptor = this.terminals.descriptor(runtime.owner, runtime.terminalId);
-    const session = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
-    const workspace = runtime.fileAccessRoot
-      ? {
-        backend: descriptor.transport === 'ssh' ? 'sftp' as const : 'local' as const,
-        root: runtime.fileAccessRoot,
-        ...(descriptor.hostId ? { hostId: descriptor.hostId } : {}),
-      }
-      : session?.workspace;
-    const permissions = workspacePermissions(
-      runtime.fileAccessMode,
-      workspace,
-      runtime.fileAccessPolicy,
+    const risk = classifyTerminalCommand(
+      runtime.reviewMode,
+      request.command,
+      request.agentRisk,
     );
-    const filePolicy = classifyAiFileCommand({
-      command: request.command,
-      shellKind: descriptor.shellKind,
-      workspace: permissions,
-    });
-    const commandHash = fileCommandHash(request.command);
-    if (filePolicy.disposition === 'workspace-tool-required') {
-      const violationKey = `${descriptor.shellKind}:${commandHash}`;
-      const retryCount = (runtime.fileCommandViolationCounts.get(violationKey) ?? 0) + 1;
-      runtime.fileCommandViolationCounts.set(violationKey, retryCount);
-      const halted = retryCount >= 3;
-      this.sessions.appendAudit(runtime.sessionId, 'file_command_policy', 'system', {
-        action: 'workspace_tool_required',
-        commandHash,
-        shellKind: descriptor.shellKind,
-        categories: filePolicy.categories,
-        commandNames: filePolicy.commandNames,
-        suggestedTools: filePolicy.suggestedTools,
-        retryCount,
-        halted,
-      });
-      throw new WorkspaceToolPolicyError({
-        ok: false,
-        code: 'WORKSPACE_TOOL_REQUIRED',
-        error: halted
-          ? 'Repeated file-tool bypass attempts stopped this turn.'
-          : 'Use the suggested authorized Workspace tool instead of a terminal filesystem command.',
-        categories: filePolicy.categories,
-        suggestedTools: filePolicy.suggestedTools,
-        retryCount,
-        halted,
-      });
-    }
     const approval: CommandApproval = {
       id: randomUUID(),
       sessionId: runtime.sessionId,
       terminalId: runtime.terminalId,
       command: request.command,
-      reason: request.reason,
+      reason: risk.reason ?? request.reason,
+      kind: 'terminal-command',
       status: 'waiting',
       requestedAt: new Date().toISOString(),
-      ...(filePolicy.disposition === 'exception-approval' ? {
-        kind: 'workspace-tool-bypass' as const,
-        fileCommandPolicy: {
-          categories: filePolicy.categories,
-          suggestedTools: filePolicy.suggestedTools,
-          reasonCode: filePolicy.reasonCode ?? 'NON_EQUIVALENT_TERMINAL_SEMANTICS',
-        },
-      } : {}),
     };
-    if (filePolicy.disposition === 'exception-approval') {
-      runtime.fileCommandException = {
-        approvalId: approval.id,
-        commandHash,
-        shellKind: descriptor.shellKind,
-        sessionId: runtime.sessionId,
-        threadId: runtime.threadId,
-        terminalId: runtime.terminalId,
-        hostId: descriptor.hostId,
-        workspaceRoot: runtime.fileAccessRoot,
-        sessionWorkspaceRoot: session?.workspace?.root,
-        fileAccessGeneration: runtime.fileAccessGeneration,
-        providerRecipient: this.fileCommandProviderRecipient(runtime),
-        turnToken: token,
-      };
-      this.sessions.appendAudit(runtime.sessionId, 'file_command_policy', 'system', {
-        action: 'exception_approval_requested',
-        approvalId: approval.id,
-        commandHash,
-        shellKind: descriptor.shellKind,
-        categories: filePolicy.categories,
-        commandNames: filePolicy.commandNames,
-        suggestedTools: filePolicy.suggestedTools,
-        reasonCode: filePolicy.reasonCode,
-        fullTakeoverActive: runtime.fullTakeover,
-        exactOneTime: true,
-      });
-    }
     this.sessions.appendAudit(runtime.sessionId, 'command_requested', 'ai', {
       approvalId: approval.id,
       command: approval.command,
@@ -1852,12 +1951,14 @@ export class AgentService {
     });
 
     let resolution: ApprovalResolution;
-    if (runtime.fullTakeover && approval.kind !== 'workspace-tool-bypass') {
+    if (!risk.approvalRequired) {
       resolution = { decision: 'execute', command: approval.command };
       this.sessions.appendAudit(runtime.sessionId, 'command_approved', 'system', {
         approvalId: approval.id,
         command: approval.command,
-        fullTakeover: true,
+        reviewMode: runtime.reviewMode,
+        riskLevel: risk.level,
+        fullTakeover: runtime.reviewMode === 'complete',
       });
       this.setLockedState(runtime, 'AI_CONTROL');
       this.emit(runtime);
@@ -2168,8 +2269,8 @@ export class AgentService {
       this.sessions.readThreadMemories(session.id, threadId),
     );
     const memoryMessage = agentMemorySystemMessage(memories);
-    const workspaceRoot = selectedSession.workspace?.root;
-    const initialFileAccessMode: AgentFileAccessMode = workspaceRoot ? 'read-write' : 'off';
+    const workspaceRoot = informationalFileToolRoot(selectedSession);
+    const initialFileAccessMode: AgentFileAccessMode = 'full-access';
     const runtime: AgentRuntimeRecord = {
       revision: this.revisionCounters.get(terminalId) ?? 0,
       owner,
@@ -2181,12 +2282,13 @@ export class AgentService {
       providerId: backend.providerId,
       state: 'USER_CONTROL',
       terminalInputMode: 'human',
+      reviewMode: 'all',
       fullTakeover: false,
       fullTakeoverPreference: session.hostId
         ? this.sessions.hostFullTakeoverPreference(session.hostId)
         : false,
       fileAccessMode: initialFileAccessMode,
-      fileAccessPolicy: legacyFileAccessPolicy(initialFileAccessMode, workspaceRoot),
+      fileAccessPolicy: legacyFileAccessPolicy('full-access'),
       fileAccessGeneration: 0,
       fileAccessRoot: workspaceRoot,
       providerFingerprint: currentProvider?.fingerprint,
@@ -2204,9 +2306,9 @@ export class AgentService {
         {
           tools: agentToolDefinitionsForAccess({
             fileAccessMode: initialFileAccessMode,
-            workspaceAvailable: Boolean(workspaceRoot),
-            workspaceEnabled: Boolean(workspaceRoot),
-            workspaceRead: Boolean(workspaceRoot),
+            workspaceAvailable: true,
+            workspaceEnabled: true,
+            workspaceRead: true,
             shellKind: session.shellKind,
           }),
           safetyFactor: currentProvider.contextEstimateSafetyFactor,
@@ -2334,6 +2436,7 @@ export class AgentService {
       runtime.providerFingerprint = currentFingerprint;
       runtime.providerReady = currentProvider.ready;
       runtime.providerConversationResetPending = true;
+      this.clearFullTakeover(runtime, 'provider_changed');
       this.invalidateRuntime(runtime, 'provider_changed');
       runtime.pendingTakeover = undefined;
       runtime.threadId = randomUUID();
@@ -2341,7 +2444,7 @@ export class AgentService {
       runtime.contextUsage = this.contextUsageFor(runtime, []);
       runtime.messages = [];
       runtime.activities = [];
-      runtime.error = 'Provider 接收端、模型或凭据已变化；文件访问权限与旧对话绑定已撤销。';
+      runtime.error = 'Provider 接收端、模型或凭据已变化；旧对话已隔离，完全访问已回落为全部审核。';
       if (turnWasActive) {
         runtime.state = 'FAILED';
         runtime.terminalInputMode = 'human';
@@ -2349,9 +2452,10 @@ export class AgentService {
     } else if (readinessLost) {
       const turnWasActive = BUSY_STATES.has(runtime.state);
       runtime.providerReady = false;
+      this.clearFullTakeover(runtime, 'provider_unavailable');
       this.invalidateRuntime(runtime, 'provider_changed');
       runtime.pendingTakeover = undefined;
-      runtime.error = 'Provider 当前不可用；已撤销临时文件访问权限。';
+      runtime.error = 'Provider 当前不可用；完全访问已回落为全部审核。';
       if (turnWasActive) {
         runtime.state = 'FAILED';
         runtime.terminalInputMode = 'human';
@@ -2552,6 +2656,7 @@ export class AgentService {
   private clearFullTakeover(runtime: AgentRuntimeRecord, reason: string): void {
     if (!runtime.fullTakeover) return;
     runtime.fullTakeover = false;
+    runtime.reviewMode = 'all';
     this.syncAutomaticFileAccess(runtime, 'full_takeover_disabled');
     try {
       this.sessions.appendAudit(runtime.sessionId, 'full_takeover_authority_revoked', 'system', {
@@ -2596,16 +2701,15 @@ export class AgentService {
 
   private revokeFileAccess(runtime: AgentRuntimeRecord, reason: string): void {
     runtime.fileAccessGeneration += 1;
-    if (runtime.fileAccessMode !== 'off') {
-      this.appendControlAudit(runtime, 'file_permission_changed', 'system', {
-        mode: 'off',
-        reason,
-        ephemeral: true,
-      });
-    }
-    runtime.fileAccessMode = 'off';
-    runtime.fileAccessPolicy = disabledFileAccessPolicy();
-    runtime.fileAccessRoot = undefined;
+    runtime.fileAccessMode = 'full-access';
+    runtime.fileAccessPolicy = legacyFileAccessPolicy('full-access');
+    this.appendControlAudit(runtime, 'file_permission_changed', 'system', {
+      mode: 'full-access',
+      reason,
+      capabilityLeaseRevoked: true,
+      nextTurnRebindsCurrentSession: true,
+      ephemeral: true,
+    });
     runtime.contextUsage = this.contextUsageFor(runtime, runtime.priorMessages);
   }
 
@@ -2627,12 +2731,14 @@ export class AgentService {
     role: AgentChatItem['role'],
     content: string,
     id?: string,
+    metadata: Pick<AgentChatItem, 'turnId' | 'presentation'> = {},
   ): void {
     const item: AgentChatItem = {
       id: id ?? randomUUID(),
       role,
       content,
       createdAt: new Date().toISOString(),
+      ...metadata,
     };
     this.persistChatItem(runtime, item);
     runtime.messages.push(item);

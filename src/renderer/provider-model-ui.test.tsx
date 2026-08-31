@@ -69,7 +69,6 @@ function providerBridge(
     },
     agent: {
       getState: vi.fn().mockResolvedValue(undefined),
-      setFullTakeoverPreference: vi.fn(),
       onStateChanged: vi.fn(() => () => undefined),
       onAssistantDelta: vi.fn(() => () => undefined),
     },

@@ -145,40 +145,36 @@ async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<bo
         throw new Error('Agent output did not automatically follow the latest message.');
       }
 
-      sendPrompt('Run two Full Takeover marker commands.');
-      const takeoverApprovalReady = await waitFor(() => document.querySelector('.approval-card'));
-      if (!takeoverApprovalReady) throw new Error('Full Takeover command approval did not appear.');
-      const takeoverApprovalState = await window.aiTerminal.agent.getState(terminalId);
-      const switchToFull = document.querySelector('[data-action="switch-full-takeover"]');
+      const switchToFull = document.querySelector('.agent-review-modes .complete-access');
       if (!(switchToFull instanceof HTMLButtonElement)) {
-        throw new Error('Approval card Full Takeover action is missing.');
+        throw new Error('Complete Access mode button is missing.');
       }
       switchToFull.click();
-      const riskVisible = await waitFor(() => document.querySelector('.full-takeover-modal'));
-      if (!riskVisible) throw new Error('Full Takeover risk confirmation did not appear.');
-      const riskModal = document.querySelector('.full-takeover-modal');
-      if (
-        riskModal?.getAttribute('data-terminal-id') !== terminalId
-        || riskModal?.getAttribute('data-approval-id') !== takeoverApprovalState?.pendingApproval?.id
-      ) throw new Error('Full Takeover risk confirmation is not bound to the exact approval.');
-      if (pane?.textContent?.includes('__AI_FULL_TAKEOVER_ONE__')) {
-        throw new Error('Full Takeover command ran before risk confirmation.');
+      const riskVisible = await waitFor(() => document.querySelector('.complete-access-modal'));
+      if (!riskVisible) throw new Error('Complete Access risk confirmation did not appear.');
+      const riskModal = document.querySelector('.complete-access-modal');
+      if (riskModal?.getAttribute('data-terminal-id') !== terminalId) {
+        throw new Error('Complete Access confirmation is not bound to the active terminal.');
       }
-      const enableFull = document.querySelector('.full-takeover-modal [data-action="confirm-full-takeover"]');
-      if (!(enableFull instanceof HTMLButtonElement)) throw new Error('Full Takeover confirmation is missing.');
+      if (pane?.textContent?.includes('__AI_FULL_TAKEOVER_ONE__')) {
+        throw new Error('Complete Access command ran before risk confirmation.');
+      }
+      const enableFull = document.querySelector('.complete-access-modal [data-action="confirm-complete-access"]');
+      if (!(enableFull instanceof HTMLButtonElement)) throw new Error('Complete Access confirmation is missing.');
       enableFull.click();
       const fullEnabled = await waitFor(
-        () => document.querySelector('.terminal-stage')?.getAttribute('data-full-takeover') === 'true',
+        () => document.querySelector('.terminal-stage')?.getAttribute('data-review-mode') === 'complete',
       );
-      if (!fullEnabled) throw new Error('Full Takeover did not become active.');
+      if (!fullEnabled) throw new Error('Complete Access did not become active.');
 
+      sendPrompt('Run two Complete Access marker commands.');
       const fullOne = await waitFor(() => pane?.textContent?.includes('__AI_FULL_TAKEOVER_ONE__'));
       const fullTwo = await waitFor(() => pane?.textContent?.includes('__AI_FULL_TAKEOVER_TWO__'));
       const fullComplete = await waitFor(
-        () => document.querySelector('.agent-body')?.textContent?.includes('Full Takeover smoke complete'),
+        () => document.querySelector('.agent-body')?.textContent?.includes('Complete Access smoke complete'),
       );
       if (!fullOne || !fullTwo || !fullComplete || document.querySelector('.approval-card')) {
-        throw new Error('Consecutive Full Takeover execution failed.');
+        throw new Error('Consecutive Complete Access execution failed.');
       }
 
       sendPrompt('Run the secure authentication smoke.');
@@ -209,26 +205,14 @@ async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<bo
         throw new Error('Secure multiline paste tail reached the shell.');
       }
 
-      sendPrompt('Run the manual takeover smoke.');
+      sendPrompt('Run the stop-button smoke.');
       const running = await waitFor(
         () => document.querySelector('.terminal-stage')?.getAttribute('data-agent-state') === 'RUNNING',
       );
-      if (!running) throw new Error('Manual Takeover command did not start.');
-      const takeControl = document.querySelector('[data-action="take-control"]');
-      if (!(takeControl instanceof HTMLButtonElement)) throw new Error('Take Control button is missing.');
-      takeControl.click();
-      const takeoverVisible = await waitFor(() => document.querySelector('.takeover-modal'));
-      if (!takeoverVisible) throw new Error('Takeover process choice did not appear.');
-      const pendingTakeoverState = await window.aiTerminal.agent.getState(terminalId);
-      const takeoverModal = document.querySelector('.takeover-modal');
-      if (
-        takeoverModal?.getAttribute('data-terminal-id') !== terminalId
-        || takeoverModal?.getAttribute('data-takeover-id') !== pendingTakeoverState?.pendingTakeover?.id
-        || takeoverModal?.getAttribute('data-execution-id') !== pendingTakeoverState?.pendingTakeover?.executionId
-      ) throw new Error('Takeover modal is not bound to the exact foreground execution.');
-      const interrupt = document.querySelector('.takeover-modal [data-action="interrupt-process"]');
-      if (!(interrupt instanceof HTMLButtonElement)) throw new Error('Takeover Ctrl+C action is missing.');
-      interrupt.click();
+      if (!running) throw new Error('Stop-button command did not start.');
+      const stopButton = document.querySelector('.composer .agent-stop-submit');
+      if (!(stopButton instanceof HTMLButtonElement)) throw new Error('Composer stop button is missing.');
+      stopButton.click();
       const paused = await waitFor(
         () => document.querySelector('.terminal-stage')?.getAttribute('data-agent-state') === 'PAUSED',
       );
@@ -256,7 +240,7 @@ async function runAgentSmoke(window: BrowserWindow, useSsh: boolean): Promise<bo
           && trackingSettled
           && state?.state === 'PAUSED'
           && state.activeExecution?.status !== 'running'
-          && !state.fullTakeover
+          && state.reviewMode === 'all'
         ),
         sessionId: state?.sessionId,
       };

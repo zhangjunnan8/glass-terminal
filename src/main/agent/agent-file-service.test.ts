@@ -680,7 +680,7 @@ describe('AgentFileService local workspace boundary', () => {
     expect(result.path).toBe(join(root, 'src', 'demo.ts'));
   });
 
-  it('requires an explicit compatible Workspace Root instead of falling back to cwd', async () => {
+  it('uses the Session cwd as the default file root when Workspace is informationally absent', async () => {
     const owner = { id: 1 } as WebContents;
     const noWorkspace = new AgentFileService({} as TerminalService, {
       sessionForTerminal: () => ({
@@ -688,7 +688,7 @@ describe('AgentFileService local workspace boundary', () => {
       }),
     } as unknown as SessionManager);
     await expect(noWorkspace.bindWorkspaceRoot(owner, 'terminal'))
-      .rejects.toThrow('请先设置 Workspace Root');
+      .resolves.toBe(process.cwd());
 
     const wrongBackend = new AgentFileService({} as TerminalService, {
       sessionForTerminal: () => ({
@@ -714,6 +714,36 @@ describe('AgentFileService local workspace boundary', () => {
     );
     await expect(wrongHost.bindWorkspaceRoot(owner, 'terminal')).rejects.toThrow(/Host/);
     expect(withFilesystem).not.toHaveBeenCalled();
+  });
+
+  it('asks SFTP for its absolute cwd when a remote Windows shell reports a drive path', async () => {
+    const owner = { id: 1 } as WebContents;
+    const filesystem = fakeRemoteFilesystem({
+      realpath: vi.fn(async (path: string) => path === '.' ? '/C:/Users/tester' : path),
+      stat: vi.fn(async (path: string) => (
+        path === '/C:/Users/tester' ? remoteStat('directory') : undefined
+      )),
+    });
+    const withFilesystem = vi.fn(async <T>(
+      _owner: WebContents,
+      _terminalId: string,
+      operation: (remote: RemoteFilesystem) => Promise<T>,
+    ) => operation(filesystem));
+    const service = new AgentFileService(
+      {} as TerminalService,
+      createSessionManager(() => ({
+        id: TEST_SESSION_ID,
+        transport: 'ssh',
+        hostId: 'host-1',
+        shellKind: 'powershell',
+        cwd: 'C:\\Users\\tester',
+      })),
+      { withFilesystem } as unknown as RemoteFilesystemProvider,
+    );
+
+    await expect(service.bindFileRoot(owner, 'terminal')).resolves.toBe('/C:/Users/tester');
+    expect(filesystem.realpath).toHaveBeenCalledWith('.');
+    expect(filesystem.stat).toHaveBeenCalledWith('/C:/Users/tester');
   });
 
   it('rejects a persisted local Workspace Root that now resolves through a link', async () => {
@@ -745,7 +775,7 @@ describe('AgentFileService local workspace boundary', () => {
     expect(withFilesystem).toHaveBeenCalledTimes(1);
   });
 
-  it('keeps file access bound to session.workspace when cwd changes and rejects root overrides', async () => {
+  it('uses Workspace as the default root while allowing a live turn to supply another default', async () => {
     const root = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-workspace-root-'));
     const other = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-cwd-'));
     roots.push(root, other);
@@ -768,8 +798,9 @@ describe('AgentFileService local workspace boundary', () => {
     await expect(service.readText(owner, 'terminal', 'bound.txt')).resolves.toMatchObject({
       content: 'workspace',
     });
-    await expect(service.readText(owner, 'terminal', 'bound.txt', other))
-      .rejects.toThrow(/Workspace Root.*不一致/);
+    await expect(service.readText(owner, 'terminal', 'bound.txt', other)).resolves.toMatchObject({
+      content: 'cwd',
+    });
   });
 
   it('rejects traversal, ambiguous patches, and oversized content', async () => {
@@ -1440,7 +1471,7 @@ describe('AgentFileService local workspace boundary', () => {
     expect(existsSync(join(root, 'created'))).toBe(false);
     expect(readFileSync(join(outside, 'keep.txt'), 'utf8')).toBe('keep');
     await expect(service.deletePath(owner, 'terminal', '.', { recursive: true }))
-      .rejects.toThrow('Workspace Root');
+      .rejects.toThrow('文件路径超出当前会话工作目录');
   });
 
   it('rejects mutation through a linked parent and leaves the target untouched', async () => {
@@ -2163,7 +2194,7 @@ describe('AgentFileService local workspace boundary', () => {
     expect(readdirSync(root)).toEqual(['raced.txt']);
   });
 
-  it('supports Full Access outside Workspace Root but protects Workspace ancestors', async () => {
+  it('supports Full Access outside Workspace and does not treat Workspace as a mutation boundary', async () => {
     const container = mkdtempSync(join(tmpdir(), 'ai-terminal-agent-full-access-'));
     roots.push(container);
     const workspace = join(container, 'workspace');
@@ -2188,14 +2219,14 @@ describe('AgentFileService local workspace boundary', () => {
     expect(outsideWrite.diff).not.toMatch(/^--- a\/\\\\/mu);
     await expect(service.deletePath(
       owner, 'terminal', workspace, { recursive: true }, workspace, fullAccess,
-    )).rejects.toThrow('Workspace Root');
-    await expect(service.deletePath(
-      owner, 'terminal', container, { recursive: true }, workspace, fullAccess,
-    )).rejects.toThrow('Workspace Root');
-    expect(existsSync(workspace)).toBe(true);
+    )).resolves.toBeUndefined();
+    expect(existsSync(workspace)).toBe(false);
+    await expect(service.readText(
+      owner, 'terminal', join(outside, 'outside.txt'), workspace, fullAccess,
+    )).resolves.toMatchObject({ content: 'outside' });
   });
 
-  it('durably audits a rejected Workspace Root mutation', async () => {
+  it('durably audits a successful Workspace-root mutation', async () => {
     const container = mkdtempSync(join(tmpdir(), 'ai-terminal-root-mutation-audit-'));
     roots.push(container);
     const workspace = join(container, 'workspace-root');
@@ -2233,25 +2264,24 @@ describe('AgentFileService local workspace boundary', () => {
       { recursive: true },
       workspace,
       fullAccess,
-    )).rejects.toThrow('Workspace Root');
+    )).resolves.toBeUndefined();
 
-    expect(existsSync(workspace)).toBe(true);
+    expect(existsSync(workspace)).toBe(false);
     expect(store.readWorkspaceOperations(session.id)).toMatchObject([
       {
         recordType: 'intent',
         operation: 'delete',
         target: {
           path: {
-            scope: 'rejected',
-            pathHash: expect.stringMatching(/^[0-9a-f]{64}$/u),
+            scope: 'workspace',
+            path: '.',
           },
         },
       },
       {
         recordType: 'outcome',
-        outcome: 'failed',
-        sideEffectCommitted: false,
-        failure: { stage: 'prepare', retrySafe: true },
+        outcome: 'succeeded',
+        sideEffectCommitted: true,
       },
     ]);
     const jsonl = readFileSync(

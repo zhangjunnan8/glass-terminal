@@ -26,7 +26,7 @@ export interface SharedTerminalToolOptions {
    * The owning Agent runtime supplies approval, takeover, and structured-command
    * orchestration. This is deliberately the only execution path exposed here.
    */
-  execute(command: string, reason?: string): Promise<TerminalCommandResult>;
+  execute(command: string, reason?: string, agentRisk?: 'normal' | 'elevated'): Promise<TerminalCommandResult>;
   sendInput?(input: string): Promise<void> | void;
   interrupt?(commandId?: string): Promise<void> | void;
   /** Main-process lease check for the runtime/turn that issued this tool. */
@@ -53,12 +53,14 @@ function boundedCharacterLimit(
 export class SharedTerminalTool implements TerminalTool {
   constructor(private readonly options: SharedTerminalToolOptions) {}
 
-  async execute(command: string, reason?: string): Promise<TerminalCommandResult> {
+  async execute(command: string, reason?: string, agentRisk?: 'normal' | 'elevated'): Promise<TerminalCommandResult> {
     this.assertLive();
     this.assertCurrentBinding();
     this.assertPermission('execute');
     if (!command.trim()) throw new Error('Terminal command cannot be empty.');
-    return this.options.execute(command, reason);
+    return agentRisk === undefined
+      ? this.options.execute(command, reason)
+      : this.options.execute(command, reason, agentRisk);
   }
 
   async sendInput(input: string): Promise<void> {

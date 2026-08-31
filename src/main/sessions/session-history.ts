@@ -18,6 +18,10 @@ function safeChatItem(value: unknown): AgentChatItem | undefined {
     role,
     content: item.content,
     createdAt: item.createdAt,
+    ...(typeof item.turnId === 'string' ? { turnId: item.turnId } : {}),
+    ...(item.presentation === 'intermediate' || item.presentation === 'summary'
+      ? { presentation: item.presentation }
+      : {}),
   };
 }
 
@@ -31,6 +35,15 @@ export function conversationPreview(
     if (event.type === 'chat') {
       const item = safeChatItem(event.item);
       if (item) messages.push(item);
+      continue;
+    }
+    if (
+      event.type === 'chat_presentation'
+      && typeof event.targetMessageId === 'string'
+      && (event.presentation === 'intermediate' || event.presentation === 'summary')
+    ) {
+      const target = messages.find((message) => message.id === event.targetMessageId);
+      if (target) target.presentation = event.presentation;
       continue;
     }
     if (

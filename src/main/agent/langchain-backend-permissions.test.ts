@@ -167,34 +167,34 @@ async function runTurn(mode: AgentFileAccessMode): Promise<{
   }
 }
 
-describe('LangChainBackend workspace tool gating', () => {
+describe('LangChainBackend file tool gating', () => {
   it('advertises only terminal tools when file access is off', async () => {
     const { tools } = await runTurn('off');
     expect(tools).toContain('terminal_execute');
-    expect(tools.filter((tool) => tool.startsWith('workspace_'))).toEqual([]);
+    expect(tools.filter((tool) => tool.startsWith('file_'))).toEqual([]);
   });
 
   it('advertises read tools but never write tools in read-only mode', async () => {
     const { tools } = await runTurn('read-only');
-    expect(tools).toContain('workspace_list');
-    expect(tools).toContain('workspace_read_file');
-    expect(tools).toContain('workspace_search');
-    expect(tools).toContain('workspace_glob');
-    expect(tools).not.toContain('workspace_apply_patch');
-    expect(tools).not.toContain('workspace_write_file');
-    expect(tools).not.toContain('workspace_mkdir');
-    expect(tools).not.toContain('workspace_rename');
-    expect(tools).not.toContain('workspace_delete');
+    expect(tools).toContain('file_list');
+    expect(tools).toContain('file_read');
+    expect(tools).toContain('file_search');
+    expect(tools).toContain('file_glob');
+    expect(tools).not.toContain('file_patch');
+    expect(tools).not.toContain('file_write');
+    expect(tools).not.toContain('file_mkdir');
+    expect(tools).not.toContain('file_rename');
+    expect(tools).not.toContain('file_delete');
   });
 
   it('advertises read and write tools in read-write mode', async () => {
     const { tools } = await runTurn('read-write');
-    expect(tools).toContain('workspace_read_file');
-    expect(tools).toContain('workspace_apply_patch');
-    expect(tools).toContain('workspace_write_file');
-    expect(tools).toContain('workspace_mkdir');
-    expect(tools).toContain('workspace_rename');
-    expect(tools).toContain('workspace_delete');
+    expect(tools).toContain('file_read');
+    expect(tools).toContain('file_patch');
+    expect(tools).toContain('file_write');
+    expect(tools).toContain('file_mkdir');
+    expect(tools).toContain('file_rename');
+    expect(tools).toContain('file_delete');
   });
 
   it('estimates the same serialized tool definitions dispatched to the Provider', async () => {

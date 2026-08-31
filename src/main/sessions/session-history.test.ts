@@ -69,4 +69,41 @@ describe('Session history preview', () => {
       createdAt: '2026-08-16T00:00:00.000Z',
     }]);
   });
+
+  it('replays the persisted process/summary presentation for a completed turn', () => {
+    const preview = conversationPreview([
+      {
+        type: 'chat',
+        item: {
+          id: 'step-1',
+          role: 'assistant',
+          content: 'intermediate work',
+          createdAt: '2026-08-16T00:00:00.000Z',
+          turnId: 'turn-1',
+          presentation: 'intermediate',
+        },
+      },
+      {
+        type: 'chat',
+        item: {
+          id: 'summary-1',
+          role: 'assistant',
+          content: 'final summary',
+          createdAt: '2026-08-16T00:01:00.000Z',
+          turnId: 'turn-1',
+          presentation: 'intermediate',
+        },
+      },
+      {
+        type: 'chat_presentation',
+        targetMessageId: 'summary-1',
+        presentation: 'summary',
+      },
+    ], false);
+
+    expect(preview.messages).toEqual([
+      expect.objectContaining({ id: 'step-1', turnId: 'turn-1', presentation: 'intermediate' }),
+      expect.objectContaining({ id: 'summary-1', turnId: 'turn-1', presentation: 'summary' }),
+    ]);
+  });
 });

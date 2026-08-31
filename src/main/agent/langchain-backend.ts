@@ -959,6 +959,33 @@ export class LangChainBackend implements AgentBackend {
     laterToolCallIds: readonly string[],
     tools: readonly AgentFunctionToolDefinition[],
   ): Promise<string> {
+    if ((name.startsWith('file_') || name.startsWith('workspace_')) && gateway.requestFileOperation) {
+      const operation = ({
+        file_list: 'list', file_read: 'read', file_stat: 'stat', file_search: 'search',
+        file_glob: 'glob', file_write: 'write', file_patch: 'patch', file_mkdir: 'mkdir',
+        file_rename: 'rename', file_delete: 'delete',
+        workspace_list: 'list', workspace_read_file: 'read', workspace_stat: 'stat',
+        workspace_search: 'search', workspace_glob: 'glob', workspace_write_file: 'write',
+        workspace_apply_patch: 'patch', workspace_mkdir: 'mkdir', workspace_rename: 'rename',
+        workspace_delete: 'delete',
+      } as const)[name as 'file_list'];
+      const target = name === 'file_rename' || name === 'workspace_rename'
+        ? `${String(args.source ?? '')} → ${String(args.destination ?? '')}`
+        : String(args.path ?? '.');
+      const approved = await gateway.requestFileOperation({
+        toolName: name,
+        operation,
+        target,
+        ...(name === 'file_delete' || name === 'workspace_delete'
+          ? { recursive: args.recursive === true }
+          : {}),
+        ...(args.riskLevel === 'elevated' ? { agentRisk: 'elevated' as const } : {}),
+        ...(typeof args.riskReason === 'string' ? { riskReason: args.riskReason } : {}),
+      });
+      if (!approved) {
+        return JSON.stringify({ ok: false, code: 'USER_REJECTED', error: 'User rejected this file operation.' });
+      }
+    }
     const dynamicChars = this.dynamicReadCharacters(transcript, laterToolCallIds, tools);
     const fits = (result: string) => this.toolResultFits(
       transcript,
@@ -1005,7 +1032,8 @@ export class LangChainBackend implements AgentBackend {
           'Terminal state does not fit the remaining context budget.',
         );
       }
-      case 'workspace_list': {
+      case 'workspace_list':
+      case 'file_list': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, name);
         const path = typeof args.path === 'string' ? args.path : '.';
         const listed = await workspace.listDirectory(path);
@@ -1022,10 +1050,11 @@ export class LangChainBackend implements AgentBackend {
           ? candidate(count)
           : this.contextBudgetToolError('Directory metadata does not fit the remaining context budget.');
       }
-      case 'workspace_read_file': {
+      case 'workspace_read_file':
+      case 'file_read': {
         if (dynamicChars < MIN_DYNAMIC_READ_CHARS) {
           return this.contextBudgetToolError(
-            'No safe room remains for file content; workspace_read_file was not executed.',
+            'No safe room remains for file content; file_read was not executed.',
           );
         }
         const workspace = this.requireWorkspace(gateway, fileAccessMode, name);
@@ -1048,14 +1077,16 @@ export class LangChainBackend implements AgentBackend {
           ? candidate(count)
           : this.contextBudgetToolError('File page metadata does not fit the remaining context budget.');
       }
-      case 'workspace_stat': {
+      case 'workspace_stat':
+      case 'file_stat': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, name);
         const result = JSON.stringify({ ok: true, ...await workspace.stat(requirePath(args, name)) });
         return fits(result) ? result : this.contextBudgetToolError(
           'File metadata does not fit the remaining context budget.',
         );
       }
-      case 'workspace_search': {
+      case 'workspace_search':
+      case 'file_search': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, name);
         const query = requireString(args, 'query', name);
         const path = typeof args.path === 'string' ? args.path : '.';
@@ -1069,7 +1100,7 @@ export class LangChainBackend implements AgentBackend {
         const dynamicResults = Math.floor(dynamicChars / 320);
         if (dynamicResults < 1) {
           return this.contextBudgetToolError(
-            'No safe room remains for search matches; workspace_search was not executed.',
+            'No safe room remains for search matches; file_search was not executed.',
           );
         }
         const pageSize = Math.min(200, Math.max(1, Math.floor(requested)), dynamicResults);
@@ -1100,7 +1131,8 @@ export class LangChainBackend implements AgentBackend {
           ? candidate(count)
           : this.contextBudgetToolError('Search metadata does not fit the remaining context budget.');
       }
-      case 'workspace_glob': {
+      case 'workspace_glob':
+      case 'file_glob': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, name);
         const pattern = requireString(args, 'pattern', name);
         const path = typeof args.path === 'string' ? args.path : '.';
@@ -1114,7 +1146,7 @@ export class LangChainBackend implements AgentBackend {
         const dynamicResults = Math.floor(dynamicChars / 128);
         if (dynamicResults < 1) {
           return this.contextBudgetToolError(
-            'No safe room remains for glob paths; workspace_glob was not executed.',
+            'No safe room remains for glob paths; file_glob was not executed.',
           );
         }
         const pageSize = Math.min(500, Math.max(1, Math.floor(requested)), dynamicResults);
@@ -1176,9 +1208,20 @@ export class LangChainBackend implements AgentBackend {
         const result = await gateway.terminal.execute(
           args.command,
           typeof args.reason === 'string' ? args.reason : undefined,
+          args.riskLevel === 'elevated' ? 'elevated' : 'normal',
         );
         return JSON.stringify({ ok: result.status === 'completed', ...result });
       }
+      case 'file_list':
+      case 'file_read':
+      case 'file_stat':
+      case 'file_search':
+      case 'file_glob':
+      case 'file_patch':
+      case 'file_write':
+      case 'file_mkdir':
+      case 'file_rename':
+      case 'file_delete':
       case 'workspace_list':
       case 'workspace_read_file':
       case 'workspace_stat':
@@ -1191,18 +1234,22 @@ export class LangChainBackend implements AgentBackend {
       case 'workspace_delete': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, name);
         switch (name) {
-          case 'workspace_list': {
+          case 'workspace_list':
+          case 'file_list': {
             const path = typeof args.path === 'string' ? args.path : '.';
             return JSON.stringify({ ok: true, ...await workspace.listDirectory(path) });
           }
           case 'workspace_read_file':
+          case 'file_read':
             return JSON.stringify({
               ok: true,
               ...await workspace.readFile(requirePath(args, name)),
             });
           case 'workspace_stat':
+          case 'file_stat':
             return JSON.stringify({ ok: true, ...await workspace.stat(requirePath(args, name)) });
           case 'workspace_search':
+          case 'file_search':
             return JSON.stringify({
               ok: true,
               ...await workspace.search(requireString(args, 'query', name), {
@@ -1211,6 +1258,7 @@ export class LangChainBackend implements AgentBackend {
               }),
             });
           case 'workspace_glob':
+          case 'file_glob':
             return JSON.stringify({
               ok: true,
               ...await workspace.glob(requireString(args, 'pattern', name), {
@@ -1219,6 +1267,7 @@ export class LangChainBackend implements AgentBackend {
               }),
             });
           case 'workspace_apply_patch':
+          case 'file_patch':
             return JSON.stringify({
               ok: true,
               ...await workspace.applyPatch(
@@ -1228,6 +1277,7 @@ export class LangChainBackend implements AgentBackend {
               ),
             });
           case 'workspace_write_file':
+          case 'file_write':
             return JSON.stringify({
               ok: true,
               ...await workspace.writeFile(
@@ -1237,15 +1287,18 @@ export class LangChainBackend implements AgentBackend {
               ),
             });
           case 'workspace_mkdir':
+          case 'file_mkdir':
             await workspace.mkdir(requirePath(args, name));
             return JSON.stringify({ ok: true, path: requirePath(args, name) });
-          case 'workspace_rename': {
+          case 'workspace_rename':
+          case 'file_rename': {
             const source = requirePath(args, name, 'source');
             const destination = requirePath(args, name, 'destination');
             await workspace.rename(source, destination);
             return JSON.stringify({ ok: true, source, destination });
           }
-          case 'workspace_delete': {
+          case 'workspace_delete':
+          case 'file_delete': {
             const recursive = args.recursive === true;
             await workspace.delete(requirePath(args, name), { recursive });
             return JSON.stringify({ ok: true, path: requirePath(args, name), recursive });

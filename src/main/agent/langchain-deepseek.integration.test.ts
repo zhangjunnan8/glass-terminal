@@ -172,8 +172,8 @@ describe.runIf(enabled)('real DeepSeek via LangChain harness', () => {
 
       const result = await backend.sendMessage({
         thread,
-        prompt: 'Read the file `hello.txt` in the workspace using the workspace_read_file tool, then tell me its exact contents.',
-        systemPrompt: 'You are a coding assistant. Read files with the workspace_read_file tool; never use cat.',
+        prompt: 'Read the file `hello.txt` using the file_read tool, then tell me its exact contents.',
+        systemPrompt: 'You are a coding assistant. Read files with the file_read tool; never use cat.',
         terminalContext: '',
         fileAccessMode: 'read-only',
         gateway,

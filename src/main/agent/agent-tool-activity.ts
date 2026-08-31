@@ -109,14 +109,19 @@ function activityLabel(call: AgentToolCall, toolName: string): string {
     case 'workspace_stat':
     case 'file_stat': return withPath('Stat', path);
     case 'workspace_search': return withPath('Search workspace', path);
+    case 'file_search': return withPath('Search files', path);
     case 'workspace_glob': return withPath('Glob workspace', path);
+    case 'file_glob': return withPath('Glob files', path);
     case 'workspace_apply_patch':
     case 'file_patch': return withPath('Patch', path);
     case 'workspace_write_file':
     case 'file_write': return withPath('Write', path);
-    case 'workspace_mkdir': return withPath('Create directory', path);
-    case 'workspace_delete': return withPath('Delete', path);
-    case 'workspace_rename': {
+    case 'workspace_mkdir':
+    case 'file_mkdir': return withPath('Create directory', path);
+    case 'workspace_delete':
+    case 'file_delete': return withPath('Delete', path);
+    case 'workspace_rename':
+    case 'file_rename': {
       const source = structuredPath(args, 'source');
       const destination = structuredPath(args, 'destination');
       return sanitizedText(
@@ -171,12 +176,12 @@ function completedSummary(
     const deletions = safeCount(result.deletions);
     if (additions !== undefined || deletions !== undefined) {
       parts.push(`+${additions ?? 0}/-${deletions ?? 0}`);
-    } else if (toolName === 'workspace_search') {
+    } else if (toolName === 'workspace_search' || toolName === 'file_search') {
       const matches = arrayCount(result.matches);
       const files = safeCount(result.filesScanned);
       if (matches !== undefined) parts.push(`${matches} matches`);
       if (files !== undefined) parts.push(`${files} files`);
-    } else if (toolName === 'workspace_glob') {
+    } else if (toolName === 'workspace_glob' || toolName === 'file_glob') {
       const paths = arrayCount(result.paths);
       if (paths !== undefined) parts.push(`${paths} paths`);
     } else if (toolName === 'workspace_list' || toolName === 'file_list') {

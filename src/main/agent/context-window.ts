@@ -34,8 +34,13 @@ const WORKSPACE_TOOL_NAMES = new Set([
   'file_list',
   'file_read',
   'file_stat',
+  'file_search',
+  'file_glob',
   'file_write',
   'file_patch',
+  'file_mkdir',
+  'file_rename',
+  'file_delete',
 ]);
 
 export interface ContextCompressionResult {

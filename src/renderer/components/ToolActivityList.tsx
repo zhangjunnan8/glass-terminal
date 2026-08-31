@@ -17,18 +17,21 @@ interface ToolActivityListProps {
   testId?: string;
   /** Tighter spacing for inline (inside a message) rendering. */
   compact?: boolean;
+  /** Initial disclosure state; turn-process containers start expanded. */
+  defaultExpanded?: boolean;
 }
 
 /**
- * Bounded, collapsed-by-default summary of tool use. The full list stays in the
- * DOM (visually hidden) so it remains accessible to tests and screen readers.
+ * Bounded summary of tool use. Standalone lists start collapsed, while a live
+ * turn can opt into an expanded initial state.
  */
 export function ToolActivityList({
   activities,
   testId = 'tool-activity-list',
   compact = false,
+  defaultExpanded = false,
 }: ToolActivityListProps) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(defaultExpanded);
   const recentActivities = activities.slice(-MAX_VISIBLE_ACTIVITIES);
   if (!recentActivities.length) return null;
 

@@ -197,7 +197,7 @@ describe('LangChain dynamic context budget', () => {
 
   it('pages a large CJK file result to the live remaining budget and preserves a cursor', async () => {
     const provider = await providerServer((index) => index === 0
-      ? { toolCalls: [{ id: 'read-big', name: 'workspace_read_file', args: { path: 'big.txt' } }] }
+      ? { toolCalls: [{ id: 'read-big', name: 'file_read', args: { path: 'big.txt' } }] }
       : { content: 'page consumed' });
     const content = '上下文'.repeat(4_000);
     const files = workspace({
@@ -234,8 +234,8 @@ describe('LangChain dynamic context budget', () => {
     const provider = await providerServer((index) => index === 0
       ? {
         toolCalls: [
-          { id: 'read-one', name: 'workspace_read_file', args: { path: 'a.txt' } },
-          { id: 'stat-one', name: 'workspace_stat', args: { path: 'a.txt' } },
+          { id: 'read-one', name: 'file_read', args: { path: 'a.txt' } },
+          { id: 'stat-one', name: 'file_stat', args: { path: 'a.txt' } },
         ],
       }
       : { content: 'both consumed' });
@@ -269,7 +269,7 @@ describe('LangChain dynamic context budget', () => {
     const provider = await providerServer(() => ({
       toolCalls: [{
         id: 'write-huge',
-        name: 'workspace_write_file',
+        name: 'file_write',
         args: { path: 'large.txt', content: hugeContent, expectedSha256: null },
       }],
     }));

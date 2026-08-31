@@ -48,8 +48,7 @@ import type {
   ReviseAgentPromptRequest,
   SendAgentPromptRequest,
   SaveAgentMemoryRequest,
-  SetFullTakeoverRequest,
-  SetFullTakeoverPreferenceRequest,
+  SetAgentReviewModeRequest,
   TakeoverRequest,
 } from '../shared/agent';
 import { HostStore } from './hosts/host-store';
@@ -811,17 +810,10 @@ handleTrusted(
   },
 );
 handleTrusted(
-  AGENT_CHANNELS.setFullTakeover,
-  (event, request: SetFullTakeoverRequest) => {
+  AGENT_CHANNELS.setReviewMode,
+  (event, request: SetAgentReviewModeRequest) => {
     if (!agentService) throw new Error('Agent service is not ready.');
-    return agentService.setFullTakeover(event.sender, request);
-  },
-);
-handleTrusted(
-  AGENT_CHANNELS.setFullTakeoverPreference,
-  (event, request: SetFullTakeoverPreferenceRequest) => {
-    if (!agentService) throw new Error('Agent service is not ready.');
-    return agentService.setFullTakeoverPreference(event.sender, request);
+    return agentService.setReviewMode(event.sender, request);
   },
 );
 handleTrusted(AGENT_CHANNELS.takeover, (event, request: TakeoverRequest) => {

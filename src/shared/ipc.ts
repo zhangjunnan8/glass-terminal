@@ -51,8 +51,7 @@ import type {
   ReviseAgentPromptRequest,
   SendAgentPromptRequest,
   SaveAgentMemoryRequest,
-  SetFullTakeoverRequest,
-  SetFullTakeoverPreferenceRequest,
+  SetAgentReviewModeRequest,
   TakeoverRequest,
 } from './agent';
 import type { AppSettings, AppSettingsPatch, SettingsWindowSection } from './settings';
@@ -147,10 +146,7 @@ export interface DesktopBridge {
     getState(terminalId: string): Promise<AgentSessionView | null>;
     activateBackend?(request: ActivateAgentBackendRequest): Promise<AgentSessionView>;
     resolveApproval(request: ResolveApprovalRequest): Promise<AgentSessionView>;
-    setFullTakeover(request: SetFullTakeoverRequest): Promise<AgentSessionView>;
-    setFullTakeoverPreference(
-      request: SetFullTakeoverPreferenceRequest,
-    ): Promise<AgentSessionView | null>;
+    setReviewMode(request: SetAgentReviewModeRequest): Promise<AgentSessionView>;
     takeover(request: TakeoverRequest): Promise<AgentSessionView>;
     resolveTakeover(request: ResolveTakeoverRequest): Promise<AgentSessionView>;
     confirmShellReady(request: ConfirmShellReadyRequest): Promise<AgentSessionView>;

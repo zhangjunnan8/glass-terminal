@@ -18,6 +18,8 @@ export type AgentRuntimeState =
   | 'FAILED';
 
 export type TerminalInputMode = 'human' | 'locked' | 'secure-human';
+/** One atomic policy for terminal commands and direct file tools. */
+export type AgentReviewMode = 'all' | 'risky' | 'complete';
 /** `read-only` is retained for persisted/internal policy compatibility but is no longer exposed by the UI. */
 export type AgentFileAccessMode = 'off' | 'read-only' | 'read-write' | 'full-access';
 
@@ -75,8 +77,16 @@ export interface CommandApproval {
   terminalId: string;
   command: string;
   reason?: string;
-  /** File-tool bypasses are always exact, one-time approvals, even in Full Takeover. */
-  kind?: 'standard' | 'workspace-tool-bypass';
+  /** Legacy values remain readable; Beta.4 emits terminal-command/file-operation. */
+  kind?: 'standard' | 'workspace-tool-bypass' | 'terminal-command' | 'file-operation';
+  fileOperation?: {
+    toolName: string;
+    operation: 'list' | 'read' | 'stat' | 'search' | 'glob' | 'write' | 'patch' | 'mkdir' | 'rename' | 'delete';
+    target: string;
+    recursive?: boolean;
+    sensitive?: boolean;
+    riskReason?: string;
+  };
   fileCommandPolicy?: {
     categories: Array<'read' | 'search' | 'list' | 'stat'>;
     suggestedTools: string[];
@@ -92,6 +102,9 @@ export interface AgentChatItem {
   role: 'user' | 'assistant' | 'system';
   content: string;
   createdAt: string;
+  /** Stable task-turn grouping for the Beta.4 summary/process presentation. */
+  turnId?: string;
+  presentation?: 'intermediate' | 'summary';
 }
 
 export type AgentToolActivityKind = 'terminal' | 'workspace' | 'other';
@@ -169,6 +182,8 @@ export interface AgentSessionView {
   providerId: string;
   state: AgentRuntimeState;
   terminalInputMode: TerminalInputMode;
+  /** Atomic approval/access mode. `fullTakeover` below is a derived legacy mirror. */
+  reviewMode: AgentReviewMode;
   /** Ephemeral authority bound to this exact terminal runtime. */
   fullTakeover: boolean;
   /** Persistent Host hint only; never grants runtime authority. */
@@ -177,7 +192,7 @@ export interface AgentSessionView {
   fileAccessMode: AgentFileAccessMode;
   /** Optional for compatibility with persisted Alpha sessions and older render fixtures. */
   fileAccessPolicy?: AgentFileAccessPolicy;
-  /** Canonical explicit Session Workspace Root captured when file access was enabled. */
+  /** Default root for relative file paths; an explicit Workspace is guidance, not a permission boundary. */
   fileAccessRoot?: string;
   messages: AgentChatItem[];
   /** User-reviewed, bounded memories injected independently of summaries. */
@@ -263,6 +278,14 @@ export interface SetFullTakeoverRequest {
   editedCommand?: string;
 }
 
+export interface SetAgentReviewModeRequest {
+  terminalId: string;
+  mode: AgentReviewMode;
+  backend?: AgentBackendRef;
+  /** Required when entering Complete Access from the renderer confirmation flow. */
+  completeAccessConfirmed?: boolean;
+}
+
 export interface SetFullTakeoverPreferenceRequest {
   terminalId: string;
   enabled: boolean;
@@ -304,8 +327,7 @@ export const AGENT_CHANNELS = {
   getState: 'agent:get-state',
   activateBackend: 'agent:activate-backend',
   resolveApproval: 'agent:resolve-approval',
-  setFullTakeover: 'agent:set-full-takeover',
-  setFullTakeoverPreference: 'agent:set-full-takeover-preference',
+  setReviewMode: 'agent:set-review-mode',
   takeover: 'agent:takeover',
   resolveTakeover: 'agent:resolve-takeover',
   confirmShellReady: 'agent:confirm-shell-ready',

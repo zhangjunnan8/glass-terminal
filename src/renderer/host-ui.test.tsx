@@ -115,7 +115,6 @@ function hostBridge() {
     },
     agent: {
       getState: vi.fn().mockResolvedValue(undefined),
-      setFullTakeoverPreference: vi.fn(),
       onStateChanged: vi.fn(() => () => undefined),
       onAssistantDelta: vi.fn(() => () => undefined),
     },
@@ -202,6 +201,14 @@ describe('主机分组与协议界面', () => {
 
     expect(details.classList.contains('open')).toBe(true);
     expect(details.textContent).toContain('生产会话');
+    expect(details.querySelector('[data-action="connect-host"]')?.textContent).toBe('连接');
+    expect(details.querySelector('[data-action="remove-host"]')?.textContent).toBe('删除');
+    const hostActions = details.querySelector('.host-card-actions')!;
+    expect(hostActions.parentElement?.classList).toContain('host-card-summary');
+    expect([...hostActions.querySelectorAll('button')].map((button) => button.textContent))
+      .toEqual(['连接', '编辑', '删除']);
+    expect(details.querySelector('[data-action="view-session-history"]')?.textContent).toBe('历史');
+    expect(details.querySelector('[data-action="rename-session"]')?.textContent).toBe('重命名');
     expect(details.parentElement).toBe(item);
   });
 
@@ -269,7 +276,7 @@ describe('主机分组与协议界面', () => {
     await act(async () => item.querySelector<HTMLButtonElement>('.host-row')!.click());
 
     await act(async () => {
-      item.querySelector<HTMLButtonElement>('.selected-host-card .icon-btn.danger')!.click();
+      item.querySelector<HTMLButtonElement>('[data-action="remove-host"]')!.click();
     });
 
     expect(bridge.hosts.remove).toHaveBeenCalledWith(groupedHost.id);
@@ -288,7 +295,7 @@ describe('主机分组与协议界面', () => {
     const item = container.querySelector<HTMLElement>('[data-host-id="host-1"]')!;
     await act(async () => item.querySelector<HTMLButtonElement>('.host-row')!.click());
     await act(async () => {
-      item.querySelector<HTMLButtonElement>('.selected-host-card .icon-btn.danger')!.click();
+      item.querySelector<HTMLButtonElement>('[data-action="remove-host"]')!.click();
     });
     await settle();
 

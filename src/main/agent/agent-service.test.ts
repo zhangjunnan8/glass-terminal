@@ -12,7 +12,7 @@ import type {
 } from '../../shared/agent';
 import type { ProviderProfile } from '../../shared/provider';
 import type { SessionRecord } from '../../shared/session';
-import type { ToolGateway } from '../../shared/tools';
+import type { FileToolReviewRequest, ToolGateway } from '../../shared/tools';
 import type { ProviderStore } from '../providers/provider-store';
 import type { SessionManager } from '../sessions/session-manager';
 import type {
@@ -233,11 +233,13 @@ class ScriptedLoopBackend implements AgentBackend {
         );
         return JSON.stringify({ ok: result.status === 'completed', ...result });
       }
+      case 'file_list':
       case 'workspace_list': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
         const path = typeof args.path === 'string' ? args.path : '.';
         return JSON.stringify({ ok: true, ...await workspace.listDirectory(path) });
       }
+      case 'file_read':
       case 'workspace_read_file': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
         return JSON.stringify({
@@ -245,6 +247,7 @@ class ScriptedLoopBackend implements AgentBackend {
           ...await workspace.readFile(this.requiredPath(args, call.name)),
         });
       }
+      case 'file_stat':
       case 'workspace_stat': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
         return JSON.stringify({
@@ -252,6 +255,7 @@ class ScriptedLoopBackend implements AgentBackend {
           ...await workspace.stat(this.requiredPath(args, call.name)),
         });
       }
+      case 'file_search':
       case 'workspace_search': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
         if (typeof args.query !== 'string' || !args.query) {
@@ -265,6 +269,7 @@ class ScriptedLoopBackend implements AgentBackend {
           }),
         });
       }
+      case 'file_glob':
       case 'workspace_glob': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
         if (typeof args.pattern !== 'string' || !args.pattern) {
@@ -278,6 +283,7 @@ class ScriptedLoopBackend implements AgentBackend {
           }),
         });
       }
+      case 'file_patch':
       case 'workspace_apply_patch': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
         return JSON.stringify({
@@ -289,6 +295,7 @@ class ScriptedLoopBackend implements AgentBackend {
           ),
         });
       }
+      case 'file_write':
       case 'workspace_write_file': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
         return JSON.stringify({
@@ -300,12 +307,14 @@ class ScriptedLoopBackend implements AgentBackend {
           ),
         });
       }
+      case 'file_mkdir':
       case 'workspace_mkdir': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
         const path = this.requiredPath(args, call.name);
         await workspace.mkdir(path);
         return JSON.stringify({ ok: true, path });
       }
+      case 'file_rename':
       case 'workspace_rename': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
         const source = this.requiredPath(args, call.name, 'source');
@@ -313,6 +322,7 @@ class ScriptedLoopBackend implements AgentBackend {
         await workspace.rename(source, destination);
         return JSON.stringify({ ok: true, source, destination });
       }
+      case 'file_delete':
       case 'workspace_delete': {
         const workspace = this.requireWorkspace(gateway, fileAccessMode, call.name);
         const path = this.requiredPath(args, call.name);
@@ -440,6 +450,25 @@ class RecordingBackend implements AgentBackend {
       finalText,
       rounds: 1,
     };
+  }
+}
+
+class FileReviewBackend extends RecordingBackend {
+  readonly approvals: boolean[] = [];
+
+  constructor(private readonly requests: FileToolReviewRequest[]) {
+    super();
+  }
+
+  override async sendMessage(input: SendAgentBackendMessageInput): Promise<AgentBackendResult> {
+    this.sendInputs.push(input);
+    this.priorMessagesAtSend.push([]);
+    const request = this.requests[this.sendInputs.length - 1];
+    if (!request || !input.gateway.requestFileOperation) {
+      throw new Error('File review request is missing.');
+    }
+    this.approvals.push(await input.gateway.requestFileOperation(request));
+    return this.complete(input);
   }
 }
 
@@ -1558,6 +1587,79 @@ describe('AgentService shared-terminal controls', () => {
     ]);
   });
 
+  it('keeps file tools available when an informational Workspace has disappeared', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      workspace: { backend: 'sftp', root: '/stale-workspace', hostId: 'host' },
+    };
+    const bindWorkspaceRoot = vi.fn().mockRejectedValue(new Error('Workspace Root 已不可用。'));
+    const backend = new RecordingBackend();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      { bindWorkspaceRoot } as unknown as AgentFileService,
+      () => backend,
+    );
+    const owner = browserOwner();
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Use an absolute file path.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(bindWorkspaceRoot).toHaveBeenCalledTimes(1);
+    expect(backend.sendInputs[0]?.gateway.context.workspace).toMatchObject({ root: '/' });
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      fileAccessMode: 'full-access',
+      fileAccessRoot: '/',
+    });
+  });
+
+  it('uses an absolute default file root when an SSH shell reports cwd as tilde', async () => {
+    const sessions = new FakeSessions();
+    sessions.session = {
+      ...sessions.session,
+      cwd: '~',
+      workspace: undefined,
+    };
+    const bindWorkspaceRoot = vi.fn().mockResolvedValue('/');
+    const backend = new RecordingBackend();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      { bindWorkspaceRoot } as unknown as AgentFileService,
+      () => backend,
+    );
+    const owner = browserOwner();
+
+    expect(service.activateBackend(owner, {
+      terminalId: 'terminal',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+    })).toMatchObject({
+      fileAccessMode: 'full-access',
+      fileAccessRoot: '/',
+    });
+
+    service.setReviewMode(owner, {
+      terminalId: 'terminal',
+      mode: 'complete',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+      completeAccessConfirmed: true,
+    });
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Inspect an absolute path.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(bindWorkspaceRoot).toHaveBeenCalledTimes(1);
+    expect(backend.sendInputs[0]?.gateway.context.workspace).toMatchObject({ root: '/' });
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      reviewMode: 'complete',
+      fileAccessMode: 'full-access',
+      fileAccessRoot: '/',
+      error: undefined,
+    });
+  });
+
   it('resumes a Generic backend thread from the latest persisted turn', async () => {
     const sessions = new FakeSessions();
     sessions.session = {
@@ -1767,7 +1869,7 @@ describe('AgentService shared-terminal controls', () => {
     expect(() => service.assertWorkspaceChangeAllowed(owner, 'terminal')).not.toThrow();
   });
 
-  it('binds Workspace to read-write access and Full Takeover to full filesystem access', () => {
+  it('keeps full file capability in every atomic review mode while Workspace only selects the default root', () => {
     const sessions = new FakeSessions();
     sessions.session = {
       ...sessions.session,
@@ -1795,9 +1897,10 @@ describe('AgentService shared-terminal controls', () => {
     });
     expect(disabled).toMatchObject({
       fullTakeover: false,
-      fileAccessMode: 'read-write',
+      reviewMode: 'all',
+      fileAccessMode: 'full-access',
       fileAccessRoot: '/work',
-      fileAccessPolicy: { fullAccess: false, read: true, write: true, create: true, delete: true },
+      fileAccessPolicy: { fullAccess: true, read: true, write: true, create: true, delete: true },
     });
 
     sessions.session = {
@@ -1805,9 +1908,93 @@ describe('AgentService shared-terminal controls', () => {
       workspace: { backend: 'sftp', root: '/replacement', hostId: 'host' },
     };
     expect(service.syncWorkspaceAccess(owner, 'terminal')).toMatchObject({
-      fileAccessMode: 'read-write',
+      fileAccessMode: 'full-access',
       fileAccessRoot: '/replacement',
     });
+  });
+
+  it('switches All Review, Risk Review, and Complete Access as one atomic runtime state', () => {
+    const sessions = new FakeSessions();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+    );
+    const owner = browserOwner();
+    const backend = { kind: 'generic-provider', providerId: 'provider' } as const;
+
+    const risky = service.setReviewMode(owner, {
+      terminalId: 'terminal', mode: 'risky', backend,
+    });
+    expect(risky).toMatchObject({
+      reviewMode: 'risky', fullTakeover: false, fileAccessMode: 'full-access',
+      fileAccessPolicy: { fullAccess: true, read: true, write: true, create: true, delete: true },
+    });
+    expect(() => service.setReviewMode(owner, {
+      terminalId: 'terminal', mode: 'complete', backend,
+    })).toThrow('明确确认');
+    const complete = service.setReviewMode(owner, {
+      terminalId: 'terminal', mode: 'complete', backend, completeAccessConfirmed: true,
+    });
+    expect(complete).toMatchObject({
+      reviewMode: 'complete', fullTakeover: true, fileAccessMode: 'full-access',
+    });
+    const all = service.setReviewMode(owner, {
+      terminalId: 'terminal', mode: 'all', backend,
+    });
+    expect(all).toMatchObject({
+      reviewMode: 'all', fullTakeover: false, fileAccessMode: 'full-access',
+    });
+  });
+
+  it('applies the atomic mode to real file-tool review requests', async () => {
+    const backend = new FileReviewBackend([
+      { toolName: 'file_stat', operation: 'stat', target: '/tmp/item' },
+      { toolName: 'file_delete', operation: 'delete', target: '/tmp/one.txt', recursive: false },
+      { toolName: 'file_delete', operation: 'delete', target: '/tmp/tree', recursive: true },
+    ]);
+    const sessions = new FakeSessions();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      () => backend,
+    );
+    const owner = browserOwner();
+    const backendRef = { kind: 'generic-provider', providerId: 'provider' } as const;
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'stat', backend: backendRef });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
+    const allApproval = service.getState(owner, 'terminal')!.pendingApproval!;
+    expect(allApproval).toMatchObject({
+      kind: 'file-operation',
+      fileOperation: { toolName: 'file_stat', operation: 'stat' },
+    });
+    service.resolveApproval(owner, {
+      terminalId: 'terminal', approvalId: allApproval.id, decision: 'execute',
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    service.setReviewMode(owner, { terminalId: 'terminal', mode: 'risky', backend: backendRef });
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'delete one', backend: backendRef });
+    await waitFor(() => backend.approvals.length === 2);
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    expect(service.getState(owner, 'terminal')?.pendingApproval).toBeUndefined();
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'delete tree', backend: backendRef });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
+    const recursiveApproval = service.getState(owner, 'terminal')!.pendingApproval!;
+    expect(recursiveApproval).toMatchObject({
+      kind: 'file-operation',
+      fileOperation: { toolName: 'file_delete', recursive: true },
+    });
+    service.resolveApproval(owner, {
+      terminalId: 'terminal', approvalId: recursiveApproval.id, decision: 'reject',
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(backend.approvals).toEqual([true, true, false]);
   });
 
   it('maps legacy file-access modes to ephemeral policies and returns isolated snapshots', async () => {
@@ -1939,7 +2126,7 @@ describe('AgentService shared-terminal controls', () => {
     expect(canonicalizeAccessRoot).toHaveBeenCalledTimes(3);
   });
 
-  it('requires an explicit confirmation for Full Access and still requires a Workspace Root', async () => {
+  it('requires an explicit confirmation for Full Access and works without a Workspace', async () => {
     const sessions = new FakeSessions();
     sessions.session = {
       ...sessions.session,
@@ -1983,18 +2170,24 @@ describe('AgentService shared-terminal controls', () => {
     });
     expect(canonicalizeAccessRoot).not.toHaveBeenCalled();
 
-    const missingWorkspaceService = new AgentService(
+    const noWorkspaceSessions = new FakeSessions();
+    const bindDefaultFileRoot = vi.fn().mockResolvedValue('/home/tester/project');
+    const noWorkspaceService = new AgentService(
       new FakeTerminals() as unknown as TerminalService,
-      new FakeSessions() as unknown as SessionManager,
+      noWorkspaceSessions as unknown as SessionManager,
       providerStore(),
       {
-        bindWorkspaceRoot: vi.fn().mockRejectedValue(new Error('请先设置 Workspace Root。')),
+        bindWorkspaceRoot: bindDefaultFileRoot,
       } as unknown as AgentFileService,
     );
-    await expect(missingWorkspaceService.setFileAccess(browserOwner(), {
+    await expect(noWorkspaceService.setFileAccess(browserOwner(), {
       ...request,
       fullAccessConfirmed: true,
-    })).rejects.toThrow('请先设置 Workspace Root');
+    })).resolves.toMatchObject({
+      fileAccessMode: 'full-access',
+      fileAccessRoot: '/home/tester/project',
+    });
+    expect(bindDefaultFileRoot).toHaveBeenCalledTimes(1);
   });
 
   it('rejects stale and asynchronously changed Workspace roots without granting access', async () => {
@@ -2048,7 +2241,7 @@ describe('AgentService shared-terminal controls', () => {
     resolveCanonical!('/scope');
     await expect(pending).rejects.toThrow('状态已变化');
     expect(service.getState(owner, 'terminal')).toMatchObject({
-      fileAccessMode: 'read-write',
+      fileAccessMode: 'full-access',
       fileAccessRoot: '/work',
     });
     expect(sessions.audits.filter((entry) => entry.type === 'file_permission_changed'))
@@ -2125,61 +2318,7 @@ describe('AgentService shared-terminal controls', () => {
     await expect(pendingGrant).rejects.toThrow('状态已变化');
     expect(service.getState(owner, 'terminal')).toMatchObject({
       state: 'FAILED',
-      fileAccessMode: 'off',
-      fileAccessRoot: undefined,
-    });
-  });
-
-  it('does not let a pending grant cross a Generic Provider runtime switch', async () => {
-    const profiles = new Map([
-      ['provider-a', readyProviderProfile('provider-a')],
-      ['provider-b', readyProviderProfile('provider-b', { isDefault: false })],
-    ]);
-    const providers = {
-      get: (providerId: string) => {
-        const profile = profiles.get(providerId);
-        if (!profile) throw new Error('Provider not found.');
-        return profile;
-      },
-      list: () => [...profiles.values()],
-    } as unknown as ProviderStore;
-    const sessions = new FakeSessions();
-    sessions.session = {
-      ...sessions.session,
-      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
-    };
-    let resolveBinding: ((root: string) => void) | undefined;
-    const bindWorkspaceRoot = vi.fn(() => new Promise<string>((resolve) => {
-      resolveBinding = resolve;
-    }));
-    const backendAdapter = new RecordingBackend();
-    const service = new AgentService(
-      new FakeTerminals() as unknown as TerminalService,
-      sessions as unknown as SessionManager,
-      providers,
-      { bindWorkspaceRoot } as unknown as AgentFileService,
-      () => backendAdapter,
-    );
-    const owner = browserOwner();
-    const pendingGrant = service.setFileAccess(owner, {
-      terminalId: 'terminal',
-      mode: 'full-access',
-      backend: { kind: 'generic-provider', providerId: 'provider-a' },
-      fullAccessConfirmed: true,
-    });
-    await waitFor(() => bindWorkspaceRoot.mock.calls.length === 1);
-    service.sendPrompt(owner, {
-      terminalId: 'terminal',
-      prompt: 'switch provider',
-      backend: { kind: 'generic-provider', providerId: 'provider-b' },
-    });
-    resolveBinding!('/work');
-
-    await expect(pendingGrant).rejects.toThrow('状态已变化');
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
-    expect(service.getState(owner, 'terminal')).toMatchObject({
-      backend: { kind: 'generic-provider', providerId: 'provider-b' },
-      fileAccessMode: 'read-write',
+      fileAccessMode: 'full-access',
       fileAccessRoot: '/work',
     });
   });
@@ -2381,7 +2520,7 @@ describe('AgentService shared-terminal controls', () => {
 
     expect(service.getState(owner, 'terminal')).toMatchObject({
       threadId: originalThreadId,
-      fileAccessMode: 'read-only',
+      fileAccessMode: 'full-access',
     });
     expect(backendAdapter.priorMessagesAtSend[1]).not.toEqual([]);
   });
@@ -2510,6 +2649,16 @@ describe('AgentService shared-terminal controls', () => {
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'old recipient turn', backend });
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
     const oldThreadId = service.getState(owner, 'terminal')!.threadId;
+    service.setReviewMode(owner, {
+      terminalId: 'terminal',
+      mode: 'complete',
+      backend,
+      completeAccessConfirmed: true,
+    });
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      reviewMode: 'complete',
+      fullTakeover: true,
+    });
     await service.setFileAccess(owner, {
       terminalId: 'terminal', mode: 'read-only', backend,
     });
@@ -2524,7 +2673,9 @@ describe('AgentService shared-terminal controls', () => {
     })).toThrow('旧对话未发送');
     expect(backendAdapter.sendInputs).toHaveLength(1);
     expect(service.getState(owner, 'terminal')).toMatchObject({
-      fileAccessMode: 'off',
+      fileAccessMode: 'full-access',
+      reviewMode: 'all',
+      fullTakeover: false,
       messages: [],
     });
     expect(service.getState(owner, 'terminal')!.threadId).not.toBe(oldThreadId);
@@ -2532,11 +2683,13 @@ describe('AgentService shared-terminal controls', () => {
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'new recipient', backend });
     await waitFor(() => backendAdapter.sendInputs.length === 2);
     expect(backendAdapter.priorMessagesAtSend[1]).toEqual([]);
-    expect(backendAdapter.sendInputs[1].gateway.context.permissions.workspace.enabled).toBe(false);
-    expect(sessions.audits).toContainEqual({
+    expect(backendAdapter.sendInputs[1].gateway.context.permissions.workspace.enabled).toBe(true);
+    expect(sessions.audits).toContainEqual(expect.objectContaining({
       type: 'file_permission_changed',
-      details: { mode: 'off', reason: 'provider_changed', ephemeral: true },
-    });
+      details: expect.objectContaining({
+        mode: 'full-access', reason: 'provider_changed', ephemeral: true,
+      }),
+    }));
   });
 
   it('allows off to revoke authority after the provider is removed or becomes unavailable', async () => {
@@ -2806,14 +2959,18 @@ describe('AgentService shared-terminal controls', () => {
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
   });
 
-    it('binds ephemeral file permission and does not use a hidden command or legacy mutation audit', async () => {
+    it('binds direct file tools with full account capability and does not use a hidden command', async () => {
     const sessions = new FakeSessions();
-    sessions.session = { ...sessions.session, cwd: '/work' };
+    sessions.session = {
+      ...sessions.session,
+      cwd: '/work',
+      workspace: { backend: 'sftp', root: '/work', hostId: 'host' },
+    };
     const terminals = new FakeTerminals();
     const provider = new FakeProvider([
       { message: { role: 'assistant', content: null, toolCalls: [{
         id: 'write-1',
-        name: 'workspace_write_file',
+        name: 'file_write',
         arguments: JSON.stringify({
           path: 'new.ts', content: 'export {};\n', expectedSha256: null,
         }),
@@ -2841,7 +2998,12 @@ describe('AgentService shared-terminal controls', () => {
       backend: { kind: 'generic-provider', providerId: 'provider' },
     });
     expect(permission).toMatchObject({ fileAccessMode: 'read-write', fileAccessRoot: '/work' });
-    sessions.session = { ...sessions.session, cwd: '/' };
+    service.setReviewMode(owner, {
+      terminalId: 'terminal',
+      mode: 'complete',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+      completeAccessConfirmed: true,
+    });
     service.sendPrompt(owner, {
       terminalId: 'terminal', prompt: 'create it',
       backend: { kind: 'generic-provider', providerId: 'provider' },
@@ -2852,9 +3014,9 @@ describe('AgentService shared-terminal controls', () => {
     expect(fileService.writeText).toHaveBeenCalledWith(
       owner, 'terminal', 'new.ts', 'export {};\n', null, '/work',
       expect.objectContaining({
-        readablePaths: ['/work'],
-        writablePaths: ['/work'],
-        fullAccess: false,
+        readablePaths: [],
+        writablePaths: [],
+        fullAccess: true,
         assertLive: expect.any(Function),
       }),
     );
@@ -3189,7 +3351,7 @@ describe('AgentService shared-terminal controls', () => {
     expect(toolResult?.content).toContain('User rejected');
   });
 
-  it('rejects an equivalent AI file command before approval and returns a structured correction', async () => {
+  it('treats terminal filesystem commands like ordinary reviewed commands', async () => {
     const provider = new FakeProvider([
       toolCall('call-file-read', 'cat README.md'),
       { message: { role: 'assistant', content: 'I will use the Workspace tool.' } },
@@ -3219,24 +3381,21 @@ describe('AgentService shared-terminal controls', () => {
     });
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Read README.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
+    const approval = service.getState(owner, 'terminal')!.pendingApproval!;
+    expect(approval).toMatchObject({ kind: 'terminal-command', command: 'cat README.md' });
+    service.resolveApproval(owner, {
+      terminalId: 'terminal', approvalId: approval.id, decision: 'reject',
+    });
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
 
     expect(terminals.executions).toEqual([]);
     expect(service.getState(owner, 'terminal')?.pendingApproval).toBeUndefined();
     const result = provider.requests[1]!.messages.find((message) => message.role === 'tool');
-    expect(JSON.parse(result!.content)).toMatchObject({
-      ok: false,
-      code: 'WORKSPACE_TOOL_REQUIRED',
-      categories: ['read'],
-      suggestedTools: ['workspace_read_file'],
-      retryCount: 1,
-      halted: false,
-    });
-    expect(sessions.audits.find((audit) => audit.type === 'file_command_policy')?.details)
-      .not.toHaveProperty('command');
+    expect(JSON.parse(result!.content)).toMatchObject({ ok: false, status: 'rejected' });
   });
 
-  it('requires an exact file-tool bypass approval even while Full Takeover is active', async () => {
+  it('lets Complete Access run a terminal filesystem command without a second approval', async () => {
     const provider = new FakeProvider([
       toolCall('call-bypass', 'cat /var/log/app.log'),
       { message: { role: 'assistant', content: 'Read the log.' } },
@@ -3256,26 +3415,11 @@ describe('AgentService shared-terminal controls', () => {
     });
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Read the log.' });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
-    const approval = service.getState(owner, 'terminal')!.pendingApproval!;
-    expect(approval).toMatchObject({ kind: 'workspace-tool-bypass', status: 'waiting' });
-    expect(() => service.setFullTakeover(owner, {
-      terminalId: 'terminal',
-      enabled: true,
-      providerId: 'provider',
-      approvalId: approval.id,
-    })).toThrow(/逐次明确批准/u);
-    service.resolveApproval(owner, {
-      terminalId: 'terminal', approvalId: approval.id, decision: 'execute',
-    });
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
 
     expect(terminals.executions).toEqual([{ command: 'cat /var/log/app.log', actor: 'ai' }]);
     expect(service.getState(owner, 'terminal')?.fullTakeover).toBe(true);
-    expect(sessions.audits.some((audit) => (
-      audit.type === 'file_command_policy'
-      && audit.details?.action === 'exception_approved'
-    ))).toBe(true);
+    expect(service.getState(owner, 'terminal')?.pendingApproval).toBeUndefined();
   });
 
   it('keeps explicitly edited bypass commands attributable to the user', async () => {
@@ -3308,10 +3452,7 @@ describe('AgentService shared-terminal controls', () => {
     expect(terminals.executions).toEqual([{
       command: 'printf reviewed', actor: 'user_modified_ai_command',
     }]);
-    expect(sessions.audits.some((audit) => (
-      audit.type === 'file_command_policy'
-      && audit.details?.action === 'exception_edited_and_approved'
-    ))).toBe(true);
+    expect(sessions.audits.some((audit) => audit.type === 'command_edited')).toBe(true);
   });
 
   it('runs multiple commands without approval only after explicit Full Takeover', async () => {

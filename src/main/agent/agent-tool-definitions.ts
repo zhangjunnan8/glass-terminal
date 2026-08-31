@@ -46,6 +46,10 @@ const tool = (
 const path = string({ minLength: 1, maxLength: 4_096 });
 const optionalPath = string({ maxLength: 4_096 });
 const sha256 = string({ pattern: '^[a-fA-F0-9]{64}$' });
+const riskProperties = {
+  riskLevel: { type: 'string', enum: ['normal', 'elevated'] },
+  riskReason: string({ maxLength: 1_024 }),
+};
 
 function terminalTools(shellKind?: ShellProfile['kind']): AgentFunctionToolDefinition[] {
   const shellLabel = shellKind ?? 'current';
@@ -53,12 +57,12 @@ function terminalTools(shellKind?: ShellProfile['kind']): AgentFunctionToolDefin
   tool(
     'terminal_execute',
     `Request execution of one command in the same visible ${shellLabel} terminal. `
-      + 'User approval is required unless Full Takeover is explicitly active. '
-      + 'Filesystem reads, searches, listings, and stat checks must use authorized workspace_* tools; '
-      + 'Full Takeover does not bypass this policy, and a non-equivalent exception requires exact one-time approval.',
+      + 'Approval follows the selected mode: all operations, risky operations, or Complete Access. '
+      + 'Use the direct file_* tools for filesystem work so results stay structured and do not pollute the terminal.',
     object({
       command: string({ minLength: 1, description: 'The single shell command to execute.' }),
       reason: string({ description: 'Optional one-line justification.' }),
+      riskLevel: { type: 'string', enum: ['normal', 'elevated'], description: 'Set elevated to request review; it can never reduce software-classified risk.' },
     }, ['command']),
   ),
   tool(
@@ -79,34 +83,37 @@ function terminalTools(shellKind?: ShellProfile['kind']): AgentFunctionToolDefin
 
 const WORKSPACE_READ_TOOLS: readonly AgentFunctionToolDefinition[] = [
   tool(
-    'workspace_list',
-    'List one bounded directory inside the explicit Workspace Root without running a shell command.',
+    'file_list',
+    'List one bounded directory directly. Relative paths start at the informational Workspace/default file root; absolute paths are supported.',
     object({
-      path: { ...optionalPath, description: 'Directory path relative to the Workspace Root.' },
+      ...riskProperties,
+      path: { ...optionalPath, description: 'Directory path relative to the default file root; absolute paths are accepted.' },
     }),
   ),
   tool(
-    'workspace_read_file',
-    'Read one needed, bounded text file inside the Workspace Root and return its SHA-256. '
+    'file_read',
+    'Read one needed, bounded text file directly and return its SHA-256. '
       + 'Supports UTF-8 and Windows GBK (ANSI) encodings; edits keep the file\'s original encoding. '
       + 'Use startLine/endLine for a targeted range and pass nextCursor to continue a truncated page. '
-      + 'Prefer small reads; never use cat/Get-Content/type in the terminal for this.',
+      + 'Prefer small reads; never use cat/Get-Content/type in the terminal for this. Sensitive paths may require approval.',
     object({
-      path: { ...path, description: 'File path relative to the Workspace Root.' },
+      ...riskProperties,
+      path: { ...path, description: 'File path relative to the default file root; absolute paths are accepted.' },
       startLine: integer({ minimum: 1, maximum: 10_000_000 }),
       endLine: integer({ minimum: 1, maximum: 10_000_000 }),
       cursor: string({ minLength: 1, maxLength: 2_048 }),
     }, ['path']),
   ),
   tool(
-    'workspace_stat',
-    'Inspect one file, directory, or symbolic link inside the Workspace Root without reading its contents.',
-    object({ path }, ['path']),
+    'file_stat',
+    'Inspect one file, directory, or symbolic link without reading its contents.',
+    object({ ...riskProperties, path }, ['path']),
   ),
   tool(
-    'workspace_search',
-    'Search bounded UTF-8 workspace files for literal text and return structured line/column previews. Pass nextCursor to continue a truncated result page. Use this instead of grep in the terminal.',
+    'file_search',
+    'Search bounded text files for literal text and return structured line/column previews. Pass nextCursor to continue a truncated result page.',
     object({
+      ...riskProperties,
       query: string({ minLength: 1, maxLength: 4_096 }),
       path: optionalPath,
       maxResults: integer({ minimum: 1, maximum: 200 }),
@@ -114,9 +121,10 @@ const WORKSPACE_READ_TOOLS: readonly AgentFunctionToolDefinition[] = [
     }, ['query']),
   ),
   tool(
-    'workspace_glob',
-    'Find bounded workspace paths matching a glob pattern; pass nextCursor to continue a truncated result page. Do not run find, dir, or another shell command.',
+    'file_glob',
+    'Find bounded paths matching a glob pattern; pass nextCursor to continue a truncated result page.',
     object({
+      ...riskProperties,
       pattern: string({ minLength: 1, maxLength: 4_096 }),
       path: optionalPath,
       maxResults: integer({ minimum: 1, maximum: 500 }),
@@ -127,11 +135,12 @@ const WORKSPACE_READ_TOOLS: readonly AgentFunctionToolDefinition[] = [
 
 const WORKSPACE_WRITE_TOOLS: readonly AgentFunctionToolDefinition[] = [
   tool(
-    'workspace_apply_patch',
+    'file_patch',
     'Preferred way to modify an existing file. Atomically apply exact, unique text replacements and return a diff. '
       + 'Works on UTF-8 and Windows GBK (ANSI) text; the file keeps its original encoding on write-back. '
-      + 'expectedSha256 must come from the latest workspace_read_file; re-read after a conflict.',
+      + 'expectedSha256 must come from the latest file_read; re-read after a conflict.',
     object({
+      ...riskProperties,
       path,
       expectedSha256: sha256,
       patches: {
@@ -146,28 +155,29 @@ const WORKSPACE_WRITE_TOOLS: readonly AgentFunctionToolDefinition[] = [
     }, ['path', 'expectedSha256', 'patches']),
   ),
   tool(
-    'workspace_write_file',
-    'Atomically create one bounded UTF-8 text file. For an existing file prefer workspace_apply_patch; pass null only when the path must not exist.',
+    'file_write',
+    'Atomically create or replace one bounded UTF-8 text file. For an existing file prefer file_patch; pass null only when the path must not exist.',
     object({
+      ...riskProperties,
       path,
       content: string({ maxLength: 131_072 }),
       expectedSha256: { anyOf: [sha256, { type: 'null' }] },
     }, ['path', 'content', 'expectedSha256']),
   ),
   tool(
-    'workspace_mkdir',
-    'Create one directory inside the Workspace Root without running a shell command.',
-    object({ path }, ['path']),
+    'file_mkdir',
+    'Create one directory directly without running a shell command.',
+    object({ ...riskProperties, path }, ['path']),
   ),
   tool(
-    'workspace_rename',
-    'Rename or move one workspace path to another path inside the same Workspace Root.',
-    object({ source: path, destination: path }, ['source', 'destination']),
+    'file_rename',
+    'Rename or move one path to another path on the same filesystem.',
+    object({ ...riskProperties, source: path, destination: path }, ['source', 'destination']),
   ),
   tool(
-    'workspace_delete',
-    'Delete one workspace path. Recursive directory deletion must be explicitly requested.',
-    object({ path, recursive: { type: 'boolean' } }, ['path']),
+    'file_delete',
+    'Delete one path. Recursive directory deletion must be explicitly requested and is reviewed in All/Risky modes.',
+    object({ ...riskProperties, path, recursive: { type: 'boolean' } }, ['path']),
   ),
 ];
 

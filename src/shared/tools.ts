@@ -121,7 +121,7 @@ export interface TerminalReadPage {
 }
 
 export interface TerminalTool {
-  execute(command: string, reason?: string): Promise<TerminalCommandResult>;
+  execute(command: string, reason?: string, agentRisk?: 'normal' | 'elevated'): Promise<TerminalCommandResult>;
   sendInput(input: string): Promise<void>;
   interrupt(commandId?: string): Promise<void>;
   readVisible(options?: { maxChars?: number }): Promise<string>;
@@ -233,9 +233,20 @@ export interface WorkspaceTool {
   delete(path: string, options?: { recursive?: boolean }): Promise<void>;
 }
 
+export interface FileToolReviewRequest {
+  toolName: string;
+  operation: 'list' | 'read' | 'stat' | 'search' | 'glob' | 'write' | 'patch' | 'mkdir' | 'rename' | 'delete';
+  target: string;
+  recursive?: boolean;
+  /** The model may raise risk, but the application never accepts it as a downgrade. */
+  agentRisk?: 'normal' | 'elevated';
+  riskReason?: string;
+}
+
 /** Harnesses depend on this boundary, never on xterm, node-pty, ssh2, or Electron UI. */
 export interface ToolGateway {
   readonly context: SessionToolContext;
   readonly terminal: TerminalTool;
   readonly workspace?: WorkspaceTool;
+  requestFileOperation?(request: FileToolReviewRequest): Promise<boolean>;
 }

@@ -12,8 +12,8 @@ Glass Terminal 是一个 **Windows-first、终端优先、远程设备优先**�
 ![Electron](https://img.shields.io/badge/Electron-43-2b2e3a?logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178c6?logo=typescript&logoColor=white)
-![Version](https://img.shields.io/badge/version-0.1.0--beta.1-blue)
-![Tests](https://img.shields.io/badge/tests-682%20passed-brightgreen)
+![Version](https://img.shields.io/badge/version-0.1.0--beta.4-blue)
+![Tests](https://img.shields.io/badge/tests-Vitest-brightgreen)
 ![Status](https://img.shields.io/badge/status-beta-blue)
 
 </div>
@@ -36,7 +36,7 @@ AI IDE、Remote IDE 和通用 Agent Harness 主要围绕代码工作区与 Agent
 
 > Glass Terminal 不替代单片机本身的物理调试链路。对于不能运行 SSH 的 MCU，它连接的是挂载该设备、烧录器或串口的控制主机。
 
-> **当前模式边界：**OpenAI 兼容 Provider 通过受控工具将获批命令只执行一次于当前可见 PTY/SSH；本地 Workspace 使用本机文件工具，SSH Workspace 复用现有连接的 SFTP 通道。
+> **当前模式边界：**OpenAI 兼容 Provider 通过受控工具将命令只执行一次于当前可见 PTY/SSH；本地文件使用本机文件 API，远程文件复用现有连接的 SFTP 通道。Workspace 只提供工作范围提示，不构成权限边界。
 
 ## ✨ 核心特性
 
@@ -46,11 +46,12 @@ AI IDE、Remote IDE 和通用 Agent Harness 主要围绕代码工作区与 Agent
 | 🪶 **远程零侵入** | 目标主机无需安装 Glass Terminal、远程 IDE 或 Agent Runtime；会话集成不修改远端 PowerShell Profile、不落地脚本 |
 | 🤖 **开放模型接入** | 基于 LangChain 的 OpenAI 兼容 Provider，可接入 DeepSeek / GLM / MiniMax / OpenAI 等兼容端点，并支持手动填写模型 ID |
 | 🧠 **有界上下文记忆** | Generic Provider 按模型窗口保守估算；满阈值生成经校验的结构化摘要，用户还可审阅、编辑和合并独立的短记忆卡片 |
-| ✅ **命令审批** | AI 请求执行命令需你确认；支持编辑后执行、拒绝 |
-| 🎮 **AI 全接管 / 人工接管** | 显式确认后 Full Takeover 可连续执行命令，Take Control 可随时抢回当前终端；SSH Host 当前会记住该偏好 |
+| ✅ **三档统一审核** | “全部审核”覆盖每条命令和文件操作；“风险审核”由软件最终判定未知/危险命令、敏感读取与递归删除；“完全访问”在显式橙色确认后自动执行 |
+| ⏹ **即时停止** | 任务运行时发送键原位变为红色停止键；审批卡固定在输入框上方，不会被阶段输出挤走 |
 | 🌐 **SSH 远程主机** | 密码 / 键盘交互 / 私钥 / Windows OpenSSH 代理认证；多主机、文件夹分组、收藏 |
 | 🪟 **远程 Shell 适配** | 每台主机可指定 Linux/POSIX、PowerShell 或 cmd；PowerShell 使用会话级 Shell Integration 获取命令边界、退出码和 cwd，可见 VT 流不做文本猜测或重绘过滤 |
-| 📁 **Workspace 文件工具** | 两种后端均支持只读 / 读写绑定根；Generic 另有显式风险确认的 FULL FILESYSTEM ACCESS；`read / search / glob / apply_patch / write` 全程显示 diff |
+| 📁 **直接文件工具** | `file_list/read/stat/search/glob/write/patch/mkdir/rename/delete` 在三种模式下完整可用；无需先设置 Workspace，写入保留 diff 与审计 |
+| 🧾 **任务摘要视图** | 主会话突出用户请求与最终任务总结；运行中实时展开阶段说明和工具活动，最终总结到达后才自动收进“执行过程” |
 | 🔐 **安全优先** | 凭据不进模型上下文与明文日志；密钥库 AES-256-GCM 加密；敏感认证交接；无任何遥测 |
 | 💾 **持久化与会话** | 会话历史、审计日志（audit JSONL）、断线重连、终端回放 |
 | 🌗 **主题** | 暗色 / 亮色 / 跟随系统 三态循环 |
@@ -77,7 +78,7 @@ npm run dev
 
 ```bash
 npm run typecheck   # TypeScript 类型检查
-npm test            # Vitest 全量测试（70 个文件通过、4 个跳过；676 项通过、13 项跳过）
+npm test            # Vitest 全量测试
 npm run build       # 类型检查 + 全量测试 + renderer/Electron 生产编译
 ```
 

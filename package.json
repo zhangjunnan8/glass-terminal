@@ -1,6 +1,6 @@
 {
   "name": "glass-terminal",
-  "version": "0.1.0-beta.3",
+  "version": "0.1.0-beta.4",
   "private": true,
   "description": "Windows-first visible AI agent terminal for local and SSH workflows",
   "license": "MIT",

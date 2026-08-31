@@ -16,6 +16,7 @@ import {
   resolve,
   sep,
 } from 'node:path';
+import { homedir } from 'node:os';
 import { posix } from 'node:path';
 import type { WebContents } from 'electron';
 import type {
@@ -394,18 +395,48 @@ export class AgentFileService {
   ) {}
 
   async bindWorkspaceRoot(owner: WebContents, terminalId: string): Promise<string> {
+    return this.bindFileRoot(owner, terminalId);
+  }
+
+  /**
+   * Bind the informational Workspace when present, otherwise the Session cwd
+   * (or a conservative filesystem root). This selects the default base for
+   * relative paths; it is not an authorization boundary in Beta.4.
+   */
+  async bindFileRoot(owner: WebContents, terminalId: string): Promise<string> {
     const session = this.sessions.sessionForTerminal(owner, terminalId);
     if (!session) throw new Error('文件工具需要正式会话。');
-    const workspace = session.workspace;
-    if (!workspace) throw new Error('请先设置 Workspace Root。');
+    const savedWorkspace = session.workspace;
+    const workspace: WorkspaceBinding = savedWorkspace ?? (session.transport === 'ssh'
+      ? {
+        backend: 'sftp',
+        root: session.cwd && posix.isAbsolute(session.cwd) ? session.cwd : '/',
+        ...(session.hostId ? { hostId: session.hostId } : {}),
+      }
+      : {
+        backend: 'local',
+        root: session.cwd && isAbsolute(session.cwd) ? session.cwd : homedir(),
+      });
     assertWorkspaceMatchesSession(session.transport, session.hostId, workspace);
     if (session.transport === 'ssh') {
-      if (!posix.isAbsolute(workspace.root)) {
+      if (savedWorkspace && !posix.isAbsolute(workspace.root)) {
         throw new Error('远程 Workspace Root 必须是绝对路径。');
       }
       return this.remoteFilesystems.withFilesystem(owner, terminalId, async (filesystem) => {
-        const root = await filesystem.realpath(workspace.root);
-        assertBoundRootUnchanged(workspace.root, root, 'ssh');
+        // POSIX shells may report `~`, while Windows OpenSSH shells report a
+        // drive path that is not the SFTP server's absolute-path spelling.
+        // With no saved Workspace, ask SFTP for its own current absolute path
+        // instead of treating the shell display value as a policy root.
+        const requestedRoot = savedWorkspace
+          ? workspace.root
+          : session.cwd && posix.isAbsolute(session.cwd) ? session.cwd : '.';
+        const root = await filesystem.realpath(requestedRoot);
+        if (!posix.isAbsolute(root)) {
+          throw new Error('远程默认文件路径解析结果不是绝对路径。');
+        }
+        if (savedWorkspace || requestedRoot !== '.') {
+          assertBoundRootUnchanged(requestedRoot, root, 'ssh');
+        }
         const attributes = await filesystem.stat(root);
         if (attributes?.type !== 'directory') {
           throw new Error('Workspace Root 不是可访问的目录。');
@@ -1701,10 +1732,6 @@ export class AgentFileService {
     options: { recursive?: boolean; planItems?: number } = {},
   ): OperationAuditTracker {
     const session = this.requireBoundWorkspace(owner, terminalId);
-    if (
-      workspaceRoot !== undefined
-      && !workspaceRootsMatch(session.workspace.root, workspaceRoot, session.transport)
-    ) throw new Error('显式 Workspace Root 与 Session 绑定的 Workspace Root 不一致。');
     const boundRoot = workspaceRoot ?? session.workspace.root;
     let auditSuppressed = false;
     const auditPath = (requestedPath: string): WorkspaceOperationCanonicalPath => {
@@ -1725,16 +1752,13 @@ export class AgentFileService {
         requestedPath,
         authorization,
       );
-      // Workspace and filesystem roots are protected mutation targets, but
-      // the journal deliberately rejects `.` for those scopes because a
-      // successful mutation must never address either root. Preserve an audit
-      // trail for the prepare-time denial without admitting an impossible
-      // canonical mutation coordinate.
+      // The filesystem root remains a structural file-tool guard. Workspace
+      // root mutations are valid in Beta.4 because Workspace is not a boundary.
       if (
         AUDITED_MUTATIONS.has(operation)
         && coordinate.scope !== 'rejected'
         && coordinate.path === '.'
-        && (coordinate.scope === 'workspace' || coordinate.scope === 'filesystem')
+        && coordinate.scope === 'filesystem'
       ) return this.rejectedAuditPath(requestedPath);
       return coordinate;
     };
@@ -2116,12 +2140,19 @@ export class AgentFileService {
     if (workspaceRootsMatch(target.workspaceRoot, target.root, target.transport)) {
       return { root, workspaceRoot: root };
     }
-    const workspaceRoot = await filesystem.realpath(target.workspaceRoot);
-    assertBoundRootUnchanged(target.workspaceRoot, workspaceRoot, target.transport);
-    if ((await filesystem.lstat(workspaceRoot))?.type !== 'directory') {
-      throw new Error('Workspace Root 已不可用。');
+    try {
+      const workspaceRoot = await filesystem.realpath(target.workspaceRoot);
+      assertBoundRootUnchanged(target.workspaceRoot, workspaceRoot, target.transport);
+      if ((await filesystem.lstat(workspaceRoot))?.type !== 'directory') {
+        throw new Error('Workspace Root 已不可用。');
+      }
+      return { root, workspaceRoot };
+    } catch (error) {
+      // Full Access is rooted at the filesystem/account boundary. A stale
+      // informational Workspace must not block an unrelated absolute target.
+      if (!target.authorization.fullAccess) throw error;
+      return { root, workspaceRoot: target.workspaceRoot };
     }
-    return { root, workspaceRoot };
   }
 
   private async prepareTraversalTarget(
@@ -2191,7 +2222,7 @@ export class AgentFileService {
 
   private assertProtectedMutationTarget(
     flavor: 'local' | 'ssh',
-    workspaceRoot: string,
+    _workspaceRoot: string,
     candidate: string,
     sessionId: string,
   ): void {
@@ -2201,11 +2232,8 @@ export class AgentFileService {
     if (workspaceRootsMatch(candidate, filesystemRoot, flavor)) {
       throw new Error('不允许修改或删除文件系统根目录。');
     }
-    // Deleting or renaming an ancestor would also remove the bound Workspace
-    // Root, so protect both the exact root and every containing directory.
-    if (this.pathIsWithin(flavor, candidate, workspaceRoot)) {
-      throw new Error('不允许修改或删除 Workspace Root。');
-    }
+    // Workspace is only an informational/default-path hint in Beta.4. It must
+    // not protect itself or an ancestor from an otherwise authorized mutation.
     if (
       flavor === 'local'
       && this.protectedStorageRelationship(sessionId, candidate).protected
@@ -2357,12 +2385,6 @@ export class AgentFileService {
     assertBoundedPath(requestedPath);
     const session = this.requireBoundWorkspace(owner, terminalId);
     const { workspace } = session;
-    if (
-      workspaceRoot !== undefined
-      && !workspaceRootsMatch(workspace.root, workspaceRoot, session.transport)
-    ) {
-      throw new Error('显式 Workspace Root 与 Session 绑定的 Workspace Root 不一致。');
-    }
     const boundRoot = workspaceRoot ?? workspace.root;
     if (session.transport === 'ssh') {
       const workspacePath = posix.normalize(boundRoot);
@@ -2433,8 +2455,16 @@ export class AgentFileService {
   ): BoundWorkspaceSession {
     const session = this.sessions.sessionForTerminal(owner, terminalId);
     if (!session) throw new Error('文件工具需要正式会话。');
-    const workspace = session.workspace;
-    if (!workspace) throw new Error('请先设置 Workspace Root。');
+    const workspace: WorkspaceBinding = session.workspace ?? (session.transport === 'ssh'
+      ? {
+        backend: 'sftp',
+        root: session.cwd && posix.isAbsolute(session.cwd) ? session.cwd : '/',
+        ...(session.hostId ? { hostId: session.hostId } : {}),
+      }
+      : {
+        backend: 'local',
+        root: session.cwd && isAbsolute(session.cwd) ? session.cwd : homedir(),
+      });
     assertWorkspaceMatchesSession(session.transport, session.hostId, workspace);
     return {
       sessionId: session.id,

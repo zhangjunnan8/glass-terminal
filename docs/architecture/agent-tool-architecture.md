@@ -44,9 +44,10 @@ human keyboard -----------------------------------------+             v
   `LangChainBackend` is the current Generic Provider implementation. The former
   in-house `AgentLoop` and `GenericHarnessBackend` were removed.
 - `SessionToolContext` is an immutable snapshot of the Session identifier,
-  terminal binding, optional explicit Workspace Root, Host identity, and
-  granular capabilities. A Workspace Root is never inferred from terminal
-  `cwd`.
+  terminal binding, default relative-path root, Host identity, and capabilities.
+  An explicit Workspace is an informational work-range hint, not a permission
+  boundary. Without one, the root falls back to Session cwd, the SFTP server's
+  current absolute directory, or the local user home directory.
 - `ToolGateway` is created for one live turn. `SharedTerminalTool` revalidates
   the Session/terminal/Host binding and routes execution through the normal
   approval and shared-terminal command path. It also reads the history produced
@@ -58,8 +59,9 @@ human keyboard -----------------------------------------+             v
   `RemoteFilesystemProvider`. Both sit behind the common `FilesystemBackend`
   primitive contract (`RemoteFilesystem` is its SFTP compatibility name).
 - Turn, provider recipient, permission generation, Session connection,
-  terminal identity, Workspace Root, and Host changes revoke the injected
-  tools. In-flight Workspace operations are settled before a turn is released.
+  terminal identity, default root, and Host changes revoke the injected tool
+  lease. The next turn rebinds the current Session, and in-flight file
+  operations are settled before a turn is released.
 
 For SSH, `SessionToolContext` requires the terminal, Session, Workspace binding,
 and SFTP backend to carry the same `hostId`. The remote filesystem provider
@@ -71,24 +73,21 @@ machines.
 
 Terminal permissions are independent `read`, `execute`, `sendInput`, and
 `interrupt` capabilities. Command execution remains owned by `AgentService`,
-including approval, command serialization, cancellation, and Full Takeover;
+including approval, command serialization, cancellation, and the atomic review mode;
 arbitrary `sendInput` is disabled by default.
 
-The current SSH implementation persists the Full Takeover preference on the
-Host after the first explicit risk confirmation, so a later terminal for that
-Host can initialize with Full Takeover enabled. This is current behavior, not a
-turn-scoped permission guarantee; security-sensitive changes must review this
-Host-level persistence and its disable/take-control lifecycle together.
+Beta.4 uses one `reviewMode` for commands and file tools: `all`, `risky`, or
+`complete`. New runtimes start in `all`. Entering Complete Access requires an
+explicit orange confirmation and grants no authority beyond the current OS or
+SSH/SFTP account. Risk Review uses deterministic software classification as the
+final arbiter; the model can raise but never lower risk. Unknown commands,
+sensitive content reads, and recursive deletion fail into exact approval.
 
-Workspace access defaults to `off` and supports `read-only`, `read-write`, and
-explicitly confirmed `full-access` modes. The policy membrane checks
-`read`/`write`/`create`/`delete` independently and enforces canonical absolute
-readable and writable scopes on every call. Full Filesystem Access removes only
-the application's path-range restriction. It does not bypass capability bits,
-OS or SFTP account permissions, same-host checks, protected Session storage,
-symlink/path validation, expected-SHA conflict checks, or operation auditing.
-Grants are fail-closed and bound to the current connected Session and provider
-recipient.
+File tools are always available and use full path capability within the current
+account. Workspace is only an informational default root for relative paths.
+The existing policy membrane still enforces operation capabilities, same-host
+binding, protected Session storage, path/symlink validation, expected-SHA
+conflict checks, bounded recursive deletion, and operation auditing.
 
 ## Journal and activity surfaces
 
@@ -134,13 +133,13 @@ It replaces the in-house `AgentLoop` while keeping every boundary below it intac
   secret store and the recipient revision is fenced, matching `GenericOpenAiProvider`.
 - Tool schemas are derived only from the per-turn `ToolGateway`. LangChain's own
   Shell/LocalShell/ApplyPatch tools are never imported; `terminal_execute` and
-  `workspace_*` are the only tools the model can call. Workspace tool exposure is
-  gated by `fileAccessMode` (off / read-only / read-write) with `PolicyWorkspaceTool`
-  remaining the authoritative per-call enforcement.
+  `file_*` are the only advertised file tools. Legacy `workspace_*` calls remain
+  executable only so persisted conversations can resume. `PolicyWorkspaceTool`
+  remains the authoritative per-call path and mutation-safety enforcement layer.
 - Responses stream over SSE (`assistant_delta` → `assistant_text`), preserving the
   renderer streaming contract and the smoke tests. Tool calls are aggregated from
   streamed chunks via `collapseToolCallChunks`.
-- Each Provider records its model input window (64K default). The renderer shows
+- Each Provider records its model input window (500,736-token default). The renderer shows
   estimated working-context use as a circular meter. Its 100% mark is the safe
   compression threshold (85% of the configured model window), leaving output and
   tool-call headroom rather than waiting for a Provider overflow.
@@ -171,7 +170,7 @@ It replaces the in-house `AgentLoop` while keeping every boundary below it intac
   cursors. Mutating Workspace calls, terminal commands, and path arguments are
   never shortened: a call that cannot fit with its protocol result is rejected
   before execution and asks the model/user to split the operation.
-- Completed `workspace_*` tool bodies are reduced to stable metadata after the next
+- Completed file-tool bodies are reduced to stable metadata after the next
   reasoning step. Normal turns persist only a context delta; a compression or tool
   history rewrite persists a bounded checkpoint. Legacy full-checkpoint events are
   still replayed as checkpoints, so existing conversations remain readable.

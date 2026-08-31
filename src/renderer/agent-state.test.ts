@@ -13,6 +13,7 @@ function view(revision: number, state: AgentSessionView['state']): AgentSessionV
     providerId: 'provider',
     state,
     terminalInputMode: state === 'PAUSED' ? 'human' : 'locked',
+    reviewMode: 'all',
     fullTakeover: false,
     fullTakeoverPreference: false,
     fileAccessMode: 'off',

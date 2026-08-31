@@ -153,8 +153,7 @@ function bridgeWith(rename: DesktopBridge['sessions']['rename']): DesktopBridge 
       removeMemory: vi.fn(),
       getState: vi.fn().mockResolvedValue(undefined),
       resolveApproval: vi.fn(),
-      setFullTakeover: vi.fn(),
-      setFullTakeoverPreference: vi.fn(),
+      setReviewMode: vi.fn(),
       takeover: vi.fn(),
       resolveTakeover: vi.fn(),
       confirmShellReady: vi.fn(),
@@ -331,6 +330,28 @@ describe('renderer host and session dialogs', () => {
       '[data-testid="open-agent-backend-settings"]',
     )!.click());
     expect(bridge.settingsWindow.open).toHaveBeenLastCalledWith('ai');
+  });
+
+  it('starts with the AI header controls collapsed and highlights Provider management', async () => {
+    const bridge = bridgeWith(vi.fn());
+    Object.defineProperty(window, 'aiTerminal', { configurable: true, value: bridge });
+    await act(async () => root.render(<App />));
+    await settle();
+
+    const toggle = container.querySelector<HTMLButtonElement>(
+      '[data-action="toggle-agent-controls"]',
+    )!;
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(container.querySelector('.agent-backend-picker')).toBeNull();
+
+    const providerButton = container.querySelector<HTMLButtonElement>(
+      '[data-testid="open-agent-backend-settings"]',
+    )!;
+    expect(providerButton.classList).toContain('primary');
+
+    await act(async () => toggle.click());
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(container.querySelector('.agent-backend-picker')).not.toBeNull();
   });
 
   it('hides and restores the AI panel without destroying the terminal workspace', async () => {
@@ -622,7 +643,7 @@ describe('renderer host and session dialogs', () => {
     const open = container.querySelector<HTMLButtonElement>(
       `[data-action="reconnect-session"][data-session-id="${session.id}"]`,
     );
-    expect(open?.textContent).toBe('↗');
+    expect(open?.textContent).toBe('打开');
     await act(async () => open!.click());
 
     expect(bridge.terminal.connectSsh).not.toHaveBeenCalled();
