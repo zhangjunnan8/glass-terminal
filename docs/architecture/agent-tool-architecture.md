@@ -77,9 +77,11 @@ including approval, command serialization, cancellation, and the atomic review m
 arbitrary `sendInput` is disabled by default.
 
 Beta.4 uses one `reviewMode` for commands and file tools: `all`, `risky`, or
-`complete`. New runtimes start in `all`. Entering Complete Access requires an
-explicit orange confirmation and grants no authority beyond the current OS or
-SSH/SFTP account. Risk Review uses deterministic software classification as the
+`complete`. Local runtimes start in `all`; SSH runtimes inherit the last mode
+explicitly selected for that Host. Entering Complete Access for a Host the first
+time requires an explicit orange confirmation, after which that confirmed mode
+can be restored as the Host default. It grants no authority beyond the current OS
+or SSH/SFTP account. Risk Review uses deterministic software classification as the
 final arbiter; the model can raise but never lower risk. Unknown commands,
 sensitive content reads, and recursive deletion fail into exact approval.
 
@@ -174,6 +176,10 @@ It replaces the in-house `AgentLoop` while keeping every boundary below it intac
   reasoning step. Normal turns persist only a context delta; a compression or tool
   history rewrite persists a bounded checkpoint. Legacy full-checkpoint events are
   still replayed as checkpoints, so existing conversations remain readable.
+- An interrupted or failed turn writes a best-effort incomplete checkpoint containing
+  the current user prompt and any assistant text already shown. Its terminal-history
+  cursor is not advanced until a complete turn context is persisted, so terminal
+  activity produced before the interruption remains available to the next turn.
 - The harness owns no PTY, SSH, SFTP, or filesystem client; those remain under
   `TerminalService` and `AgentFileService`, reachable only through `ToolGateway`.
 - One Generic harness turn freezes the current Settings checkpoint interval when it

@@ -12,8 +12,9 @@ import type {
   SshAuthMethod,
   SshShellKind,
 } from '../../shared/host';
+import type { AgentReviewMode } from '../../shared/agent';
 
-const HOST_STORE_VERSION = 3;
+const HOST_STORE_VERSION = 4;
 const MAX_HOST_NAME_LENGTH = 160;
 const MAX_FOLDER_NAME_LENGTH = 120;
 const MAX_PERSISTED_FOLDER_NAME_LENGTH = 2_048;
@@ -25,6 +26,7 @@ const AUTH_METHODS = new Set<SshAuthMethod>([
   'keyboard-interactive',
 ]);
 const SHELL_KINDS = new Set<SshShellKind>(['posix', 'powershell', 'cmd']);
+const REVIEW_MODES = new Set<AgentReviewMode>(['all', 'risky', 'complete']);
 
 interface NormalizedHostInput {
   protocol: 'ssh';
@@ -81,6 +83,17 @@ function optionalText(value: unknown): string | undefined {
 
 function safeOrder(value: unknown, fallback: number): number {
   return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : fallback;
+}
+
+function reviewModePreference(
+  value: unknown,
+  legacyFullTakeover = false,
+): AgentReviewMode {
+  if (value === undefined) return legacyFullTakeover ? 'complete' : 'all';
+  if (typeof value === 'string' && REVIEW_MODES.has(value as AgentReviewMode)) {
+    return value as AgentReviewMode;
+  }
+  throw new Error('Invalid Host AI review mode preference.');
 }
 
 function normalizeInput(input: HostInput): NormalizedHostInput {
@@ -157,6 +170,10 @@ function parseHost(
   const credentialReference = candidate.credentialReference === expectedReference
     ? expectedReference
     : undefined;
+  const preferredReviewMode = reviewModePreference(
+    candidate.reviewModePreference,
+    candidate.fullTakeoverPreference === true || candidate.fullTakeover === true,
+  );
   return {
     id,
     ...normalized,
@@ -165,8 +182,8 @@ function parseHost(
     sortOrder: safeOrder(candidate.sortOrder, fallbackOrder),
     credentialConfigured: candidate.credentialConfigured === true && Boolean(credentialReference),
     credentialReference,
-    fullTakeoverPreference: candidate.fullTakeoverPreference === true
-      || candidate.fullTakeover === true,
+    reviewModePreference: preferredReviewMode,
+    fullTakeoverPreference: preferredReviewMode === 'complete',
     revision: Number.isSafeInteger(candidate.revision) && Number(candidate.revision) > 0
       ? Number(candidate.revision)
       : 1,
@@ -273,10 +290,16 @@ export class HostStore {
   }
 
   setFullTakeoverPreference(hostId: string, enabled: boolean): HostProfile {
+    return this.setReviewModePreference(hostId, enabled ? 'complete' : 'all');
+  }
+
+  setReviewModePreference(hostId: string, mode: AgentReviewMode): HostProfile {
     const existing = this.getStored(hostId);
+    const normalizedMode = reviewModePreference(mode);
     const updated: StoredHostProfile = {
       ...existing,
-      fullTakeoverPreference: enabled,
+      reviewModePreference: normalizedMode,
+      fullTakeoverPreference: normalizedMode === 'complete',
       revision: existing.revision + 1,
       updatedAt: new Date().toISOString(),
     };
@@ -311,6 +334,11 @@ export class HostStore {
     const movingFolder = existing
       ? !sameFolder(existing.folderId, folderSelection.folderId)
       : false;
+    const preferredReviewMode = existing?.reviewModePreference
+      ?? reviewModePreference(
+        input.reviewModePreference,
+        input.fullTakeoverPreference === true || input.fullTakeover === true,
+      );
     const host: StoredHostProfile = {
       id: existing?.id ?? randomUUID(),
       ...normalized,
@@ -321,10 +349,8 @@ export class HostStore {
         : this.nextHostOrder(folderSelection.folderId),
       credentialConfigured: connectionChanged ? false : existing?.credentialConfigured ?? false,
       credentialReference: connectionChanged ? undefined : existing?.credentialReference,
-      fullTakeoverPreference: existing?.fullTakeoverPreference
-        ?? input.fullTakeoverPreference
-        ?? input.fullTakeover
-        ?? false,
+      reviewModePreference: preferredReviewMode,
+      fullTakeoverPreference: preferredReviewMode === 'complete',
       revision: (existing?.revision ?? 0) + 1,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -604,7 +630,7 @@ export class HostStore {
       if (Array.isArray(parsed)) return this.readLegacy(parsed);
       if (!parsed || typeof parsed !== 'object') return { folders: [], hosts: [] };
       const document = parsed as Partial<HostStoreDocument>;
-      if (document.version !== HOST_STORE_VERSION && document.version !== 2) {
+      if (![2, 3, HOST_STORE_VERSION].includes(document.version ?? -1)) {
         throw new Error(`Unsupported Host store version: ${String(document.version)}`);
       }
       if (!Array.isArray(document.folders) || !Array.isArray(document.hosts)) {
@@ -630,7 +656,7 @@ export class HostStore {
       return {
         folders,
         hosts,
-        ...(document.version === 2 ? { needsMigration: true } : {}),
+        ...(document.version !== HOST_STORE_VERSION ? { needsMigration: true } : {}),
       };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {

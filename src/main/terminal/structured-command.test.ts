@@ -33,14 +33,15 @@ describe('legacy structured command sentinels', () => {
     const end = `${envelope.endPrefix}0${envelope.endSuffix}`;
 
     expect(capture.push(`${envelope.input}\r\n${start.slice(0, 8)}`).output).toEqual([]);
-    expect(capture.push(`${start.slice(8)}alice\r\n${end.slice(0, 10)}`)).toMatchObject({
+    const partial = capture.push(`${start.slice(8)}alice\r\n${end.slice(0, 10)}`);
+    expect(partial).toMatchObject({
       completed: false,
     });
     const completed = capture.push(end.slice(10));
 
     expect(completed.completed).toBe(true);
     expect(completed.exitCode).toBe(0);
-    expect(completed.output.join('')).toBe('alice\r\n');
+    expect(partial.output.join('') + completed.output.join('')).toBe('alice\r\n');
   });
 
   it('reports a non-zero exit code and streams bounded output', () => {
@@ -56,6 +57,16 @@ describe('legacy structured command sentinels', () => {
     expect(partial.output.join('') + completed.output.join('')).toBe(large);
   });
 
+  it('streams short POSIX output before the end sentinel arrives', () => {
+    const envelope = buildCommandEnvelope('posix', 'demo', '0123456789abcdef');
+    const capture = new SentinelCapture(envelope);
+    capture.push(envelope.startMarker);
+
+    expect(capture.push('Password: ').output.join('')).toBe('Password: ');
+    expect(capture.push('\r10%').output.join('')).toBe('\r10%');
+    expect(capture.push('\r20%').output.join('')).toBe('\r20%');
+  });
+
   it('re-presents the clean POSIX command and retains the following prompt', () => {
     const envelope = buildCommandEnvelope('posix', 'whoami', 'abcdef0123456789');
     const filter = new CommandDisplayFilter(envelope, 'whoami', 'posix');
@@ -67,6 +78,52 @@ describe('legacy structured command sentinels', () => {
     expect(display).toContain('tester@host:~$');
     expect(display).not.toContain(envelope.endPrefix);
     expect(filter.push('next prompt echo')).toBe('next prompt echo');
+  });
+
+  it('renders POSIX authentication prompts, short output, and carriage-return progress immediately', () => {
+    const envelope = buildCommandEnvelope('posix', 'demo', '0123456789abcdef');
+    const filter = new CommandDisplayFilter(envelope, 'demo', 'posix');
+    filter.push(envelope.startMarker);
+
+    expect(filter.push('Password: ')).toBe('Password: ');
+    expect(filter.push('ok')).toBe('ok');
+    expect(filter.push('\r10%')).toBe('\r10%');
+    expect(filter.push('\r20%')).toBe('\r20%');
+  });
+
+  it('hides a POSIX end sentinel split at every character boundary', () => {
+    const envelope = buildCommandEnvelope('posix', 'demo', '0123456789abcdef');
+    const end = `${envelope.endPrefix}0${envelope.endSuffix}`;
+
+    for (let split = 1; split < end.length; split += 1) {
+      const filter = new CommandDisplayFilter(envelope, 'demo', 'posix');
+      let display = filter.push(envelope.startMarker);
+      display += filter.push(`visible${end.slice(0, split)}`);
+      display += filter.push(`${end.slice(split)}next prompt`);
+
+      expect(display).toContain('visible');
+      expect(display).toContain('next prompt');
+      expect(display).not.toContain(envelope.endPrefix);
+      expect(display).not.toContain('0123456789abcdef');
+    }
+  });
+
+  it('releases a divergent partial POSIX marker without losing ordinary output', () => {
+    const envelope = buildCommandEnvelope('posix', 'demo', '0123456789abcdef');
+    const filter = new CommandDisplayFilter(envelope, 'demo', 'posix');
+    filter.push(envelope.startMarker);
+    const partial = envelope.endPrefix.slice(0, 12);
+
+    expect(filter.push(`before${partial}`)).toBe('before');
+    expect(filter.push('X')).toBe(`${partial}X`);
+  });
+
+  it('keeps the legacy fixed reserve for CMD output', () => {
+    const envelope = buildCommandEnvelope('cmd', 'demo', '0123456789abcdef');
+    const filter = new CommandDisplayFilter(envelope, 'demo', 'cmd');
+    filter.push(envelope.startMarker);
+
+    expect(filter.push('Password: ')).toBe('');
   });
 });
 

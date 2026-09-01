@@ -105,6 +105,7 @@ export interface SessionAuditEvent {
     | 'agent_paused'
     | 'agent_checkpoint'
     | 'context_compressed'
+    | 'review_mode_preference_changed'
     | 'full_takeover_preference_changed'
     | 'full_takeover_authority_enabled'
     | 'full_takeover_authority_revoked'

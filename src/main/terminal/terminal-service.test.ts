@@ -2,6 +2,7 @@ import type { WebContents } from 'electron';
 import { describe, expect, it, vi } from 'vitest';
 import type { TerminalJournalEvent } from '../../shared/session';
 import type { TerminalDescriptor } from '../../shared/terminal';
+import { TERMINAL_CHANNELS } from '../../shared/terminal';
 import {
   encodePowerShellShellIntegrationValue,
   powerShellShellIntegrationSequence,
@@ -87,6 +88,14 @@ function nonceFromPosixEnvelope(input: string): string {
   const match = input.match(/__ait_a='([^']+)';__ait_b='([^']+)'/);
   if (!match) throw new Error('Unable to recover the test sentinel nonce.');
   return `${match[1]}${match[2]}`;
+}
+
+function sentinelMarkersFromPosixEnvelope(input: string): { start: string; end: string } {
+  const nonce = nonceFromPosixEnvelope(input);
+  return {
+    start: `\x1eAI:${nonce}:START\x1f`,
+    end: `\x1eAI:${nonce}:END:0\x1f`,
+  };
 }
 
 describe('TerminalService control and redaction invariants', () => {
@@ -200,6 +209,34 @@ describe('TerminalService control and redaction invariants', () => {
     )).join('');
     expect(persisted).toContain('[Sensitive interaction hidden]');
     expect(persisted).not.toContain(canary);
+  });
+
+  it('sends a POSIX authentication prompt to the renderer before secure input is submitted', async () => {
+    const { service, testable, browser, backend } = setup('posix');
+    service.bindSession(browser, 'terminal', 'session');
+    service.attach(browser, 'terminal');
+    const onAuthPrompt = vi.fn();
+    const executionPromise = service.executeStructured(
+      browser,
+      'terminal',
+      'read-secret',
+      'ai',
+      { onAuthPrompt },
+    );
+    const markers = sentinelMarkersFromPosixEnvelope(backend.writes[0]);
+
+    testable.emitData('terminal', `${markers.start}\r\nPassword: `);
+
+    const renderedBeforeInput = vi.mocked(browser.send).mock.calls
+      .filter(([channel]) => channel === TERMINAL_CHANNELS.data)
+      .map(([, payload]) => (payload as { data: string }).data)
+      .join('');
+    expect(onAuthPrompt).toHaveBeenCalledOnce();
+    expect(renderedBeforeInput).toContain('Password: ');
+    expect(renderedBeforeInput).not.toContain('\x1eAI:');
+
+    testable.emitData('terminal', markers.end);
+    expect((await executionPromise).outputRedacted).toBe(true);
   });
 
   it('sends Ctrl+C exactly once and only for the expected active execution', async () => {

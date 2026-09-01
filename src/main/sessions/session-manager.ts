@@ -1,6 +1,7 @@
 import { homedir } from 'node:os';
 import { isAbsolute, posix } from 'node:path';
 import type { WebContents } from 'electron';
+import type { AgentReviewMode } from '../../shared/agent';
 import type { HostStore } from '../hosts/host-store';
 import type {
   ClearWorkspaceRequest,
@@ -270,11 +271,21 @@ export class SessionManager {
   }
 
   hostFullTakeoverPreference(hostId: string): boolean {
-    return this.hosts.get(hostId).fullTakeoverPreference;
+    return this.hostReviewModePreference(hostId) === 'complete';
   }
 
   setHostFullTakeoverPreference(hostId: string, enabled: boolean): void {
-    this.hosts.setFullTakeoverPreference(hostId, enabled);
+    this.setHostReviewModePreference(hostId, enabled ? 'complete' : 'all');
+  }
+
+  hostReviewModePreference(hostId: string): AgentReviewMode {
+    const host = this.hosts.get(hostId);
+    return host.reviewModePreference
+      ?? (host.fullTakeoverPreference ? 'complete' : 'all');
+  }
+
+  setHostReviewModePreference(hostId: string, mode: AgentReviewMode): void {
+    this.hosts.setReviewModePreference(hostId, mode);
   }
 
   readTerminalHistory(sessionId: string): string {

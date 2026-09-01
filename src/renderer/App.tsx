@@ -147,6 +147,12 @@ function agentTurnBusy(state?: AgentRuntimeState): boolean {
   ].includes(state));
 }
 
+function agentReviewModeLabel(mode: AgentReviewMode): string {
+  if (mode === 'complete') return '完全访问';
+  if (mode === 'risky') return '风险审核';
+  return '全部审核';
+}
+
 /** Max composer height in pixels before the textarea stops growing and scrolls. */
 const MAX_COMPOSER_HEIGHT_PX = 240;
 
@@ -233,6 +239,7 @@ export function App() {
   const [editingAgentMessageId, setEditingAgentMessageId] = useState<string | null>(null);
   const [editingAgentTerminalId, setEditingAgentTerminalId] = useState<string | null>(null);
   const [agentMessageActionPending, setAgentMessageActionPending] = useState<string | null>(null);
+  const [agentReviewModePending, setAgentReviewModePending] = useState(false);
   const [agentMemoryDraftSource, setAgentMemoryDraftSource] = useState<AgentMemoryDraftSource | null>(null);
   const [editedApprovalCommand, setEditedApprovalCommand] = useState('');
   const [editingHost, setEditingHost] = useState<HostProfile | null | undefined>(undefined);
@@ -428,8 +435,9 @@ export function App() {
       ))
       ?? null;
   }, [activeTab, sessions]);
-  const activeHost = activeSession?.hostId
-    ? hosts.find((host) => host.id === activeSession.hostId) ?? null
+  const activeHostId = activeSession?.hostId ?? activeTab?.hostId;
+  const activeHost = activeHostId
+    ? hosts.find((host) => host.id === activeHostId) ?? null
     : null;
 
   useEffect(() => {
@@ -487,8 +495,10 @@ export function App() {
     : sessions;
   const defaultProvider = providers.find((provider) => provider.isDefault) ?? null;
   const activeAgent = activeTab ? agentStates[activeTab.id] : undefined;
+  const activeHostReviewMode = activeHost?.reviewModePreference
+    ?? (activeHost?.fullTakeoverPreference ? 'complete' : 'all');
   const activeReviewMode: AgentReviewMode = activeAgent?.reviewMode
-    ?? (activeAgent?.fullTakeover ? 'complete' : 'all');
+    ?? (activeAgent?.fullTakeover ? 'complete' : activeHostReviewMode);
   const activeMessages = activeAgent?.messages ?? [];
   const activeActivities = activeAgent?.activities ?? [];
   const activeMessageIds = new Set(activeMessages.flatMap((message) => (
@@ -811,6 +821,7 @@ export function App() {
       || !agentPrompt.trim()
       || !selectedAgentBackend
       || !selectedAgentBackendReady
+      || agentReviewModePending
       || agentMessageActionPending
     ) {
       return;
@@ -954,6 +965,7 @@ export function App() {
   ): Promise<void> {
     if (!terminalId || !backend) return;
     setWorkspaceActionError(null);
+    setAgentReviewModePending(true);
     try {
       const state = await window.aiTerminal.agent.setReviewMode({
         terminalId,
@@ -966,9 +978,11 @@ export function App() {
         tab.id === state.terminalId ? { ...tab, sessionId: state.sessionId } : tab
       )));
       setCompleteAccessChallenge(null);
-      await refreshSessions();
+      await Promise.all([refreshSessions(), refreshHosts()]);
     } catch (error) {
       setWorkspaceActionError(errorMessage(error));
+    } finally {
+      setAgentReviewModePending(false);
     }
   }
 
@@ -1564,6 +1578,13 @@ export function App() {
                   )}
                 </div>
               )}
+              <div className="host-review-mode-row">
+                <small>AI 默认审核</small>
+                <span>{agentReviewModeLabel(
+                  host.reviewModePreference
+                    ?? (host.fullTakeoverPreference ? 'complete' : 'all'),
+                )}</span>
+              </div>
               {hostCredentialMessage?.hostId === host.id && (
                 <div
                   className={`host-credential-message ${hostCredentialMessage.tone}`}
@@ -1679,7 +1700,7 @@ export function App() {
 
       <aside className="activitybar" aria-label="主导航">
         <button
-          className={`activity ${sidebarView === 'terminals' ? 'active' : ''}`}
+          className={`activity activity-label ${sidebarView === 'terminals' ? 'active' : ''}`}
           title="终端"
           data-action="show-terminals"
           aria-pressed={sidebarView === 'terminals'}
@@ -1687,9 +1708,9 @@ export function App() {
             setSidebarView('terminals');
             setSidebarSearch('');
           }}
-        >⌁</button>
+        >终端</button>
         <button
-          className={`activity ${sidebarView === 'hosts' ? 'active' : ''}`}
+          className={`activity activity-label ${sidebarView === 'hosts' ? 'active' : ''}`}
           title="主机"
           data-action="show-hosts"
           aria-pressed={sidebarView === 'hosts'}
@@ -1697,15 +1718,15 @@ export function App() {
             setSidebarView('hosts');
             setSidebarSearch('');
           }}
-        >▦</button>
+        >主机</button>
         <button
-          className={`activity ${sftpOpen ? 'active' : ''}`}
+          className={`activity activity-label ${sftpOpen ? 'active' : ''}`}
           title="SFTP 文件与传输"
           data-action="toggle-sftp"
           onClick={() => setSftpOpen((open) => !open)}
-        >⇅</button>
+        >文件</button>
         <button
-          className={`activity ${sidebarView === 'history' ? 'active' : ''}`}
+          className={`activity activity-label ${sidebarView === 'history' ? 'active' : ''}`}
           title="会话历史"
           data-action="show-history"
           aria-pressed={sidebarView === 'history'}
@@ -1713,7 +1734,7 @@ export function App() {
             setSidebarView('history');
             setSidebarSearch('');
           }}
-        >◷</button>
+        >历史</button>
         <div className="activity-spacer" />
         <button className="activity" title="设置" data-action="open-settings" onClick={() => {
           void window.aiTerminal.settingsWindow.open();
@@ -1726,16 +1747,16 @@ export function App() {
             ? '终端'
             : sidebarView === 'hosts' ? '主机' : '会话历史'}</span>
           {sidebarView === 'hosts' && (
-            <>
+            <span className="panel-heading-actions">
               <button title="导出主机配置" onClick={() => {
                 setHostBackupIncludeCredentials(false);
                 setHostBackupPassphrase('');
                 setHostBackupPassphraseConfirmation('');
                 setHostBackupExportOpen(true);
-              }}>⇩</button>
-              <button title="导入主机配置" disabled={hostBackupPending} onClick={() => void importHosts()}>⇧</button>
+              }}>导出</button>
+              <button title="导入主机配置" disabled={hostBackupPending} onClick={() => void importHosts()}>导入</button>
               <button title="添加主机" onClick={() => openHostEditor(null)}>＋</button>
-            </>
+            </span>
           )}
         </div>
         {sidebarView === 'hosts' && hostBackupNotice && (
@@ -2256,7 +2277,7 @@ export function App() {
                 <strong>{defaultProvider?.name ?? '尚未配置'}</strong>
                 <AgentReviewModePicker
                   value={activeReviewMode}
-                  disabled={!activeTab || composerBlocked || !selectedAgentBackendReady}
+                  disabled={!activeTab || composerBlocked || agentReviewModePending || !selectedAgentBackendReady}
                   onSelect={(mode) => {
                     if (mode !== 'complete') {
                       void setAgentReviewMode(mode);
@@ -2323,7 +2344,7 @@ export function App() {
               <div className="agent-glyph">✦</div>
               <strong>{selectedGenericProvider ? '理解终端上下文的 AI 助手' : '首次使用：配置 AI Provider'}</strong>
               <p>{selectedGenericProvider
-                ? '智能体会读取当前会话；默认“全部审核”，也可切换为“风险审核”或橙色“完全访问”。'
+                ? `智能体会读取当前会话；本主机默认“${agentReviewModeLabel(activeReviewMode)}”，也可随时切换审核模式。`
                 : '添加 OpenAI 兼容 API 后，即可在当前终端中使用 AI。保存时会自动检测连接，无需重启软件。'}</p>
               <div className="guardrail"><span>✓</span> {selectedGenericProvider
                 ? '同一审核模式同时管理终端命令和文件工具'
@@ -2560,7 +2581,7 @@ export function App() {
             value={agentPrompt}
             onChange={(event) => setAgentPrompt(event.target.value)}
             onKeyDown={handleAgentComposerKeyDown}
-            disabled={!selectedAgentBackendReady || !activeTab || activeTab.status !== 'connected' || composerBlocked}
+            disabled={!selectedAgentBackendReady || !activeTab || activeTab.status !== 'connected' || composerBlocked || agentReviewModePending}
           />
           <div>
             <span title="Enter 发送，Shift+Enter 换行">{selectedAgentBackendReady
@@ -2568,7 +2589,7 @@ export function App() {
                 ? `${agentStateLabel(activeAgent.state)} · ${activeReviewMode === 'complete'
                   ? '完全访问'
                   : activeReviewMode === 'risky' ? '风险审核' : '全部审核'}`
-                : '已就绪 · 全部审核'
+                : `已就绪 · ${agentReviewModeLabel(activeReviewMode)}`
               : selectedAgentBackendStatus}</span>
             <button
               type="submit"
@@ -2579,7 +2600,7 @@ export function App() {
               title={composerBlocked ? '停止当前任务；已执行的操作不会回滚' : '发送'}
               disabled={composerBlocked
                 ? !latestUserMessage || Boolean(agentMessageActionPending)
-                : !agentPrompt.trim() || !selectedAgentBackendReady || !activeTab || Boolean(agentMessageActionPending)}
+                : !agentPrompt.trim() || !selectedAgentBackendReady || !activeTab || agentReviewModePending || Boolean(agentMessageActionPending)}
             >{composerBlocked ? '■' : '↑'}</button>
           </div>
         </form>
@@ -3070,7 +3091,7 @@ export function App() {
               目标：<b>{completeAccessChallenge.target}</b>。智能体可使用当前本机用户或 SSH/SFTP 用户拥有的全部命令与文件权限，不再逐条询问。
             </p>
             <p className="risk-note" data-testid="complete-access-scope-note">
-              本次确认只对当前终端运行时生效；新建、重连或重启后的终端默认回到“全部审核”。
+              本次确认会把“完全访问”保存为该 SSH 主机的默认审核模式，之后新建或重连该主机时自动继承；本地终端仅对当前运行时生效。
             </p>
             <p className="risk-note" data-testid="complete-access-file-policy-note">
               Workspace 只是工作范围提示，不是权限边界。文件工具可访问账号有权访问的路径，但无法越过操作系统权限，也不会自动获得管理员密码、root、OTP 或密钥。
@@ -3083,13 +3104,14 @@ export function App() {
               <button
                 className="danger-action"
                 data-action="confirm-complete-access"
+                disabled={agentReviewModePending}
                 onClick={() => void setAgentReviewMode(
                   'complete',
                   true,
                   completeAccessChallenge.terminalId,
                   completeAccessChallenge.backend,
                 )}
-              >启用完全访问</button>
+              >{agentReviewModePending ? '保存中…' : '启用完全访问'}</button>
             </div>
           </div>
         </div>

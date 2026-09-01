@@ -12,7 +12,7 @@ Glass Terminal 是一个 **Windows-first、终端优先、远程设备优先**�
 ![Electron](https://img.shields.io/badge/Electron-43-2b2e3a?logo=electron&logoColor=white)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=white)
 ![TypeScript](https://img.shields.io/badge/TypeScript-3178c6?logo=typescript&logoColor=white)
-![Version](https://img.shields.io/badge/version-0.1.0--beta.4-blue)
+![Version](https://img.shields.io/badge/version-0.1.0--beta.5-blue)
 ![Tests](https://img.shields.io/badge/tests-Vitest-brightgreen)
 ![Status](https://img.shields.io/badge/status-beta-blue)
 

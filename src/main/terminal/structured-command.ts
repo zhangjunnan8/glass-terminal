@@ -1,6 +1,7 @@
 import type { ShellProfile } from '../../shared/terminal';
 
 export interface CommandEnvelope {
+  shellKind: Exclude<ShellProfile['kind'], 'powershell'>;
   input: string;
   startMarker: string;
   endPrefix: string;
@@ -21,6 +22,14 @@ function splitNonce(nonce: string): [string, string] {
 
 function posixQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function possibleMarkerSuffixLength(value: string, marker: string): number {
+  const maxLength = Math.min(value.length, Math.max(0, marker.length - 1));
+  for (let length = maxLength; length > 0; length -= 1) {
+    if (value.endsWith(marker.slice(0, length))) return length;
+  }
+  return 0;
 }
 
 export function buildCommandEnvelope(
@@ -44,7 +53,7 @@ export function buildCommandEnvelope(
       'set "__ait_ec=%ERRORLEVEL%"',
       'echo __AI_TERMINAL_%__ait_a%%__ait_b%_END_%__ait_ec%__',
     ].join('\r');
-    return { input: `${input}\r`, startMarker, endPrefix, endSuffix: '__' };
+    return { shellKind, input: `${input}\r`, startMarker, endPrefix, endSuffix: '__' };
   }
 
   const startMarker = `\x1eAI:${nonce}:START\x1f`;
@@ -58,7 +67,7 @@ export function buildCommandEnvelope(
     '__ait_ec=$?',
     "printf '\\036AI:%s%s:END:%s\\037\\n' \"$__ait_a\" \"$__ait_b\" \"$__ait_ec\"",
   ].join(';');
-  return { input: `${input}\r`, startMarker, endPrefix, endSuffix: '\x1f' };
+  return { shellKind, input: `${input}\r`, startMarker, endPrefix, endSuffix: '\x1f' };
 }
 
 export class SentinelCapture {
@@ -110,7 +119,9 @@ export class SentinelCapture {
       return { output, observed, completed: false };
     }
 
-    const reserve = Math.max(0, this.envelope.endPrefix.length - 1);
+    const reserve = this.envelope.shellKind === 'posix'
+      ? possibleMarkerSuffixLength(this.buffer, this.envelope.endPrefix)
+      : Math.max(0, this.envelope.endPrefix.length - 1);
     if (this.buffer.length > reserve) {
       const flushLength = this.buffer.length - reserve;
       output.push(this.buffer.slice(0, flushLength));
@@ -187,10 +198,12 @@ export class CommandDisplayFilter {
       this.buffer = this.buffer.slice(endIndex);
       return before;
     }
-    const reserve = Math.max(0, this.envelope.endPrefix.length - 1);
+    const reserve = this.envelope.shellKind === 'posix'
+      ? possibleMarkerSuffixLength(this.buffer, this.envelope.endPrefix)
+      : Math.max(0, this.envelope.endPrefix.length - 1);
     if (this.buffer.length > reserve) {
       const out = this.buffer.slice(0, this.buffer.length - reserve);
-      this.buffer = this.buffer.slice(this.buffer.length - reserve);
+      this.buffer = reserve > 0 ? this.buffer.slice(-reserve) : '';
       return out;
     }
     return '';

@@ -127,6 +127,11 @@ interface AgentRuntimeRecord extends AgentSessionView {
   pendingStreamDelta?: string;
   streamingTurnId?: string;
   streamingSequence?: number;
+  activeTurn?: {
+    promptMessageId: string;
+    prompt: string;
+    checkpointed: boolean;
+  };
   /**
    * Durable journal cursor where the previous turn ended.
    * The next turn's ambient context is only the terminal text produced after
@@ -699,7 +704,6 @@ export class AgentService {
     runtime.activeExecution = undefined;
     runtime.pendingTakeover = undefined;
     runtime.streamingMessageId = undefined;
-    this.clearFullTakeover(runtime, 'conversation_revised');
     this.setHumanState(runtime, 'USER_CONTROL');
 
     if (request.action === 'replace') {
@@ -1102,8 +1106,12 @@ export class AgentService {
     } else if (request.backend && !sameBackend(runtime.backend, request.backend)) {
       runtime = this.ensureRuntime(owner, request.terminalId, this.selectBackend(request.backend));
     }
-    if (runtime.reviewMode === request.mode) return this.cloneRuntime(runtime);
+    if (runtime.reviewMode === request.mode) {
+      this.persistReviewModePreference(runtime, request.mode);
+      return this.cloneRuntime(runtime);
+    }
     const previousMode = runtime.reviewMode;
+    this.persistReviewModePreference(runtime, request.mode);
     runtime.reviewMode = request.mode;
     runtime.fullTakeover = request.mode === 'complete';
     runtime.fileAccessMode = 'full-access';
@@ -1212,7 +1220,10 @@ export class AgentService {
         this.selectBackend(request.backend, request.providerId),
       );
     }
-    if (runtime.fullTakeover === request.enabled) return this.cloneRuntime(runtime);
+    if (runtime.fullTakeover === request.enabled) {
+      this.persistReviewModePreference(runtime, request.enabled ? 'complete' : 'all');
+      return this.cloneRuntime(runtime);
+    }
     if (request.enabled) {
       this.sessions.appendAudit(runtime.sessionId, 'full_takeover_authority_enabled', 'user', {
         terminalScoped: true,
@@ -1225,6 +1236,7 @@ export class AgentService {
       runtime.fullTakeover = false;
       runtime.reviewMode = 'all';
       this.syncAutomaticFileAccess(runtime, 'full_takeover_disabled');
+      this.persistReviewModePreference(runtime, 'all');
       this.appendControlAudit(runtime, 'full_takeover_authority_revoked', 'user', {
         reason: 'user_disabled',
         terminalScoped: true,
@@ -1277,6 +1289,7 @@ export class AgentService {
     if (partial?.content) {
       try { this.persistChatItem(runtime, partial); } catch { /* takeover must still proceed */ }
     }
+    this.checkpointIncompleteTurn(runtime, 'interrupted');
     runtime.streamingMessageId = undefined;
     this.cancelStreamEmit(runtime);
     runtime.turnToken += 1;
@@ -1306,7 +1319,7 @@ export class AgentService {
     resolveApproval?.({ decision: 'reject', command: '' });
     this.resolveAuth(runtime);
 
-    if (runtime.fullTakeover) {
+    if (runtime.fullTakeover && interruptReason !== 'user') {
       runtime.fullTakeover = false;
       runtime.reviewMode = 'all';
       this.appendControlAudit(runtime, 'full_takeover_authority_revoked', actor, {
@@ -1447,6 +1460,7 @@ export class AgentService {
     const assistantTurnId = randomUUID();
     let assistantMessageSequence = 0;
     let streamedMessage: AgentChatItem | undefined;
+    let turnContextPersisted = false;
     let acceptBackendEvents = true;
     let turnToolsLive = true;
     let workspaceTool: AgentFileWorkspaceAdapter | undefined;
@@ -1469,6 +1483,7 @@ export class AgentService {
           totalRounds: event.checkpoint.totalRounds,
         });
         runtime.priorMessages = checkpointMessages;
+        if (runtime.activeTurn) runtime.activeTurn.checkpointed = true;
         if (event.contextUsage) runtime.contextUsage = { ...event.contextUsage };
         runtime.activities = [
           ...runtime.activities,
@@ -1764,6 +1779,8 @@ export class AgentService {
         contextMode: contextPersistence.mode,
         messages: contextPersistence.messages,
       });
+      turnContextPersisted = true;
+      runtime.activeTurn = undefined;
       if (result.finalText.trim()) {
         const finalText = result.finalText.trim();
         const lastTurnMessage = [...runtime.messages].reverse().find((message) => (
@@ -1814,6 +1831,7 @@ export class AgentService {
       if (streamedMessage?.content) {
         try { this.persistChatItem(runtime, streamedMessage); } catch { /* preserve original error */ }
       }
+      this.checkpointIncompleteTurn(runtime, signal.aborted ? 'interrupted' : 'failed');
       streamedMessage = undefined;
       runtime.streamingMessageId = undefined;
       this.cancelStreamEmit(runtime);
@@ -1830,10 +1848,13 @@ export class AgentService {
       this.emit(runtime);
     } finally {
       await closeTurnTools();
-      // Advance the ambient-context watermark past this turn's terminal output so
-      // the next turn only carries new human input and background output.
-      runtime.terminalContextCursor = this.sessions
-        .currentTerminalHistoryCursor(runtime.sessionId);
+      // Only a fully persisted turn can rely on structured tool results for its
+      // terminal effects. After interruption/failure, retain the old watermark
+      // so the next turn also receives the missing terminal delta.
+      if (turnContextPersisted && this.isCurrentTurn(runtime, token)) {
+        runtime.terminalContextCursor = this.sessions
+          .currentTerminalHistoryCursor(runtime.sessionId);
+      }
     }
   }
 
@@ -2271,6 +2292,9 @@ export class AgentService {
     const memoryMessage = agentMemorySystemMessage(memories);
     const workspaceRoot = informationalFileToolRoot(selectedSession);
     const initialFileAccessMode: AgentFileAccessMode = 'full-access';
+    const preferredReviewMode = session.hostId
+      ? this.sessions.hostReviewModePreference(session.hostId)
+      : 'all';
     const runtime: AgentRuntimeRecord = {
       revision: this.revisionCounters.get(terminalId) ?? 0,
       owner,
@@ -2282,11 +2306,9 @@ export class AgentService {
       providerId: backend.providerId,
       state: 'USER_CONTROL',
       terminalInputMode: 'human',
-      reviewMode: 'all',
-      fullTakeover: false,
-      fullTakeoverPreference: session.hostId
-        ? this.sessions.hostFullTakeoverPreference(session.hostId)
-        : false,
+      reviewMode: preferredReviewMode,
+      fullTakeover: preferredReviewMode === 'complete',
+      fullTakeoverPreference: preferredReviewMode === 'complete',
       fileAccessMode: initialFileAccessMode,
       fileAccessPolicy: legacyFileAccessPolicy('full-access'),
       fileAccessGeneration: 0,
@@ -2318,6 +2340,13 @@ export class AgentService {
       fileCommandViolationCounts: new Map(),
     };
     this.runtimes.set(terminalId, runtime);
+    if (preferredReviewMode === 'complete') {
+      this.appendControlAudit(runtime, 'full_takeover_authority_enabled', 'system', {
+        source: 'host_review_mode_preference',
+        hostId: session.hostId,
+        terminalScoped: true,
+      });
+    }
     return runtime;
   }
 
@@ -2672,10 +2701,10 @@ export class AgentService {
     try {
       const session = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
       if (!session?.hostId) return;
-      this.persistFullTakeoverPreference(runtime, true);
+      this.persistReviewModePreference(runtime, 'complete');
     } catch (error) {
-      // Runtime authority remains terminal-scoped even if its optional Host hint cannot persist.
-      console.error('Unable to persist Full Takeover Host preference:', error);
+      // The active runtime remains usable even if its Host default cannot persist.
+      console.error('Unable to persist Complete Access Host default:', error);
     }
   }
 
@@ -2683,19 +2712,27 @@ export class AgentService {
     runtime: AgentRuntimeRecord,
     enabled: boolean,
   ): void {
+    this.persistReviewModePreference(runtime, enabled ? 'complete' : 'all');
+  }
+
+  private persistReviewModePreference(
+    runtime: AgentRuntimeRecord,
+    mode: AgentReviewMode,
+  ): void {
     const session = this.sessions.sessionForTerminal(runtime.owner, runtime.terminalId);
     if (!session?.hostId) {
-      if (enabled) throw new Error('Local terminals do not have a Host preference.');
       runtime.fullTakeoverPreference = false;
       return;
     }
-    if (runtime.fullTakeoverPreference === enabled) return;
-    this.sessions.setHostFullTakeoverPreference(session.hostId, enabled);
-    runtime.fullTakeoverPreference = enabled;
-    this.appendControlAudit(runtime, 'full_takeover_preference_changed', 'user', {
-      enabled,
+    const current = this.sessions.hostReviewModePreference(session.hostId);
+    runtime.fullTakeoverPreference = mode === 'complete';
+    if (current === mode) return;
+    this.sessions.setHostReviewModePreference(session.hostId, mode);
+    this.appendControlAudit(runtime, 'review_mode_preference_changed', 'user', {
+      previousMode: current,
+      mode,
       hostId: session.hostId,
-      grantsRuntimeAuthority: false,
+      inheritedByFutureSessions: true,
     });
   }
 
@@ -2886,6 +2923,10 @@ export class AgentService {
     runtime.fileCommandException = undefined;
     const token = runtime.turnToken;
     const checkpointIntervalRounds = this.genericMaxRounds();
+    const promptMessage = [...runtime.messages].reverse().find((item) => item.role === 'user');
+    runtime.activeTurn = promptMessage
+      ? { promptMessageId: promptMessage.id, prompt, checkpointed: false }
+      : undefined;
     runtime.abortController = new AbortController();
     runtime.error = undefined;
     runtime.activeExecution = undefined;
@@ -2899,6 +2940,7 @@ export class AgentService {
         runtime.terminalId,
       );
     } catch (error) {
+      runtime.activeTurn = undefined;
       runtime.abortController = undefined;
       runtime.error = error instanceof Error ? error.message : String(error);
       runtime.state = 'FAILED';
@@ -2910,6 +2952,49 @@ export class AgentService {
     this.emit(runtime);
     void this.runTurn(runtime, token, prompt, runtime.controlLeaseId, checkpointIntervalRounds);
     return cloneView(runtime);
+  }
+
+  private checkpointIncompleteTurn(
+    runtime: AgentRuntimeRecord,
+    reason: 'interrupted' | 'failed',
+  ): void {
+    const activeTurn = runtime.activeTurn;
+    if (!activeTurn) return;
+    const messages = runtime.priorMessages.map((message) => ({ ...message }));
+    if (!activeTurn.checkpointed) {
+      messages.push({ role: 'user', content: activeTurn.prompt });
+    }
+    const promptIndex = runtime.messages.findIndex(
+      (message) => message.id === activeTurn.promptMessageId,
+    );
+    const visibleAssistantMessages = promptIndex < 0
+      ? []
+      : runtime.messages.slice(promptIndex + 1).filter((message) => (
+        message.role === 'assistant' && message.content.trim().length > 0
+      ));
+    for (const message of visibleAssistantMessages) {
+      const content = message.content.trim();
+      const alreadyPresent = activeTurn.checkpointed && messages.slice(-16).some((candidate) => (
+        candidate.role === 'assistant' && candidate.content === content
+      ));
+      if (!alreadyPresent) messages.push({ role: 'assistant', content });
+    }
+    runtime.priorMessages = messages;
+    runtime.contextUsage = this.contextUsageFor(runtime, messages);
+    runtime.activeTurn = undefined;
+    try {
+      this.sessions.appendThreadEvent(runtime.sessionId, runtime.threadId, {
+        type: 'turn',
+        id: randomUUID(),
+        timestamp: new Date().toISOString(),
+        contextMode: 'checkpoint',
+        messages,
+        incomplete: true,
+        reason,
+      });
+    } catch (error) {
+      console.error('Unable to persist incomplete Agent turn checkpoint:', error);
+    }
   }
 
   private emit(runtime: AgentRuntimeRecord): void {

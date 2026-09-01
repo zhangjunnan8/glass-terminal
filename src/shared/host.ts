@@ -1,3 +1,5 @@
+import type { AgentReviewMode } from './agent';
+
 export type SshAuthMethod =
   | 'password'
   | 'private-key'
@@ -149,8 +151,10 @@ export interface HostProfile {
   group?: string;
   favorite: boolean;
   credentialConfigured: boolean;
-  /** Persistent hint only. Every new terminal still requires explicit runtime authorization. */
+  /** @deprecated Compatibility mirror for reviewModePreference === 'complete'. */
   fullTakeoverPreference: boolean;
+  /** Last user-selected AI review mode; inherited by future Sessions for this Host. */
+  reviewModePreference?: AgentReviewMode;
   /** Remote shell kind; defaults to POSIX for hosts created before this field. */
   shellKind?: SshShellKind;
   createdAt: string;
@@ -174,6 +178,8 @@ export interface HostInput {
   /** @deprecated Use folderId. A matching folder is created when necessary. */
   group?: string;
   favorite?: boolean;
+  reviewModePreference?: AgentReviewMode;
+  /** @deprecated Use reviewModePreference. */
   fullTakeoverPreference?: boolean;
   /** @deprecated Version-2 import alias; migrated to fullTakeoverPreference. */
   fullTakeover?: boolean;

@@ -339,10 +339,11 @@ describe('HostBackupService', () => {
       version: number;
       hosts: Array<Record<string, unknown>>;
     };
-    expect(migrated.version).toBe(3);
+    expect(migrated.version).toBe(4);
     expect(migrated.hosts[0]).toMatchObject({
       id: 'legacy-host',
       fullTakeoverPreference: true,
+      reviewModePreference: 'complete',
     });
     expect(migrated.hosts[0]).not.toHaveProperty('fullTakeover');
   });

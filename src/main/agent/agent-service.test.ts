@@ -5,6 +5,7 @@ import { AGENT_CHANNELS } from '../../shared/agent';
 import type {
   AgentBackendRef,
   AgentFileAccessMode,
+  AgentReviewMode,
   AgentSessionView,
   CommandActor,
   CommandExecution,
@@ -573,7 +574,12 @@ class FakeSessions {
   readonly failAuditTypes = new Set<string>();
   failThreadEvents = false;
   persistedThreadId?: string;
-  fullTakeoverPreference = false;
+  reviewModePreference: AgentReviewMode = 'all';
+  terminalHistory = 'tester@host:~$ ';
+  get fullTakeoverPreference() { return this.reviewModePreference === 'complete'; }
+  set fullTakeoverPreference(enabled: boolean) {
+    this.reviewModePreference = enabled ? 'complete' : 'all';
+  }
   session: SessionRecord = {
     schemaVersion: 1,
     id: '11111111-1111-1111-1111-111111111111',
@@ -668,7 +674,11 @@ class FakeSessions {
   setHostFullTakeoverPreference(_hostId: string, enabled: boolean) {
     this.fullTakeoverPreference = enabled;
   }
-  readTerminalHistory() { return 'tester@host:~$ '; }
+  hostReviewModePreference(_hostId: string) { return this.reviewModePreference; }
+  setHostReviewModePreference(_hostId: string, mode: AgentReviewMode) {
+    this.reviewModePreference = mode;
+  }
+  readTerminalHistory() { return this.terminalHistory; }
   readTerminalHistorySince(
     _sessionId: string,
     cursor: { version: 1; position: number } | undefined,
@@ -1065,16 +1075,12 @@ describe('AgentService shared-terminal controls', () => {
     expect(terminals.hasControlLease()).toBe(false);
 
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Replacement turn.' });
-    await waitFor(() => backendB.createInputs.length === 1);
+    await waitFor(() => backendB.resumeInputs.length === 1);
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
     backendA.resolveCreate();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(backendA.sendInputs).toEqual([]);
-    expect(backendB.sendInputs).toEqual([]);
-    expect(service.getState(owner, 'terminal')?.state).toBe('THINKING');
-
-    backendB.resolveCreate();
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
     expect(backendFactory).toHaveBeenCalledTimes(2);
     expect(backendB.sendInputs).toHaveLength(1);
     expect(backendB.sendInputs[0].prompt).toBe('Replacement turn.');
@@ -1110,17 +1116,16 @@ describe('AgentService shared-terminal controls', () => {
     await waitFor(() => backendA.createInputs.length === 1);
     service.takeover(owner, { terminalId: 'terminal' });
     service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Replacement turn.' });
-    await waitFor(() => backendB.createInputs.length === 1);
+    await waitFor(() => backendB.resumeInputs.length === 1);
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
 
     backendA.rejectCreate(new Error('stale create rejected'));
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(service.getState(owner, 'terminal')).toMatchObject({
-      state: 'THINKING',
+      state: 'COMPLETED',
       error: undefined,
     });
 
-    backendB.resolveCreate();
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
     expect(backendB.sendInputs).toHaveLength(1);
     expect(service.getState(owner, 'terminal')).toMatchObject({
       state: 'COMPLETED',
@@ -1133,7 +1138,7 @@ describe('AgentService shared-terminal controls', () => {
     await waitFor(() => backendB.sendInputs.length === 2);
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
     expect(backendFactory).toHaveBeenCalledTimes(2);
-    expect(backendB.createInputs).toHaveLength(1);
+    expect(backendB.resumeInputs).toHaveLength(1);
     expect(terminals.hasControlLease()).toBe(false);
     service.close();
   });
@@ -1930,6 +1935,7 @@ describe('AgentService shared-terminal controls', () => {
       reviewMode: 'risky', fullTakeover: false, fileAccessMode: 'full-access',
       fileAccessPolicy: { fullAccess: true, read: true, write: true, create: true, delete: true },
     });
+    expect(sessions.reviewModePreference).toBe('risky');
     expect(() => service.setReviewMode(owner, {
       terminalId: 'terminal', mode: 'complete', backend,
     })).toThrow('明确确认');
@@ -1939,12 +1945,14 @@ describe('AgentService shared-terminal controls', () => {
     expect(complete).toMatchObject({
       reviewMode: 'complete', fullTakeover: true, fileAccessMode: 'full-access',
     });
+    expect(sessions.reviewModePreference).toBe('complete');
     const all = service.setReviewMode(owner, {
       terminalId: 'terminal', mode: 'all', backend,
     });
     expect(all).toMatchObject({
       reviewMode: 'all', fullTakeover: false, fileAccessMode: 'full-access',
     });
+    expect(sessions.reviewModePreference).toBe('all');
   });
 
   it('applies the atomic mode to real file-tool review requests', async () => {
@@ -3493,7 +3501,7 @@ describe('AgentService shared-terminal controls', () => {
       ));
   });
 
-  it('treats a persisted Host preference as a hint and starts every runtime unauthorized', async () => {
+  it('inherits the persisted Host review mode in a new Agent runtime', async () => {
     const provider = new FakeProvider([
       toolCall('call-1', 'printf guarded'),
       { message: { role: 'assistant', content: 'Not run.' } },
@@ -3511,20 +3519,15 @@ describe('AgentService shared-terminal controls', () => {
 
     const started = service.sendPrompt(owner, {
       terminalId: 'terminal',
-      prompt: 'Do not auto-run.',
+      prompt: 'Use the saved default.',
     });
     expect(started).toMatchObject({
-      fullTakeover: false,
+      reviewMode: 'complete',
+      fullTakeover: true,
       fullTakeoverPreference: true,
     });
-    await waitFor(() => service.getState(owner, 'terminal')?.state === 'WAITING_APPROVAL');
-    const approval = service.getState(owner, 'terminal')!.pendingApproval!;
-    service.resolveApproval(owner, {
-      terminalId: 'terminal',
-      approvalId: approval.id,
-      decision: 'reject',
-    });
     await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    expect(service.getState(owner, 'terminal')?.pendingApproval).toBeUndefined();
   });
 
   it('can forget a Host preference before an Agent runtime exists', () => {
@@ -3587,7 +3590,7 @@ describe('AgentService shared-terminal controls', () => {
     });
     expect(sessions.audits.map((audit) => audit.type)).toEqual(expect.arrayContaining([
       'full_takeover_authority_enabled',
-      'full_takeover_preference_changed',
+      'review_mode_preference_changed',
       'full_takeover_authority_revoked',
     ]));
   });
@@ -3621,7 +3624,7 @@ describe('AgentService shared-terminal controls', () => {
     }));
   });
 
-  it('starts an attached runtime unauthorized after the prior terminal is closed', () => {
+  it('restores the saved Complete Access default after the prior terminal is closed', () => {
     const sessions = new FakeSessions();
     const owner = browserOwner();
     const service = new AgentService(
@@ -3638,7 +3641,8 @@ describe('AgentService shared-terminal controls', () => {
     service.closeTerminal(owner, 'terminal');
 
     expect(service.getState(owner, 'terminal')).toMatchObject({
-      fullTakeover: false,
+      reviewMode: 'complete',
+      fullTakeover: true,
       fullTakeoverPreference: true,
     });
     expect(sessions.audits).toContainEqual(expect.objectContaining({
@@ -3686,7 +3690,7 @@ describe('AgentService shared-terminal controls', () => {
     ]);
     expect(sessions.audits.filter((audit) => audit.type === 'full_takeover_authority_enabled'))
       .toHaveLength(1);
-    expect(sessions.audits.filter((audit) => audit.type === 'full_takeover_preference_changed'))
+    expect(sessions.audits.filter((audit) => audit.type === 'review_mode_preference_changed'))
       .toHaveLength(1);
     expect(sessions.audits.map((audit) => audit.type)).toContain('command_edited');
   });
@@ -3727,6 +3731,7 @@ describe('AgentService shared-terminal controls', () => {
     expect(sessions.audits.some((audit) => (
       audit.type === 'full_takeover_authority_enabled'
       || audit.type === 'full_takeover_preference_changed'
+      || audit.type === 'review_mode_preference_changed'
     ))).toBe(false);
 
     service.resolveApproval(owner, {
@@ -4151,6 +4156,12 @@ describe('AgentService shared-terminal controls', () => {
       undefined,
       () => new ScriptedLoopBackend(provider),
     );
+    service.setReviewMode(owner, {
+      terminalId: 'terminal',
+      mode: 'complete',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+      completeAccessConfirmed: true,
+    });
 
     const running = service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Long task.' });
     const messageId = running.messages.at(-1)!.id;
@@ -4161,7 +4172,11 @@ describe('AgentService shared-terminal controls', () => {
       messageId: 'stale-message',
     })).toThrow('最后一条用户消息');
     const interrupted = service.interruptTurn(owner, { terminalId: 'terminal', messageId });
-    expect(interrupted.state).toBe('PAUSED');
+    expect(interrupted).toMatchObject({
+      state: 'PAUSED',
+      reviewMode: 'complete',
+      fullTakeover: true,
+    });
     expect(interrupted.terminalInputMode).toBe('human');
     expect(provider.request?.signal.aborted).toBe(true);
 
@@ -4172,6 +4187,117 @@ describe('AgentService shared-terminal controls', () => {
     expect(service.getState(owner, 'terminal')?.messages.some((item) => (
       item.content === 'must be ignored'
     ))).toBe(false);
+  });
+
+  it('carries an interrupted turn and its terminal delta into the next prompt', async () => {
+    const interruptedBackend = new DeferredActivityBackend();
+    const resumedBackend = new RecordingBackend();
+    const backends: AgentBackend[] = [interruptedBackend, resumedBackend];
+    const sessions = new FakeSessions();
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      () => backends.shift()!,
+    );
+    service.setReviewMode(owner, {
+      terminalId: 'terminal',
+      mode: 'complete',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+      completeAccessConfirmed: true,
+    });
+
+    const running = service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Inspect and change the configuration.',
+    });
+    await waitFor(() => interruptedBackend.sendInputs.length === 1);
+    interruptedBackend.emit({
+      type: 'assistant_text',
+      text: 'I inspected the configuration and changed the first setting.',
+    });
+    sessions.terminalHistory += '\r\nchanged-setting=one\r\n';
+    const messageId = running.messages.find((message) => message.role === 'user')!.id;
+
+    const interrupted = service.interruptTurn(owner, {
+      terminalId: 'terminal',
+      messageId,
+    });
+    expect(interrupted).toMatchObject({
+      state: 'PAUSED',
+      reviewMode: 'complete',
+      fullTakeover: true,
+    });
+    interruptedBackend.fail(new Error('turn interrupted'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Continue with a different direction.',
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(resumedBackend.resumeInputs[0]?.priorMessages).toEqual(expect.arrayContaining([
+      { role: 'user', content: 'Inspect and change the configuration.' },
+      { role: 'assistant', content: 'I inspected the configuration and changed the first setting.' },
+    ]));
+    expect(resumedBackend.sendInputs[0]?.terminalContext).toContain('changed-setting=one');
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      reviewMode: 'complete',
+      fullTakeover: true,
+    });
+    expect(sessions.threadEvents).toContainEqual(expect.objectContaining({
+      type: 'turn',
+      contextMode: 'checkpoint',
+      incomplete: true,
+      reason: 'interrupted',
+    }));
+  });
+
+  it('keeps complete access when an interrupted prompt is edited and resent', async () => {
+    const interruptedBackend = new DeferredActivityBackend();
+    const replacementBackend = new RecordingBackend();
+    const backends: AgentBackend[] = [interruptedBackend, replacementBackend];
+    const owner = browserOwner();
+    const service = new AgentService(
+      new FakeTerminals() as unknown as TerminalService,
+      new FakeSessions() as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      () => backends.shift()!,
+    );
+    service.setReviewMode(owner, {
+      terminalId: 'terminal',
+      mode: 'complete',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+      completeAccessConfirmed: true,
+    });
+
+    const running = service.sendPrompt(owner, {
+      terminalId: 'terminal',
+      prompt: 'Follow the old direction.',
+    });
+    await waitFor(() => interruptedBackend.sendInputs.length === 1);
+    const messageId = running.messages.find((message) => message.role === 'user')!.id;
+    service.interruptTurn(owner, { terminalId: 'terminal', messageId });
+    interruptedBackend.fail(new Error('turn interrupted'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    service.revisePrompt(owner, {
+      terminalId: 'terminal',
+      messageId,
+      action: 'replace',
+      prompt: 'Follow the corrected direction.',
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(replacementBackend.sendInputs[0]?.prompt).toBe('Follow the corrected direction.');
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      reviewMode: 'complete',
+      fullTakeover: true,
+    });
   });
 
   it('replaces only the latest completed prompt using append-only conversation actions', async () => {
@@ -4247,6 +4373,53 @@ describe('AgentService shared-terminal controls', () => {
       'Revised second prompt.',
       'Revised answer.',
     ]);
+  });
+
+  it('uses the newly selected review mode when a completed prompt is edited and resent', async () => {
+    const provider = new FakeProvider([
+      { message: { role: 'assistant', content: 'Original answer.' } },
+      toolCall('revised-call', 'printf revised'),
+      { message: { role: 'assistant', content: 'Revised with current mode.' } },
+    ]);
+    const sessions = new FakeSessions();
+    const terminals = new FakeTerminals();
+    const owner = browserOwner();
+    const service = new AgentService(
+      terminals as unknown as TerminalService,
+      sessions as unknown as SessionManager,
+      providerStore(),
+      undefined,
+      () => new ScriptedLoopBackend(provider),
+    );
+
+    service.sendPrompt(owner, { terminalId: 'terminal', prompt: 'Original prompt.' });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+    const originalMessageId = service.getState(owner, 'terminal')!.messages
+      .find((item) => item.role === 'user')!.id;
+    service.setReviewMode(owner, {
+      terminalId: 'terminal',
+      mode: 'complete',
+      backend: { kind: 'generic-provider', providerId: 'provider' },
+      completeAccessConfirmed: true,
+    });
+
+    service.revisePrompt(owner, {
+      terminalId: 'terminal',
+      messageId: originalMessageId,
+      action: 'replace',
+      prompt: 'Revised prompt.',
+    });
+    await waitFor(() => service.getState(owner, 'terminal')?.state === 'COMPLETED');
+
+    expect(service.getState(owner, 'terminal')).toMatchObject({
+      reviewMode: 'complete',
+      fullTakeover: true,
+    });
+    expect(terminals.executions).toContainEqual({
+      command: 'printf revised',
+      actor: 'ai',
+    });
+    expect(service.getState(owner, 'terminal')?.pendingApproval).toBeUndefined();
   });
 
               it('keeps renderer revisions increasing when the Provider creates a new runtime', async () => {

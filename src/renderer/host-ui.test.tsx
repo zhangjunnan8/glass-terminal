@@ -34,6 +34,7 @@ const groupedHost: HostProfile = {
   sortOrder: 0,
   favorite: false,
   fullTakeoverPreference: false,
+  reviewModePreference: 'risky',
   credentialConfigured: false,
   createdAt: now,
   updatedAt: now,
@@ -186,6 +187,18 @@ describe('主机分组与协议界面', () => {
     });
   }
 
+  it('使用中文主导航和明确的主机导入导出文字', async () => {
+    await openHosts();
+
+    expect(container.querySelector('[data-action="show-terminals"]')?.textContent).toBe('终端');
+    expect(container.querySelector('[data-action="show-hosts"]')?.textContent).toBe('主机');
+    expect(container.querySelector('[data-action="toggle-sftp"]')?.textContent).toBe('文件');
+    expect(container.querySelector('[data-action="show-history"]')?.textContent).toBe('历史');
+    expect(container.querySelector('[title="导出主机配置"]')?.textContent).toBe('导出');
+    expect(container.querySelector('[title="导入主机配置"]')?.textContent).toBe('导入');
+    expect(container.querySelector('[title="添加主机"]')?.textContent).toBe('＋');
+  });
+
   it('按文件夹显示主机，并在对应主机正下方展开会话详情', async () => {
     await openHosts();
 
@@ -203,6 +216,8 @@ describe('主机分组与协议界面', () => {
     expect(details.textContent).toContain('生产会话');
     expect(details.querySelector('[data-action="connect-host"]')?.textContent).toBe('连接');
     expect(details.querySelector('[data-action="remove-host"]')?.textContent).toBe('删除');
+    expect(details.querySelector('.host-review-mode-row')?.textContent)
+      .toContain('AI 默认审核风险审核');
     const hostActions = details.querySelector('.host-card-actions')!;
     expect(hostActions.parentElement?.classList).toContain('host-card-summary');
     expect([...hostActions.querySelectorAll('button')].map((button) => button.textContent))

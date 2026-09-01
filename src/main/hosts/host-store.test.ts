@@ -55,7 +55,7 @@ describe('HostStore', () => {
       credentialConfigured: false,
     });
     const persisted = readFileSync(filePath, 'utf8');
-    expect(storedDocument(filePath).version).toBe(3);
+    expect(storedDocument(filePath).version).toBe(4);
     expect(persisted).not.toContain('password": "');
     expect(persisted).not.toContain('passphrase');
   });
@@ -136,11 +136,11 @@ describe('HostStore', () => {
       beforeHostId: null,
     });
     const persisted = storedDocument(filePath);
-    expect(persisted.version).toBe(3);
+    expect(persisted.version).toBe(4);
     expect(persisted.hosts[0].revision).toBe(7);
   });
 
-  it('migrates a version-two Full Takeover flag into a non-authorizing preference', () => {
+  it('migrates a version-two Full Takeover flag into the Complete Access Host default', () => {
     const { filePath } = createStore();
     const timestamp = '2026-01-02T03:04:05.000Z';
     writeFileSync(filePath, JSON.stringify({
@@ -167,10 +167,30 @@ describe('HostStore', () => {
     const store = new HostStore(filePath);
 
     expect(store.get('legacy-takeover-host').fullTakeoverPreference).toBe(true);
+    expect(store.get('legacy-takeover-host').reviewModePreference).toBe('complete');
     const persisted = storedDocument(filePath);
-    expect(persisted.version).toBe(3);
-    expect(persisted.hosts[0]).toMatchObject({ fullTakeoverPreference: true });
+    expect(persisted.version).toBe(4);
+    expect(persisted.hosts[0]).toMatchObject({
+      fullTakeoverPreference: true,
+      reviewModePreference: 'complete',
+    });
     expect(persisted.hosts[0]).not.toHaveProperty('fullTakeover');
+  });
+
+  it('persists the last selected three-state AI review mode per Host', () => {
+    const { store, filePath } = createStore();
+    const host = store.save(sshHost('Review default'));
+
+    expect(host.reviewModePreference).toBe('all');
+    expect(store.setReviewModePreference(host.id, 'risky')).toMatchObject({
+      reviewModePreference: 'risky',
+      fullTakeoverPreference: false,
+    });
+    expect(new HostStore(filePath).get(host.id).reviewModePreference).toBe('risky');
+    expect(store.setReviewModePreference(host.id, 'complete')).toMatchObject({
+      reviewModePreference: 'complete',
+      fullTakeoverPreference: true,
+    });
   });
 
   it('creates, renames, orders, and only removes empty Host folders', () => {
